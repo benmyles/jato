@@ -38,9 +38,13 @@ fn charge(encoded: usize, file: bool) -> usize {
 
 // Only the SQLite writer publishes or removes a frame. Renaming one private
 // pending file makes publication atomic for readers on an older WAL snapshot.
-fn write_frame(dir: &Path, digest: &Digest, bytes: &[u8]) -> Result<()> {
+fn write_frame(dir: &Path, digest: &Digest, bytes: &[u8], shards: &mut u16) -> Result<()> {
     let dest = Kind::Frame.path(dir, digest);
-    fs::create_dir_all(dest.parent().unwrap())?;
+    let bit = 1u16 << (digest[0] >> 4);
+    if *shards & bit == 0 {
+        objects::prepare_shard(dest.parent().unwrap())?;
+        *shards |= bit;
+    }
     let pending = dir.join("frames-v1/.pending");
     let create = || {
         OpenOptions::new()
@@ -190,6 +194,7 @@ pub(super) struct Recorder {
     populated: bool,
     dir: PathBuf,
     pub has_files: bool,
+    shards: u16,
     pub reused: u64,
 }
 
@@ -202,6 +207,7 @@ impl Recorder {
             populated,
             dir: dir.to_owned(),
             has_files: false,
+            shards: 0,
             reused: 0,
         }
     }
@@ -313,7 +319,7 @@ impl Recorder {
             .execute(params![&digest, raw, inline, external])?;
         if added != 0 && external != 0 {
             self.has_files = true;
-            write_frame(&self.dir, &digest, bytes)?;
+            write_frame(&self.dir, &digest, bytes, &mut self.shards)?;
         }
         Ok((digest, raw as u64))
     }

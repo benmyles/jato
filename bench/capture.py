@@ -18,7 +18,15 @@ from compare import binary, run
 from worktrees import cargo_environment, private_environment
 
 
-def wrapper_trace(exe, command, env, project, prefix):
+def wrapper_trace(
+    exe,
+    command,
+    env,
+    project,
+    prefix,
+    crate_name="capture",
+    syscalls="write,writev,pwrite64",
+):
     run(
         [
             "strace",
@@ -28,7 +36,7 @@ def wrapper_trace(exe, command, env, project, prefix):
             "-s",
             "96",
             "-e",
-            "trace=execve,write,writev,pwrite64",
+            f"trace=execve,{syscalls}",
             "-o",
             prefix,
             *command,
@@ -40,7 +48,8 @@ def wrapper_trace(exe, command, env, project, prefix):
     for f in prefix.parent.glob(prefix.name + ".*"):
         lines = f.read_text(errors="replace").splitlines()
         if any(
-            line.startswith(f'execve("{exe}"') and '"--crate-name", "capture"' in line
+            line.startswith(f'execve("{exe}"')
+            and f'"--crate-name", "{crate_name}"' in line
             for line in lines
         ):
             traces.append(lines)
@@ -48,7 +57,7 @@ def wrapper_trace(exe, command, env, project, prefix):
     return traces[0]
 
 
-def packed_writes(exe, cargo, env, project, root, runs):
+def packed_writes(exe, cargo, env, project, root):
     command = [cargo, "build", "--release", "--lib", "--locked", "-q"]
     env = dict(env, JATO_STORAGE="packed")
     cold = wrapper_trace(exe, command, env, project, root / "cold")
@@ -88,22 +97,13 @@ def packed_writes(exe, cargo, env, project, root, runs):
         assert hashlib.file_digest(stream, "sha256").digest() == expected.digest()
     restored = json.loads(run([exe, "stats", "--json"], env, project))
     assert restored["counters"].get("hit", 0) == 1
-    times = []
-    for _ in range(runs):
-        shutil.rmtree(target)
-        start = time.perf_counter()
-        run(command, env, project)
-        times.append(round(time.perf_counter() - start, 6))
-        with archive.open("rb") as stream:
-            assert hashlib.file_digest(stream, "sha256").digest() == expected.digest()
     target_writes = re.compile(
         r"^(?:write|writev|pwrite64)\(\d+<"
         + re.escape(str(target))
         + r"/[^>]+>.* = (\d+)$"
     )
     return {
-        "untraced_restore_seconds": times,
-        "median_restore_seconds": statistics.median(times),
+        "untraced_restore_seconds": [],
         "logical_restored_bytes": stats["artifact_bytes"],
         "restore_output_bytes_written": total(target_writes, warm),
         "restore_archive_sha256": expected.hexdigest(),
@@ -184,6 +184,7 @@ fn main(){
         config.touch()
         results = {}
         envs = {}
+        packed_envs = {}
 
         def environment(work, exe):
             work.mkdir()
@@ -196,13 +197,42 @@ fn main(){
         for name, exe in tools.items():
             private = root / name
             private.mkdir()
-            trace_env = environment(private / "packed", exe)
+            trace_env = dict(
+                environment(private / "packed", exe), JATO_STORAGE="packed"
+            )
+            packed_envs[name] = trace_env
             envs[name] = dict(environment(private / "auto", exe), JATO_LOG="timings")
             results[name] = {
                 "version": run([exe, "--version"], base, project).decode().strip(),
-                "cold_packed": packed_writes(exe, cargo, trace_env, project, private, opts.runs),
+                "cold_packed": packed_writes(exe, cargo, trace_env, project, private),
                 "builds": [],
             }
+        # Alternate independently primed targets to reduce time-of-run bias.
+        for i in range(opts.runs):
+            for name in list(tools) if i % 2 == 0 else reversed(tools):
+                cfg = packed_envs[name]
+                target = Path(cfg["CARGO_TARGET_DIR"])
+                shutil.rmtree(target)
+                start = time.perf_counter()
+                run(
+                    [cargo, "build", "--release", "--lib", "--locked", "-q"],
+                    cfg,
+                    project,
+                )
+                result = results[name]["cold_packed"]
+                result["untraced_restore_seconds"].append(
+                    round(time.perf_counter() - start, 6)
+                )
+                with (target / "release/libcapture.rlib").open("rb") as stream:
+                    assert (
+                        hashlib.file_digest(stream, "sha256").hexdigest()
+                        == result["restore_archive_sha256"]
+                    )
+        for row in results.values():
+            packed = row["cold_packed"]
+            packed["median_restore_seconds"] = statistics.median(
+                packed["untraced_restore_seconds"]
+            )
         for revision in range(opts.runs + 1):
             edit(revision)
             for name in list(tools) if revision % 2 == 0 else reversed(tools):

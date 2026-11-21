@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Measure packed-store growth across source revisions of one Rust library."""
+"""Measure local cache growth and verified restores across revisions of a Rust library."""
 
 import argparse
 import contextlib
 import hashlib
 import json
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from capture import wrapper_trace
 from compare import binary, extent_usage, run, tree_bytes
 from worktrees import cargo_environment, counters, private_environment
 
@@ -80,7 +82,7 @@ fn main() {
     run([program, project / "src/table.bin"], env, directory)
 
 
-def revisions(label, exe, project, target, env, edit, count, symbol):
+def revisions(label, exe, project, target, env, edit, count, symbol, trace_edited):
     command = [env["CARGO"], "build", "--release", "--lib", "--locked", "-q"]
     archive = target / "release/libjato_history_bench.rlib"
     jato = label in {"jato", "previous_jato"}
@@ -144,6 +146,23 @@ def revisions(label, exe, project, target, env, edit, count, symbol):
     if jato:
         assert latest_hits == 1
     verify_library(project, archive, env, count - 1, symbol)
+    trace = {}
+    if trace_edited and jato:
+        shutil.rmtree(target)
+        prefix = project.parent / (label + "-restore")
+        lines = wrapper_trace(
+            exe, command, env, project, prefix, "jato_history_bench", "read,pread64"
+        )
+        pattern = re.compile(
+            r"^(?:read|pread64)\(\d+<"
+            + re.escape(str(target))
+            + r"/[^>]*(?:/#[0-9]+|/part-[^>]+)>.* = (\d+)$"
+        )
+        trace["edited_staging_bytes_read"] = sum(
+            int(m[1]) for line in lines if (m := pattern.match(line))
+        )
+        assert archive_hash(archive) == last
+        assert counters(label, exe, env, project)["hits"] == before + latest_hits + 1
     return {
         "version": run([exe, "--version"], env, project).decode().strip(),
         "revisions": rows,
@@ -152,6 +171,7 @@ def revisions(label, exe, project, target, env, edit, count, symbol):
         "edited_restore_seconds": round(latest, 6),
         "edited_restore_hits": latest_hits,
         "edited_archive_sha256": last,
+        **trace,
         "verified_revisions": count,
         "archive_sha256": initial,
     }
@@ -168,6 +188,11 @@ def main():
         "--sccache", help="include this sccache binary with a private local server"
     )
     parser.add_argument("--variants", type=int, default=8)
+    parser.add_argument(
+        "--trace-edited",
+        action="store_true",
+        help="trace Jato reads of staged targets on a separate edited restore",
+    )
     parser.add_argument("--storage", choices=["packed", "auto"], default="packed")
     workload = parser.add_mutually_exclusive_group()
     workload.add_argument(
@@ -267,6 +292,7 @@ def main():
                     edit,
                     opts.variants,
                     not (opts.edit_asset or opts.insert_asset),
+                    opts.trace_edited,
                 )
             store = private / "store"
             row.update(store_bytes=tree_bytes(store), **extent_usage(store))

@@ -1340,6 +1340,38 @@ mod tests {
     }
 
     #[test]
+    fn redirected_frame_directories_do_not_receive_writes_or_cleanup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = Store::at(dir.path().join("cache"), 4 << 20)?;
+        let other = dir.path().join("unrelated");
+        fs::create_dir(&other)?;
+        fs::write(other.join(".pending"), b"keep")?;
+        let mut bytes = vec![0; CHUNK];
+        blake3::Hasher::new()
+            .update(b"unrelated")
+            .finalize_xof()
+            .fill(&mut bytes);
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let managed = store.dir.join("frames-v1");
+        let names = objects::Kind::Frame.path(&store.dir, &hash);
+        let outside = other.join(names.strip_prefix(&managed)?);
+        fs::create_dir(outside.parent().unwrap())?;
+        fs::write(&outside, b"keep")?;
+        std::os::unix::fs::symlink(&other, &managed)?;
+        let input = dir.path().join("compiler-output");
+        fs::write(&input, bytes)?;
+        assert!(
+            store
+                .save(&[2; 32], &[3; 32], &[input], b"", 1, None)
+                .is_err()
+        );
+        assert!(store.prune(0).is_err());
+        assert_eq!(fs::read(other.join(".pending"))?, b"keep");
+        assert_eq!(fs::read(outside)?, b"keep");
+        Ok(())
+    }
+
+    #[test]
     fn rolled_back_publication_leaves_existing_frames_and_no_new_files() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = Store::at(dir.path().join("cache"), 8 << 20)?;

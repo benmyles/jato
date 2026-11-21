@@ -29,6 +29,9 @@ impl Kind {
     }
 
     pub fn collect(self, dir: &Path, tx: &Transaction<'_>, sweep: bool) -> Result<()> {
+        let (directory, width) = self.layout();
+        let root = dir.join(directory);
+        let present = directory_exists(&root)?;
         let (retired, forget, exists) = match self {
             Self::Sealed => (
                 "SELECT hash FROM retired LIMIT 128",
@@ -51,16 +54,14 @@ impl Kind {
                 break;
             }
             for digest in batch {
-                remove(&self.path(dir, &digest))?;
+                let path = self.path(dir, &digest);
+                if present && directory_exists(path.parent().unwrap())? {
+                    remove(&path)?;
+                }
                 forget.execute([digest])?;
             }
         }
-        if !sweep {
-            return Ok(());
-        }
-        let (directory, width) = self.layout();
-        let root = dir.join(directory);
-        if !root.is_dir() {
+        if !sweep || !present {
             return Ok(());
         }
         if matches!(self, Self::Frame) {
@@ -93,6 +94,31 @@ impl Kind {
         }
         Ok(())
     }
+}
+
+fn directory_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "redirected cache directory",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+// Called under the writer lock. The configured cache root itself may be a
+// symlink. The two managed components below it must be directories we own.
+pub(crate) fn prepare_shard(shard: &Path) -> io::Result<()> {
+    for path in [shard.parent().expect("object namespace"), shard] {
+        match fs::create_dir(path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && directory_exists(path)? => (),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn remove(path: &Path) -> io::Result<()> {

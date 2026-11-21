@@ -157,7 +157,7 @@ mod linux {
 
     pub fn publish(object: &Object, path: &Path) -> Result<()> {
         let shard = path.parent().context("missing object directory")?;
-        fs::create_dir_all(shard)?;
+        crate::store::objects::prepare_shard(shard)?;
         if let Ok(f) = crate::content::open_with_flags(path, libc::O_NONBLOCK | libc::O_NOFOLLOW)
             && measure(&f).ok() == Some(object.verity)
         {
