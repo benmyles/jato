@@ -1,0 +1,626 @@
+{
+  "versions": {
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "jato": "jato 0.2.0",
+    "kache": "kache 2.1.1",
+    "sccache": "sccache 0.19.0",
+    "jato_packed": "jato 0.2.0"
+  },
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "project": "ripgrep-14.1.1",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "jobs": 4,
+  "runs": 3,
+  "samples": {
+    "cargo": {
+      "check": [
+        {
+          "cold": 3.46247,
+          "cold_peak_process_rss_kib": 275568,
+          "warm": 3.69529,
+          "warm_peak_process_rss_kib": 275948,
+          "fresh": 0.05993,
+          "fresh_peak_process_rss_kib": 35040,
+          "store_bytes": 0
+        },
+        {
+          "cold": 5.92479,
+          "cold_peak_process_rss_kib": 275172,
+          "warm": 5.00488,
+          "warm_peak_process_rss_kib": 275564,
+          "fresh": 0.05833,
+          "fresh_peak_process_rss_kib": 34944,
+          "store_bytes": 0
+        },
+        {
+          "cold": 6.13522,
+          "cold_peak_process_rss_kib": 275856,
+          "warm": 8.13209,
+          "warm_peak_process_rss_kib": 275804,
+          "fresh": 0.0753,
+          "fresh_peak_process_rss_kib": 35120,
+          "store_bytes": 0
+        }
+      ],
+      "release": [
+        {
+          "cold": 21.3981,
+          "cold_peak_process_rss_kib": 377016,
+          "warm": 25.6783,
+          "warm_peak_process_rss_kib": 376928,
+          "fresh": 0.05402,
+          "fresh_peak_process_rss_kib": 35136,
+          "store_bytes": 0
+        },
+        {
+          "cold": 40.29189,
+          "cold_peak_process_rss_kib": 378304,
+          "warm": 38.30479,
+          "warm_peak_process_rss_kib": 375992,
+          "fresh": 0.06792,
+          "fresh_peak_process_rss_kib": 34996,
+          "store_bytes": 0
+        },
+        {
+          "cold": 28.03713,
+          "cold_peak_process_rss_kib": 374256,
+          "warm": 25.5186,
+          "warm_peak_process_rss_kib": 376196,
+          "fresh": 0.06683,
+          "fresh_peak_process_rss_kib": 34828,
+          "store_bytes": 0
+        }
+      ]
+    },
+    "jato": {
+      "check": [
+        {
+          "cold": 4.50628,
+          "cold_peak_process_rss_kib": 276204,
+          "warm": 0.15471,
+          "warm_peak_process_rss_kib": 87460,
+          "fresh": 0.04042,
+          "fresh_peak_process_rss_kib": 26560,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 48038023,
+          "packed_bytes": 895106,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 50458759,
+          "btrfs_total": 50499584,
+          "btrfs_exclusive": 2420736,
+          "btrfs_set_shared": 45359104
+        },
+        {
+          "cold": 7.31878,
+          "cold_peak_process_rss_kib": 275664,
+          "warm": 0.22136,
+          "warm_peak_process_rss_kib": 87092,
+          "fresh": 0.05257,
+          "fresh_peak_process_rss_kib": 26592,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 48038023,
+          "packed_bytes": 895106,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 50454663,
+          "btrfs_total": 50495488,
+          "btrfs_exclusive": 2416640,
+          "btrfs_set_shared": 47398912
+        },
+        {
+          "cold": 9.53572,
+          "cold_peak_process_rss_kib": 275452,
+          "warm": 0.40563,
+          "warm_peak_process_rss_kib": 87292,
+          "fresh": 0.05975,
+          "fresh_peak_process_rss_kib": 26672,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 48038023,
+          "packed_bytes": 895106,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 50462855,
+          "btrfs_total": 50503680,
+          "btrfs_exclusive": 2424832,
+          "btrfs_set_shared": 41758720
+        }
+      ],
+      "release": [
+        {
+          "cold": 25.90327,
+          "cold_peak_process_rss_kib": 379916,
+          "warm": 0.28176,
+          "warm_peak_process_rss_kib": 87264,
+          "fresh": 0.03954,
+          "fresh_peak_process_rss_kib": 26664,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 165301920,
+          "packed_bytes": 1591707,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 168509088,
+          "btrfs_total": 168587264,
+          "btrfs_exclusive": 3207168,
+          "btrfs_set_shared": 151146496
+        },
+        {
+          "cold": 29.85923,
+          "cold_peak_process_rss_kib": 379016,
+          "warm": 0.27463,
+          "warm_peak_process_rss_kib": 87372,
+          "fresh": 0.03866,
+          "fresh_peak_process_rss_kib": 26584,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 165301920,
+          "packed_bytes": 1591707,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 168500896,
+          "btrfs_total": 168579072,
+          "btrfs_exclusive": 3198976,
+          "btrfs_set_shared": 156311552
+        },
+        {
+          "cold": 28.14586,
+          "cold_peak_process_rss_kib": 377016,
+          "warm": 0.28131,
+          "warm_peak_process_rss_kib": 87360,
+          "fresh": 0.04218,
+          "fresh_peak_process_rss_kib": 26528,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 165301920,
+          "packed_bytes": 1591707,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 168509088,
+          "btrfs_total": 168587264,
+          "btrfs_exclusive": 3207168,
+          "btrfs_set_shared": 149807104
+        }
+      ]
+    },
+    "kache": {
+      "check": [
+        {
+          "cold": 3.5192,
+          "cold_peak_process_rss_kib": 277536,
+          "warm": 0.31373,
+          "warm_peak_process_rss_kib": 34932,
+          "fresh": 0.07711,
+          "fresh_peak_process_rss_kib": 34996,
+          "idle_server_rss_kib": 27072,
+          "hits": 45,
+          "store_bytes": 50575386,
+          "btrfs_total": 50597888,
+          "btrfs_exclusive": 618496,
+          "btrfs_set_shared": 48107520
+        },
+        {
+          "cold": 8.36055,
+          "cold_peak_process_rss_kib": 276948,
+          "warm": 0.81489,
+          "warm_peak_process_rss_kib": 35140,
+          "fresh": 0.14529,
+          "fresh_peak_process_rss_kib": 35000,
+          "idle_server_rss_kib": 27704,
+          "hits": 45,
+          "store_bytes": 50575396,
+          "btrfs_total": 50597888,
+          "btrfs_exclusive": 618496,
+          "btrfs_set_shared": 39514112
+        },
+        {
+          "cold": 4.63556,
+          "cold_peak_process_rss_kib": 277716,
+          "warm": 0.28133,
+          "warm_peak_process_rss_kib": 35040,
+          "fresh": 0.08142,
+          "fresh_peak_process_rss_kib": 35068,
+          "idle_server_rss_kib": 27668,
+          "hits": 45,
+          "store_bytes": 50575391,
+          "btrfs_total": 50597888,
+          "btrfs_exclusive": 618496,
+          "btrfs_set_shared": 47050752
+        }
+      ],
+      "release": [
+        {
+          "cold": 23.00444,
+          "cold_peak_process_rss_kib": 374240,
+          "warm": 0.34066,
+          "warm_peak_process_rss_kib": 34996,
+          "fresh": 0.09812,
+          "fresh_peak_process_rss_kib": 34988,
+          "idle_server_rss_kib": 26740,
+          "hits": 45,
+          "store_bytes": 168694270,
+          "btrfs_total": 168755200,
+          "btrfs_exclusive": 720896,
+          "btrfs_set_shared": 154456064
+        },
+        {
+          "cold": 21.51398,
+          "cold_peak_process_rss_kib": 378424,
+          "warm": 0.24092,
+          "warm_peak_process_rss_kib": 35036,
+          "fresh": 0.08445,
+          "fresh_peak_process_rss_kib": 34976,
+          "idle_server_rss_kib": 27836,
+          "hits": 45,
+          "store_bytes": 168694399,
+          "btrfs_total": 168755200,
+          "btrfs_exclusive": 720896,
+          "btrfs_set_shared": 160002048
+        },
+        {
+          "cold": 39.30315,
+          "cold_peak_process_rss_kib": 385584,
+          "warm": 0.35136,
+          "warm_peak_process_rss_kib": 35156,
+          "fresh": 0.09429,
+          "fresh_peak_process_rss_kib": 35056,
+          "idle_server_rss_kib": 28312,
+          "hits": 45,
+          "store_bytes": 168690184,
+          "btrfs_total": 168751104,
+          "btrfs_exclusive": 716800,
+          "btrfs_set_shared": 143282176
+        }
+      ]
+    },
+    "sccache": {
+      "check": [
+        {
+          "cold": 4.72862,
+          "cold_peak_process_rss_kib": 184428,
+          "warm": 1.30621,
+          "warm_peak_process_rss_kib": 184124,
+          "fresh": 0.06178,
+          "fresh_peak_process_rss_kib": 35004,
+          "idle_server_rss_kib": 20184,
+          "hits": 32,
+          "store_bytes": 7653526,
+          "btrfs_total": 7725056,
+          "btrfs_exclusive": 7725056,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 7.18767,
+          "cold_peak_process_rss_kib": 183876,
+          "warm": 1.72902,
+          "warm_peak_process_rss_kib": 184348,
+          "fresh": 0.08257,
+          "fresh_peak_process_rss_kib": 34912,
+          "idle_server_rss_kib": 17304,
+          "hits": 32,
+          "store_bytes": 7653526,
+          "btrfs_total": 7725056,
+          "btrfs_exclusive": 7725056,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 4.37215,
+          "cold_peak_process_rss_kib": 184568,
+          "warm": 1.59911,
+          "warm_peak_process_rss_kib": 184108,
+          "fresh": 0.07006,
+          "fresh_peak_process_rss_kib": 34932,
+          "idle_server_rss_kib": 17840,
+          "hits": 32,
+          "store_bytes": 7653526,
+          "btrfs_total": 7725056,
+          "btrfs_exclusive": 7725056,
+          "btrfs_set_shared": 0
+        }
+      ],
+      "release": [
+        {
+          "cold": 17.67144,
+          "cold_peak_process_rss_kib": 553860,
+          "warm": 8.47389,
+          "warm_peak_process_rss_kib": 569240,
+          "fresh": 0.07681,
+          "fresh_peak_process_rss_kib": 35044,
+          "idle_server_rss_kib": 20256,
+          "hits": 32,
+          "store_bytes": 30589120,
+          "btrfs_total": 30654464,
+          "btrfs_exclusive": 30654464,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 12.91659,
+          "cold_peak_process_rss_kib": 571936,
+          "warm": 4.45168,
+          "warm_peak_process_rss_kib": 553052,
+          "fresh": 0.05875,
+          "fresh_peak_process_rss_kib": 35024,
+          "idle_server_rss_kib": 20160,
+          "hits": 32,
+          "store_bytes": 30589120,
+          "btrfs_total": 30654464,
+          "btrfs_exclusive": 30654464,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 13.74446,
+          "cold_peak_process_rss_kib": 569484,
+          "warm": 4.78356,
+          "warm_peak_process_rss_kib": 560952,
+          "fresh": 0.07112,
+          "fresh_peak_process_rss_kib": 35120,
+          "idle_server_rss_kib": 20248,
+          "hits": 32,
+          "store_bytes": 30589120,
+          "btrfs_total": 30654464,
+          "btrfs_exclusive": 30654464,
+          "btrfs_set_shared": 0
+        }
+      ]
+    },
+    "jato_packed": {
+      "check": [
+        {
+          "cold": 3.72676,
+          "cold_peak_process_rss_kib": 275332,
+          "warm": 0.16598,
+          "warm_peak_process_rss_kib": 87280,
+          "fresh": 0.03848,
+          "fresh_peak_process_rss_kib": 26824,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 15550956,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 17498112,
+          "btrfs_total": 17498112,
+          "btrfs_exclusive": 17498112,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 9.59915,
+          "cold_peak_process_rss_kib": 275196,
+          "warm": 0.24238,
+          "warm_peak_process_rss_kib": 87372,
+          "fresh": 0.05974,
+          "fresh_peak_process_rss_kib": 26752,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 15550956,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 17489920,
+          "btrfs_total": 17489920,
+          "btrfs_exclusive": 17489920,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 5.16759,
+          "cold_peak_process_rss_kib": 275404,
+          "warm": 0.21065,
+          "warm_peak_process_rss_kib": 87464,
+          "fresh": 0.04291,
+          "fresh_peak_process_rss_kib": 26432,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 15550956,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 17485824,
+          "btrfs_total": 17485824,
+          "btrfs_exclusive": 17485824,
+          "btrfs_set_shared": 0
+        }
+      ],
+      "release": [
+        {
+          "cold": 44.77209,
+          "cold_peak_process_rss_kib": 373116,
+          "warm": 0.33732,
+          "warm_peak_process_rss_kib": 87200,
+          "fresh": 0.03843,
+          "fresh_peak_process_rss_kib": 26836,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 48180124,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 51130368,
+          "btrfs_total": 51130368,
+          "btrfs_exclusive": 51130368,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 30.18763,
+          "cold_peak_process_rss_kib": 378664,
+          "warm": 0.40753,
+          "warm_peak_process_rss_kib": 87388,
+          "fresh": 0.06542,
+          "fresh_peak_process_rss_kib": 26612,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 48180124,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 51130368,
+          "btrfs_total": 51130368,
+          "btrfs_exclusive": 51130368,
+          "btrfs_set_shared": 0
+        },
+        {
+          "cold": 24.29668,
+          "cold_peak_process_rss_kib": 378032,
+          "warm": 0.40855,
+          "warm_peak_process_rss_kib": 87236,
+          "fresh": 0.04358,
+          "fresh_peak_process_rss_kib": 26612,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 48180124,
+          "probe_hits": 8,
+          "hits": 39,
+          "store_bytes": 51146752,
+          "btrfs_total": 51146752,
+          "btrfs_exclusive": 51146752,
+          "btrfs_set_shared": 0
+        }
+      ]
+    }
+  },
+  "median": {
+    "cargo": {
+      "check": {
+        "cold": 5.92479,
+        "cold_peak_process_rss_kib": 275568,
+        "warm": 5.00488,
+        "warm_peak_process_rss_kib": 275804,
+        "fresh": 0.05993,
+        "fresh_peak_process_rss_kib": 35040,
+        "store_bytes": 0
+      },
+      "release": {
+        "cold": 28.03713,
+        "cold_peak_process_rss_kib": 377016,
+        "warm": 25.6783,
+        "warm_peak_process_rss_kib": 376196,
+        "fresh": 0.06683,
+        "fresh_peak_process_rss_kib": 34996,
+        "store_bytes": 0
+      }
+    },
+    "jato": {
+      "check": {
+        "cold": 7.31878,
+        "cold_peak_process_rss_kib": 275664,
+        "warm": 0.22136,
+        "warm_peak_process_rss_kib": 87292,
+        "fresh": 0.05257,
+        "fresh_peak_process_rss_kib": 26592,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 48038023,
+        "packed_bytes": 895106,
+        "probe_hits": 8,
+        "hits": 39,
+        "store_bytes": 50458759,
+        "btrfs_total": 50499584,
+        "btrfs_exclusive": 2420736,
+        "btrfs_set_shared": 45359104
+      },
+      "release": {
+        "cold": 28.14586,
+        "cold_peak_process_rss_kib": 379016,
+        "warm": 0.28131,
+        "warm_peak_process_rss_kib": 87360,
+        "fresh": 0.03954,
+        "fresh_peak_process_rss_kib": 26584,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 165301920,
+        "packed_bytes": 1591707,
+        "probe_hits": 8,
+        "hits": 39,
+        "store_bytes": 168509088,
+        "btrfs_total": 168587264,
+        "btrfs_exclusive": 3207168,
+        "btrfs_set_shared": 151146496
+      }
+    },
+    "kache": {
+      "check": {
+        "cold": 4.63556,
+        "cold_peak_process_rss_kib": 277536,
+        "warm": 0.31373,
+        "warm_peak_process_rss_kib": 35040,
+        "fresh": 0.08142,
+        "fresh_peak_process_rss_kib": 35000,
+        "idle_server_rss_kib": 27668,
+        "hits": 45,
+        "store_bytes": 50575391,
+        "btrfs_total": 50597888,
+        "btrfs_exclusive": 618496,
+        "btrfs_set_shared": 47050752
+      },
+      "release": {
+        "cold": 23.00444,
+        "cold_peak_process_rss_kib": 378424,
+        "warm": 0.34066,
+        "warm_peak_process_rss_kib": 35036,
+        "fresh": 0.09429,
+        "fresh_peak_process_rss_kib": 34988,
+        "idle_server_rss_kib": 27836,
+        "hits": 45,
+        "store_bytes": 168694270,
+        "btrfs_total": 168755200,
+        "btrfs_exclusive": 720896,
+        "btrfs_set_shared": 154456064
+      }
+    },
+    "sccache": {
+      "check": {
+        "cold": 4.72862,
+        "cold_peak_process_rss_kib": 184428,
+        "warm": 1.59911,
+        "warm_peak_process_rss_kib": 184124,
+        "fresh": 0.07006,
+        "fresh_peak_process_rss_kib": 34932,
+        "idle_server_rss_kib": 17840,
+        "hits": 32,
+        "store_bytes": 7653526,
+        "btrfs_total": 7725056,
+        "btrfs_exclusive": 7725056,
+        "btrfs_set_shared": 0
+      },
+      "release": {
+        "cold": 13.74446,
+        "cold_peak_process_rss_kib": 569484,
+        "warm": 4.78356,
+        "warm_peak_process_rss_kib": 560952,
+        "fresh": 0.07112,
+        "fresh_peak_process_rss_kib": 35044,
+        "idle_server_rss_kib": 20248,
+        "hits": 32,
+        "store_bytes": 30589120,
+        "btrfs_total": 30654464,
+        "btrfs_exclusive": 30654464,
+        "btrfs_set_shared": 0
+      }
+    },
+    "jato_packed": {
+      "check": {
+        "cold": 5.16759,
+        "cold_peak_process_rss_kib": 275332,
+        "warm": 0.21065,
+        "warm_peak_process_rss_kib": 87372,
+        "fresh": 0.04291,
+        "fresh_peak_process_rss_kib": 26752,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 0,
+        "packed_bytes": 15550956,
+        "probe_hits": 8,
+        "hits": 39,
+        "store_bytes": 17489920,
+        "btrfs_total": 17489920,
+        "btrfs_exclusive": 17489920,
+        "btrfs_set_shared": 0
+      },
+      "release": {
+        "cold": 30.18763,
+        "cold_peak_process_rss_kib": 378032,
+        "warm": 0.40753,
+        "warm_peak_process_rss_kib": 87236,
+        "fresh": 0.04358,
+        "fresh_peak_process_rss_kib": 26612,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 0,
+        "packed_bytes": 48180124,
+        "probe_hits": 8,
+        "hits": 39,
+        "store_bytes": 51130368,
+        "btrfs_total": 51130368,
+        "btrfs_exclusive": 51130368,
+        "btrfs_set_shared": 0
+      }
+    }
+  }
+}
