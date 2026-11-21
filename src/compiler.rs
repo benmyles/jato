@@ -36,9 +36,9 @@ fn discover(
     compiler: &OsStr,
     inv: &Invocation,
     recipe: &fingerprint::Recipe,
+    plans: Vec<Vec<u8>>,
 ) -> Result<Option<Hit>> {
     let before = Instant::now();
-    let plans = store.plans(&recipe.key)?;
     if plans.is_empty() {
         trace(
             &inv.name,
@@ -274,28 +274,40 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             return passthrough(original(compiler, args));
         }
     };
-    // Take the ticket before lookup to close the publication race. Warm
-    // readers restore concurrently and never need to wait for the owner.
-    let ticket = crate::flight::Ticket::enter(&store.dir, &recipe.key, &inv.source);
+    let mut ticket = None;
     let mut waited = false;
     loop {
-        match discover(&mut store, compiler, inv, &recipe) {
-            Ok(Some(hit)) => {
+        let lookup = store.plans(&recipe.key).and_then(|(plans, version)| {
+            discover(&mut store, compiler, inv, &recipe, plans).map(|hit| (hit, version))
+        });
+        let version = match lookup {
+            Ok((Some(hit), _)) => {
                 io::stderr().write_all(&hit.diagnostics)?;
                 let _ = store.record_hit(&hit, waited);
                 trace(&inv.name, "hit");
                 return Ok(0);
             }
-            Ok(None) => (),
+            Ok((None, _)) if ticket.is_some() => break,
+            Ok((None, version)) => version,
             Err(e) => {
                 trace(&inv.name, format_args!("compile after lookup: {e:#}"));
                 break;
             }
+        };
+        ticket = crate::flight::Ticket::enter(&store.dir, &recipe.key, &inv.source);
+        let Some(claim) = &ticket else { break };
+        if claim.is_owner() {
+            // Another compiler may have published between the first miss
+            // and this election. Recheck only if a transaction intervened.
+            if store.data_version().is_ok_and(|now| now == version) {
+                break;
+            }
+        } else {
+            waited = claim.wait();
+            if !waited {
+                break;
+            }
         }
-        if waited || !ticket.as_ref().is_some_and(crate::flight::Ticket::wait) {
-            break;
-        }
-        waited = true;
     }
     let _ = store.count("miss", 1);
     let since = SystemTime::now();

@@ -56,6 +56,10 @@ mod linux {
             }
         }
 
+        pub fn is_owner(&self) -> bool {
+            matches!(self.0, Role::Owner { .. })
+        }
+
         pub fn wait(&self) -> bool {
             let Role::Peer(name) = &self.0 else {
                 return false;
@@ -193,6 +197,9 @@ pub struct Ticket;
 impl Ticket {
     pub fn enter(_: &Path, _: &Digest, _: &Path) -> Option<Self> {
         None
+    }
+    pub fn is_owner(&self) -> bool {
+        false
     }
     pub fn wait(&self) -> bool {
         false

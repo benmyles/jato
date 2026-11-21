@@ -8,6 +8,9 @@
 - Preserved up to three additional checked directory layouts per published entry. Six switches between two ripgrep checkouts required two module-resolution probes, down from twelve. Tested the metadata budget, bounded replacement and GC.
 - Replaced duplicate full extern reads on native misses with an indexed size prefilter and a single post-compile content certification against the original file identities. A same-length unknown artifact and a replaced path both fail certification. All 47 standard tests passed on Rust 1.89 and 1.100.
 
+- Moved the election off the warm-hit path. A miss compares SQLite’s connection-local data version after acquiring ownership to catch publication in the intervening interval. Added a concurrent benchmark that includes the CPU and sampled proportional memory of private cache daemons and their compilers.
+- Found 0.4 rebuilding all watches after a subtree arrived. In a two-package workspace with 4,096 watched leaf directories, five directory arrivals took a median 458 ms to reach workspace success.
+
 ## 2026-11-21 — worktrees and packed writes
 
 - Rebuilt the locked regex application in two target directories. All five registry libraries and their five metadata files were byte-identical, while their dep-info referred to different output paths. Jato 0.3 missed all five in the second target.

@@ -257,7 +257,7 @@ impl Store {
                         "ALTER TABLE plans ADD COLUMN manifest INTEGER REFERENCES manifests",
                     )?;
                 }
-                if version != 0 {
+                if (1..11).contains(&version) {
                     tx.execute_batch(
                         "DROP TRIGGER IF EXISTS drop_single; DROP TRIGGER IF EXISTS drop_part;",
                     )?;
@@ -354,7 +354,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn plans(&mut self, recipe: &Digest) -> Result<Vec<Vec<u8>>> {
+    pub fn data_version(&self) -> Result<u32> {
+        Ok(self
+            .conn
+            .prepare_cached("PRAGMA data_version")?
+            .query_row([], |r| r.get(0))?)
+    }
+
+    pub fn plans(&mut self, recipe: &Digest) -> Result<(Vec<Vec<u8>>, u32)> {
         let tx = self.conn.unchecked_transaction()?;
         let mut q = tx.prepare_cached(
             "SELECT p.manifest,m.hash,
@@ -403,6 +410,9 @@ impl Store {
         }
         drop(rows);
         drop(q);
+        // Capture the version in the same read snapshot. Only a miss needs
+        // to compare it after electing a compiler.
+        let version = self.data_version()?;
         // Keeping the read snapshot through invalidation prevents removal of
         // a newer manifest installed concurrently under a recycled row id.
         let reap = !damaged.is_empty();
@@ -417,7 +427,7 @@ impl Store {
         if reap {
             self.collect_objects(false)?;
         }
-        Ok(plans)
+        Ok((plans, version))
     }
 
     pub fn has_sources(&self, digest: &Digest) -> Result<bool> {
@@ -1209,16 +1219,16 @@ mod tests {
             0
         );
         assert_eq!(
-            store.plans(&[8; 32])?.as_slice(),
+            store.plans(&[8; 32])?.0.as_slice(),
             std::slice::from_ref(&inputs)
         );
         store
             .conn
             .execute("UPDATE manifests SET data=zeroblob(length(data))", [])?;
-        assert!(store.plans(&[8; 32])?.is_empty());
+        assert!(store.plans(&[8; 32])?.0.is_empty());
         assert_eq!(store.stats()?.charged_bytes, 0);
         assert!(store.save(&[8; 32], &[1; 32], &outputs, b"", 1, Some(evidence()))?);
-        assert_eq!(store.plans(&[8; 32])?, [inputs]);
+        assert_eq!(store.plans(&[8; 32])?.0, [inputs]);
         assert_eq!(store.restore(&[1; 32], &outputs)?, Some(vec![]));
         store.prune(0)?;
         assert_eq!(store.stats()?.charged_bytes, 0);
@@ -1316,7 +1326,7 @@ mod tests {
         let b = *blake3::hash(b"downstream").as_bytes();
         save(&mut store, 1, b"downstream", &[a], true)?;
         save(&mut store, 2, b"leaf", &[b], true)?;
-        assert!(store.plans(&[2; 32])?.is_empty());
+        assert!(store.plans(&[2; 32])?.0.is_empty());
         assert!(!store.knows_artifact(&b, true)?);
         assert!(
             store
@@ -1324,9 +1334,9 @@ mod tests {
                 .is_none()
         );
         save(&mut store, 3, b"producer", &[], false)?;
-        assert!(store.plans(&[2; 32])?.is_empty());
+        assert!(store.plans(&[2; 32])?.0.is_empty());
         save(&mut store, 4, b"producer", &[], true)?;
-        assert!(!store.plans(&[2; 32])?.is_empty());
+        assert!(!store.plans(&[2; 32])?.0.is_empty());
         assert!(store.knows_artifact(&b, true)?);
         Ok(())
     }

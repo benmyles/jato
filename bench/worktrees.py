@@ -17,10 +17,75 @@ import time
 from compare import binary, run, tree_bytes
 
 
+def cargo_environment(root, rustc, jobs):
+    cargo_home = root / "registry-home"
+    cargo_home.mkdir()
+    for name in ["git", "registry"]:
+        src = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")) / name
+        if src.is_dir():
+            (cargo_home / name).symlink_to(src.resolve(), target_is_directory=True)
+    base = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(
+            ("CARGO_", "RUSTC_", "RUSTFLAGS", "JATO_", "KACHE_", "SCCACHE_")
+        )
+    }
+    base.update(
+        CARGO=str(rustc.with_name("cargo")),
+        RUSTC=str(rustc),
+        RUSTDOC=str(rustc.with_name("rustdoc")),
+        CARGO_HOME=str(cargo_home),
+        CARGO_NET_OFFLINE="true",
+        CARGO_BUILD_JOBS=str(jobs),
+        PATH=os.pathsep.join(
+            [str(rustc.parent), "/usr/bin", "/bin", os.environ["PATH"]]
+        ),
+        CC="/usr/bin/cc",
+        CXX="/usr/bin/c++",
+        HOST_CC="/usr/bin/cc",
+        HOST_CXX="/usr/bin/c++",
+        RUSTC_WORKSPACE_WRAPPER="",
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="/usr/bin/cc",
+    )
+    return base
+
+
+def private_environment(base, private, config, wrapper):
+    store = str(private / "store")
+    return dict(
+        base,
+        RUSTC_WRAPPER=wrapper,
+        JATO_CACHE_DIR=store,
+        JATO_MAX_SIZE="1GiB",
+        KACHE_CACHE_DIR=store,
+        KACHE_MAX_SIZE="1GiB",
+        KACHE_RUNTIME_DIR=str(private / "run"),
+        KACHE_SOCKET_PATH=str(private / "k.sock"),
+        KACHE_CONFIG=str(config),
+        KACHE_HOST_CONFIG="",
+        KACHE_LOCAL_ONLY="1",
+        SCCACHE_DIR=store,
+        SCCACHE_CACHE_SIZE="1G",
+        SCCACHE_SERVER_UDS=str(private / "s.sock"),
+        SCCACHE_CONF=str(config),
+        SCCACHE_ALLOW_INCREMENTAL="1",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato")
+    parser.add_argument(
+        "--previous-worktree",
+        help="compare an earlier Jato in the same projected layout",
+    )
+    parser.add_argument(
+        "--revisit",
+        action="store_true",
+        help="alternate the same two checkouts and clear targets each trial",
+    )
     parser.add_argument("--kache", default="kache")
     parser.add_argument("--sccache", default="sccache")
     parser.add_argument(
@@ -64,6 +129,8 @@ def main():
     }
     if opts.previous_jato:
         tools["previous_jato"] = binary(opts.previous_jato)
+    if opts.previous_worktree:
+        tools["previous_worktree"] = binary(opts.previous_worktree)
     versions = {
         n: subprocess.check_output([exe, "--version"], text=True).strip()
         for n, exe in tools.items()
@@ -90,38 +157,9 @@ def main():
         )
         if not opts.project:
             (first / "Cargo.toml.in").rename(first / "Cargo.toml")
-        cargo_home = root / "registry-home"
-        cargo_home.mkdir()
-        for name in ["git", "registry"]:
-            src = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")) / name
-            if src.is_dir():
-                (cargo_home / name).symlink_to(src.resolve(), target_is_directory=True)
+        base = cargo_environment(root, rustc, opts.jobs)
         config = root / "empty.toml"
         config.touch()
-        base = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith(
-                ("CARGO_", "RUSTC_", "RUSTFLAGS", "JATO_", "KACHE_", "SCCACHE_")
-            )
-        }
-        base.update(
-            CARGO=str(cargo),
-            RUSTC=str(rustc),
-            RUSTDOC=str(rustc.with_name("rustdoc")),
-            CARGO_HOME=str(cargo_home),
-            CARGO_NET_OFFLINE="true",
-            CARGO_BUILD_JOBS=str(opts.jobs),
-            PATH=os.pathsep.join(
-                [str(rustc.parent), "/usr/bin", "/bin", os.environ["PATH"]]
-            ),
-            CC="/usr/bin/cc",
-            CXX="/usr/bin/c++",
-            HOST_CC="/usr/bin/cc",
-            HOST_CXX="/usr/bin/c++",
-            RUSTC_WORKSPACE_WRAPPER="",
-            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="/usr/bin/cc",
-        )
         # Versioned source and output roots are known before the private
         # sccache server starts and are all eligible for its prefix stripping.
         roots = [first, root / "first-target"]
@@ -136,25 +174,10 @@ def main():
         for n, exe in tools.items():
             private = root / n
             private.mkdir()
-            store = str(private / "store")
-            cfg = dict(
-                base,
-                RUSTC_WRAPPER="" if n in {"cargo", "worktree"} else str(exe),
-                JATO_CACHE_DIR=store,
-                JATO_MAX_SIZE="1GiB",
-                KACHE_CACHE_DIR=store,
-                KACHE_MAX_SIZE="1GiB",
-                KACHE_RUNTIME_DIR=str(private / "run"),
-                KACHE_SOCKET_PATH=str(private / "k.sock"),
-                KACHE_CONFIG=str(config),
-                KACHE_HOST_CONFIG="",
-                KACHE_LOCAL_ONLY="1",
-                SCCACHE_DIR=store,
-                SCCACHE_CACHE_SIZE="1G",
-                SCCACHE_SERVER_UDS=str(private / "s.sock"),
-                SCCACHE_CONF=str(config),
-                SCCACHE_ALLOW_INCREMENTAL="1",
+            wrapper = (
+                "" if n in {"cargo", "worktree", "previous_worktree"} else str(exe)
             )
+            cfg = private_environment(base, private, config, wrapper)
             if n == "sccache_basedirs":
                 cfg["SCCACHE_BASEDIRS"] = os.pathsep.join(map(str, roots))
             configs[n] = cfg
@@ -176,7 +199,11 @@ def main():
                 CARGO_TARGET_DIR=str(target),
                 CARGO_BUILD_BUILD_DIR=str(target),
             )
-            command = [exe, "worktree", "--root", "."] if n == "worktree" else [cargo]
+            command = (
+                [exe, "worktree", "--root", "."]
+                if n in {"worktree", "previous_worktree"}
+                else [cargo]
+            )
             command.extend(
                 (["check"] if opts.mode == "check" else ["build", "--release"])
                 + ["--locked", "-q"]
@@ -186,17 +213,22 @@ def main():
             timed = (
                 [timer, "-f", "%M", "-o", rss, *command] if timer.exists() else command
             )
-            baseline = hits(n, exe, cfg, project)
+            baseline = counters(n, exe, cfg, project)
             start = time.perf_counter()
             run(timed, cfg, project)
             row = {"seconds": round(time.perf_counter() - start, 6)}
             if timer.exists():
                 row["peak_process_kib"] = int(rss.read_text())
-            if baseline is not None:
-                row["hits"] = hits(n, exe, cfg, project) - baseline
+            if baseline:
+                row.update(
+                    {
+                        k: v - baseline[k]
+                        for k, v in counters(n, exe, cfg, project).items()
+                    }
+                )
             if opts.mode == "release":
                 out_dir = target
-                if n == "worktree":
+                if n in {"worktree", "previous_worktree"}:
                     paths = json.loads(
                         run([exe, "worktree", "--root", ".", "paths"], cfg, project)
                     )
@@ -220,21 +252,27 @@ def main():
             measure(n, "cold", first, target)
             measure(n, "fresh", first, target)
         for trial in range(opts.runs):
-            other = root / f"checkout {trial}"
-            shutil.copytree(
-                first, other, symlinks=True, ignore=ignore, dirs_exist_ok=True
-            )
+            other = root / f"checkout {0 if opts.revisit else trial}"
+            if not opts.revisit or trial == 0:
+                shutil.copytree(
+                    first, other, symlinks=True, ignore=ignore, dirs_exist_ok=True
+                )
             names = list(tools)
             for n in names[trial % len(names) :] + names[: trial % len(names)]:
                 for phase, project, dest in [
                     ("same_target", first, target),
                     ("new_target", first, root / f"target-{trial}"),
-                    ("new_checkout", other, root / f"other-{trial}"),
+                    (
+                        "other_checkout" if opts.revisit else "new_checkout",
+                        other,
+                        root / f"other-{trial}",
+                    ),
                 ]:
                     if dest.exists():
                         shutil.rmtree(dest)
                     measure(n, phase, project, dest)
-            shutil.rmtree(other)
+            if not opts.revisit:
+                shutil.rmtree(other)
         servers.close()
         medians = {
             n: {
@@ -254,6 +292,7 @@ def main():
                     kernel=platform.release(),
                     jobs=opts.jobs,
                     runs=opts.runs,
+                    revisit=opts.revisit,
                     versions=versions,
                     samples=samples,
                     median_seconds=medians,
@@ -264,23 +303,28 @@ def main():
         )
 
 
-def hits(name, exe, env, project):
+def counters(name, exe, env, project):
     if name == "sccache_basedirs":
         name = "sccache"
     if name == "cargo":
-        return None
+        return {}
     args = {
         "kache": ["--json", "stats"],
         "sccache": ["--show-stats", "--stats-format", "json"],
     }.get(name, ["stats", "--json"])
     stats = json.loads(run([exe, *args], env, project))
     if name == "kache":
-        return (
-            stats["local_hits"] if "local_hits" in stats else stats["lifetime"]["hits"]
-        )
+        return {
+            "hits": stats["local_hits"]
+            if "local_hits" in stats
+            else stats["lifetime"]["hits"]
+        }
     if name == "sccache":
-        return sum(stats["stats"]["cache_hits"]["counts"].values())
-    return stats["counters"].get("hit", 0)
+        return {"hits": sum(stats["stats"]["cache_hits"]["counts"].values())}
+    return {
+        "hits": stats["counters"].get("hit", 0),
+        "discovery_probes": stats["counters"].get("discovery_probe", 0),
+    }
 
 
 if __name__ == "__main__":
