@@ -2,6 +2,8 @@ mod admission;
 mod compiler;
 mod fingerprint;
 mod invocation;
+mod native;
+mod sealed;
 mod staging;
 mod store;
 mod watch;

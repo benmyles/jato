@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 pub struct Invocation {
     pub name: String,
     pub codegen: bool,
+    pub executable: bool,
+    pub deferred_links: bool,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
     pub outputs: Vec<PathBuf>, // dep-info is always first
@@ -38,6 +40,16 @@ impl Invocation {
         let mut suffix = "";
         let mut crate_type = None;
         let mut test = false;
+        let mut deferred_links = cfg!(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_env = "gnu"
+        ));
+        let mut native_link = cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu"
+        ));
         let mut emit = None;
         let mut json_errors = false;
         let mut artifacts = false;
@@ -109,10 +121,22 @@ impl Invocation {
                 "-C" => {
                     let (setting, v) = value()?.split_once('=').ok_or("codegen_option")?;
                     match setting {
-                        "incremental" => probe = false,
+                        "incremental" => {
+                            probe = false;
+                            native_link = false;
+                        }
+                        "link-arg" | "link-args" => {
+                            native_link &= matches!(
+                                v,
+                                "-fuse-ld=lld" | "-fuse-ld=bfd" | "-fuse-ld=gold" | "-fuse-ld=mold"
+                            );
+                        }
                         "extra-filename" => suffix = v,
                         "split-debuginfo" if v == "off" => (),
                         "target-cpu" if v != "native" => (),
+                        "target-feature" => {
+                            deferred_links &= !v.contains("+crt-static");
+                        }
                         "metadata"
                         | "opt-level"
                         | "embed-bitcode"
@@ -123,12 +147,9 @@ impl Invocation {
                         | "codegen-units"
                         | "strip"
                         | "lto"
-                        | "target-feature"
                         | "relocation-model"
                         | "symbol-mangling-version"
                         | "linker"
-                        | "link-arg"
-                        | "link-args"
                         | "linker-features"
                         | "force-frame-pointers"
                         | "force-unwind-tables" => (),
@@ -137,6 +158,8 @@ impl Invocation {
                 }
                 "--target" => {
                     let target = value()?;
+                    native_link &= target == "x86_64-unknown-linux-gnu";
+                    deferred_links &= target == "x86_64-unknown-linux-gnu";
                     if target.ends_with(".json") || !safe_component(target) {
                         return Err("custom_target");
                     }
@@ -198,7 +221,11 @@ impl Invocation {
         if !library && !(test || crate_type == Some("bin")) {
             return Err("crate_type");
         }
-        if kinds.contains(&"link") && (!library || test) {
+        let executable = kinds.contains(&"link") && (!library || test);
+        if executable
+            && (!native_link
+                || std::env::var_os("JATO_LINK_CACHE").as_deref() == Some(OsStr::new("0")))
+        {
             return Err("linker");
         }
         if !kinds.contains(&"link") && !kinds.contains(&"metadata") {
@@ -210,11 +237,17 @@ impl Invocation {
             outputs.push(dir.join(format!("lib{stem}.rmeta")));
         }
         if kinds.contains(&"link") {
-            outputs.push(dir.join(format!("lib{stem}.rlib")));
+            outputs.push(if executable {
+                dir.join(&stem)
+            } else {
+                dir.join(format!("lib{stem}.rlib"))
+            });
         }
         Ok(Self {
             name: name.into(),
             codegen: kinds.contains(&"link"),
+            executable,
+            deferred_links,
             source: source.ok_or("missing_source")?,
             externs,
             outputs,

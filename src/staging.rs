@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::DirBuilderExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 fn with_directory<T>(parent: &Path, action: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
@@ -31,12 +31,30 @@ fn with_directory<T>(parent: &Path, action: impl FnOnce(&Path) -> Result<T>) -> 
     action(&dir)
 }
 
+fn locked_file(dir: &Path) -> Result<NamedTempFile> {
+    let tmp = tempfile::Builder::new().prefix("part-").tempfile_in(dir)?;
+    tmp.as_file().lock()?;
+    Ok(tmp)
+}
+
 pub fn file(parent: &Path) -> Result<NamedTempFile> {
-    with_directory(parent, |dir| {
-        let tmp = tempfile::Builder::new().prefix("part-").tempfile_in(dir)?;
-        tmp.as_file().lock()?;
-        Ok(tmp)
-    })
+    with_directory(parent, locked_file)
+}
+
+pub fn for_outputs(outputs: &[PathBuf]) -> Result<Vec<NamedTempFile>> {
+    let mut files = Vec::with_capacity(outputs.len());
+    for group in outputs.chunk_by(|a, b| a.parent() == b.parent()) {
+        let dir = group[0]
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("output has no parent"))?;
+        with_directory(dir, |dir| {
+            for _ in group {
+                files.push(locked_file(dir)?);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(files)
 }
 
 pub fn clean(parent: &Path) -> Result<()> {

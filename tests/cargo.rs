@@ -575,3 +575,93 @@ fn damaged_shared_chunks_trigger_a_real_recompile_and_heal() {
     assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
     assert!(p.hits() > hits);
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
+fn native_executable_tracks_archive_contents_and_negative_search_paths() {
+    let p = Project::new();
+    write(
+        p.root.join("src/main.rs"),
+        r#"
+        #[link(name="jato_test_value", kind="static", modifiers="-bundle")]
+        unsafe extern "C" { fn jato_test_value() -> i32; }
+        fn main() { println!("{}",unsafe { jato_test_value() }); }
+    "#,
+    );
+    let early = p.temp.path().join("earlier");
+    let late = p.temp.path().join("later");
+    fs::create_dir(&early).unwrap();
+    fs::create_dir(&late).unwrap();
+    let lib_path = std::env::join_paths([&early, &late]).unwrap();
+    let archive = |dir: &Path, v| {
+        write(
+            dir.join("value.c"),
+            &format!("int jato_test_value(void) {{return {v};}}"),
+        );
+        success(
+            Command::new("cc")
+                .current_dir(dir)
+                .args(["-c", "value.c", "-o", "value.o"]),
+        );
+        success(Command::new("ar").current_dir(dir).args([
+            "crs",
+            "libjato_test_value.a",
+            "value.o",
+        ]));
+    };
+    let build = || {
+        let mut cmd = p.command();
+        cmd.env("LIBRARY_PATH", &lib_path)
+            .env(
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                "/usr/bin/cc",
+            )
+            .env("JATO_LOG", "debug")
+            .env_remove("JATO_LINK_CACHE")
+            .args(["build", "--release"]);
+        cmd.output().unwrap()
+    };
+    let output = p.root.join("target/release/app");
+    archive(&late, 1);
+    let cold = build();
+    assert!(
+        cold.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let plain = fs::read(&output).unwrap();
+    assert_eq!(success(&mut Command::new(&output)).stdout, b"1\n");
+    p.clean();
+    let warm = build();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(fs::read(&output).unwrap(), plain);
+    // Opt-in assertion for CI and local qualification where tracing is available.
+    if std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+        assert!(
+            String::from_utf8_lossy(&warm.stderr).contains("jato [app] hit"),
+            "{}",
+            String::from_utf8_lossy(&warm.stderr)
+        );
+    }
+    archive(&early, 2);
+    p.clean();
+    let changed = build();
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    assert_eq!(success(&mut Command::new(&output)).stdout, b"2\n");
+    archive(&early, 3);
+    p.clean();
+    assert!(build().status.success());
+    assert_eq!(success(&mut Command::new(&output)).stdout, b"3\n");
+    fs::remove_file(early.join("libjato_test_value.a")).unwrap();
+    fs::remove_file(late.join("libjato_test_value.a")).unwrap();
+    p.clean();
+    assert!(!build().status.success());
+}

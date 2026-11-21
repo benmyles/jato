@@ -7,23 +7,26 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+pub(crate) fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
     hash.update(&(bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
 }
 
-fn stamp(meta: &fs::Metadata) -> [u64; 6] {
+pub(crate) fn stamp(meta: &fs::Metadata) -> [u64; 7] {
     [
         meta.dev(),
         meta.ino(),
         meta.len(),
         meta.ctime() as u64,
         meta.ctime_nsec() as u64,
+        meta.mtime() as u64,
         meta.mtime_nsec() as u64,
     ]
 }
@@ -44,7 +47,13 @@ fn ordered(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub fn recipe(compiler: &OsStr, args: &[OsString]) -> Result<Digest> {
+pub struct Recipe {
+    pub key: Digest,
+    pub toolchain: Digest,
+    pub root: PathBuf,
+}
+
+pub fn recipe(compiler: &OsStr, args: &[OsString], native: bool) -> Result<Recipe> {
     let cwd = env::current_dir()?;
     let bin = Path::new(compiler);
     let root = bin
@@ -61,7 +70,7 @@ pub fn recipe(compiler: &OsStr, args: &[OsString]) -> Result<Digest> {
             PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end())
         }
     };
-    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v4");
+    let mut identity = blake3::Hasher::new_derive_key("jato local toolchain v1");
     let executable = if bin.components().count() > 1 {
         cwd.join(bin)
     } else {
@@ -79,24 +88,27 @@ pub fn recipe(compiler: &OsStr, args: &[OsString]) -> Result<Digest> {
         });
         ensure!(same_inode, "custom rustc driver");
     }
-    field(&mut hash, compiler.as_bytes());
-    field(&mut hash, cwd.as_os_str().as_bytes());
-    for arg in args {
-        field(&mut hash, arg.as_bytes());
-    }
-    stamp_path(&mut hash, &root.join("bin/rustc"))?;
+    stamp_path(&mut identity, &root.join("bin/rustc"))?;
     for p in ordered(&root.join("lib"))? {
         if p.is_file() {
-            stamp_path(&mut hash, &p)?;
+            stamp_path(&mut identity, &p)?;
         }
     }
     for target in ordered(&root.join("lib/rustlib"))? {
         let dir = target.join("lib");
         if dir.is_dir() {
             for p in ordered(&dir)? {
-                stamp_path(&mut hash, &p)?;
+                stamp_path(&mut identity, &p)?;
             }
         }
+    }
+    let toolchain = *identity.finalize().as_bytes();
+    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v6");
+    field(&mut hash, &toolchain);
+    field(&mut hash, compiler.as_bytes());
+    field(&mut hash, cwd.as_os_str().as_bytes());
+    for arg in args {
+        field(&mut hash, arg.as_bytes());
     }
     let mut settings: Vec<_> = env::vars_os()
         .filter(|(k, _)| {
@@ -119,35 +131,76 @@ pub fn recipe(compiler: &OsStr, args: &[OsString]) -> Result<Digest> {
         field(&mut hash, k.as_bytes());
         field(&mut hash, v.as_bytes());
     }
-    Ok(*hash.finalize().as_bytes())
+    if let Ok(status) = fs::read_to_string("/proc/self/status")
+        && let Some(mask) = status.lines().find(|l| l.starts_with("Umask:"))
+    {
+        field(&mut hash, mask.as_bytes());
+    }
+    if native {
+        crate::native::environment(&mut hash);
+    }
+    Ok(Recipe {
+        root,
+        key: *hash.finalize().as_bytes(),
+        toolchain,
+    })
 }
 
-fn recent(m: &fs::Metadata, since: SystemTime) -> bool {
+pub(crate) fn recent(m: &fs::Metadata, since: SystemTime) -> bool {
     let epoch = since.duration_since(UNIX_EPOCH).unwrap_or_default();
     (m.ctime(), m.ctime_nsec()) >= (epoch.as_secs() as i64, epoch.subsec_nanos() as i64)
         || m.modified().is_ok_and(|t| t >= since)
 }
 
-fn hash_file(path: &Path, since: SystemTime) -> Result<Digest> {
-    let mut f = File::open(path)?;
+pub(crate) fn hash_file(
+    path: &Path,
+    since: SystemTime,
+    scan: Option<&mut Vec<u8>>,
+) -> Result<Digest> {
+    hash_open(File::open(path)?, path, since, scan, false)
+}
+
+fn hash_open(
+    mut f: File,
+    path: &Path,
+    since: SystemTime,
+    scan: Option<&mut Vec<u8>>,
+    deferred_links: bool,
+) -> Result<Digest> {
     let before = f.metadata()?;
     ensure!(
         before.is_file() && !recent(&before, since),
         "input changed during compilation"
     );
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(&mut f)?;
+    let digest = if let Some(buffer) = scan {
+        const MAX: u64 = 8 << 20;
+        ensure!(before.len() <= MAX, "source exceeds admission scan limit");
+        buffer.clear();
+        f.take(MAX + 1).read_to_end(buffer)?;
+        ensure!(
+            buffer.len() as u64 <= MAX,
+            "source changed size during admission"
+        );
+        crate::admission::verify_bytes(buffer, path, deferred_links)?;
+        blake3::hash(buffer)
+    } else {
+        let mut h = blake3::Hasher::new();
+        h.update_reader(&mut f)?;
+        h.finalize()
+    };
     ensure!(
         stamp(&before) == stamp(&fs::metadata(path)?),
         "input changed while hashing"
     );
-    Ok(*hasher.finalize().as_bytes())
+    Ok(*digest.as_bytes())
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 pub struct Plan {
     files: BTreeSet<PathBuf>,
     env: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::native::Manifest>,
 }
 
 pub fn dependencies(path: &Path) -> Result<Plan> {
@@ -224,6 +277,7 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
             .map(|s| PathBuf::from(s.replace("\\ ", " ")))
             .collect(),
         env,
+        native: None,
     })
 }
 
@@ -233,34 +287,50 @@ pub struct Snapshot {
 }
 
 impl Plan {
-    pub fn verify_admission(&self, compiler: &OsStr, codegen: bool) -> Result<()> {
-        crate::admission::verify(self.files.iter(), compiler, codegen)
-    }
-
     pub fn snapshot(
         &self,
-        recipe: &Digest,
+        recipe: &Recipe,
         inv: &Invocation,
         since: SystemTime,
         externs: &Digest,
+        admit_codegen: bool,
     ) -> Result<Snapshot> {
         let root = fs::canonicalize(&inv.source)?;
         let mut has_root = false;
         let mut hash = blake3::Hasher::new_derive_key("jato verified Rust inputs v2");
         let mut namespace = BTreeSet::new();
-        field(&mut hash, recipe);
+        field(&mut hash, &recipe.key);
+        let mut covered = BTreeSet::new();
+        let mut scan = admit_codegen.then(Vec::new);
+        let cwd = std::env::current_dir()?;
         for file in &self.files {
-            let path =
-                fs::canonicalize(file).with_context(|| format!("resolving {}", file.display()))?;
+            let opened = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+            #[cfg(target_os = "linux")]
+            let path = fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+                .or_else(|_| fs::canonicalize(file))?;
+            #[cfg(not(target_os = "linux"))]
+            let path = fs::canonicalize(file)?;
+            if self.native.is_some() {
+                ensure!(
+                    !["/proc", "/sys", "/dev"]
+                        .iter()
+                        .any(|p| path.starts_with(p)),
+                    "volatile compiler input"
+                );
+                covered.insert(path.clone());
+            }
             has_root |= root == path;
             field(&mut hash, b"source");
             field(&mut hash, file.as_os_str().as_bytes());
             field(&mut hash, path.as_os_str().as_bytes());
-            field(&mut hash, &hash_file(&path, since)?);
+            field(
+                &mut hash,
+                &hash_open(opened, file, since, scan.as_mut(), inv.deferred_links)?,
+            );
             // rustc can change module resolution when a second legal location
             // appears. Track the containing directories and the alternate name,
             // even when the alternate directory or file does not yet exist.
-            let original = std::path::absolute(file)?;
+            let original = cwd.join(file);
             for resolved in [&original, &path] {
                 let parent = resolved.parent().context("source without a parent")?;
                 namespace.insert(parent.to_owned());
@@ -295,6 +365,12 @@ impl Plan {
             }
         }
         field(&mut hash, externs);
+        if let Some(native) = &self.native {
+            for p in &inv.externs {
+                covered.insert(fs::canonicalize(p)?);
+            }
+            field(&mut hash, &native.digest(&recipe.root, since, &covered)?);
+        }
         let mut topology = blake3::Hasher::new();
         for p in namespace {
             field(&mut topology, p.as_os_str().as_bytes());
@@ -326,17 +402,27 @@ impl Plan {
     }
 }
 
-pub fn extern_key(inv: &Invocation, since: SystemTime, store: &Store) -> Result<Digest> {
+pub struct Externs {
+    pub key: Digest,
+    pub needs: Vec<Digest>,
+}
+
+pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) -> Result<Externs> {
     let mut hash = blake3::Hasher::new_derive_key("jato extern closure v1");
+    let mut needs = Vec::new();
     for path in &inv.externs {
-        let digest = hash_file(path, since)?;
-        // A pure-looking rlib can re-export a procedural macro. Trust only a
-        // dependency chain whose outputs Jato previously admitted itself.
+        let digest = hash_file(path, since, None)?;
         if !store.knows_artifact(&digest, inv.codegen)? {
-            bail!("unverified extern {}", path.display());
+            if !defer || path.extension() != Some(OsStr::new("rmeta")) {
+                bail!("unverified extern {}", path.display());
+            }
+            needs.push(digest);
         }
         field(&mut hash, b"extern");
         field(&mut hash, &digest);
     }
-    Ok(*hash.finalize().as_bytes())
+    Ok(Externs {
+        key: *hash.finalize().as_bytes(),
+        needs,
+    })
 }

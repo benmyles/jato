@@ -35,9 +35,9 @@ fn discover(
     store: &mut Store,
     compiler: &OsStr,
     inv: &Invocation,
-    recipe: &Digest,
+    recipe: &fingerprint::Recipe,
 ) -> Result<Option<Vec<u8>>> {
-    let plans = store.plans(recipe)?;
+    let plans = store.plans(&recipe.key)?;
     if plans.is_empty() {
         trace(
             &inv.name,
@@ -46,10 +46,13 @@ fn discover(
         return Ok(None);
     }
     let start = SystemTime::now();
-    let externs = fingerprint::extern_key(inv, start, store)?;
+    let externs = fingerprint::externs(inv, start, store, false)?.key;
     for encoded in plans {
         let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
-        let Ok(snapshot) = plan.snapshot(recipe, inv, start, &externs) else {
+        if inv.executable && plan.native.is_none() {
+            continue;
+        }
+        let Ok(snapshot) = plan.snapshot(recipe, inv, start, &externs, false) else {
             continue;
         };
         let Some(topology) = store.topology(&snapshot.key)? else {
@@ -60,6 +63,9 @@ fn discover(
         }
         // Familiar bytes with a changed module search directory need fresh
         // name resolution. Ordinary edits go directly to the actual compiler.
+        if plan.native.is_some() {
+            continue;
+        }
         return rediscover(store, compiler, inv, recipe, start, &externs);
     }
     trace(
@@ -73,7 +79,7 @@ fn rediscover(
     store: &mut Store,
     compiler: &OsStr,
     inv: &Invocation,
-    recipe: &Digest,
+    recipe: &fingerprint::Recipe,
     start: SystemTime,
     externs: &Digest,
 ) -> Result<Option<Vec<u8>>> {
@@ -89,7 +95,7 @@ fn rediscover(
         .status()?;
     ensure!(status.success(), "input discovery failed");
     let plan = fingerprint::dependencies(probe.path())?;
-    let snapshot = plan.snapshot(recipe, inv, start, externs)?;
+    let snapshot = plan.snapshot(recipe, inv, start, externs, false)?;
     let restored = store.restore(&snapshot.key, &inv.outputs)?;
     if restored.is_some() {
         let _ = store.refresh_topology(&snapshot.key, &snapshot.topology);
@@ -97,11 +103,12 @@ fn rediscover(
     Ok(restored)
 }
 
-fn compile(compiler: &OsStr, args: &[OsString]) -> Result<(ExitStatus, Option<Vec<u8>>)> {
-    let mut child = original(compiler, args)
+fn compile(mut cmd: Command) -> Result<(ExitStatus, Option<Vec<u8>>)> {
+    let mut child = cmd
         .stderr(Stdio::piped())
         .spawn()
         .context("starting rustc")?;
+    drop(cmd);
     let mut pipe = child.stderr.take().unwrap();
     let mut stderr = io::stderr().lock();
     let mut log = Some(Vec::new());
@@ -148,15 +155,17 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         "RUSTC_BOOTSTRAP",
         "RUSTC_LOG",
         "LD_PRELOAD",
+        "LD_AUDIT",
         "RUST_TARGET_PATH",
     ]
     .iter()
-    .any(|k| env::var_os(k).is_some_and(|s| !s.is_empty() && s != "0"))
+    .any(|k| env::var_os(k).is_some_and(|s| !s.is_empty() && (*k != "RUSTC_BOOTSTRAP" || s != "0")))
     {
         trace(&inv.name, "custom compiler environment");
         return passthrough(original(compiler, args));
     }
-    let setup = Store::open().and_then(|s| Ok((s, fingerprint::recipe(compiler, args)?)));
+    let setup =
+        Store::open().and_then(|s| Ok((s, fingerprint::recipe(compiler, args, inv.executable)?)));
     let (mut store, recipe) = match setup {
         Ok(v) => v,
         Err(e) => {
@@ -176,7 +185,40 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     let _ = store.count("miss", 1);
     let since = SystemTime::now();
     let timer = Instant::now();
-    let (status, diagnostics) = compile(compiler, args)?;
+    let mut native = None;
+    let cmd = if inv.executable {
+        if let Err(e) = fingerprint::externs(inv, since, &store, false) {
+            trace(&inv.name, e);
+            return passthrough(original(compiler, args));
+        }
+        match crate::native::Capture::command(compiler, args) {
+            Ok((cmd, capture)) => {
+                native = Some(capture);
+                cmd
+            }
+            Err(e) => {
+                trace(&inv.name, e);
+                return passthrough(original(compiler, args));
+            }
+        }
+    } else {
+        original(compiler, args)
+    };
+    let result = compile(cmd);
+    let observed = if let Some(capture) = native {
+        let (started, observed) = capture.finish();
+        if !started
+            && result
+                .as_ref()
+                .map_or(true, |(status, _)| !status.success())
+        {
+            return passthrough(original(compiler, args));
+        }
+        Some(observed)
+    } else {
+        None
+    };
+    let (status, diagnostics) = result?;
     let elapsed = timer.elapsed().as_millis() as u64;
     if status.success() {
         let result = (|| -> Result<()> {
@@ -185,23 +227,31 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 inv.confirms_outputs(&log),
                 "compiler reported an unexpected artifact set"
             );
-            let externs = fingerprint::extern_key(inv, since, &store)?;
-            let plan = fingerprint::dependencies(&inv.outputs[0])?;
-            plan.verify_admission(compiler, inv.codegen)?;
-            let snapshot = plan.snapshot(&recipe, inv, since, &externs)?;
+            let externs = fingerprint::externs(inv, since, &store, !inv.executable)?;
+            let mut plan = fingerprint::dependencies(&inv.outputs[0])?;
+            if let Some(observed) = observed {
+                plan.native =
+                    Some(observed?.manifest(inv, &recipe.root, &recipe.root.join("bin/rustc"))?);
+            }
+            ensure!(
+                store.stable_compiler(compiler, &recipe.toolchain)?,
+                "prerelease or custom compiler"
+            );
+            let snapshot = plan.snapshot(&recipe, inv, since, &externs.key, inv.codegen)?;
             let encoded = serde_json::to_vec(&plan)?;
             ensure!(
                 encoded.len() <= 256 * 1024,
                 "input manifest exceeds recording limit"
             );
             if !store.save(
-                &recipe,
+                &recipe.key,
                 &snapshot.key,
                 &inv.outputs,
                 &log,
                 elapsed,
                 Some(Evidence {
                     inputs: &encoded,
+                    needs: &externs.needs,
                     topology: &snapshot.topology,
                     codegen: inv.codegen,
                 }),
