@@ -32,4 +32,4 @@
 - [x] Coalesce matching compiler misses across independent Cargo builds and verify each follower’s own inputs.
 - [x] Remove repeat validation work from native misses and recurring worktree restores.
 - [x] Reduce watcher registration, idle memory and subtree attachment costs on large workspaces.
-- [ ] Test failure, cancellation, divergent inputs and eviction, then compare CPU time, wall time and storage against the installed release and upstream peers.
+- [x] Test failure, cancellation, divergent inputs and eviction, then compare CPU time, wall time and storage against the installed release and upstream peers.

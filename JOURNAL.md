@@ -20,6 +20,10 @@
 - Verified that a second checkout with a different included source could finish compiling while the first checkout’s actual rustc process was suspended. Both binaries printed their intended values.
 - Three paired cold ripgrep trials finished in a median 25.92 s with the 0.5 engine, 59.96 s with 0.4, 31.63 s with upstream kache and 32.02 s with sccache. Jato used 77.05 CPU-seconds and 815 MiB sampled peak PSS. kache used less sampled memory.
 
+- Measured the installed release with four concurrent cold regex checkouts. It used 24.65 CPU-seconds and 417 MiB sampled peak PSS. Jato 0.4 used 108.70 CPU-seconds and 1271 MiB. Seven alternating warm ripgrep trials put the installed release at 234 ms and kache at 379 ms.
+
+- Built and verified the locked source package offline, including the Linux and portable watch backends, benchmark harnesses, raw samples, fixtures and project documents.
+
 ## 2026-11-21 — worktrees and packed writes
 
 - Rebuilt the locked regex application in two target directories. All five registry libraries and their five metadata files were byte-identical, while their dep-info referred to different output paths. Jato 0.3 missed all five in the second target.
