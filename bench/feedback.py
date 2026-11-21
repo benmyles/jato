@@ -33,6 +33,7 @@ def idle_tree_pss(pid):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jato", default="jato")
+    parser.add_argument("--dev", action="store_true", help="use the jato-dev profile for the watcher and initial check")
     parser.add_argument("--worktree", action="store_true", help="run the watcher inside a projected checkout")
     parser.add_argument("--directories", type=int, default=0, help="add this many watched leaf directories and measure attaching new subtrees")
     parser.add_argument("--runs", type=int, default=5)
@@ -66,6 +67,8 @@ def main():
                    CARGO_TARGET_DIR=str(root / "target"), CARGO_BUILD_BUILD_DIR=str(root / "target"),
                    CARGO_NET_OFFLINE="true", RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
         command = [jato, "worktree", "--root", "."] if options.worktree else [jato]
+        if options.dev:
+            command.append("dev")
         subprocess.run([*command, "check", "--workspace", "-q"], cwd=workspace, env=env, check=True)
         watch_args = [] if options.debounce is None else ["--debounce", str(options.debounce)]
         launched = time.perf_counter()
@@ -137,7 +140,7 @@ def main():
                               save_to_diagnostic_ms=errors, fix_to_workspace_green_ms=fixes,
                               median_diagnostic_ms=statistics.median(errors),
                               median_workspace_green_ms=statistics.median(fixes), idle_watch_rss_kib=idle_kib,
-                              worktree=options.worktree, idle_tree_pss_kib=idle_pss,
+                              worktree=options.worktree, fast_profile=options.dev, idle_tree_pss_kib=idle_pss,
                               watched_leaf_directories=options.directories,start_to_watching_ms=ready_ms,
                               added_subtree_to_workspace_green_ms=additions,
                               median_subtree_ms=statistics.median(additions) if additions else None),

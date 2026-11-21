@@ -247,12 +247,18 @@ def main():
                         command = build_command(cargo, mode, exe if name in {"jato", "jato_packed"} else None)
                         def measure(phase):
                             rss = private / "rss"
-                            timed = ["/usr/bin/time", "-f", "%M", "-o", rss, *command] if Path("/usr/bin/time").is_file() else command
+                            timed = ["/usr/bin/time", "-f", "%M %U %S", "-o", rss, *command] if Path("/usr/bin/time").is_file() else command
                             start = time.perf_counter()
                             run(timed, cfg, project)
                             sample[phase] = round(time.perf_counter() - start, 5)
                             if rss.is_file():
-                                sample[phase + "_peak_process_rss_kib"] = int(rss.read_text())
+                                peak, user, system = rss.read_text().split()
+                                sample[phase + "_peak_process_rss_kib"] = int(peak)
+                                # Private peer daemons launch compilers outside
+                                # Cargo's process tree. Its CPU sum is complete
+                                # for bare Cargo and both daemonless Jato runs.
+                                if kind not in {"kache", "sccache"}:
+                                    sample[phase + "_cpu_seconds"] = round(float(user) + float(system), 2)
                         server = {"sccache": (["--start-server"], ["--stop-server"]),
                                   "kache": (["daemon", "start"], ["daemon", "stop"])}.get(kind)
                         if server:

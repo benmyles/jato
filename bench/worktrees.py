@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 
-from compare import binary, run, tree_bytes
+from compare import binary, build_command, profile_directory, run, tree_bytes
 
 
 def cargo_environment(root, rustc, jobs):
@@ -102,13 +102,15 @@ def main():
     parser.add_argument(
         "--verify-bin", help="executable that implements --version, for --project"
     )
-    parser.add_argument("--mode", choices=["check", "release"], default="release")
+    parser.add_argument(
+        "--mode", choices=["check", "release", "dev", "jato-dev"], default="release"
+    )
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     opts = parser.parse_args()
-    if opts.project and opts.mode == "release" and not opts.verify_bin:
-        parser.error("--project release builds need --verify-bin")
+    if opts.project and opts.mode != "check" and not opts.verify_bin:
+        parser.error("--project executable builds need --verify-bin")
     if min(opts.runs, opts.jobs) < 1:
         parser.error("--runs and --jobs must be positive")
     rustc = binary(
@@ -199,15 +201,17 @@ def main():
                 CARGO_TARGET_DIR=str(target),
                 CARGO_BUILD_BUILD_DIR=str(target),
             )
-            command = (
-                [exe, "worktree", "--root", "."]
-                if n in {"worktree", "previous_worktree"}
-                else [cargo]
+            command = build_command(
+                cargo, opts.mode, exe if n in {"jato", "worktree"} else None
             )
-            command.extend(
-                (["check"] if opts.mode == "check" else ["build", "--release"])
-                + ["--locked", "-q"]
-            )
+            if n in {"worktree", "previous_worktree"}:
+                # The earlier engine takes the equivalent profile through Cargo.
+                verb = (
+                    ["cargo"]
+                    if n == "previous_worktree" and opts.mode == "jato-dev"
+                    else []
+                )
+                command = [exe, "worktree", "--root", ".", *verb, *command[1:]]
             rss = root / "rss"
             timer = Path("/usr/bin/time")
             timed = (
@@ -226,14 +230,18 @@ def main():
                         for k, v in counters(n, exe, cfg, project).items()
                     }
                 )
-            if opts.mode == "release":
+            if opts.mode != "check":
                 out_dir = target
                 if n in {"worktree", "previous_worktree"}:
                     paths = json.loads(
                         run([exe, "worktree", "--root", ".", "paths"], cfg, project)
                     )
                     out_dir = Path(paths["target_directory"])
-                program = out_dir / "release" / (opts.verify_bin or "jato-regex-bench")
+                program = (
+                    out_dir
+                    / profile_directory(opts.mode)
+                    / (opts.verify_bin or "jato-regex-bench")
+                )
                 output = run(
                     [program, *(["--version"] if opts.verify_bin else [])], cfg, project
                 )
