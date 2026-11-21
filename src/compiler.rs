@@ -287,8 +287,10 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         }
     };
     let inv = &invocation;
-    let setup = Store::open()
-        .and_then(|s| Ok((s, fingerprint::recipe(compiler, args, inv.observe_native)?)));
+    let setup = Store::open().and_then(|mut store| {
+        let recipe = fingerprint::recipe(compiler, args, inv.observe_native, &mut store)?;
+        Ok((store, recipe))
+    });
     let (mut store, recipe) = match setup {
         Ok(v) => v,
         Err(e) => {

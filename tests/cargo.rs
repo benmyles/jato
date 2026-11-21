@@ -1203,6 +1203,61 @@ fn cargo_probe_cache_replays_exact_bytes_and_leaves_source_queries_alone() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn named_rustc_honors_path_order_and_keeps_custom_drivers_out_of_the_cache() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let p = Project::new();
+    let real = success(Command::new("rustc").args(["--print", "sysroot"]));
+    let bin = Path::new(std::str::from_utf8(&real.stdout).unwrap().trim_end()).join("bin");
+    let shadow = p.temp.path().join("shadow");
+    let driver = shadow.join("rustc");
+    write(&driver, "not executable");
+    let search = std::env::join_paths(
+        [shadow.clone(), bin]
+            .into_iter()
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let check = || {
+        success(
+            p.command()
+                .env("PATH", &search)
+                .env("RUSTC", "rustc")
+                .env_remove("LD_LIBRARY_PATH")
+                .arg("check"),
+        );
+    };
+    check();
+    p.clean();
+    check();
+    assert!(p.hits() >= 2);
+
+    // This driver can change its answers without changing the real toolchain.
+    write(
+        &driver,
+        "#!/bin/sh\nif [ \"$1\" = --print ]; then printf '%s\\n' \"$TEST_ROOT\"; else cat \"$TEST_REPLY\"; fi\n",
+    );
+    fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).unwrap();
+    let reply = shadow.join("reply");
+    for bytes in ["first\n", "second\n"] {
+        write(&reply, bytes);
+        let out = success(
+            p.command()
+                .env("PATH", &search)
+                .env_remove("LD_LIBRARY_PATH")
+                .env(
+                    "TEST_ROOT",
+                    std::str::from_utf8(&real.stdout).unwrap().trim_end(),
+                )
+                .env("TEST_REPLY", &reply)
+                .args(["rustc", "-vV"]),
+        );
+        assert_eq!(out.stdout, bytes.as_bytes());
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn worktree_available() -> bool {
     let available = Command::new("bwrap")
         .args(["--dev-bind", "/", "/", "--", "true"])

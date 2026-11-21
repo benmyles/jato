@@ -1,3 +1,5 @@
+mod toolchain;
+
 use crate::invocation::Invocation;
 use crate::store::{Digest, Store};
 use anyhow::{Context, Result, bail, ensure};
@@ -11,7 +13,6 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
@@ -31,88 +32,20 @@ pub(crate) fn stamp(meta: &fs::Metadata) -> [u64; 7] {
     ]
 }
 
-fn stamp_path(hash: &mut blake3::Hasher, path: &Path) -> Result<()> {
-    field(hash, path.as_os_str().as_bytes());
-    for n in stamp(&fs::metadata(path)?) {
-        hash.update(&n.to_le_bytes());
-    }
-    Ok(())
-}
-
-fn ordered(dir: &Path, include: Option<fn(&fs::FileType) -> bool>) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if let Some(include) = include {
-            let ty = entry.file_type()?;
-            let keep = if ty.is_symlink() {
-                fs::metadata(entry.path()).is_ok_and(|m| include(&m.file_type()))
-            } else {
-                include(&ty)
-            };
-            if !keep {
-                continue;
-            }
-        }
-        paths.push(entry.path());
-    }
-    paths.sort();
-    Ok(paths)
-}
-
 pub struct Recipe {
     pub key: Digest,
     pub toolchain: Digest,
     pub root: PathBuf,
 }
 
-pub fn recipe(compiler: &OsStr, args: &[OsString], native: bool) -> Result<Recipe> {
+pub fn recipe(
+    compiler: &OsStr,
+    args: &[OsString],
+    native: bool,
+    store: &mut Store,
+) -> Result<Recipe> {
     let cwd = env::current_dir()?;
-    let bin = Path::new(compiler);
-    let root = bin
-        .parent()
-        .and_then(Path::parent)
-        .filter(|p| p.is_absolute() && p.join("lib/rustlib").is_dir());
-    let root = match root {
-        Some(path) => path.to_owned(),
-        None => {
-            let output = Command::new(compiler)
-                .args(["--print", "sysroot"])
-                .output()?;
-            ensure!(output.status.success(), "cannot identify sysroot");
-            PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end())
-        }
-    };
-    let mut identity = blake3::Hasher::new_derive_key("jato local toolchain v1");
-    let executable = if bin.components().count() > 1 {
-        cwd.join(bin)
-    } else {
-        env::split_paths(&env::var_os("PATH").unwrap_or_default())
-            .map(|d| d.join(bin))
-            .find(|p| p.is_file())
-            .context("compiler missing from PATH")?
-    };
-    let bundled = root.join("bin/rustc");
-    if executable != bundled && fs::canonicalize(&executable)? != fs::canonicalize(&bundled)? {
-        let proxy = executable.with_file_name("rustup");
-        let same_inode = fs::metadata(proxy).is_ok_and(|m| {
-            fs::metadata(&executable).is_ok_and(|a| a.dev() == m.dev() && a.ino() == m.ino())
-        });
-        ensure!(same_inode, "custom rustc driver");
-    }
-    stamp_path(&mut identity, &root.join("bin/rustc"))?;
-    for p in ordered(&root.join("lib"), Some(fs::FileType::is_file))? {
-        stamp_path(&mut identity, &p)?;
-    }
-    for target in ordered(&root.join("lib/rustlib"), Some(fs::FileType::is_dir))? {
-        let dir = target.join("lib");
-        if dir.is_dir() {
-            for p in ordered(&dir, None)? {
-                stamp_path(&mut identity, &p)?;
-            }
-        }
-    }
-    let toolchain = *identity.finalize().as_bytes();
+    let (root, toolchain) = toolchain::resolve(compiler, &cwd, store)?;
     let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v9");
     if env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")) {
         field(&mut hash, b"jato worktree paths v1");

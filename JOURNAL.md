@@ -3,6 +3,7 @@
 ## 2026-11-21 — compiler discovery and cache publication
 
 - Traced a one-crate Cargo check on 0.8. When Cargo passed `rustc` by name, four extra compiler processes queried the sysroot. The rustup-launched Cargo control passed an absolute compiler and needed zero extra queries. Added both layouts and an explicit rustup proxy to the comparison harness.
+- Added confirmed sysroot reuse for physical Rust distributions. Jato asks the real compiler on first use, binds its answer to the toolchain and launcher identities, and asks rustup which compiler an override selects. A Cargo regression checks an unexecutable PATH entry and a custom driver whose answers change.
 
 ## 2026-11-21 — coding agent skill
 

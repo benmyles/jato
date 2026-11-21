@@ -68,10 +68,10 @@ pub fn run(compiler_path: &OsStr, args: &[OsString]) -> Result<Option<i32>> {
     if Path::new(compiler_path).file_name() != Some(OsStr::new("rustc")) || !eligible(args) {
         return Ok(None);
     }
-    let (Ok(mut store), Ok(recipe)) = (
-        Store::open(),
-        fingerprint::recipe(compiler_path, args, false),
-    ) else {
+    let Ok(mut store) = Store::open() else {
+        return Ok(None);
+    };
+    let Ok(recipe) = fingerprint::recipe(compiler_path, args, false, &mut store) else {
         return Ok(None);
     };
     if let Ok(Some((stdout, stderr))) = store.probe(&recipe.key) {
