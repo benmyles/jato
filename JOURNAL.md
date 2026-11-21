@@ -21,3 +21,8 @@
 - Measured the installed release over three runs per build scenario. Ripgrep clean checks went from 6.28 s to 0.65 s and release rebuilds from 61.61 s to 25.62 s. Its 116.1 MiB of artifacts occupied 36.0 MiB of SQLite files.
 - Measured five edits end to end. Median save-to-diagnostic latency was 186 ms with a 100 ms debounce. Recorded raw samples, fresh and cold builds, edit overhead, RSS, and reproduction commands in bench/.
 - Verified the distributable Cargo package and made the locked benchmark fixture available inside its source archive.
+
+## 2026-11-21 — optimization pass
+
+- Downloaded the upstream sccache 0.19.0 Linux release and verified its SHA-256. Ran kache 2.1.1 and sccache with private local stores and separate server sockets.
+- A first regex fixture run placed warm release at 852 ms for Jato 0.1, 141 ms for kache, and 846 ms for sccache. Warm check took 112, 134, and 437 ms respectively. Identified the final executable as the main release gap.
