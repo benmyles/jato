@@ -62,6 +62,14 @@ def server_rss(sock):
 def extent_usage(root):
     if not root.is_dir() or not shutil.which("btrfs"):
         return {}
+    # Only flush files owned by this trial, after timing. Delayed allocation
+    # can otherwise give a small new store an apparent zero extent footprint.
+    for directory, _, files in os.walk(root):
+        for name in files:
+            path = Path(directory) / name
+            if path.is_file() and not path.is_symlink():
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
     result = subprocess.run(["btrfs", "filesystem", "du", "-s", "--raw", root], capture_output=True, text=True)
     if result.returncode:
         return {}
