@@ -6,11 +6,13 @@ use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tree::Tree;
@@ -30,7 +32,7 @@ A custom Cargo command runs verbatim on every change. Ctrl-C stops the job.
 
 struct Options {
     focus_only: bool,
-    delay: Duration,
+    delay: Option<Duration>,
     extra: Vec<PathBuf>,
     job: Vec<OsString>,
 }
@@ -39,7 +41,7 @@ impl Options {
     fn parse(args: &[OsString]) -> Result<Self> {
         let mut opts = Self {
             focus_only: false,
-            delay: Duration::from_millis(100),
+            delay: None,
             extra: Vec::new(),
             job: Vec::new(),
         };
@@ -57,7 +59,7 @@ impl Options {
                         .context("--debounce needs milliseconds")?
                         .parse()?;
                     ensure!(ms <= 60_000, "debounce must be at most 60000 ms");
-                    opts.delay = Duration::from_millis(ms);
+                    opts.delay = Some(Duration::from_millis(ms));
                 }
                 Some("--") => {
                     opts.job = args.cloned().collect();
@@ -119,28 +121,32 @@ impl Changes {
 
 struct Inbox {
     changes: Mutex<Changes>,
-    wake: mpsc::SyncSender<()>,
+    wake: UnixDatagram,
     stop: AtomicBool,
 }
 
 impl Inbox {
     fn record(&self, paths: Vec<PathBuf>, created_dir: bool) {
         let mut changes = self.changes.lock().unwrap();
+        let wake = changes.empty();
         for p in paths {
             changes.add(p, created_dir);
         }
-        let _ = self.wake.try_send(());
+        if wake {
+            let _ = self.wake.send(&[1]);
+        }
     }
 
     fn rescan(&self) {
         *self.changes.lock().unwrap() = Changes::all();
-        let _ = self.wake.try_send(());
+        let _ = self.wake.send(&[1]);
     }
 }
 
 struct Job {
     child: Child,
     start: Instant,
+    completion: Option<OwnedFd>,
 }
 
 impl Job {
@@ -156,7 +162,17 @@ impl Job {
             .process_group(0)
             .spawn()
             .context("starting Cargo job")?;
+        #[cfg(target_os = "linux")]
+        let completion = {
+            // A pidfd becomes readable at exit, even if Cargo finished before
+            // poll starts. It stays associated with this particular child.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+            (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        #[cfg(not(target_os = "linux"))]
+        let completion = None;
         Ok(Self {
+            completion,
             child,
             start: Instant::now(),
         })
@@ -170,11 +186,20 @@ impl Job {
             libc::kill(group, libc::SIGTERM);
         }
         let deadline = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                break;
+        if let Some(fd) = &self.completion {
+            let mut pfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let _ = poll(std::slice::from_mut(&mut pfd), Some(deadline));
+        } else {
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
-            thread::sleep(Duration::from_millis(10));
         }
         unsafe {
             libc::kill(group, libc::SIGKILL);
@@ -183,13 +208,63 @@ impl Job {
     }
 }
 
+fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> std::io::Result<()> {
+    loop {
+        let millis = deadline.map_or(-1, |d| {
+            d.saturating_duration_since(Instant::now())
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32
+        });
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, millis) };
+        if ready >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn wait(
+    receiver: &UnixDatagram,
+    job: Option<&Job>,
+    mut deadline: Option<Instant>,
+) -> std::io::Result<()> {
+    let child = job.and_then(|j| j.completion.as_ref());
+    if job.is_some() && child.is_none() {
+        let fallback = Instant::now() + Duration::from_millis(40);
+        deadline = Some(deadline.map_or(fallback, |d| d.min(fallback)));
+    }
+    let mut fds = [
+        libc::pollfd {
+            fd: receiver.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: child.map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    poll(&mut fds, deadline)?;
+    if fds[0].revents != 0 {
+        let _ = receiver.recv(&mut [0]);
+    }
+    Ok(())
+}
+
 pub fn run(args: &[OsString]) -> Result<i32> {
     if args == ["--help"] || args == ["-h"] {
         print!("{HELP}");
         return Ok(0);
     }
     let options = Options::parse(args)?;
-    let (wake, receiver) = mpsc::sync_channel(1);
+    let (wake, receiver) = UnixDatagram::pair()?;
+    wake.set_nonblocking(true)?;
+    receiver.set_nonblocking(true)?;
     let inbox = Arc::new(Inbox {
         changes: Mutex::default(),
         wake,
@@ -198,7 +273,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
     let signal = inbox.clone();
     ctrlc::set_handler(move || {
         signal.stop.store(true, Ordering::Release);
-        let _ = signal.wake.try_send(());
+        let _ = signal.wake.send(&[1]);
     })?;
     let mut workspace = Workspace::load(&options)?;
     let mut tree = Tree::new(&workspace, inbox.clone())?;
@@ -218,7 +293,15 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         let incoming = tree.filter(std::mem::take(&mut *inbox.changes.lock().unwrap()));
         if !incoming.empty() {
             batch.merge(incoming);
-            deadline = Some(Instant::now() + options.delay);
+            let delay = options.delay.unwrap_or_else(|| {
+                // Editor saves usually touch one member. Give checkout and
+                // configuration bursts more time to settle before restarting.
+                let bulk = batch.full
+                    || batch.paths.len() > 4
+                    || batch.paths.iter().any(|p| configuration(p));
+                Duration::from_millis(if bulk { 100 } else { 16 })
+            });
+            deadline = Some(Instant::now() + delay);
         }
         if deadline.is_some_and(|d| d <= Instant::now()) {
             tree.drop_transient_output_dirs(&mut batch);
@@ -279,15 +362,6 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         {
             job = Some(Job::spawn(&args)?);
         }
-        let timeout = match (deadline, job.is_some()) {
-            (Some(d), _) => Some(d.saturating_duration_since(Instant::now())),
-            (None, true) => Some(Duration::from_millis(40)),
-            (None, false) => None,
-        };
-        if let Some(timeout) = timeout {
-            let _ = receiver.recv_timeout(timeout);
-        } else {
-            receiver.recv()?;
-        }
+        wait(&receiver, job.as_ref(), deadline)?;
     }
 }

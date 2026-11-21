@@ -26,3 +26,4 @@
 
 - Downloaded the upstream sccache 0.19.0 Linux release and verified its SHA-256. Ran kache 2.1.1 and sccache with private local stores and separate server sockets.
 - A first regex fixture run placed warm release at 852 ms for Jato 0.1, 141 ms for kache, and 846 ms for sccache. Warm check took 112, 134, and 437 ms respectively. Identified the final executable as the main release gap.
+- Replaced periodic child-status polling on Linux with pidfd notifications. Small saves now get a 16 ms default debounce, and larger or configuration changes retain a 100 ms window. Explicit debounce values still take precedence.

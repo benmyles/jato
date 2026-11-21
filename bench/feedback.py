@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--debounce", type=int, default=100)
+    parser.add_argument("--debounce", type=int, help="override the installed watcher’s default")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     options = parser.parse_args()
     if options.runs < 1:
@@ -44,7 +44,8 @@ def main():
                    CARGO_TARGET_DIR=str(root / "target"), CARGO_BUILD_BUILD_DIR=str(root / "target"),
                    CARGO_NET_OFFLINE="true", RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
         subprocess.run([jato, "check", "--workspace", "-q"], cwd=workspace, env=env, check=True)
-        proc = subprocess.Popen([jato, "watch", "--debounce", str(options.debounce)], cwd=workspace,
+        watch_args = [] if options.debounce is None else ["--debounce", str(options.debounce)]
+        proc = subprocess.Popen([jato, "watch", *watch_args], cwd=workspace,
                                 env=env, stderr=subprocess.PIPE, text=True)
         events = Queue()
 
