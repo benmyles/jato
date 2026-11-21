@@ -1,3 +1,4 @@
+pub(crate) mod objects;
 mod packed;
 
 use crate::staging::Output;
@@ -7,7 +8,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -116,6 +117,7 @@ pub struct Stats {
     pub entries: u64,
     pub chunks: u64,
     pub compressed_bytes: u64,
+    pub frame_file_bytes: u64,
     pub sealed_objects: u64,
     pub sealed_bytes: u64,
     pub pending_entries: u64,
@@ -141,6 +143,7 @@ struct Prepared {
 
 #[derive(Default)]
 struct Decoder {
+    last: Option<Digest>,
     zstd: Option<zstd::bulk::Decompressor<'static>>,
     buffer: Vec<u8>,
 }
@@ -151,6 +154,9 @@ impl Decoder {
         if raw == packed.len() {
             return Ok(packed);
         }
+        if self.last.as_ref() == Some(&hash) && self.buffer.len() == raw {
+            return Ok(&self.buffer);
+        }
         let zstd = match &mut self.zstd {
             Some(zstd) => zstd,
             None => self.zstd.insert(zstd::bulk::Decompressor::new()?),
@@ -160,6 +166,7 @@ impl Decoder {
         zstd.decompress_to_buffer(packed, &mut self.buffer)
             .map_err(|_| Damaged::Chunk(hash))?;
         ensure!(self.buffer.len() == raw, Damaged::Chunk(hash));
+        self.last = Some(hash);
         Ok(&self.buffer)
     }
 }
@@ -262,6 +269,9 @@ impl Store {
                     tx.execute_batch(
                         "DROP TRIGGER IF EXISTS drop_single; DROP TRIGGER IF EXISTS drop_part;",
                     )?;
+                }
+                if version != 0 && !tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('chunks') WHERE name='external')",[],|r| r.get::<_,bool>(0))? {
+                    tx.execute_batch("ALTER TABLE chunks ADD COLUMN external INTEGER NOT NULL DEFAULT 0")?;
                 }
                 tx.execute_batch(SCHEMA)?;
                 tx.commit()?;
@@ -741,9 +751,9 @@ impl Store {
             }
         }
         let time = now();
-        let sweep = files.iter().any(|f| f.sealed.is_some())
+        let sweep = (packed.has_files || files.iter().any(|f| f.sealed.is_some()))
             && tx.execute(
-                "INSERT INTO maintenance VALUES('sealed',?1) ON CONFLICT(name)
+                "INSERT INTO maintenance VALUES('objects',?1) ON CONFLICT(name)
              DO UPDATE SET last_run=excluded.last_run WHERE last_run < ?2",
                 params![time, time - 3_600_000_000],
             )? == 1;
@@ -771,7 +781,7 @@ impl Store {
             ensure!(blake3::hash(&stderr).as_bytes() == &hash, Damaged::Entry);
             let mut files = tx.prepare_cached(
                 "SELECT f.slot,f.digest,f.size,f.mode,f.single,o.verity,c.raw,
-                        CASE WHEN length(c.data)<=?2 THEN c.data END
+                        CASE WHEN length(c.data)<=?2 THEN c.data END,c.external
                  FROM files f LEFT JOIN clones x ON x.entry=f.entry AND x.slot=f.slot AND x.hash=f.digest
                  LEFT JOIN objects o ON o.hash=x.hash
                  LEFT JOIN chunks c ON f.single=1 AND c.hash=f.digest
@@ -780,6 +790,7 @@ impl Store {
             let mut records = files.query(params![id, CHUNK])?;
             let mut staged = crate::staging::for_outputs(outputs)?;
             let mut decoder = Decoder::default();
+            let mut frame = Vec::new();
             for (slot, staged_file) in staged.iter_mut().enumerate() {
                 let tmp = staged_file.writer();
                 let row = records.next()?.ok_or(Damaged::Entry)?;
@@ -794,13 +805,18 @@ impl Store {
                         .get_ref(7)?
                         .as_blob()
                         .map_err(|_| Damaged::Chunk(digest))?;
+                    let external = row.get::<_, usize>(8).map_err(|_| Damaged::Chunk(digest))?;
+                    let packed =
+                        packed::payload(&self.dir, &digest, raw, packed, external, &mut frame)?;
                     let bytes = decoder.decode(packed, raw, digest)?;
                     ensure!(
                         blake3::hash(bytes).as_bytes() == &digest,
                         Damaged::Chunk(digest)
                     );
                     ensure!(size == raw as u64, Damaged::Entry);
-                    tmp.write_all(bytes)?;
+                    if packed::write_output(tmp, bytes)? {
+                        tmp.set_len(size)?;
+                    }
                     continue;
                 }
                 let verity = row.get::<_, Option<Digest>>(5)?;
@@ -818,7 +834,8 @@ impl Store {
                 }
                 let mut hasher = blake3::Hasher::new();
                 let mut written = 0u64;
-                let mut stmt = tx.prepare_cached("SELECT c.hash,c.raw,CASE WHEN length(c.data)<=262144 THEN c.data END FROM parts p JOIN chunks c ON c.hash=p.chunk WHERE entry=?1 AND slot=?2 ORDER BY ordinal")?;
+                let mut trailing_hole = false;
+                let mut stmt = tx.prepare_cached("SELECT c.hash,c.raw,CASE WHEN length(c.data)<=262144 THEN c.data END,c.external FROM parts p JOIN chunks c ON c.hash=p.chunk WHERE entry=?1 AND slot=?2 ORDER BY ordinal")?;
                 let mut rows = stmt.query(params![id, slot])?;
                 while let Some(row) = rows.next()? {
                     let hash: Digest = row.get(0)?;
@@ -827,10 +844,16 @@ impl Store {
                         .get_ref(2)?
                         .as_blob()
                         .map_err(|_| Damaged::Chunk(hash))?;
+                    let external = row.get::<_, usize>(3).map_err(|_| Damaged::Chunk(hash))?;
+                    let packed =
+                        packed::payload(&self.dir, &hash, raw, packed, external, &mut frame)?;
                     let bytes = decoder.decode(packed, raw, hash)?;
-                    tmp.write_all(bytes)?;
+                    trailing_hole = packed::write_output(tmp, bytes)?;
                     hasher.update(bytes);
                     written += raw as u64;
+                }
+                if trailing_hole {
+                    tmp.set_len(written)?;
                 }
                 if written != size || hasher.finalize().as_bytes() != &digest {
                     // Normal restores hash each decoded byte once. Only a failed
@@ -854,26 +877,16 @@ impl Store {
             ensure!(records.next()?.is_none(), Damaged::Entry);
             Ok(staged)
         })();
-        tx.commit()?;
-        let staged = match staged {
-            Ok(files) => files,
-            Err(e) => {
-                if let Some(damage) = e.downcast_ref::<Damaged>() {
-                    match damage {
-                        Damaged::Chunk(hash) => self.conn.execute(
-                            "DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1 UNION SELECT entry FROM files WHERE single=1 AND digest=?1)", [hash],
-                        )?,
-                        Damaged::Object(hash) => self.conn.execute(
-                            "DELETE FROM entries WHERE id IN (SELECT entry FROM clones WHERE hash=?1)", [hash],
-                        )?,
-                        Damaged::Entry => self.conn.execute("DELETE FROM entries WHERE key=?1", [key])?,
-                    };
-                    self.collect_objects(false)?;
-                    let _ = self.count("corrupt", 1);
-                }
-                return Err(e);
+        if let Err(error) = staged {
+            if let Some(damage) = error.downcast_ref::<Damaged>() {
+                let version = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+                tx.commit()?;
+                self.invalidate(key, damage, version)?;
             }
-        };
+            return Err(error);
+        }
+        let staged = staged?;
+        tx.commit()?;
         for (tmp, path) in staged.into_iter().zip(outputs) {
             tmp.publish(path)?;
         }
@@ -882,6 +895,25 @@ impl Store {
             key: *key,
             compiler_ms: ms,
         }))
+    }
+
+    fn invalidate(&mut self, key: &Digest, damage: &Damaged, version: u32) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A WAL reader can still hold the old entry while GC unlinks its
+        // files. Never remove a healthy replacement published in the meantime.
+        if tx.query_row("PRAGMA data_version", [], |r| r.get::<_, u32>(0))? != version {
+            return Ok(());
+        }
+        match damage {
+            Damaged::Chunk(hash) => tx.execute("DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1 UNION SELECT entry FROM files WHERE single=1 AND digest=?1)",[hash])?,
+            Damaged::Object(hash) => tx.execute("DELETE FROM entries WHERE id IN (SELECT entry FROM clones WHERE hash=?1)",[hash])?,
+            Damaged::Entry => tx.execute("DELETE FROM entries WHERE key=?1", [key])?,
+        };
+        tx.execute("INSERT INTO counters VALUES('corrupt',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[])?;
+        tx.commit()?;
+        self.collect_objects(false)
     }
 
     pub fn record_hit(&mut self, hit: &Hit, extra: Option<&str>) -> Result<()> {
@@ -919,29 +951,8 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut select = tx.prepare("SELECT hash FROM retired LIMIT 128")?;
-        let mut forget = tx.prepare("DELETE FROM retired WHERE hash=?1")?;
-        loop {
-            let retired = select
-                .query_map([], |r| r.get::<_, Digest>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if retired.is_empty() {
-                break;
-            }
-            for digest in retired {
-                let p = crate::sealed::path(&self.dir, &digest);
-                match fs::remove_file(p) {
-                    Ok(()) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                    Err(e) => return Err(e.into()),
-                }
-                forget.execute([digest])?;
-            }
-        }
-        drop((select, forget));
-        if sweep {
-            crate::sealed::sweep(&self.dir, &tx)?;
-        }
+        objects::Kind::Sealed.collect(&self.dir, &tx, sweep)?;
+        objects::Kind::Frame.collect(&self.dir, &tx, sweep)?;
         tx.commit()?;
         Ok(())
     }
@@ -970,7 +981,8 @@ impl Store {
             probe_entries: scalar("SELECT COUNT(*) FROM probes")?,
             sealed_objects: scalar("SELECT COUNT(*) FROM objects")?,
             sealed_bytes: scalar("SELECT COALESCE(SUM(bytes),0) FROM objects")?,
-            compressed_bytes: scalar("SELECT COALESCE(SUM(length(data)),0) FROM chunks")?,
+            compressed_bytes: scalar("SELECT COALESCE(SUM(length(data)+external),0) FROM chunks")?,
+            frame_file_bytes: scalar("SELECT COALESCE(SUM(external),0) FROM chunks")?,
             artifact_bytes: scalar("SELECT COALESCE(SUM(size),0) FROM files")?,
             counters: events
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1157,6 +1169,104 @@ mod tests {
         let since = SystemTime::now();
         let pre = fingerprint::native_externs(&inv, since, &store)?;
         assert!(fingerprint::certify_externs(&pre, true, since, &store, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_frame_files_recover_from_missing_and_corrupt_payloads() -> Result<()> {
+        for missing in [false, true] {
+            let d = tempfile::tempdir()?;
+            let mut store = Store::at(d.path().join("cache"), 4 << 20)?;
+            let path = d.path().join("out");
+            let mut half = vec![0; 80 << 10];
+            blake3::Hasher::new()
+                .update(b"compressed frame file")
+                .finalize_xof()
+                .fill(&mut half);
+            let data = half.repeat(2);
+            fs::write(&path, &data)?;
+            let paths = std::slice::from_ref(&path);
+            for n in [1, 2] {
+                assert!(store.save(&[0; 32], &[n; 32], paths, b"", 1, None)?);
+            }
+            let hash = *blake3::hash(&data).as_bytes();
+            let object = objects::Kind::Frame.path(&store.dir, &hash);
+            let encoded = object.metadata()?.len();
+            let stats = store.stats()?;
+            assert!(encoded < data.len() as u64 && encoded >= 64 << 10);
+            assert_eq!(stats.frame_file_bytes, encoded);
+            fs::remove_file(&path)?;
+            assert!(store.restore(&[2; 32], paths)?.is_some());
+            assert_eq!(fs::read(&path)?, data);
+            if missing {
+                fs::remove_file(&object)?;
+            } else {
+                fs::write(&object, vec![0; encoded as usize])?;
+            }
+            fs::write(&path, b"working copy")?;
+            assert!(store.restore(&[1; 32], paths).is_err());
+            assert_eq!(fs::read(path)?, b"working copy");
+            assert_eq!(store.stats()?.charged_bytes, 0);
+            assert!(!object.exists());
+            let abandoned = objects::Kind::Frame.path(&store.dir, &[17; 32]);
+            fs::create_dir_all(abandoned.parent().unwrap())?;
+            fs::write(&abandoned, b"interrupted")?;
+            let pending = store.dir.join("frames-v1/.pending");
+            fs::write(&pending, b"unfinished")?;
+            let unrelated = abandoned.with_file_name("unrelated");
+            fs::write(&unrelated, b"keep")?;
+            store.prune(0)?;
+            assert!(!abandoned.exists() && !pending.exists() && unrelated.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_reader_cannot_remove_a_newly_published_frame() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = dir.path().join("cache");
+        let paths = [dir.path().join("output")];
+        let mut raw = vec![0; CHUNK];
+        blake3::Hasher::new()
+            .update(b"concurrent")
+            .finalize_xof()
+            .fill(&mut raw);
+        fs::write(&paths[0], &raw)?;
+        let mut first = Store::at(cache.clone(), 2 << 20)?;
+        first.save(&[1; 32], &[2; 32], &paths, b"", 1, None)?;
+        let tx = first.conn.transaction()?;
+        let _: u64 = tx.query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;
+        let mut second = Store::at(cache, 2 << 20)?;
+        second.prune(0)?;
+        second.save(&[1; 32], &[2; 32], &paths, b"", 1, None)?;
+        let version = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        tx.commit()?;
+        first.invalidate(
+            &[2; 32],
+            &Damaged::Chunk(*blake3::hash(&raw).as_bytes()),
+            version,
+        )?;
+        assert!(first.restore(&[2; 32], &paths)?.is_some());
+        assert_eq!(fs::read(&paths[0])?, raw);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_packed_restores_preserve_middle_pages_and_trailing_length() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = Store::at(dir.path().join("cache"), 2 << 20)?;
+        let path = dir.path().join("artifact");
+        let paths = std::slice::from_ref(&path);
+        for (key, size) in [(1, CHUNK - 73), (2, 13 * CHUNK + 317)] {
+            let mut data = vec![0; size];
+            data[19] = 81;
+            data[size / 2 + 31] = 17;
+            fs::write(&path, &data)?;
+            store.save(&[0; 32], &[key; 32], paths, b"", 1, None)?;
+            fs::write(&path, b"replace")?;
+            assert!(store.restore(&[key; 32], paths)?.is_some());
+            assert_eq!(fs::read(&path)?, data);
+        }
         Ok(())
     }
 

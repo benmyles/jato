@@ -48,6 +48,9 @@ def packed_writes(exe, cargo, env, project, root):
     db = re.compile(
         r"^pwrite64\(\d+<" + store + r"/artifacts-v1\.sqlite3(?:-wal)?>.* = (\d+)$"
     )
+    frame = re.compile(
+        r"^(?:write|pwrite64)\(\d+<" + store + r"/frames-v1/\.pending>.* = (\d+)$"
+    )
     traces = []
     for f in root.glob("trace.*"):
         lines = f.read_text(errors="replace").splitlines()
@@ -64,10 +67,13 @@ def packed_writes(exe, cargo, env, project, root):
     stats = json.loads(run([exe, "stats", "--json"], env, project))
     assert stats["entries"] == 1
     written = total(db)
-    assert written >= stats["compressed_bytes"], "SQLite writes missing from trace"
+    payload = total(frame)
+    assert payload == stats.get("frame_file_bytes", 0), "frame writes missing from trace"
+    assert written + payload >= stats["compressed_bytes"], "payload writes missing from trace"
     return {
         "anonymous_staging_bytes_written": total(anonymous),
         "sqlite_bytes_written": written,
+        "frame_file_bytes_written": payload,
         "compressed_payload_bytes": stats["compressed_bytes"],
     }
 

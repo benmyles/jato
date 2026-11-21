@@ -15,8 +15,7 @@ pub struct Object {
 }
 
 pub fn path(dir: &Path, digest: &Digest) -> PathBuf {
-    let name = blake3::Hash::from_bytes(*digest).to_hex();
-    dir.join("objects-v1").join(&name[..2]).join(&name[2..])
+    crate::store::objects::Kind::Sealed.path(dir, digest)
 }
 
 #[cfg(target_os = "linux")]
@@ -310,43 +309,5 @@ pub fn restore(
     }
     ensure!(dest.metadata()?.len() == size, "incomplete sealed restore");
     dest.rewind()?;
-    Ok(())
-}
-
-// Run under the database writer lease. A kill between linkat and COMMIT can
-// leave an otherwise unreachable inode. Only delete recognized object names.
-pub fn sweep(dir: &Path, tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    let root = dir.join("objects-v1");
-    if !root.is_dir() {
-        return Ok(());
-    }
-    for shard in fs::read_dir(root)? {
-        let shard = shard?;
-        let prefix = shard.file_name();
-        let Some(prefix) = prefix.to_str() else {
-            continue;
-        };
-        if prefix.len() != 2 || !shard.file_type()?.is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(shard.path())? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Ok(hash) = blake3::Hash::from_hex(format!("{prefix}{name}")) else {
-                continue;
-            };
-            let referenced = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM objects WHERE hash=?1)",
-                [hash.as_bytes()],
-                |r| r.get::<_, bool>(0),
-            )?;
-            if !referenced && entry.file_type()?.is_file() {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        // Empty shards are optional, and another reader may be finishing.
-        let _ = fs::remove_dir(shard.path());
-    }
     Ok(())
 }

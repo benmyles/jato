@@ -16,7 +16,8 @@ CREATE INDEX IF NOT EXISTS artifact_sizes ON files(size);
 -- Keep the legacy refs column for existing databases. The files and parts
 -- indexes identify live users without dirtying a compressed payload.
 CREATE TABLE IF NOT EXISTS chunks(
-    hash BLOB PRIMARY KEY, raw INTEGER NOT NULL, data BLOB NOT NULL, refs INTEGER NOT NULL
+    hash BLOB PRIMARY KEY, raw INTEGER NOT NULL, data BLOB NOT NULL, refs INTEGER NOT NULL,
+    external INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS parts(
     entry INTEGER REFERENCES entries ON DELETE CASCADE, slot INTEGER, ordinal INTEGER, chunk BLOB NOT NULL,
@@ -129,4 +130,15 @@ CREATE TABLE IF NOT EXISTS input_samples(entry INTEGER PRIMARY KEY REFERENCES en
 CREATE INDEX IF NOT EXISTS sample_keys ON input_samples(digest);
 CREATE TRIGGER IF NOT EXISTS add_input_sample AFTER INSERT ON input_samples BEGIN UPDATE usage SET bytes=bytes+128; END;
 CREATE TRIGGER IF NOT EXISTS drop_input_sample AFTER DELETE ON input_samples BEGIN UPDATE usage SET bytes=bytes-128; END;
-PRAGMA user_version=13;
+-- Large packed payloads live in files named by the raw digest. The row owns
+-- their encoded length; active readers always verify the reconstructed bytes.
+CREATE TABLE IF NOT EXISTS retired_frames(hash BLOB PRIMARY KEY) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS add_frame_file AFTER INSERT ON chunks WHEN NEW.external>0 BEGIN
+    UPDATE usage SET bytes=bytes+((NEW.external+4095)/4096)*4096+256;
+    DELETE FROM retired_frames WHERE hash=NEW.hash;
+END;
+CREATE TRIGGER IF NOT EXISTS drop_frame_file AFTER DELETE ON chunks WHEN OLD.external>0 BEGIN
+    UPDATE usage SET bytes=bytes-((OLD.external+4095)/4096)*4096-256;
+    INSERT OR IGNORE INTO retired_frames VALUES(OLD.hash);
+END;
+PRAGMA user_version=14;

@@ -144,6 +144,7 @@ def main():
         "--sccache", help="include this sccache binary with a private local server"
     )
     parser.add_argument("--variants", type=int, default=8)
+    parser.add_argument("--storage", choices=["packed", "auto"], default="packed")
     workload = parser.add_mutually_exclusive_group()
     workload.add_argument(
         "--insert-asset",
@@ -202,7 +203,7 @@ def main():
         env.update(
             CARGO_TARGET_DIR=str(target),
             CARGO_BUILD_BUILD_DIR=str(target),
-            JATO_STORAGE="packed",
+            JATO_STORAGE=opts.storage,
         )
         run([cargo, "generate-lockfile", "--offline"], env, project)
         config = root / "empty.toml"
@@ -253,6 +254,7 @@ def main():
                     "variants": opts.variants,
                     "edit_asset": opts.edit_asset,
                     "insert_asset": opts.insert_asset,
+                    "storage": opts.storage,
                     "samples": report,
                 },
                 indent=2,

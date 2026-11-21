@@ -1,13 +1,14 @@
 //! Stage ordered frames without retaining a per-frame vector. The private
 //! spool holds compressed bytes or descriptors for bytes available elsewhere.
-use super::{CHUNK, Digest};
+use super::objects::{self, Kind};
+use super::{CHUNK, Damaged, Digest};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
-use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 // Archive boundaries delimit independent regions. Inside a long region,
 // content-defined cuts can meet the same bytes again after an insertion.
@@ -24,7 +25,105 @@ const MEMORY_DIGESTS: usize = 1024;
 const EXISTING: u32 = u32::MAX;
 const RAW_SOURCE: u32 = u32::MAX - 1;
 const PROBE_MIN: usize = 16 * 1024;
-const INSERT_CHUNK: &str = "INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO NOTHING";
+const FILE_MIN: usize = 64 * 1024;
+const INSERT_CHUNK: &str = "INSERT INTO chunks(hash,raw,data,refs,external) VALUES(?1,?2,?3,1,?4) ON CONFLICT(hash) DO NOTHING";
+
+fn charge(encoded: usize, file: bool) -> usize {
+    96 + if file {
+        encoded.div_ceil(4096) * 4096 + 256
+    } else {
+        encoded
+    }
+}
+
+// Only the SQLite writer publishes or removes a frame. Renaming one private
+// pending file makes publication atomic for readers on an older WAL snapshot.
+fn write_frame(dir: &Path, digest: &Digest, bytes: &[u8]) -> Result<()> {
+    let dest = Kind::Frame.path(dir, digest);
+    fs::create_dir_all(dest.parent().unwrap())?;
+    let pending = dir.join("frames-v1/.pending");
+    let create = || {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&pending)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            objects::remove(&pending)?;
+            create()?
+        }
+        result => result?,
+    };
+    file.write_all(bytes)?;
+    fs::rename(pending, dest)?;
+    Ok(())
+}
+
+// The destination is a newly created staging inode. Seeking over complete
+// zero pages there reproduces those bytes without dirtying output pages.
+pub(super) fn write_output(file: &mut File, bytes: &[u8]) -> Result<bool> {
+    const ZERO: [u8; 4096] = [0; 4096];
+    let hole = if bytes.len() >= 2 * ZERO.len() && bytes.ends_with(&[0; 16]) {
+        bytes
+            .rchunks_exact(ZERO.len())
+            .take_while(|b| *b == ZERO)
+            .count()
+            * ZERO.len()
+    } else {
+        0
+    };
+    if hole < 2 * ZERO.len() {
+        file.write_all(bytes)?;
+        return Ok(false);
+    }
+    file.write_all(&bytes[..bytes.len() - hole])?;
+    file.seek_relative(hole as i64)?;
+    Ok(true)
+}
+
+pub(super) fn payload<'a>(
+    dir: &Path,
+    hash: &Digest,
+    raw: usize,
+    inline: &'a [u8],
+    external: usize,
+    buffer: &'a mut Vec<u8>,
+) -> Result<&'a [u8]> {
+    if external == 0 {
+        return Ok(inline);
+    }
+    ensure!(
+        inline.is_empty() && external <= raw && raw <= CHUNK,
+        Damaged::Chunk(*hash)
+    );
+    let mut file = crate::content::open_with_flags(
+        &Kind::Frame.path(dir, hash),
+        libc::O_NONBLOCK | libc::O_NOFOLLOW,
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) {
+            anyhow::Error::new(Damaged::Chunk(*hash))
+        } else {
+            e.into()
+        }
+    })?;
+    let m = file.metadata()?;
+    ensure!(
+        m.is_file() && m.len() == external as u64,
+        Damaged::Chunk(*hash)
+    );
+    buffer.resize(external, 0);
+    file.read_exact(buffer).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            anyhow::Error::new(Damaged::Chunk(*hash))
+        } else {
+            e.into()
+        }
+    })?;
+    Ok(buffer)
+}
 
 // Preserve exact standalone admission accounting even when several GiB of
 // frames repeat in a different order. Only large distinct sets spill.
@@ -89,6 +188,8 @@ pub(super) struct Recorder {
     seen: Seen,
     encoder: Encoder,
     populated: bool,
+    dir: PathBuf,
+    pub has_files: bool,
     pub reused: u64,
 }
 
@@ -99,28 +200,30 @@ impl Recorder {
             seen: Seen::default(),
             encoder: Encoder::default(),
             populated,
+            dir: dir.to_owned(),
+            has_files: false,
             reused: 0,
         }
     }
 
     pub fn frame(&mut self, conn: &Connection, digest: Digest, raw: &[u8]) -> Result<u64> {
         let mut tag = 0;
-        let mut charge = 0;
+        let mut cost = 0;
         let mut data = None;
         if self.seen.insert(digest)? {
-            let size: Option<usize> = if self.populated && raw.len() >= PROBE_MIN {
-                conn.prepare_cached("SELECT length(data) FROM chunks WHERE hash=?1 AND raw=?2 AND length(data) BETWEEN 1 AND raw")?
-                    .query_row(params![&digest, raw.len()], |r| r.get(0)).optional()?
+            let size: Option<(usize, usize)> = if self.populated && raw.len() >= PROBE_MIN {
+                conn.prepare_cached("SELECT length(data),external FROM chunks WHERE hash=?1 AND raw=?2 AND length(data)+external BETWEEN 1 AND raw")?
+                    .query_row(params![&digest, raw.len()], |r| Ok((r.get(0)?,r.get(1)?))).optional()?
             } else {
                 None
             };
-            if let Some(size) = size {
+            if let Some((inline, external)) = size {
                 tag = EXISTING;
-                charge = size + 96;
+                cost = charge(inline + external, external != 0);
                 self.reused += raw.len() as u64;
             } else {
                 let bytes = self.encoder.encode(raw)?;
-                charge = bytes.len() + 96;
+                cost = charge(bytes.len(), bytes.len() >= FILE_MIN);
                 if bytes.len() == raw.len() && raw.len() >= PROBE_MIN {
                     // The original file already holds the exact publication
                     // payload. Verify it again before inserting it into SQLite.
@@ -139,7 +242,7 @@ impl Recorder {
         if let Some(data) = data {
             self.spool.write_all(data)?;
         }
-        Ok(charge as u64)
+        Ok(cost as u64)
     }
 
     pub fn rewind(&mut self) -> Result<()> {
@@ -200,8 +303,18 @@ impl Recorder {
                 bytes
             }
         };
-        tx.prepare_cached(INSERT_CHUNK)?
-            .execute(params![&digest, raw, bytes])?;
+        let (inline, external) = if bytes.len() >= FILE_MIN {
+            (&[][..], bytes.len())
+        } else {
+            (bytes, 0)
+        };
+        let added = tx
+            .prepare_cached(INSERT_CHUNK)?
+            .execute(params![&digest, raw, inline, external])?;
+        if added != 0 && external != 0 {
+            write_frame(&self.dir, &digest, bytes)?;
+            self.has_files = true;
+        }
         Ok((digest, raw as u64))
     }
 }
@@ -224,7 +337,10 @@ mod tests {
         let mut buffer = vec![0; CHUNK];
         for changed in [false, true] {
             let mut record = Recorder::new(&store.dir, false);
-            assert_eq!(record.frame(&store.conn, hash, &raw)?, CHUNK as u64 + 96);
+            assert_eq!(
+                record.frame(&store.conn, hash, &raw)?,
+                charge(CHUNK, true) as u64
+            );
             assert_eq!(record.spool.stream_position()?, 40);
             record.rewind()?;
             std::fs::write(&path, &raw)?;
@@ -240,8 +356,15 @@ mod tests {
                 assert!(result.is_err());
             } else {
                 assert_eq!(result?, (hash, CHUNK as u64));
-                let bytes: Vec<u8> = tx.query_row("SELECT data FROM chunks", [], |r| r.get(0))?;
-                assert_eq!(bytes, raw);
+                let (inline, external): (Vec<u8>, usize) =
+                    tx.query_row("SELECT data,external FROM chunks", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                assert_eq!(external, CHUNK);
+                assert_eq!(
+                    payload(&store.dir, &hash, raw.len(), &inline, external, &mut buffer)?,
+                    raw
+                );
             }
             tx.rollback()?;
             assert_eq!(store.stats()?.charged_bytes, 0);
