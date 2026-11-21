@@ -33,3 +33,9 @@
 - [x] Remove repeat validation work from native misses and recurring worktree restores.
 - [x] Reduce watcher registration, idle memory and subtree attachment costs on large workspaces.
 - [x] Test failure, cancellation, divergent inputs and eviction, then compare CPU time, wall time and storage against the installed release and upstream peers.
+
+## Live edits and shifted artifacts
+
+- [ ] Restore verified native results on live incremental hits and keep new edits on rustc’s normal incremental path.
+- [ ] Reuse packed data across insertions and deletions while preserving bounded capture and exact restoration.
+- [ ] Profile remaining verification costs, qualify the installed build, and compare edit and rebuild workloads with peers.

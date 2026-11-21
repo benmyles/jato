@@ -1,5 +1,10 @@
 # Work journal
 
+## 2026-11-21 — live incremental replay and shifted artifacts
+
+- A dev-profile edit and undo both bypassed the installed 0.5 cache because rustc’s incremental session was active. The original executable had already been recorded from a clean session.
+- Inserted one byte per revision near the front of a 16 MiB embedded asset. Four releases grew from 32.0 to 128.0 MiB of packed payload, with no prior frames reused across those revisions.
+
 ## 2026-11-21 — concurrent builds and repeated validation
 
 - Started two clean regex worktrees against the same empty 0.4 cache. All six compiler units ran twice and produced six stored entries. The pair finished in 11.18 s.

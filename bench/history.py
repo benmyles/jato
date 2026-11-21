@@ -31,7 +31,9 @@ def main():
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato", required=True)
     parser.add_argument("--variants", type=int, default=8)
-    parser.add_argument("--edit-asset", action="store_true", help="edit one byte of a 16 MiB static asset between builds")
+    workload = parser.add_mutually_exclusive_group()
+    workload.add_argument("--insert-asset", action="store_true", help="insert bytes near the beginning of a 16 MiB asset between builds")
+    workload.add_argument("--edit-asset", action="store_true", help="edit one byte of a 16 MiB static asset between builds")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     opts = parser.parse_args()
     if not 2 <= opts.variants <= 64:
@@ -45,14 +47,21 @@ def main():
         src.mkdir(parents=True)
         (project / "Cargo.toml").write_text('[package]\nname="jato-history-bench"\nversion="0.1.0"\nedition="2021"\n')
         asset = src / "table.bin"
-        size = (16 if opts.edit_asset else 4) * 1024 * 1024 + 19
+        size = (16 if opts.edit_asset or opts.insert_asset else 4) * 1024 * 1024 + 19
         asset.write_bytes(hashlib.shake_256(b"jato history v1").digest(size))
         lib = src / "lib.rs"
-        if opts.edit_asset:
+        original = asset.read_bytes() if opts.insert_asset else None
+        if opts.edit_asset or opts.insert_asset:
             lib.write_text('pub static TABLE: &[u8] = include_bytes!("table.bin");')
 
         def edit(revision):
-            if opts.edit_asset:
+            if opts.insert_asset:
+                offset=8192
+                with asset.open("wb") as file:
+                    file.write(memoryview(original)[:offset])
+                    file.write(b"x"*revision)
+                    file.write(memoryview(original)[offset:])
+            elif opts.edit_asset:
                 with asset.open("r+b") as file:
                     file.seek(size // 2)
                     file.write(bytes([revision]))
@@ -102,7 +111,7 @@ def main():
             report[label] = dict(version=run([binary, "--version"], project, cfg).decode().strip(),
                                  revisions=sample, restore_seconds=round(restore, 6), archive_sha256=initial)
         print(json.dumps(dict(rustc=run([rustc, "-V"], project, env).decode().strip(),
-                              variants=opts.variants, edit_asset=opts.edit_asset, samples=report), indent=2))
+                              variants=opts.variants, edit_asset=opts.edit_asset, insert_asset=opts.insert_asset, samples=report), indent=2))
 
 
 if __name__ == "__main__":
