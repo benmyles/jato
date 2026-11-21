@@ -1,0 +1,33 @@
+[
+  {
+    "phase": "cold",
+    "decision_lines": [],
+    "counter_delta": 0
+  },
+  {
+    "phase": "restore",
+    "decision_lines": [
+      "jato [leaf] hit",
+      "jato [client] hit"
+    ],
+    "counter_delta": 2
+  },
+  {
+    "phase": "fresh",
+    "decision_lines": [
+      "jato [leaf] hit",
+      "jato [client] hit"
+    ],
+    "counter_delta": 0
+  },
+  {
+    "phase": "test",
+    "decision_lines": [],
+    "counter_delta": 0
+  },
+  {
+    "phase": "test_fresh",
+    "decision_lines": [],
+    "counter_delta": 0
+  }
+]

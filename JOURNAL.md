@@ -6,12 +6,14 @@
 - A clean nightly library restore reproduced both files byte-for-byte. A downstream program returned its new value after an edit. Added CI coverage for the pinned compiler, active cfg-gated features, unknown options and ordinary Rust modules named `asm`.
 - Added a persistent per-cache budget. Publishers read the shared policy inside the write transaction and explicit GC targets leave it in place. A smaller project setting and a second project's GC both honored the configured budget.
 - Confirmed two separate issues from the report. A fresh Cargo check replayed two previous hit lines with zero new hits. Nightly Cargo exported the same runnable binary to a conventional release directory after switching both physical build directories and restoring both units.
+- Installed 0.9.0 and measured a two-package Olo clean rebuild at 366.72 s with 123 hits. A private kache 2.3.0 store restored the same build in 2.97 s. The two Olo rlibs recompiled by Jato varied. The protocol library passed 75 tests. The Olo developer independently measured 97–127 s against 2.0 s and kept kache for this workload.
 
 ## 2026-11-21 — compiler discovery and cache publication
 
 - Traced a one-crate Cargo check on 0.8. When Cargo passed `rustc` by name, four extra compiler processes queried the sysroot. The rustup-launched Cargo control passed an absolute compiler and needed zero extra queries. Added both layouts and an explicit rustup proxy to the comparison harness.
 - Added confirmed sysroot reuse for physical Rust distributions. Jato asks the real compiler on first use, binds its answer to the toolchain and launcher identities, and asks rustup which compiler an override selects. A Cargo regression checks an unexecutable PATH entry and a custom driver whose answers change.
 - Measured 327,700 SQLite VM instructions to scan 32,768 unrelated pending inputs on 0.8. Added a reverse index and a transaction-local SQLite queue for newly verified outputs. Tested delayed publications, fan-in, cycles, self-dependencies, and independent metadata and code-generation evidence.
+- The installed 0.9 build published the head of a 64-entry chain amid 16,384 unrelated requirements in a median 3.46 ms, down from 283.64 ms. On ripgrep, an ordinary PATH-compiler clean-target rebuild fell from 252 to 146 ms. kache took 319 ms and sccache took 1.62 s. The migrated binary matched its cold digest and passed 299 upstream tests.
 
 ## 2026-11-21 — coding agent skill
 

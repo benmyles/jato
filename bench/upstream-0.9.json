@@ -1,0 +1,17 @@
+{
+  "cold": {
+    "program": "c662808f8889e73f2ac5d5b000a2ed8f7c2b7771d93509e9c9512b72d14babb1",
+    "version": "ripgrep 14.1.1",
+    "entries": 39,
+    "hits": 0,
+    "schema": 15
+  },
+  "upgrade": {
+    "program": "c662808f8889e73f2ac5d5b000a2ed8f7c2b7771d93509e9c9512b72d14babb1",
+    "version": "ripgrep 14.1.1",
+    "entries": 39,
+    "hits": 39,
+    "schema": 17
+  },
+  "integration": "test result: ok. 299 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s"
+}

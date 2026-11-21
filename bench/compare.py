@@ -109,13 +109,15 @@ def paired_restores(options, tools, env, project, root, target):
         # One untimed build per store, followed by alternating clean targets.
         for iteration in range(options.paired_restores + 1):
             for name in names[iteration % len(names):] + names[:iteration % len(names)]:
-                cfg = dict(env, RUSTC_WRAPPER=str(tools[name]), JATO_CACHE_DIR=str(root / f"{name}-{mode}"))
+                cfg = dict(env, RUSTC_WRAPPER=str(tools[name]), JATO_CACHE_DIR=str(root / f"{name}-{mode}"),
+                           JATO_MAX_SIZE=f"{options.cache_gib}GiB")
                 if name.endswith("_packed"):
                     cfg["JATO_STORAGE"] = "packed"
                 if target.exists():
                     shutil.rmtree(target)
                 start = time.perf_counter()
-                run(build_command(env["CARGO"], mode, tools[name] if name in {"jato", "jato_packed"} else None), cfg, project)
+                command = build_command(env["CARGO"], mode, tools[name] if name in {"jato", "jato_packed"} else None)
+                run(command + options.package_args, cfg, project)
                 elapsed = time.perf_counter() - start
                 if iteration:
                     timings[name].append(round(elapsed, 6))
@@ -136,6 +138,7 @@ def main():
     source.add_argument("--project", type=Path, help="an existing locked Cargo project")
     source.add_argument("--fixture", choices=["regex", "zlib", "embedded"], default="regex")
     parser.add_argument("--verify-bin", help="compare this release program's --version output")
+    parser.add_argument("--package", action="append", default=[], help="select a Cargo workspace package (repeatable)")
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato")
     parser.add_argument("--compiler-path", choices=["absolute", "path", "rustup"], default="absolute",
@@ -152,11 +155,13 @@ def main():
                         default=["cargo","jato","kache","sccache"], help="base contenders to measure")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--cache-gib", type=int, default=1, help="private cache budget per contender in GiB")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     options = parser.parse_args()
-    if min(options.jobs, options.runs) < 1:
-        parser.error("--jobs and --runs must be positive")
+    options.package_args = [arg for package in options.package for arg in ("-p", package)]
+    if min(options.jobs, options.runs, options.cache_gib) < 1:
+        parser.error("--jobs, --runs and --cache-gib must be positive")
     if options.paired_restores is not None:
         if options.paired_restores < 1 or not options.previous_jato:
             parser.error("--paired-restores needs a positive count and --previous-jato")
@@ -228,7 +233,7 @@ def main():
         run([cargo, "fetch", "--locked"], env, project)
         if options.paired_restores:
             result = paired_restores(options, tools, env, project, root, target)
-            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, project=project.name if options.project else options.fixture,
+            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, project=project.name if options.project else options.fixture,
                                   rustc=run([rustc, "-V"], env, project).decode().strip(), jobs=options.jobs,
                                   pairs=options.paired_restores, **result), indent=2))
             return
@@ -245,16 +250,16 @@ def main():
                         private = Path(private)
                         cache = private / "store"
                         cfg = dict(env, RUSTC_WRAPPER=str(exe or ""), JATO_CACHE_DIR=str(cache),
-                                   JATO_MAX_SIZE="1GiB", KACHE_CACHE_DIR=str(cache),
+                                   JATO_MAX_SIZE=f"{options.cache_gib}GiB", KACHE_CACHE_DIR=str(cache),
                                    KACHE_RUNTIME_DIR=str(private / "run"), KACHE_SOCKET_PATH=str(private / "k.sock"),
                                    KACHE_CONFIG=str(config), KACHE_HOST_CONFIG="", KACHE_LOCAL_ONLY="1",
-                                   KACHE_MAX_SIZE="1GiB", SCCACHE_DIR=str(cache), SCCACHE_CACHE_SIZE="1G",
+                                   KACHE_MAX_SIZE=f"{options.cache_gib}GiB", SCCACHE_DIR=str(cache), SCCACHE_CACHE_SIZE=f"{options.cache_gib}G",
                                    SCCACHE_SERVER_UDS=str(private / "s.sock"), SCCACHE_CONF=str(config),
                                    SCCACHE_ALLOW_INCREMENTAL="1")
                         if name in {"jato_packed", "previous_packed"}:
                             cfg["JATO_STORAGE"] = "packed"
                         assert len(os.fsencode(cfg["SCCACHE_SERVER_UDS"])) < 104, "use a shorter --scratch path"
-                        command = build_command(cargo, mode, exe if name in {"jato", "jato_packed"} else None)
+                        command = build_command(cargo, mode, exe if name in {"jato", "jato_packed"} else None) + options.package_args
                         def measure(phase):
                             rss = private / "rss"
                             timed = ["/usr/bin/time", "-f", "%M %U %S", "-o", rss, *command] if Path("/usr/bin/time").is_file() else command
@@ -327,7 +332,7 @@ def main():
         medians = {k: {m: {key: statistics.median(s[key] for s in samples)
                            for key in samples[0] if all(s.get(key) is not None for s in samples)} for m, samples in modes.items()}
                    for k, modes in results.items()}
-        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
+        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
                               rustc=run([rustc, "-V"], env, project).decode().strip(),
                               jobs=options.jobs, runs=options.runs, samples=results, median=medians), indent=2))
 

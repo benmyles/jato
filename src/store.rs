@@ -1888,6 +1888,12 @@ mod tests {
         let b = *blake3::hash(b"downstream").as_bytes();
         save(&mut store, 1, b"downstream", &[a], true)?;
         save(&mut store, 2, b"leaf", &[b], true)?;
+        // Carry outstanding 0.8 evidence through the index and policy migration.
+        store.conn.execute_batch(
+            "DROP INDEX waiting_for_artifact; DROP TABLE cache_settings; PRAGMA user_version=15;",
+        )?;
+        drop(store);
+        let mut store = Store::at(root.path().join("cache"), 1 << 20)?;
         assert!(store.plans(&[2; 32])?.0.is_empty());
         assert!(!store.knows_artifact(&b, true)?);
         assert!(
@@ -1921,6 +1927,32 @@ mod tests {
         for id in 6..=9 {
             assert!(!store.plans(&[id; 32])?.0.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn already_open_publishers_use_the_current_shared_limit() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("cache");
+        let mut old = Store::at(path.clone(), 0)?;
+        let mut admin = Store::at(path, 1 << 20)?;
+        let file = root.path().join("output");
+        fs::write(&file, "previously compiled output")?;
+        admin.set_budget(Some(1 << 20))?;
+        assert!(old.save(
+            &[1; 32],
+            &[2; 32],
+            std::slice::from_ref(&file),
+            &[],
+            1,
+            None
+        )?);
+        old.prune(None)?;
+        assert_eq!(old.stats()?.entries, 1);
+        admin.set_budget(Some(0))?;
+        assert!(!old.save(&[1; 32], &[3; 32], &[file], &[], 1, None)?);
+        old.prune(None)?;
+        assert_eq!(old.stats()?.entries, 0);
         Ok(())
     }
 

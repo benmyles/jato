@@ -12,12 +12,13 @@
 - [x] Reproduce compiler discovery through PATH, rustup and an absolute toolchain.
 - [x] Remove redundant discovery work while preserving compiler selection and cache validity.
 - [x] Measure publication costs as unresolved Cargo dependencies accumulate and address verified bottlenecks.
-- [ ] Compare clean builds, warm targets and live edits with upstream caches and qualify the installed update.
+- [x] Compare clean builds, warm targets and live edits with upstream caches and qualify the installed update.
 
 ## Olo and nightly Cargo
 
 - [x] Test the reported nightly options, split library metadata, shared cache budgeting and delivery to a conventional artifact directory.
-- [ ] Measure the installed version on Olo protocol and system packages and report the results to the Olo developer.
+- [x] Measure the installed version on Olo protocol and system packages and report the results to the Olo developer.
+- [ ] Close the fully emptied-target Olo performance gap while preserving correct behavior for changing procedural-macro inputs and native dependencies.
 
 ## Coding agent skill
 

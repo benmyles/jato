@@ -2,7 +2,9 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-Jato 0.8 reduces the cost of changing a dependency and retaining large artifact revisions. Across eight builds that inserted bytes into a 16 MiB embedded asset, automatic storage retained **49.3 MiB** of files, compared with **385.1 MiB** for Jato 0.7, **384.2 MiB** for kache and **384.1 MiB** for sccache. In a four-consumer Cargo workspace, a compiler error after a dependency edit reached Cargo in a median **307 ms**, down from **427 ms** with 0.7. The same check took 494 ms with kache and 736 ms with sccache. [Measurements, controls and reproduction commands](bench/README.md)
+Jato 0.9 supports eligible nightly builds with split library metadata and parallel compiler front ends. It also reuses confirmed sysroot lookups when Cargo finds rustc on PATH. When a pipelined producer finishes, Jato updates only the consumers waiting for its verified outputs. [Measurements, controls and reproduction commands](bench/README.md)
+
+On stable ripgrep, a clean-target development rebuild took a median 146 ms with Jato, 319 ms with kache and 1.62 s with sccache. Olo’s pinned nightly workload gave a different result. Jato restored 123 units and took 367 s in one clean-target rebuild. kache restored 304 and took 2.97 s. [Workloads, limitations and raw samples](bench/README.md)
 
 ## Get started
 
@@ -70,6 +72,12 @@ Each invocation starts Cargo in a private mount namespace with the invoking user
 
 Writable outputs live in a checkout-specific `.jato-worktree` subdirectory under Cargo’s configured target and build directories. This keeps Cargo’s freshness and incremental state independent, including when multiple checkouts share a global `CARGO_TARGET_DIR`. Using both ordinary and projected builds retains both sets of Cargo outputs until cleaned. `paths` prints the physical directories as JSON and accepts the same `--target-dir`, `--manifest-path`, and `--config` options as the build. `jato worktree … cargo clean` clears that view’s build outputs. Ordinary `cargo clean` can clear the entire configured target directory.
 
+If a launcher watches the checkout’s conventional release directory, nightly Cargo can copy final artifacts there. Run this from the same checkout with each physical target directory. The private Cargo outputs stay in their respective views. Choose the export directory that should receive the finished programs. [Cargo artifact directory](https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#artifact-dir)
+
+```sh
+jato worktree build --release -Z unstable-options --artifact-dir "$PWD/target/release"
+```
+
 Compiler diagnostics, Cargo JSON, debug information and path-valued macros such as `env!("CARGO_MANIFEST_DIR")` and `env!("OUT_DIR")` can contain view paths. Use `jato worktree --root . run` or `jato worktree --root . exec PROGRAM [ARGS...]` when a program or debugger needs to open those paths. Programs that need the host checkout path embedded in a shipped binary can use ordinary `jato build`. Separate caches, toolchains, features and differing inputs still affect reuse.
 
 On Linux, simultaneous cache misses with matching compiler settings can share one compilation. This also works for ordinary Cargo wrappers whose inputs and output paths align. The owner holds a short-lived local socket while compiling. A peer checks its own source files, tracked environment, dependency artifacts and native inputs before restoring verified outputs into its own target. A failed compiler or an ineligible result sends the peer through its own compiler. Warm hits proceed independently.
@@ -119,7 +127,8 @@ Jato's Cargo commands select Jato as `RUSTC_WRAPPER` for the child process. Carg
 | Setting or command | Purpose |
 | --- | --- |
 | `JATO_CACHE_DIR` | Private directory on a local filesystem with locking. Defaults to `$XDG_CACHE_HOME/jato`, or `~/.cache/jato`. |
-| `JATO_MAX_SIZE=512MiB` | Set the budget for packed frames, shared sealed bases, revision patches and record overhead. The default is 1 GiB. |
+| `jato limit 32GiB` | Set a shared budget for this cache directory. All projects and GC use it. `jato limit` prints the effective bytes. |
+| `JATO_MAX_SIZE=512MiB` | Choose the per-process budget when the store has no shared limit. The default is 1 GiB. `jato limit --unset` returns to this policy. |
 | `JATO_COALESCE=0` | Run concurrent misses independently. Each build still uses the cache. |
 | `JATO_STORAGE=packed` | Store all new artifacts in deduplicated, compressed chunks. The default `auto` can also share file extents on compressed Btrfs. |
 | `jato stats --json` | Show logical artifact bytes, packed and sealed payloads, patch sizes, SQLite file sizes, compiler hits and bypasses. |
@@ -141,11 +150,15 @@ When a compiler emits an identical file, Jato can reuse a sealed object after ch
 
 For a small in-place change, Jato can clone the authenticated base, rehash each modified region, and recompute the standard BLAKE3 root for the entire result. When much of a file shifted, it can reconstruct and hash the bytes in one pass. All paths check the complete result before publication. `patched_files` and `patch_bytes` report the number and size of revision patches. `frame_file_bytes` is the file-backed portion of `compressed_bytes`.
 
-Jato 0.8 upgrades earlier local caches in place. To move a cache, copy its entire directory when builds are idle so the SQLite files, frames and sealed objects travel together. Old fixed-size chunks and new content-defined chunks can coexist. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
+Jato 0.9 upgrades earlier local caches in place. To move a cache, copy its entire directory when builds are idle so the SQLite files, frames, sealed objects and shared budget travel together. Old fixed-size chunks and new content-defined chunks can coexist. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
 
 ## What can be reused
 
-Jato caches stable rustc metadata checks and eligible Rust libraries. Keys include the working directory, compiler arguments, toolchain and sysroot identities, compiler environment, source and included-file contents, rustc's tracked environment inputs, and dependency artifact hashes. A new source edit can go directly to rustc before Jato reads its compiled dependencies. A hit requires the complete key. Changes to module search directories trigger fresh resolution.
+Jato caches eligible Rust metadata checks and libraries. Keys include the working directory, compiler arguments, toolchain and sysroot identities, compiler environment, source and included-file contents, rustc's tracked environment inputs, and dependency artifact hashes. A new source edit can go directly to rustc before Jato reads its compiled dependencies. A hit requires the complete key. Changes to module search directories trigger fresh resolution.
+
+On nightly, Jato accepts `-Zthreads=N` and `-Zembed-metadata=yes|no`, including the two-argument spellings. It restores the declared rlib and companion rmeta and verifies the dependency files Cargo passes to each consumer. Unrecognized unstable options increment `bypass.unstable_option`. Documentation and selected procedural-macro API declarations can be recorded. For other conditional language features, Jato can ask rustc to evaluate a small generated cfg probe. Active unreviewed gates and opaque macro expansions use ordinary compilation.
+
+Cargo can replay a compiler unit’s previous stderr on a fresh target, including a prior `JATO_LOG=debug` decision. Compare the `hit` counters from `jato stats --json` before and after a build to count the units restored by that command.
 
 When rustc tracks a source input or direct compiled dependency of at least 4 MiB, Jato can rule out a new variant using bounded samples. This lets a consumer skip an unsuccessful full read of a large rmeta or rlib when its producer changes. A matching sample proceeds through whole-file validation. For large inputs Jato can borrow up to three immediately available job slots from Cargo. It streams independent files or aligned BLAKE3 subtrees in parallel and falls back to a single reader when the slots are occupied. Oversized UTF-8 inputs that need a complete assembly or native-link syntax scan take the compiler path.
 

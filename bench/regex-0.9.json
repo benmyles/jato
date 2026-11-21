@@ -1,0 +1,127 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "runs": 1,
+  "jobs": 4,
+  "samples_seconds": {
+    "cargo_clean_release": [
+      5.4581
+    ],
+    "cargo_fresh_release": [
+      0.0377
+    ],
+    "jato_cold_release": [
+      5.3344
+    ],
+    "jato_restored_release": [
+      0.0693
+    ],
+    "jato_fresh_release": [
+      0.0222
+    ],
+    "cargo_clean_check": [
+      1.5544
+    ],
+    "cargo_edited_check": [
+      0.0657
+    ],
+    "cargo_undo_check": [
+      0.0644
+    ],
+    "cargo_repeated_clean_check": [
+      1.505
+    ],
+    "jato_clean_check": [
+      1.6197
+    ],
+    "jato_edited_check": [
+      0.0532
+    ],
+    "jato_undo_check": [
+      0.0266
+    ],
+    "jato_repeated_clean_check": [
+      0.0644
+    ]
+  },
+  "median_seconds": {
+    "cargo_clean_release": 5.4581,
+    "cargo_fresh_release": 0.0377,
+    "jato_cold_release": 5.3344,
+    "jato_restored_release": 0.0693,
+    "jato_fresh_release": 0.0222,
+    "cargo_clean_check": 1.5544,
+    "cargo_edited_check": 0.0657,
+    "cargo_undo_check": 0.0644,
+    "cargo_repeated_clean_check": 1.505,
+    "jato_clean_check": 1.6197,
+    "jato_edited_check": 0.0532,
+    "jato_undo_check": 0.0266,
+    "jato_repeated_clean_check": 0.0644
+  },
+  "peak_rss_kib": {
+    "cargo_clean_release": [
+      322212
+    ],
+    "cargo_fresh_release": [
+      34996
+    ],
+    "jato_cold_release": [
+      330156
+    ],
+    "jato_restored_release": [
+      20144
+    ],
+    "jato_fresh_release": [
+      20648
+    ],
+    "cargo_clean_check": [
+      256176
+    ],
+    "cargo_edited_check": [
+      95880
+    ],
+    "cargo_undo_check": [
+      95820
+    ],
+    "cargo_repeated_clean_check": [
+      256244
+    ],
+    "jato_clean_check": [
+      256716
+    ],
+    "jato_edited_check": [
+      95872
+    ],
+    "jato_undo_check": [
+      20464
+    ],
+    "jato_repeated_clean_check": [
+      20576
+    ]
+  },
+  "cache": {
+    "directory": "/var/tmp/jato-perf.LR5fdB6D/tmp/jato-bench-na8dgbrp/cache",
+    "limit_bytes": 1073741824,
+    "charged_bytes": 45475241,
+    "database_bytes": 1261568,
+    "entries": 13,
+    "chunks": 12,
+    "compressed_bytes": 6259,
+    "frame_file_bytes": 0,
+    "patched_files": 0,
+    "patch_bytes": 0,
+    "sealed_objects": 16,
+    "sealed_bytes": 45438980,
+    "pending_entries": 0,
+    "probe_entries": 2,
+    "artifact_bytes": 45578210,
+    "counters": {
+      "hit": 13,
+      "miss": 13,
+      "probe_hit": 19,
+      "reused_compiler_ms": 13293,
+      "stored": 13
+    }
+  }
+}

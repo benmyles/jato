@@ -1,0 +1,57 @@
+{
+  "versions": {
+    "jato": "jato 0.9.0",
+    "previous_jato": "jato 0.8.0"
+  },
+  "compiler_path": "absolute",
+  "packages": [],
+  "cache_gib": 1,
+  "project": "ripgrep-14.1.1",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "jobs": 4,
+  "pairs": 5,
+  "samples": {
+    "check": {
+      "jato": [
+        0.184418,
+        0.163415,
+        0.169765,
+        0.160833,
+        0.186628
+      ],
+      "previous_jato": [
+        0.186541,
+        0.166339,
+        0.167682,
+        0.163129,
+        0.160601
+      ]
+    },
+    "jato-dev": {
+      "jato": [
+        0.20603,
+        0.218566,
+        0.203595,
+        0.239785,
+        0.212341
+      ],
+      "previous_jato": [
+        0.222265,
+        0.201378,
+        0.20839,
+        0.2062,
+        0.197227
+      ]
+    }
+  },
+  "median": {
+    "check": {
+      "jato": 0.169765,
+      "previous_jato": 0.166339
+    },
+    "jato-dev": {
+      "jato": 0.212341,
+      "previous_jato": 0.2062
+    }
+  }
+}

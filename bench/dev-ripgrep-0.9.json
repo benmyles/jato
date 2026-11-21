@@ -1,0 +1,467 @@
+{
+  "versions": {
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "jato": "jato 0.9.0",
+    "kache": "kache 2.3.0",
+    "sccache": "sccache 0.19.0",
+    "previous_jato": "jato 0.8.0"
+  },
+  "profile": "jato-dev",
+  "project": "ripgrep-14.1.1",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "runs": 7,
+  "jobs": 4,
+  "samples": {
+    "cargo": {
+      "cold": [
+        {
+          "seconds": 4.470773
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.047558
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.50614
+        },
+        {
+          "seconds": 0.463012
+        },
+        {
+          "seconds": 0.672877
+        },
+        {
+          "seconds": 0.468858
+        },
+        {
+          "seconds": 0.429288
+        },
+        {
+          "seconds": 0.396686
+        },
+        {
+          "seconds": 0.419061
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.525958
+        },
+        {
+          "seconds": 0.486936
+        },
+        {
+          "seconds": 0.55105
+        },
+        {
+          "seconds": 0.483709
+        },
+        {
+          "seconds": 0.431992
+        },
+        {
+          "seconds": 0.392117
+        },
+        {
+          "seconds": 0.436705
+        }
+      ]
+    },
+    "jato": {
+      "cold": [
+        {
+          "seconds": 4.865459,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.032532,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.51226,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.478472,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.487918,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.463193,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.442908,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.430815,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.429125,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.065259,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.068406,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.067964,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.064545,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.060039,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.061164,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.062964,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        }
+      ]
+    },
+    "kache": {
+      "cold": [
+        {
+          "seconds": 4.602937,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.07953,
+          "hits": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 1.481687,
+          "hits": 0
+        },
+        {
+          "seconds": 1.694859,
+          "hits": 0
+        },
+        {
+          "seconds": 1.59584,
+          "hits": 0
+        },
+        {
+          "seconds": 1.45066,
+          "hits": 0
+        },
+        {
+          "seconds": 1.188734,
+          "hits": 0
+        },
+        {
+          "seconds": 1.662238,
+          "hits": 0
+        },
+        {
+          "seconds": 1.557678,
+          "hits": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.150952,
+          "hits": 1
+        },
+        {
+          "seconds": 0.238499,
+          "hits": 1
+        },
+        {
+          "seconds": 0.173476,
+          "hits": 1
+        },
+        {
+          "seconds": 0.159027,
+          "hits": 1
+        },
+        {
+          "seconds": 0.125072,
+          "hits": 1
+        },
+        {
+          "seconds": 0.14819,
+          "hits": 1
+        },
+        {
+          "seconds": 0.162905,
+          "hits": 1
+        }
+      ]
+    },
+    "sccache": {
+      "cold": [
+        {
+          "seconds": 6.184046,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.055036,
+          "hits": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.599467,
+          "hits": 0
+        },
+        {
+          "seconds": 0.487226,
+          "hits": 0
+        },
+        {
+          "seconds": 0.48653,
+          "hits": 0
+        },
+        {
+          "seconds": 0.466956,
+          "hits": 0
+        },
+        {
+          "seconds": 0.405867,
+          "hits": 0
+        },
+        {
+          "seconds": 0.435719,
+          "hits": 0
+        },
+        {
+          "seconds": 0.430625,
+          "hits": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.458669,
+          "hits": 0
+        },
+        {
+          "seconds": 0.474849,
+          "hits": 0
+        },
+        {
+          "seconds": 0.456272,
+          "hits": 0
+        },
+        {
+          "seconds": 0.480649,
+          "hits": 0
+        },
+        {
+          "seconds": 0.422847,
+          "hits": 0
+        },
+        {
+          "seconds": 0.519562,
+          "hits": 0
+        },
+        {
+          "seconds": 0.422549,
+          "hits": 0
+        }
+      ]
+    },
+    "previous_jato": {
+      "cold": [
+        {
+          "seconds": 5.883552,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.034137,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.480054,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.53483,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.495704,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.469703,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.41897,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.411936,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.404435,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.064398,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.066234,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.072647,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.062622,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.058411,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.06095,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.060409,
+          "hits": 1,
+          "live_incremental_hits": 1,
+          "discovery_probes": 0
+        }
+      ]
+    }
+  },
+  "median_seconds": {
+    "cargo": {
+      "cold": 4.470773,
+      "fresh": 0.047558,
+      "edit": 0.463012,
+      "undo": 0.483709
+    },
+    "jato": {
+      "cold": 4.865459,
+      "fresh": 0.032532,
+      "edit": 0.463193,
+      "undo": 0.064545
+    },
+    "kache": {
+      "cold": 4.602937,
+      "fresh": 0.07953,
+      "edit": 1.557678,
+      "undo": 0.159027
+    },
+    "sccache": {
+      "cold": 6.184046,
+      "fresh": 0.055036,
+      "edit": 0.466956,
+      "undo": 0.458669
+    },
+    "previous_jato": {
+      "cold": 5.883552,
+      "fresh": 0.034137,
+      "edit": 0.469703,
+      "undo": 0.062622
+    }
+  }
+}
