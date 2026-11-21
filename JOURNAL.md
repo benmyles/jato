@@ -1,5 +1,9 @@
 # Work journal
 
+## 2026-11-21 — compiler discovery and cache publication
+
+- Traced a one-crate Cargo check on 0.8. When Cargo passed `rustc` by name, four extra compiler processes queried the sysroot. The rustup-launched Cargo control passed an absolute compiler and needed zero extra queries. Added both layouts and an explicit rustup proxy to the comparison harness.
+
 ## 2026-11-21 — coding agent skill
 
 - Wrote a shared Cargo workflow for Claude Code, Codex and agy. Checked its skill manifest and ran the examples in a two-crate workspace, including a filtered test, Clippy, toolchain forwarding, fast profiles, worktree execution and both watch modes after an edit.

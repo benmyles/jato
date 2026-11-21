@@ -138,6 +138,8 @@ def main():
     parser.add_argument("--verify-bin", help="compare this release program's --version output")
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato")
+    parser.add_argument("--compiler-path", choices=["absolute", "path", "rustup"], default="absolute",
+                        help="give Cargo an absolute rustc, a rustc on PATH, or a rustup proxy on PATH")
     parser.add_argument("--include-packed", action="store_true", help="also measure Jato with portable packed storage")
     parser.add_argument("--previous-packed", action="store_true", help="also measure --previous-jato in packed mode")
     parser.add_argument("--paired-restores", type=int, metavar="N",
@@ -213,12 +215,20 @@ def main():
                    CARGO_BUILD_JOBS=str(options.jobs), RUSTC_WORKSPACE_WRAPPER="", RUSTC_WRAPPER="",
                    PATH=os.pathsep.join([str(rustc.parent), "/usr/bin", "/bin", os.environ["PATH"]]),
                    CC="/usr/bin/cc", CXX="/usr/bin/c++", HOST_CC="/usr/bin/cc", HOST_CXX="/usr/bin/c++")
+        if options.compiler_path != "absolute":
+            env.pop("RUSTC")
+        if options.compiler_path == "rustup":
+            proxies = root / "proxies"
+            proxies.mkdir()
+            for name in ["rustc", "rustup"]:
+                (proxies / name).symlink_to(binary("rustup"))
+            env["PATH"] = os.pathsep.join([str(proxies), env["PATH"]])
         if options.offline:
             env["CARGO_NET_OFFLINE"] = "true"
         run([cargo, "fetch", "--locked"], env, project)
         if options.paired_restores:
             result = paired_restores(options, tools, env, project, root, target)
-            print(json.dumps(dict(versions=versions, project=project.name if options.project else options.fixture,
+            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, project=project.name if options.project else options.fixture,
                                   rustc=run([rustc, "-V"], env, project).decode().strip(), jobs=options.jobs,
                                   pairs=options.paired_restores, **result), indent=2))
             return
@@ -317,7 +327,7 @@ def main():
         medians = {k: {m: {key: statistics.median(s[key] for s in samples)
                            for key in samples[0] if all(s.get(key) is not None for s in samples)} for m, samples in modes.items()}
                    for k, modes in results.items()}
-        print(json.dumps(dict(versions=versions, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
+        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
                               rustc=run([rustc, "-V"], env, project).decode().strip(),
                               jobs=options.jobs, runs=options.runs, samples=results, median=medians), indent=2))
 

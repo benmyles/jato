@@ -7,6 +7,13 @@
 - [x] Exercise clean rebuilds, edited inputs, concurrent builds, cache failures, and watch behavior on real Cargo invocations.
 - [x] Measure performance, resource use, and installability. Document the operating envelope and release checks.
 
+## Compiler discovery and cache publication
+
+- [x] Reproduce compiler discovery through PATH, rustup and an absolute toolchain.
+- [ ] Remove redundant discovery work while preserving compiler selection and cache validity.
+- [ ] Measure publication costs as unresolved Cargo dependencies accumulate and address verified bottlenecks.
+- [ ] Compare clean builds, warm targets and live edits with upstream caches and qualify the installed update.
+
 ## Coding agent skill
 
 - [x] Write a portable Jato skill and exercise its Cargo commands in a Rust workspace.
