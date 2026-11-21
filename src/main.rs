@@ -1,4 +1,5 @@
 mod admission;
+mod archive;
 mod compiler;
 mod content;
 mod fingerprint;

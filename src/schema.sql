@@ -62,6 +62,7 @@ END;
 CREATE TABLE IF NOT EXISTS plans(
     entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, inputs BLOB NOT NULL, topology BLOB NOT NULL, codegen INTEGER NOT NULL DEFAULT 0, manifest INTEGER REFERENCES manifests
 );
+CREATE INDEX IF NOT EXISTS manifest_users ON plans(manifest) WHERE manifest IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS release_manifest AFTER DELETE ON plans WHEN OLD.manifest IS NOT NULL BEGIN
     UPDATE manifests SET refs=refs-1 WHERE id=OLD.manifest;
     DELETE FROM manifests WHERE id=OLD.manifest AND refs=0;
@@ -108,4 +109,4 @@ CREATE INDEX IF NOT EXISTS source_keys ON source_variants(digest);
 CREATE TRIGGER IF NOT EXISTS add_variant AFTER INSERT ON source_variants BEGIN UPDATE usage SET bytes=bytes+96; END;
 CREATE TRIGGER IF NOT EXISTS drop_variant AFTER DELETE ON source_variants BEGIN UPDATE usage SET bytes=bytes-96; END;
 CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY,last_run INTEGER NOT NULL) WITHOUT ROWID;
-PRAGMA user_version=9;
+PRAGMA user_version=10;

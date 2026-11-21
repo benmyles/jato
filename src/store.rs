@@ -2,7 +2,7 @@ use crate::staging::Output;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -83,6 +83,27 @@ pub struct Store {
     allow_sealed: Option<bool>,
 }
 
+pub struct Hit {
+    pub diagnostics: Vec<u8>,
+    key: Digest,
+    compiler_ms: u64,
+}
+
+// Most WAL writers update a handful of rows. A short first retry keeps a
+// burst of wrapper completions from incurring millisecond-sized delays.
+fn wait_for_writer(attempt: i32) -> bool {
+    if attempt >= 130 {
+        return false;
+    }
+    let micros = match attempt {
+        0..=5 => 50u64 << attempt,
+        6..=10 => 2_000,
+        _ => 25_000,
+    };
+    std::thread::sleep(Duration::from_micros(micros));
+    true
+}
+
 #[derive(Serialize)]
 pub struct Stats {
     pub directory: PathBuf,
@@ -110,7 +131,7 @@ fn now() -> i64 {
 struct Frame {
     hash: Digest,
     raw: usize,
-    packed: usize,
+    packed: Option<usize>,
 }
 
 struct Prepared {
@@ -199,7 +220,7 @@ impl Store {
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             true,
         )?;
-        conn.busy_timeout(Duration::from_secs(3))?;
+        conn.busy_handler(Some(wait_for_writer))?;
         conn.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA mmap_size=33554432; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576;",
         )?;
@@ -230,12 +251,12 @@ impl Store {
                         "ALTER TABLE plans ADD COLUMN codegen INTEGER NOT NULL DEFAULT 0",
                     )?;
                 }
-                if version > 0 {
+                if (1..9).contains(&version) {
                     tx.execute_batch(
                         "ALTER TABLE files ADD COLUMN single INTEGER NOT NULL DEFAULT 0",
                     )?;
                 }
-                if version >= 2 {
+                if (2..9).contains(&version) {
                     tx.execute_batch(
                         "ALTER TABLE plans ADD COLUMN manifest INTEGER REFERENCES manifests",
                     )?;
@@ -466,6 +487,8 @@ impl Store {
             .query_row("SELECT bytes FROM usage", [], |r| r.get::<_, u64>(0))?;
         let headroom = self.limit.saturating_sub(used);
         let mut files = Vec::new();
+        let mut known_frames = HashSet::new();
+        let mut sidecar = None;
         for path in outputs {
             let mut source =
                 File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -503,23 +526,43 @@ impl Store {
                 self.allow_sealed = Some(false);
             }
             let mut hasher = blake3::Hasher::new();
+            let mut boundaries = Vec::new();
+            match path.extension().and_then(|v| v.to_str()) {
+                Some("rmeta") => sidecar = crate::archive::Sidecar::read(&source, length),
+                Some("rlib") if length > CHUNK as u64 => {
+                    boundaries = crate::archive::boundaries(&source, length, sidecar.as_ref())
+                        .unwrap_or_default();
+                }
+                _ => (),
+            }
+            let mut boundaries = boundaries.into_iter().peekable();
             let window = length.min(CHUNK as u64) as usize;
             if buffer.len() < window {
                 buffer.resize(window, 0);
             }
-            loop {
-                let mut n = 0;
-                while n < buffer.len() {
-                    let read = source.read(&mut buffer[n..])?;
-                    if read == 0 {
-                        break;
-                    }
-                    n += read;
-                }
-                if n == 0 {
-                    break;
-                }
+            while file.size < length {
+                while boundaries.next_if_eq(&file.size).is_some() {}
+                let end = boundaries.peek().copied().unwrap_or(length);
+                let n = (end - file.size).min(CHUNK as u64) as usize;
+                source.read_exact(&mut buffer[..n])?;
                 let raw = &buffer[..n];
+                let digest = *blake3::hash(raw).as_bytes();
+                if length > CHUNK as u64 {
+                    hasher.update(raw);
+                    charge += 96; // one ordered part reference
+                }
+                file.size += n as u64;
+                if !known_frames.insert(digest) {
+                    if charge > self.limit {
+                        return Ok(false);
+                    }
+                    file.frames.push(Frame {
+                        hash: digest,
+                        raw: n,
+                        packed: None,
+                    });
+                    continue;
+                }
                 let packed = if n >= 64 {
                     let encoder = match &mut compressor {
                         Some(encoder) => encoder,
@@ -536,20 +579,15 @@ impl Store {
                 } else {
                     raw
                 };
-                let overhead = if length <= CHUNK as u64 { 96 } else { 192 };
-                charge += (packed.len() + overhead) as u64;
+                charge += (packed.len() + 96) as u64;
                 if charge > self.limit {
                     return Ok(false);
                 }
                 spool.write_all(packed)?;
-                if metadata.len() > CHUNK as u64 {
-                    hasher.update(raw);
-                }
-                file.size += n as u64;
                 file.frames.push(Frame {
-                    hash: *blake3::hash(raw).as_bytes(),
+                    hash: digest,
                     raw: n,
-                    packed: packed.len(),
+                    packed: Some(packed.len()),
                 });
             }
             ensure!(
@@ -591,10 +629,17 @@ impl Store {
                 )?;
             }
             for (ordinal, frame) in file.frames.iter().enumerate() {
-                let packed = &mut buffer[..frame.packed];
-                spool.read_exact(packed)?;
-                tx.prepare_cached("INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1")?
-                    .execute(params![&frame.hash, frame.raw, &*packed])?;
+                if let Some(size) = frame.packed {
+                    let packed = &mut buffer[..size];
+                    spool.read_exact(packed)?;
+                    tx.prepare_cached("INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1")?
+                        .execute(params![&frame.hash, frame.raw, &*packed])?;
+                } else {
+                    let updated = tx
+                        .prepare_cached("UPDATE chunks SET refs=refs+1 WHERE hash=?1")?
+                        .execute([frame.hash])?;
+                    ensure!(updated == 1, "missing earlier packed chunk");
+                }
                 if !single {
                     tx.prepare_cached("INSERT INTO parts VALUES(?1,?2,?3,?4)")?
                         .execute(params![entry, slot, ordinal, &frame.hash])?;
@@ -658,7 +703,7 @@ impl Store {
         Ok(kept)
     }
 
-    pub fn restore(&mut self, key: &Digest, outputs: &[PathBuf]) -> Result<Option<Vec<u8>>> {
+    pub fn materialize(&mut self, key: &Digest, outputs: &[PathBuf]) -> Result<Option<Hit>> {
         let tx = self.conn.transaction()?;
         let entry = tx.query_row("SELECT id,stderr,stderr_hash,compile_ms FROM entries WHERE key=?1 AND length(stderr)<=?2 AND NOT EXISTS(SELECT 1 FROM needs WHERE needs.entry=id)",
             params![key, DIAGNOSTIC_LIMIT], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Digest>(2)?, r.get::<_, u64>(3)?))).optional()?;
@@ -775,20 +820,24 @@ impl Store {
         for (tmp, path) in staged.into_iter().zip(outputs) {
             tmp.publish(path)?;
         }
-        // A failed statistics update cannot invalidate already verified outputs.
-        let _ = (|| -> Result<()> {
-            let tx = self
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE entries SET access=?1 WHERE key=?2",
-                params![now(), key],
-            )?;
-            tx.execute("INSERT INTO counters VALUES ('hit',1),('reused_compiler_ms',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [ms])?;
-            tx.commit()?;
-            Ok(())
-        })();
-        Ok(Some(stderr))
+        Ok(Some(Hit {
+            diagnostics: stderr,
+            key: *key,
+            compiler_ms: ms,
+        }))
+    }
+
+    pub fn record_hit(&mut self, hit: &Hit) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE entries SET access=?1 WHERE key=?2",
+            params![now(), hit.key],
+        )?;
+        tx.execute("INSERT INTO counters VALUES ('hit',1),('reused_compiler_ms',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [hit.compiler_ms])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn prune(&mut self, limit: u64) -> Result<u64> {
@@ -911,6 +960,74 @@ fn evict(tx: &Transaction<'_>, limit: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Store {
+        fn restore(&mut self, key: &Digest, paths: &[PathBuf]) -> Result<Option<Vec<u8>>> {
+            let Some(hit) = self.materialize(key, paths)? else {
+                return Ok(None);
+            };
+            self.record_hit(&hit)?;
+            Ok(Some(hit.diagnostics))
+        }
+    }
+
+    #[test]
+    fn packed_archives_share_unaligned_metadata_and_shifted_members() -> Result<()> {
+        fn member(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+            let header = format!(
+                "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                0,
+                0,
+                0,
+                "100644",
+                data.len()
+            );
+            assert_eq!(header.len(), 60);
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        let d = tempfile::tempdir()?;
+        let files = [d.path().join("libx.rmeta"), d.path().join("libx.rlib")];
+        let mut store = Store::at(d.path().join("store"), 16 << 20)?;
+        let mut rng = 123u32;
+        let random: Vec<_> = (0..CHUNK * 6 + 17)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                rng as u8
+            })
+            .collect();
+        let (meta, object) = random.split_at(CHUNK * 3 + 11);
+        fs::write(&files[0], meta)?;
+        let mut wrapped = vec![42; 73];
+        wrapped.extend_from_slice(meta);
+        wrapped.extend_from_slice(b"object footer");
+        for k in [1u8, 2] {
+            let mut archive = b"!<arch>\n".to_vec();
+            member(&mut archive, "/", &vec![k; k as usize * 81]);
+            member(&mut archive, "lib.rmeta/", &wrapped);
+            member(&mut archive, "object.o/", object);
+            fs::write(&files[1], &archive)?;
+            assert!(store.save(&[1; 32], &[k; 32], &files, b"", 1, None)?);
+            let stats = store.stats()?;
+            assert!(
+                stats.compressed_bytes < random.len() as u64 + 4096,
+                "{stats:?}",
+                stats = stats.compressed_bytes
+            );
+            fs::write(&files[1], b"replace")?;
+            assert_eq!(store.restore(&[k; 32], &files)?, Some(vec![]));
+            assert_eq!(fs::read(&files[1])?, archive);
+            assert_eq!(fs::read(&files[0])?, meta);
+        }
+        store.prune(0)?;
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        Ok(())
+    }
 
     #[test]
     fn variants_share_checked_manifests_and_single_chunk_payloads() -> Result<()> {

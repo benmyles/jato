@@ -1,6 +1,6 @@
 use crate::fingerprint;
 use crate::invocation::Invocation;
-use crate::store::{DIAGNOSTIC_LIMIT, Digest, Evidence, Store};
+use crate::store::{DIAGNOSTIC_LIMIT, Digest, Evidence, Hit, Store};
 use anyhow::{Context, Result, bail, ensure};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -36,7 +36,7 @@ fn discover(
     compiler: &OsStr,
     inv: &Invocation,
     recipe: &fingerprint::Recipe,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Hit>> {
     let before = Instant::now();
     let plans = store.plans(&recipe.key)?;
     if plans.is_empty() {
@@ -80,7 +80,7 @@ fn discover(
         };
         if topology == current {
             let restore = Instant::now();
-            let result = store.restore(&key, &inv.outputs)?;
+            let result = store.materialize(&key, &inv.outputs)?;
             if env::var_os("JATO_LOG").as_deref() == Some(OsStr::new("timings")) {
                 eprintln!(
                     "jato [{}] sources {} us, externs {} us, namespace and link {} us, restore {} us",
@@ -114,7 +114,7 @@ fn rediscover(
     recipe: &fingerprint::Recipe,
     start: SystemTime,
     externs: &Digest,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Hit>> {
     let _ = store.count("discovery_probe", 1);
     let probe = crate::staging::file(&store.dir)?;
     let mut emit = OsString::from("--emit=dep-info=");
@@ -130,7 +130,7 @@ fn rediscover(
     let inputs = plan.inputs(recipe, inv, start, false)?;
     let topology = inputs.topology(start)?;
     let key = inputs.key(&plan, recipe, inv, start, externs)?;
-    let restored = store.restore(&key, &inv.outputs)?;
+    let restored = store.materialize(&key, &inv.outputs)?;
     if restored.is_some() {
         let _ = store.refresh_topology(&key, &topology);
     }
@@ -241,8 +241,11 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         }
     };
     match discover(&mut store, compiler, inv, &recipe) {
-        Ok(Some(stderr)) => {
-            io::stderr().write_all(&stderr)?;
+        Ok(Some(hit)) => {
+            // Cargo can schedule dependent units as soon as their verified
+            // metadata notification arrives, even with a busy WAL writer.
+            io::stderr().write_all(&hit.diagnostics)?;
+            let _ = store.record_hit(&hit);
             trace(&inv.name, "hit");
             return Ok(0);
         }
