@@ -20,3 +20,9 @@
 - [x] Shorten content verification on the last link while respecting Cargo's job limit.
 - [x] Reduce repeated store work on small artifacts and closely spaced saves.
 - [x] Compare against the installed 0.2 release and peers, and qualify the installed update.
+
+## Worktree reuse and packed writes
+
+- [ ] Reuse builds across independent worktrees and target locations with verified, stable compiler inputs.
+- [ ] Reduce repeated compression and bound per-entry indexing memory in packed storage.
+- [ ] Exercise concurrent and changed checkouts, compare warm and relocated builds with peers, and qualify the installed release.
