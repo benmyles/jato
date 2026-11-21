@@ -11,6 +11,9 @@
 - Moved the election off the warm-hit path. A miss compares SQLite’s connection-local data version after acquiring ownership to catch publication in the intervening interval. Added a concurrent benchmark that includes the CPU and sampled proportional memory of private cache daemons and their compilers.
 - Found 0.4 rebuilding all watches after a subtree arrived. In a two-package workspace with 4,096 watched leaf directories, five directory arrivals took a median 458 ms to reach workspace success.
 
+- Registered and polled Linux inotify watches directly. The watcher retains matchers only where ignore rules exist, shares directory paths, and attaches new subtrees in place after Cargo confirms workspace ownership. Tests move a populated subtree with ignore exceptions and add a workspace member with a previously unwatched external dependency.
+- Across three launches and fifteen edits with 4,096 extra leaf directories, median time to start watching fell from 302 ms to 56.6 ms. Subtree arrival to workspace success fell from 346 ms to 70.9 ms, and idle process-tree PSS fell from 5,986 to 3,039 KiB.
+
 ## 2026-11-21 — worktrees and packed writes
 
 - Rebuilt the locked regex application in two target directories. All five registry libraries and their five metadata files were byte-identical, while their dep-info referred to different output paths. Jato 0.3 missed all five in the second target.

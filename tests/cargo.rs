@@ -196,7 +196,16 @@ fn check_watcher(projected: bool) {
     let p = Project::new();
     let manifest = p.root.join("Cargo.toml");
     let mut contents = fs::read_to_string(&manifest).unwrap();
-    contents.push_str("\n[workspace]\nmembers=['leaf']\n");
+    if projected {
+        contents.push_str("\n[workspace]\nmembers=['leaf']\n");
+    } else {
+        contents.push_str("\n[workspace]\nmembers=['leaf','plugins/*']\n");
+        write(
+            p.root.join("plugins/base/Cargo.toml"),
+            "[package]\nname='base'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write(p.root.join("plugins/base/src/lib.rs"), "");
+    }
     write(manifest, &contents);
     p.run(&["check", "--workspace"]); // establish lockfile and initial target
     let mut cmd = p.command();
@@ -246,6 +255,63 @@ fn check_watcher(projected: bool) {
     wait("cargo check -p leaf");
     wait("cargo check --workspace");
     wait("finished in");
+    // A populated directory can be renamed in before any watch on its
+    // children exists. Preserve its ignore rules, and follow later moves.
+    let stage = p.temp.path().join("incoming");
+    write(stage.join(".ignore"), "*.tmp\n!important.tmp\n");
+    write(stage.join("nested/ignored.tmp"), "before");
+    write(stage.join("nested/important.tmp"), "before");
+    let arrived = p.root.join("leaf/assets");
+    fs::rename(&stage, &arrived).unwrap();
+    let finish_leaf = || {
+        wait("cargo check -p leaf");
+        wait("cargo check --workspace");
+        wait("finished in");
+    };
+    finish_leaf();
+    write(arrived.join("nested/ignored.tmp"), "ignored");
+    assert!(recv.recv_timeout(Duration::from_millis(180)).is_err());
+    write(arrived.join("nested/important.tmp"), "included");
+    finish_leaf();
+    let moved = p.root.join("leaf/moved");
+    fs::rename(&arrived, &moved).unwrap();
+    finish_leaf();
+    write(moved.join("nested/important.tmp"), "edited after move");
+    finish_leaf();
+    if !projected {
+        // An arriving workspace member can introduce a dependency outside
+        // every previous watch root. Cargo must re-resolve this topology.
+        let external = p.temp.path().join("external");
+        write(
+            external.join("Cargo.toml"),
+            "[package]\nname='external'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        let external_src = external.join("src/lib.rs");
+        write(&external_src, "pub fn source(){}");
+        write(
+            stage.join("Cargo.toml"),
+            &format!(
+                "[package]\nname='discovered'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nexternal={{path={external:?}}}\n"
+            ),
+        );
+        write(
+            stage.join("src/lib.rs"),
+            "pub fn external(){external::source();}",
+        );
+        fs::rename(&stage, p.root.join("plugins/new")).unwrap();
+        wait("Checking discovered");
+        wait("finished in");
+        // Let Cargo's own lockfile update finish before the external edit.
+        let end = Instant::now() + Duration::from_secs(5);
+        while recv.recv_timeout(Duration::from_millis(180)).is_ok() {
+            assert!(Instant::now() < end);
+        }
+        write(&external_src, "pub fn source(){missing_external();}");
+        wait("error[E0425]");
+        wait("exit 101");
+        write(&external_src, "pub fn source(){}");
+        wait("exit 0");
+    }
     unsafe {
         libc::kill(child.0.id() as i32, libc::SIGINT);
     }

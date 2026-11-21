@@ -1,3 +1,9 @@
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod events;
+#[cfg(not(target_os = "linux"))]
+#[path = "portable.rs"]
+mod events;
 mod tree;
 mod workspace;
 
@@ -11,8 +17,10 @@ use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::Arc;
+#[cfg(not(target_os = "linux"))]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tree::Tree;
@@ -140,11 +148,13 @@ impl Changes {
 }
 
 struct Inbox {
+    #[cfg(not(target_os = "linux"))]
     changes: Mutex<Changes>,
     wake: UnixDatagram,
     stop: AtomicBool,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Inbox {
     fn record(&self, paths: Vec<PathBuf>, created_dir: bool, completed: Option<PathBuf>) {
         let mut changes = self.changes.lock().unwrap();
@@ -252,6 +262,7 @@ fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> std::io::Result<
 
 fn wait(
     receiver: &UnixDatagram,
+    filesystem: std::os::fd::RawFd,
     job: Option<&Job>,
     mut deadline: Option<Instant>,
 ) -> std::io::Result<()> {
@@ -268,6 +279,11 @@ fn wait(
         },
         libc::pollfd {
             fd: child.map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: filesystem,
             events: libc::POLLIN,
             revents: 0,
         },
@@ -289,6 +305,7 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
     wake.set_nonblocking(true)?;
     receiver.set_nonblocking(true)?;
     let inbox = Arc::new(Inbox {
+        #[cfg(not(target_os = "linux"))]
         changes: Mutex::default(),
         wake,
         stop: AtomicBool::new(false),
@@ -301,6 +318,7 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
     let mut workspace = Workspace::load(&options)?;
     let mut tree = Tree::new(&workspace, inbox.clone())?;
     eprintln!("jato watch: watching {}", env::current_dir()?.display());
+    let mut handoff = Changes::default();
     let mut batch = Changes::default();
     let mut deadline = None;
     let mut wave = Changes::all();
@@ -313,7 +331,8 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
             }
             return Ok(130);
         }
-        let incoming = tree.filter(std::mem::take(&mut *inbox.changes.lock().unwrap()));
+        let mut incoming = std::mem::take(&mut handoff);
+        incoming.merge(tree.changes(&inbox)?);
         if !incoming.empty()
             || options.delay.is_none()
                 && incoming
@@ -349,17 +368,22 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
             if !queue.is_empty() {
                 batch.merge(wave.clone());
             }
-            if batch.full
-                || batch.paths.iter().any(|p| configuration(p))
-                || tree.topology_changed(&batch.paths)
-            {
-                match Workspace::load(&options)
-                    .and_then(|ws| Ok((Tree::new(&ws, inbox.clone())?, ws)))
-                {
-                    Ok((new_tree, ws)) => {
-                        tree = new_tree;
-                        workspace = ws;
+            let rescan = batch.full || batch.paths.iter().any(|p| configuration(p));
+            if rescan || tree.topology_changed(&batch.paths) {
+                match Workspace::load(&options).and_then(|ws| {
+                    if rescan || !tree.extend(&ws, &batch.paths).unwrap_or(false) {
+                        let replacement = Tree::new(&ws, inbox.clone())?;
+                        // An edit can arrive on an old watch before its
+                        // replacement has registered this particular path.
+                        #[cfg(target_os = "linux")]
+                        {
+                            handoff = tree.changes(&inbox)?;
+                        }
+                        tree = replacement;
                     }
+                    Ok(ws)
+                }) {
+                    Ok(ws) => workspace = ws,
                     Err(e) => {
                         eprintln!("jato watch: {e:#}");
                         batch = Changes::all();
@@ -386,7 +410,9 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
         {
             job = Some(Job::spawn(&args, system_linker)?);
         }
-        wait(&receiver, job.as_ref(), deadline)?;
+        if handoff.empty() && handoff.completed.is_none() {
+            wait(&receiver, tree.fd(), job.as_ref(), deadline)?;
+        }
     }
 }
 

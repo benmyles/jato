@@ -1,18 +1,17 @@
 use super::workspace::Workspace;
-use super::{Changes, Inbox};
+use super::{Changes, Inbox, events::Events};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct Tree {
-    watcher: RecommendedWatcher,
-    directories: BTreeSet<PathBuf>,
+    watcher: Events,
+    directories: HashSet<Arc<Path>>,
     ignores: BTreeMap<PathBuf, Gitignore>,
     roots: BTreeSet<PathBuf>,
     excluded: Vec<PathBuf>,
@@ -20,86 +19,100 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(workspace: &Workspace, inbox: Arc<Inbox>) -> Result<Self> {
-        let watcher =
-            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                Ok(e) if !e.need_rescan() && !e.paths.is_empty() => {
-                    let closed = matches!(
-                        e.kind,
-                        EventKind::Access(AccessKind::Close(AccessMode::Write))
-                    );
-                    let renamed = matches!(
-                        e.kind,
-                        EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both))
-                    );
-                    let completed = (closed || renamed)
-                        .then(|| e.paths.last())
-                        .flatten()
-                        .filter(|p| p.extension() == Some(OsStr::new("rs")))
-                        .cloned();
-                    if closed {
-                        // A close is a completion hint for a pending change.
-                        // Opening a file for writing without editing it, or
-                        // closing after a prior run, must not start another job.
-                        if completed.is_some() {
-                            inbox.record(Vec::new(), false, completed);
-                        }
-                    } else if !matches!(e.kind, EventKind::Access(_)) {
-                        let directory =
-                            matches!(e.kind, EventKind::Create(notify::event::CreateKind::Folder));
-                        inbox.record(e.paths, directory, completed);
-                    }
-                }
-                _ => inbox.rescan(),
-            })?;
+        let watcher = Events::new(inbox)?;
         let mut tree = Self {
             watcher,
-            directories: BTreeSet::new(),
+            directories: HashSet::new(),
             ignores: BTreeMap::new(),
             roots: workspace.roots.clone(),
             excluded: workspace.excluded.clone(),
         };
+        // Complete recursive roots first. A single-file watch only registers
+        // its parent and must not mark an unvisited subtree as scanned.
+        let mut parents = BTreeSet::new();
         for root in &workspace.roots {
             if root.is_dir() {
                 tree.add_dir(root)?;
             } else if let Some(parent) = root.parent() {
-                tree.watch_directory(parent)?;
+                parents.insert(parent);
             }
+        }
+        for parent in parents {
+            tree.watch_directory(parent)?;
         }
         Ok(tree)
     }
 
-    fn watch_directory(&mut self, path: &Path) -> Result<()> {
-        if self.directories.insert(path.to_owned()) {
-            self.watcher
-                .watch(path, RecursiveMode::NonRecursive)
-                .with_context(|| format!("watching {}", path.display()))?;
+    fn watch_directory(&mut self, path: &Path) -> Result<bool> {
+        if self.directories.contains(path) {
+            return Ok(false);
         }
-        Ok(())
+        let path: Arc<Path> = path.into();
+        self.watcher
+            .watch(path.clone())
+            .with_context(|| format!("watching {}", path.display()))?;
+        self.directories.insert(path);
+        Ok(true)
     }
 
     fn add_dir(&mut self, root: &Path) -> Result<()> {
         let mut todo = vec![root.to_owned()];
         while let Some(dir) = todo.pop() {
-            if self.ignores.contains_key(&dir) || self.ignored(&dir, true) {
+            if self.ignored(&dir, true) || !self.watch_directory(&dir)? {
                 continue;
             }
-            self.watch_directory(&dir)?;
-            let mut builder = GitignoreBuilder::new(&dir);
-            for name in [".git/info/exclude", ".gitignore", ".ignore"] {
-                let path = dir.join(name);
-                if path.is_file() {
-                    builder.add(path);
-                }
-            }
-            self.ignores.insert(dir.clone(), builder.build()?);
+            // Watch before enumerating. Find ignore files in the same listing
+            // as children; most directories need no matcher or metadata probes.
+            let mut present = [false; 3];
             for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
                 let entry = entry?;
+                match entry.file_name().as_encoded_bytes() {
+                    b".git" => present[0] = true,
+                    b".gitignore" => present[1] = true,
+                    b".ignore" => present[2] = true,
+                    _ => (),
+                }
                 if entry.file_type()?.is_dir() {
                     todo.push(entry.path());
                 }
             }
+            if present.contains(&true) {
+                let mut builder = GitignoreBuilder::new(&dir);
+                for (name, found) in [".git/info/exclude", ".gitignore", ".ignore"]
+                    .into_iter()
+                    .zip(present)
+                {
+                    if found {
+                        let path = dir.join(name);
+                        if path.is_file() {
+                            builder.add(path);
+                        }
+                    }
+                }
+                let matcher = builder.build()?;
+                if !matcher.is_empty() {
+                    self.ignores.insert(dir, matcher);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Cargo has re-resolved workspace ownership. With unchanged roots, a
+    /// newly introduced subtree can join the running watcher in place.
+    pub fn extend(&mut self, workspace: &Workspace, paths: &BTreeSet<PathBuf>) -> Result<bool> {
+        if self.roots != workspace.roots
+            || self.excluded != workspace.excluded
+            || paths.iter().any(|p| self.directories.contains(p.as_path()))
+        {
+            return Ok(false);
+        }
+        for path in paths {
+            if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                self.add_dir(path)?;
+            }
+        }
+        Ok(true)
     }
 
     fn ignored(&self, path: &Path, dir: bool) -> bool {
@@ -126,6 +139,9 @@ impl Tree {
         {
             return true;
         }
+        if self.ignores.is_empty() {
+            return false;
+        }
         for parent in path.ancestors().skip(1) {
             if let Some(ignore) = self.ignores.get(parent) {
                 let matched = ignore.matched_path_or_any_parents(path, dir);
@@ -140,9 +156,14 @@ impl Tree {
         false
     }
 
-    pub fn filter(&self, mut changes: Changes) -> Changes {
+    pub fn fd(&self) -> RawFd {
+        self.watcher.fd()
+    }
+
+    pub fn changes(&mut self, inbox: &Inbox) -> Result<Changes> {
+        let mut changes = self.watcher.read(inbox)?;
         changes.paths.retain(|p| !self.ignored(p, p.is_dir()));
-        changes
+        Ok(changes)
     }
 
     pub fn drop_transient_output_dirs(&self, changes: &mut Changes) {
@@ -150,7 +171,8 @@ impl Tree {
         // named <basename><six random characters>, then renaming it. Ignore
         // only a newly created directory that has already disappeared.
         changes.paths.retain(|p| {
-            if !changes.new_dirs.contains(p) || self.directories.contains(p) || p.exists() {
+            if !changes.new_dirs.contains(p) || self.directories.contains(p.as_path()) || p.exists()
+            {
                 return true;
             }
             let name = p.file_name().unwrap_or_default().as_encoded_bytes();
@@ -168,6 +190,6 @@ impl Tree {
     pub fn topology_changed(&self, paths: &BTreeSet<PathBuf>) -> bool {
         paths
             .iter()
-            .any(|p| self.directories.contains(p) || p.is_dir())
+            .any(|p| self.directories.contains(p.as_path()) || p.is_dir())
     }
 }
