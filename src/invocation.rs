@@ -5,11 +5,19 @@ pub struct Invocation {
     pub name: String,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
+    extern_names: Vec<String>,
     pub outputs: Vec<PathBuf>, // dep-info is always first
     pub probe_args: Vec<OsString>,
 }
 
 impl Invocation {
+    pub fn has_extern(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "self" | "core" | "alloc" | "std" | "test" | "proc_macro"
+        ) || self.extern_names.iter().any(|s| s == name)
+    }
+
     pub fn parse(compiler: &OsStr, args: &[OsString]) -> Result<Self, &'static str> {
         if Path::new(compiler).file_name() != Some(OsStr::new("rustc")) {
             return Err("other_driver");
@@ -22,6 +30,7 @@ impl Invocation {
         let mut out_dir = None;
         let mut source = None;
         let mut externs = Vec::new();
+        let mut extern_names = Vec::new();
         let mut probe_args = Vec::new();
         let mut i = 0;
         while i < args.len() {
@@ -61,7 +70,13 @@ impl Invocation {
                 "--out-dir" => out_dir = Some(PathBuf::from(value()?)),
                 "--test" => test = true,
                 "--extern" => {
-                    let (_, path) = value()?.split_once('=').ok_or("implicit_extern")?;
+                    let arg = value()?;
+                    if matches!(arg, "proc_macro" | "std" | "alloc" | "core" | "test") {
+                        probe_args.extend_from_slice(&args[start..i]);
+                        continue;
+                    }
+                    let (name, path) = arg.split_once('=').ok_or("implicit_extern")?;
+                    extern_names.push(name.rsplit(':').next().unwrap().to_owned());
                     let path = PathBuf::from(path);
                     if !matches!(
                         path.extension().and_then(OsStr::to_str),
@@ -171,6 +186,7 @@ impl Invocation {
             name: name.into(),
             source: source.ok_or("missing_source")?,
             externs,
+            extern_names,
             outputs,
             probe_args,
         })

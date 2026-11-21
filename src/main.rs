@@ -1,10 +1,11 @@
+mod admission;
 mod compiler;
 mod fingerprint;
 mod invocation;
 mod store;
 mod watch;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -57,9 +58,23 @@ fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let first = args.first().map(OsString::as_os_str);
     let verb = first.and_then(OsStr::to_str);
+    if let Some(driver) = first
+        && (Path::new(driver).components().count() > 1
+            || driver == "rustc"
+            || env::var_os("RUSTC_WORKSPACE_WRAPPER").as_deref() == Some(driver)
+            || env::var_os("RUSTC").as_deref() == Some(driver)
+            || (env::var_os("CARGO").is_some()
+                && args.get(1).is_some_and(|s| {
+                    s == "-vV"
+                        || s == "--crate-name"
+                        || Path::new(s).file_name() == Some(OsStr::new("rustc"))
+                })))
+    {
+        return compiler::wrap(driver, &args[1..]);
+    }
     match verb {
         Some("--version" | "-V") => println!("jato {}", env!("CARGO_PKG_VERSION")),
-        Some("--help" | "-h" | "help") | None if first.is_none() || verb.is_some() => {
+        Some("--help" | "-h" | "help") | None => {
             print!("{HELP}")
         }
         Some("check" | "build" | "test" | "run" | "clippy") => {
@@ -93,21 +108,10 @@ fn run() -> Result<i32> {
         Some("gc") if args.len() <= 2 => {
             let limit = args
                 .get(1)
-                .and_then(|a| a.to_str())
-                .map(parse_size)
+                .map(|a| parse_size(a.to_str().context("size must be UTF-8")?))
                 .transpose()?
                 .unwrap_or(cache_limit()?);
             println!("Evicted {} entries", Store::open()?.prune(limit)?);
-        }
-        _ if first.is_some_and(|s| {
-            Path::new(s).components().count() > 1
-                || s == "rustc"
-                || env::var_os("RUSTC_WRAPPER").is_some_and(|w| !w.is_empty())
-                    && args.len() > 1
-                    && args[1].to_string_lossy().contains("rustc")
-        }) =>
-        {
-            return compiler::wrap(first.unwrap(), &args[1..]);
         }
         _ => bail!("unknown command or arguments. Run jato --help"),
     }

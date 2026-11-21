@@ -52,6 +52,16 @@ pub fn cache_limit() -> Result<u64> {
     env::var("JATO_MAX_SIZE").map_or_else(|_| Ok(DEFAULT_LIMIT), |s| parse_size(&s))
 }
 
+#[derive(Debug)]
+struct Damaged(Option<Digest>);
+
+impl std::fmt::Display for Damaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cached compiler output failed an integrity check")
+    }
+}
+impl std::error::Error for Damaged {}
+
 pub struct Store {
     conn: Connection,
     pub dir: PathBuf,
@@ -107,23 +117,48 @@ impl Store {
             "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA synchronous=NORMAL;",
         )?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            conn.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL;")?;
+        if version < 2 {
+            if version == 0 {
+                conn.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL;")?;
+            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
             tx.commit()?;
         } else {
-            ensure!(version == 1, "unrecognized Jato cache format {version}");
+            ensure!(version == 2, "unrecognized Jato cache format {version}");
         }
         Ok(Self { conn, dir, limit })
     }
 
-    pub fn knows_recipe(&self, recipe: &Digest) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM entries WHERE recipe=?1)",
-            [recipe],
-            |r| r.get(0),
-        )?)
+    pub fn plans(&self, recipe: &Digest) -> Result<Vec<Vec<u8>>> {
+        let mut q = self.conn.prepare_cached("SELECT inputs FROM entries JOIN plans ON entry=id WHERE recipe=?1 ORDER BY access DESC LIMIT 4")?;
+        let mut plans = Vec::new();
+        for row in q.query_map([recipe], |r| r.get::<_, Vec<u8>>(0))? {
+            let bytes = row?;
+            if !plans.contains(&bytes) {
+                plans.push(bytes);
+            }
+        }
+        Ok(plans)
+    }
+
+    pub fn topology(&self, key: &Digest) -> Result<Option<Digest>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT topology FROM entries JOIN plans ON entry=id WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn refresh_topology(&self, key: &Digest, topology: &Digest) -> Result<()> {
+        self.conn.execute(
+            "UPDATE plans SET topology=?1 WHERE entry=(SELECT id FROM entries WHERE key=?2)",
+            params![topology, key],
+        )?;
+        Ok(())
     }
 
     pub fn knows_artifact(&self, digest: &Digest) -> Result<bool> {
@@ -146,13 +181,18 @@ impl Store {
         outputs: &[PathBuf],
         stderr: &[u8],
         elapsed_ms: u64,
+        plan: Option<(&[u8], &Digest)>,
     ) -> Result<bool> {
         // Compress in parallel with other compilers, outside SQLite's single writer.
         // Anonymous staging files are reclaimed by the OS even on process death.
         let mut spool = tempfile::tempfile_in(&self.dir)?;
         let mut buffer = vec![0; CHUNK];
         let mut compressor = zstd::bulk::Compressor::new(1)?;
-        let mut packed_total = 0u64;
+        let plan_cost = plan.map_or(0, |(bytes, _)| 80 + bytes.len());
+        let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
+        if charge > self.limit || stderr.len() > DIAGNOSTIC_LIMIT {
+            return Ok(false);
+        }
         let mut files = Vec::new();
         for path in outputs {
             let mut source =
@@ -185,8 +225,8 @@ impl Store {
                 } else {
                     raw
                 };
-                packed_total += (packed.len() + 128) as u64;
-                if packed_total + stderr.len() as u64 > self.limit {
+                charge += (packed.len() + 192) as u64;
+                if charge > self.limit {
                     return Ok(false);
                 }
                 spool.write_all(packed)?;
@@ -225,6 +265,12 @@ impl Store {
                     .execute(params![entry, slot, ordinal, &frame.hash])?;
             }
         }
+        if let Some((bytes, topology)) = plan {
+            tx.execute(
+                "INSERT INTO plans VALUES(?1,?2,?3)",
+                params![entry, bytes, topology],
+            )?;
+        }
         evict(&tx, self.limit)?;
         let kept = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE id=?1)",
@@ -243,15 +289,12 @@ impl Store {
             return Ok(None);
         };
         let staged = (|| -> Result<Vec<NamedTempFile>> {
-            ensure!(
-                blake3::hash(&stderr).as_bytes() == &hash,
-                "damaged diagnostic stream"
-            );
+            ensure!(blake3::hash(&stderr).as_bytes() == &hash, Damaged(None));
             let count: usize =
                 tx.query_row("SELECT COUNT(*) FROM files WHERE entry=?1", [id], |r| {
                     r.get(0)
                 })?;
-            ensure!(count == outputs.len(), "incomplete output set");
+            ensure!(count == outputs.len(), Damaged(None));
             let mut staged = Vec::with_capacity(count);
             for (slot, path) in outputs.iter().enumerate() {
                 let (digest, size, mode) = tx.query_row(
@@ -275,17 +318,18 @@ impl Store {
                     let hash: Digest = row.get(0)?;
                     let raw: usize = row.get(1)?;
                     let packed = row.get_ref(2)?.as_blob()?;
-                    ensure!(raw <= CHUNK && packed.len() <= raw, "invalid cache frame");
+                    ensure!(raw <= CHUNK && packed.len() <= raw, Damaged(Some(hash)));
                     let decoded;
                     let bytes = if packed.len() == raw {
                         packed
                     } else {
-                        decoded = zstd::bulk::decompress(packed, raw)?;
+                        decoded =
+                            zstd::bulk::decompress(packed, raw).map_err(|_| Damaged(Some(hash)))?;
                         &decoded
                     };
                     ensure!(
                         bytes.len() == raw && blake3::hash(bytes).as_bytes() == &hash,
-                        "damaged cache chunk"
+                        Damaged(Some(hash))
                     );
                     tmp.write_all(bytes)?;
                     hasher.update(bytes);
@@ -293,7 +337,7 @@ impl Store {
                 }
                 ensure!(
                     written == size && hasher.finalize().as_bytes() == &digest,
-                    "incomplete or damaged artifact"
+                    Damaged(None)
                 );
                 tmp.as_file()
                     .set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
@@ -305,9 +349,17 @@ impl Store {
         let staged = match staged {
             Ok(files) => files,
             Err(e) => {
-                // Drop every entry sharing the damaged entry's chunks. Otherwise a
-                // deduplicating writer could keep reusing a corrupt shared frame.
-                self.conn.execute("DELETE FROM entries WHERE key=?1 OR id IN (SELECT p.entry FROM parts p JOIN parts bad ON p.chunk=bad.chunk WHERE bad.entry=(SELECT id FROM entries WHERE key=?1))", [key])?;
+                if let Some(Damaged(chunk)) = e.downcast_ref::<Damaged>() {
+                    // Invalidate precisely the users of a damaged frame. An I/O
+                    // failure in the destination leaves the cache intact.
+                    if let Some(chunk) = chunk {
+                        self.conn.execute("DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1)", [chunk])?;
+                    } else {
+                        self.conn
+                            .execute("DELETE FROM entries WHERE key=?1", [key])?;
+                    }
+                    let _ = self.count("corrupt", 1);
+                }
                 return Err(e);
             }
         };
@@ -391,7 +443,7 @@ mod tests {
         fs::write(&files[1], [])?;
         fs::write(&output, vec![7; CHUNK * 3])?;
         for k in [1, 2] {
-            assert!(store.save(&[0; 32], &[k; 32], &files, b"warning\n", 33)?);
+            assert!(store.save(&[0; 32], &[k; 32], &files, b"warning\n", 33, None)?);
         }
         assert_eq!(store.stats()?.chunks, 1);
         fs::write(&output, b"different")?;
@@ -419,11 +471,25 @@ mod tests {
         let mut store = Store::at(root.path().join("cache"), 2048)?;
         let output = root.path().join("out");
         fs::write(&output, b"tiny")?;
-        store.save(&[0; 32], &[1; 32], std::slice::from_ref(&output), &[], 0)?;
+        store.save(
+            &[0; 32],
+            &[1; 32],
+            std::slice::from_ref(&output),
+            &[],
+            0,
+            None,
+        )?;
         let mut bytes = vec![0; 4096];
         blake3::Hasher::new().finalize_xof().fill(&mut bytes);
         fs::write(&output, bytes)?;
-        assert!(!store.save(&[0; 32], &[2; 32], std::slice::from_ref(&output), &[], 0)?);
+        assert!(!store.save(
+            &[0; 32],
+            &[2; 32],
+            std::slice::from_ref(&output),
+            &[],
+            0,
+            None
+        )?);
         assert!(store.restore(&[1; 32], &[output])?.is_some());
         Ok(())
     }

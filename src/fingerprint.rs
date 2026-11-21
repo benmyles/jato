@@ -1,6 +1,7 @@
 use crate::invocation::Invocation;
 use crate::store::{Digest, Store};
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -60,7 +61,24 @@ pub fn recipe(compiler: &OsStr, args: &[OsString]) -> Result<Digest> {
             PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end())
         }
     };
-    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v1");
+    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v3");
+    let executable = if bin.components().count() > 1 {
+        cwd.join(bin)
+    } else {
+        env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join(bin))
+            .find(|p| p.is_file())
+            .context("compiler missing from PATH")?
+    };
+    let actual = fs::canonicalize(&executable)?;
+    let bundled = fs::canonicalize(root.join("bin/rustc"))?;
+    if actual != bundled {
+        let proxy = executable.with_file_name("rustup");
+        let same_inode = fs::metadata(proxy).is_ok_and(|m| {
+            fs::metadata(&actual).is_ok_and(|a| a.dev() == m.dev() && a.ino() == m.ino())
+        });
+        ensure!(same_inode, "custom rustc driver");
+    }
     field(&mut hash, compiler.as_bytes());
     field(&mut hash, cwd.as_os_str().as_bytes());
     for arg in args {
@@ -126,12 +144,13 @@ fn hash_file(path: &Path, since: SystemTime) -> Result<Digest> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-struct Dependencies {
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct Plan {
     files: BTreeSet<PathBuf>,
     env: BTreeSet<String>,
 }
 
-fn dependencies(path: &Path) -> Result<Dependencies> {
+pub fn dependencies(path: &Path) -> Result<Plan> {
     // rustc emits one empty Make rule per input. Their entire left-hand sides
     // are filenames, including escaped spaces. Cross-check with the first
     // output rule so an unfamiliar dep-info dialect fails closed.
@@ -144,7 +163,24 @@ fn dependencies(path: &Path) -> Result<Dependencies> {
     for line in BufReader::new(f.take(LIMIT + 1)).lines() {
         let line = line?;
         if let Some(value) = line.strip_prefix("# env-dep:") {
-            env.insert(value.to_owned());
+            let (name, recorded) = value
+                .split_once('=')
+                .map_or((value, None), |(k, v)| (k, Some(v)));
+            // Unusual escaped variable names still compile through the normal path.
+            ensure!(
+                !name.is_empty() && !name.contains(['\\', '\0']),
+                "unsupported environment name"
+            );
+            let actual = std::env::var(name).ok().map(|v| {
+                v.replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+            });
+            ensure!(
+                actual.as_deref() == recorded,
+                "compiler supplied a synthetic environment value"
+            );
+            env.insert(name.to_owned());
         } else if let Some(file) = line.strip_suffix(':') {
             ensure!(
                 !file.is_empty() && !file.contains(['\r', '\t']),
@@ -182,7 +218,7 @@ fn dependencies(path: &Path) -> Result<Dependencies> {
         encoded == files && !files.is_empty(),
         "incomplete dep-info input list"
     );
-    Ok(Dependencies {
+    Ok(Plan {
         files: files
             .into_iter()
             .map(|s| PathBuf::from(s.replace("\\ ", " ")))
@@ -191,34 +227,103 @@ fn dependencies(path: &Path) -> Result<Dependencies> {
     })
 }
 
-pub fn key(
-    recipe: &Digest,
-    inv: &Invocation,
-    dep_info: &Path,
-    since: SystemTime,
-    externs: &Digest,
-) -> Result<Digest> {
-    let deps = dependencies(dep_info)?;
-    let root = fs::canonicalize(&inv.source)?;
-    let mut has_root = false;
-    let mut hash = blake3::Hasher::new_derive_key("jato verified Rust inputs v1");
-    field(&mut hash, recipe);
-    for file in deps.files {
-        let path =
-            fs::canonicalize(&file).with_context(|| format!("resolving {}", file.display()))?;
-        has_root |= root == path;
-        field(&mut hash, b"source");
-        field(&mut hash, file.as_os_str().as_bytes());
-        field(&mut hash, path.as_os_str().as_bytes());
-        field(&mut hash, &hash_file(&path, since)?);
+pub struct Snapshot {
+    pub key: Digest,
+    pub topology: Digest,
+}
+
+impl Plan {
+    pub fn verify_admission(&self, inv: &Invocation, compiler: &OsStr) -> Result<()> {
+        crate::admission::verify(self.files.iter(), inv, compiler)
     }
-    ensure!(has_root, "crate root missing from dep-info");
-    for env in deps.env {
-        field(&mut hash, b"env");
-        field(&mut hash, env.as_bytes());
+
+    pub fn snapshot(
+        &self,
+        recipe: &Digest,
+        inv: &Invocation,
+        since: SystemTime,
+        externs: &Digest,
+    ) -> Result<Snapshot> {
+        let root = fs::canonicalize(&inv.source)?;
+        let mut has_root = false;
+        let mut hash = blake3::Hasher::new_derive_key("jato verified Rust inputs v2");
+        let mut namespace = BTreeSet::new();
+        field(&mut hash, recipe);
+        for file in &self.files {
+            let path =
+                fs::canonicalize(file).with_context(|| format!("resolving {}", file.display()))?;
+            has_root |= root == path;
+            field(&mut hash, b"source");
+            field(&mut hash, file.as_os_str().as_bytes());
+            field(&mut hash, path.as_os_str().as_bytes());
+            field(&mut hash, &hash_file(&path, since)?);
+            // rustc can change module resolution when a second legal location
+            // appears. Track the containing directories and the alternate name,
+            // even when the alternate directory or file does not yet exist.
+            let original = std::path::absolute(file)?;
+            for resolved in [&original, &path] {
+                let parent = resolved.parent().context("source without a parent")?;
+                namespace.insert(parent.to_owned());
+                if resolved.file_name() == Some(OsStr::new("mod.rs")) {
+                    namespace.insert(parent.with_extension("rs"));
+                } else if resolved.extension() == Some(OsStr::new("rs")) {
+                    namespace.insert(resolved.with_extension("").join("mod.rs"));
+                }
+            }
+            if original != path {
+                for component in original.ancestors() {
+                    let m = fs::symlink_metadata(component)?;
+                    if m.is_symlink() {
+                        ensure!(
+                            !recent(&m, since),
+                            "input symlink changed during compilation"
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(has_root, "crate root missing from dep-info");
+        for name in &self.env {
+            field(&mut hash, b"env");
+            field(&mut hash, name.as_bytes());
+            match env::var_os(name) {
+                Some(value) => {
+                    field(&mut hash, b"set");
+                    field(&mut hash, value.as_bytes());
+                }
+                None => field(&mut hash, b"unset"),
+            }
+        }
+        field(&mut hash, externs);
+        let mut topology = blake3::Hasher::new();
+        for p in namespace {
+            field(&mut topology, p.as_os_str().as_bytes());
+            match fs::metadata(&p) {
+                Ok(m) => {
+                    ensure!(
+                        !recent(&m, since),
+                        "module search path changed during compilation"
+                    );
+                    for n in stamp(&m) {
+                        topology.update(&n.to_le_bytes());
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    field(&mut topology, b"absent");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Snapshot {
+            key: *hash.finalize().as_bytes(),
+            topology: *topology.finalize().as_bytes(),
+        })
     }
-    field(&mut hash, externs);
-    Ok(*hash.finalize().as_bytes())
 }
 
 pub fn extern_key(inv: &Invocation, since: SystemTime, store: &Store) -> Result<Digest> {

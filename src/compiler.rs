@@ -37,12 +37,39 @@ fn discover(
     inv: &Invocation,
     recipe: &Digest,
 ) -> Result<Option<Vec<u8>>> {
-    if !store.knows_recipe(recipe)? {
+    let plans = store.plans(recipe)?;
+    if plans.is_empty() {
         return Ok(None);
     }
     let start = SystemTime::now();
-    // Verify extern provenance before expansion, which can execute proc macros.
     let externs = fingerprint::extern_key(inv, start, store)?;
+    for encoded in plans {
+        let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
+        let Ok(snapshot) = plan.snapshot(recipe, inv, start, &externs) else {
+            continue;
+        };
+        let Some(topology) = store.topology(&snapshot.key)? else {
+            continue;
+        };
+        if topology == snapshot.topology {
+            return store.restore(&snapshot.key, &inv.outputs);
+        }
+        // Familiar bytes with a changed module search directory need fresh
+        // name resolution. Ordinary edits go directly to the actual compiler.
+        return rediscover(store, compiler, inv, recipe, start, &externs);
+    }
+    Ok(None)
+}
+
+fn rediscover(
+    store: &mut Store,
+    compiler: &OsStr,
+    inv: &Invocation,
+    recipe: &Digest,
+    start: SystemTime,
+    externs: &Digest,
+) -> Result<Option<Vec<u8>>> {
+    let _ = store.count("discovery_probe", 1);
     let probe = tempfile::Builder::new()
         .prefix("discover-")
         .suffix(".d")
@@ -56,8 +83,13 @@ fn discover(
         .stderr(Stdio::null())
         .status()?;
     ensure!(status.success(), "input discovery failed");
-    let key = fingerprint::key(recipe, inv, probe.path(), start, &externs)?;
-    store.restore(&key, &inv.outputs)
+    let plan = fingerprint::dependencies(probe.path())?;
+    let snapshot = plan.snapshot(recipe, inv, start, externs)?;
+    let restored = store.restore(&snapshot.key, &inv.outputs)?;
+    if restored.is_some() {
+        let _ = store.refresh_topology(&snapshot.key, &snapshot.topology);
+    }
+    Ok(restored)
 }
 
 fn compile(compiler: &OsStr, args: &[OsString]) -> Result<(ExitStatus, Option<Vec<u8>>)> {
@@ -142,8 +174,22 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         let result = (|| -> Result<()> {
             let log = diagnostics.context("diagnostics exceed recording limit")?;
             let externs = fingerprint::extern_key(inv, since, &store)?;
-            let key = fingerprint::key(&recipe, inv, &inv.outputs[0], since, &externs)?;
-            if !store.save(&recipe, &key, &inv.outputs, &log, elapsed)? {
+            let plan = fingerprint::dependencies(&inv.outputs[0])?;
+            plan.verify_admission(inv, compiler)?;
+            let snapshot = plan.snapshot(&recipe, inv, since, &externs)?;
+            let encoded = serde_json::to_vec(&plan)?;
+            ensure!(
+                encoded.len() <= 256 * 1024,
+                "input manifest exceeds recording limit"
+            );
+            if !store.save(
+                &recipe,
+                &snapshot.key,
+                &inv.outputs,
+                &log,
+                elapsed,
+                Some((&encoded, &snapshot.topology)),
+            )? {
                 bail!("entry exceeds cache budget");
             }
             Ok(())

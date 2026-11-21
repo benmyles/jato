@@ -46,4 +46,13 @@ CREATE TRIGGER IF NOT EXISTS drop_part AFTER DELETE ON parts BEGIN
     UPDATE chunks SET refs=refs-1 WHERE hash=OLD.chunk;
     DELETE FROM chunks WHERE hash=OLD.chunk AND refs=0;
 END;
-PRAGMA user_version=1;
+CREATE TABLE IF NOT EXISTS plans(
+    entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, inputs BLOB NOT NULL, topology BLOB NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS add_plan AFTER INSERT ON plans BEGIN
+    UPDATE usage SET bytes=bytes+80+length(NEW.inputs);
+END;
+CREATE TRIGGER IF NOT EXISTS drop_plan AFTER DELETE ON plans BEGIN
+    UPDATE usage SET bytes=bytes-80-length(OLD.inputs);
+END;
+PRAGMA user_version=2;

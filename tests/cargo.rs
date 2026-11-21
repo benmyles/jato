@@ -230,3 +230,119 @@ fn watcher_checks_edited_package_then_workspace_and_ignores_build_outputs() {
     }
     assert_eq!(child.0.wait().unwrap().code(), Some(130));
 }
+
+#[test]
+fn generated_sources_and_proc_macro_reexports_never_replay_stale_values() {
+    let p = Project::new();
+    write(
+        p.root.join("leaf/build.rs"),
+        r#"fn main() {
+        println!("cargo:rerun-if-env-changed=GENERATED_VALUE");
+        let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let value = std::env::var("GENERATED_VALUE").unwrap_or_default();
+        std::fs::write(out.join("generated.rs"), format!("pub fn value()-> &'static str {{ {:?} }}", value)).unwrap();
+    }"#,
+    );
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+    );
+    for v in ["first", "second", "first"] {
+        assert_eq!(
+            success(p.command().env("GENERATED_VALUE", v).args(["run", "-q"])).stdout,
+            format!("{v}\n").as_bytes()
+        );
+    }
+
+    write(
+        p.root.join("mac/Cargo.toml"),
+        "[package]\nname='mac'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+    );
+    write(
+        p.root.join("mac/src/lib.rs"),
+        r#"extern crate proc_macro;
+        #[proc_macro] pub fn external(_:proc_macro::TokenStream)->proc_macro::TokenStream {
+            let value = std::fs::read_to_string(std::env::var_os("JATO_MACRO_FILE").unwrap()).unwrap();
+            format!("{:?}", value).parse().unwrap()
+        }"#,
+    );
+    let manifest = p.root.join("leaf/Cargo.toml");
+    write(
+        &manifest,
+        &(fs::read_to_string(&manifest).unwrap() + "\n[dependencies]\nmac={path='../mac'}\n"),
+    );
+    write(p.root.join("leaf/src/lib.rs"), "pub use mac::external;");
+    write(
+        p.root.join("src/lib.rs"),
+        "pub fn value() -> &'static str { leaf::external!() }",
+    );
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", app::value()); }",
+    );
+    let hidden = p.temp.path().join("macro-input");
+    for v in ["first", "changed"] {
+        write(&hidden, v);
+        p.clean();
+        assert_eq!(
+            success(
+                p.command()
+                    .env("JATO_MACRO_FILE", &hidden)
+                    .args(["run", "-q"])
+            )
+            .stdout,
+            format!("{v}\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn two_cargo_targets_can_publish_to_one_cache_while_it_is_pruned() {
+    let p = Project::new();
+    p.run(&["cargo", "generate-lockfile"]);
+    let mut a = p.command().args(["check", "-q"]).spawn().unwrap();
+    let mut b = p
+        .command()
+        .env("CARGO_TARGET_DIR", p.temp.path().join("second target"))
+        .args(["check", "-q"])
+        .spawn()
+        .unwrap();
+    for _ in 0..4 {
+        p.run(&["gc", "1MiB"]);
+    }
+    assert!(a.wait().unwrap().success());
+    assert!(b.wait().unwrap().success());
+    p.clean();
+    p.run(&["check"]);
+    assert!(p.hits() > 0);
+    p.run(&["gc", "0"]);
+    let stats = p.stats();
+    assert_eq!(stats["entries"], 0);
+    assert_eq!(stats["charged_bytes"], 0);
+    assert_eq!(stats["chunks"], 0);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn assembly_includes_are_left_to_the_compiler() {
+    let p = Project::new();
+    let blob = p.temp.path().join("assembler-input");
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        &format!(
+            r##"
+        core::arch::global_asm!(r#".section .rodata
+            .global jato_byte
+            jato_byte: .incbin "{}""#);
+        extern "C" {{ static jato_byte: u8; }}
+        pub fn value() -> u8 {{ unsafe {{ jato_byte }} }}
+    "##,
+            blob.display()
+        ),
+    );
+    for v in *b"AB" {
+        fs::write(&blob, [v]).unwrap();
+        p.clean();
+        assert_eq!(p.run(&["run", "-q"]).stdout, format!("{v}\n").as_bytes());
+    }
+}
