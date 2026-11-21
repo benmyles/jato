@@ -611,11 +611,18 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
     };
     let build = || {
         let mut cmd = p.command();
+        let toolchain_bin = Path::new(env!("CARGO")).parent().unwrap().to_owned();
+        let path = std::env::join_paths(
+            [toolchain_bin, "/usr/bin".into(), "/bin".into()]
+                .into_iter()
+                .chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )),
+        )
+        .unwrap();
         cmd.env("LIBRARY_PATH", &lib_path)
-            .env(
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-                "/usr/bin/cc",
-            )
+            .env("PATH", path)
+            .env_remove("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER")
             .env("JATO_LOG", "debug")
             .env_remove("JATO_LINK_CACHE")
             .args(["build", "--release"]);

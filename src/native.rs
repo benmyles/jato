@@ -195,7 +195,7 @@ impl Capture {
             "-xx",
             "-y",
             "-e",
-            "trace=%file,getdents64,connect,sendto,sendmsg,recvfrom,recvmsg,memfd_create,io_uring_setup",
+            "trace=%file,getdents64,%network,memfd_create,io_uring_setup",
             "-o",
         ])
         .arg(format!("/proc/self/fd/{fd}"))
@@ -255,6 +255,7 @@ fn parse(
     mut shared: Option<SharedDirectory>,
 ) -> Result<Observations> {
     let mut seen = Observations::default();
+    let mut spawn_channels = BTreeSet::new();
     let mut partial = BTreeMap::new();
     let mut pending_bytes = 0;
     let mut line = String::new();
@@ -280,6 +281,9 @@ fn parse(
             continue;
         }
         if let Some(prefix) = call.strip_suffix("<unfinished ...>") {
+            // strace inserts one separator before the marker even in the
+            // middle of an fd argument. Join the original syscall bytes.
+            let prefix = prefix.strip_suffix(' ').unwrap_or(prefix);
             pending_bytes += prefix.len();
             ensure!(
                 pending_bytes <= 2 * MAX_LINE,
@@ -313,7 +317,9 @@ fn parse(
             .trim_start()
             .strip_prefix("= ")
             .context("missing syscall result")?;
-        if name == "getdents64" {
+        if matches!(name, "socketpair" | "recvfrom") {
+            spawn_channel(&mut spawn_channels, pid, name, args, result)?;
+        } else if name == "getdents64" {
             ensure!(
                 !result.starts_with('-'),
                 "unsuccessful native directory read"
@@ -346,6 +352,43 @@ fn parse(
         seen.shared_listing = s.completed.map(|d| (s.path, d));
     }
     Ok(seen)
+}
+
+// std::process creates a private close-on-exec socketpair when spawning a
+// linker by name. EOF tells the parent exec succeeded. Match the creating
+// thread, fd and socket inode, and accept only an empty read of that channel.
+fn spawn_channel(
+    channels: &mut BTreeSet<(u32, String)>,
+    pid: u32,
+    name: &str,
+    args: &str,
+    result: &str,
+) -> Result<()> {
+    ensure!(result == "0", "external or failed native IPC");
+    if name == "socketpair" {
+        let pair = args
+            .strip_prefix("AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, [")
+            .and_then(|s| s.strip_suffix(']'))
+            .context("unrecognized native socketpair")?;
+        let (parent, _) = pair
+            .split_once(", ")
+            .context("incomplete native socketpair")?;
+        let path = fd_path(parent)?;
+        ensure!(
+            path.as_os_str().as_bytes().starts_with(b"socket:[") && channels.len() < 32,
+            "unknown private spawn descriptor"
+        );
+        channels.insert((pid, parent.to_owned()));
+    } else {
+        let parent = args
+            .strip_suffix(", \"\", 8, 0, NULL, NULL")
+            .context("native socket input")?;
+        ensure!(
+            channels.remove(&(pid, parent.to_owned())),
+            "external native socket input"
+        );
+    }
+    Ok(())
 }
 
 // With -xx strace encodes every pathname byte as four ASCII characters,
@@ -413,6 +456,13 @@ fn process_path(path: &Path) -> bool {
 impl Observations {
     fn observe(&mut self, name: &str, args: &str, result: &str, cwd: &Path) -> Result<()> {
         if name == "getcwd" {
+            return Ok(());
+        }
+        // A NULL pathname and NULL output buffer probe kernel statx support.
+        if name == "statx"
+            && result.starts_with("-1 EFAULT ")
+            && args.ends_with(", NULL, AT_STATX_SYNC_AS_STAT, STATX_ALL, NULL")
+        {
             return Ok(());
         }
         ensure!(
@@ -901,5 +951,33 @@ pub fn environment(hash: &mut blake3::Hasher) {
         }) {
             field(hash, line.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_spawn_channel_only_accepts_its_own_empty_acknowledgment() {
+        let mut channels = BTreeSet::new();
+        let fd = r"9<\x73\x6f\x63\x6b\x65\x74\x3a\x5b\x31\x5d>";
+        let pair = format!("AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, [{fd}, 10]");
+        let read = format!(r#"{fd}, "", 8, 0, NULL, NULL"#);
+        spawn_channel(&mut channels, 1, "socketpair", &pair, "0").unwrap();
+        assert!(spawn_channel(&mut channels, 2, "recvfrom", &read, "0").is_err());
+        assert!(spawn_channel(&mut channels, 1, "recvfrom", &read, "1").is_err());
+        spawn_channel(&mut channels, 1, "recvfrom", &read, "0").unwrap();
+        assert!(spawn_channel(&mut channels, 1, "recvfrom", &read, "0").is_err());
+        let split = format!(
+            "1 socketpair({pair}) = 0\n1 recvfrom({fd} <unfinished ...>\n1 <... recvfrom resumed>, \"\", 8, 0, NULL, NULL) = 0\n"
+        );
+        parse(
+            &mut split.as_bytes(),
+            Path::new("/"),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
     }
 }
