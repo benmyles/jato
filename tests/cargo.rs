@@ -690,6 +690,45 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[test]
+fn clean_incremental_native_unit_restores_and_live_edits_keep_rustc_state() {
+    let p = Project::new();
+    let source = p.root.join("src/main.rs");
+    let original = fs::read_to_string(&source).unwrap();
+    let run = || {
+        success(
+            p.command()
+                .env("CARGO_INCREMENTAL", "1")
+                .env("JATO_LOG", "debug")
+                .env_remove("JATO_LINK_CACHE")
+                .args(["--system-linker", "run"]),
+        )
+    };
+    let cold = run();
+    assert_eq!(cold.stdout, b"one:none\n");
+    write(&source, "fn main() { println!(\"edited\"); }");
+    let edit = run();
+    assert_eq!(edit.stdout, b"edited\n");
+    assert!(
+        String::from_utf8_lossy(&edit.stderr).contains("jato [app] active_incremental"),
+        "{}",
+        String::from_utf8_lossy(&edit.stderr)
+    );
+    p.clean();
+    write(&source, &original);
+    let restored = run();
+    assert_eq!(restored.stdout, cold.stdout);
+    if std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+        assert!(
+            String::from_utf8_lossy(&restored.stderr).contains("jato [app] hit"),
+            "cold {}\nrestored {}",
+            String::from_utf8_lossy(&cold.stderr),
+            String::from_utf8_lossy(&restored.stderr)
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
 fn compiled_proc_macro_is_reusable_but_its_expansion_runs_again() {
     let p = Project::new();
     write(

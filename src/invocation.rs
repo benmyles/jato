@@ -6,6 +6,7 @@ pub struct Invocation {
     pub codegen: bool,
     pub executable: bool,
     pub linker: Option<PathBuf>,
+    pub incremental: Option<PathBuf>,
     pub deferred_links: bool,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
@@ -43,6 +44,7 @@ impl Invocation {
         let mut test = false;
         let mut prefer_dynamic = false;
         let mut linker = None;
+        let mut incremental = None;
         let mut deferred_links = cfg!(all(
             target_arch = "x86_64",
             target_os = "linux",
@@ -132,7 +134,11 @@ impl Invocation {
                     match setting {
                         "incremental" => {
                             probe = false;
-                            native_link = false;
+                            let dir = PathBuf::from(v);
+                            native_link &= dir.is_absolute()
+                                && dir.ends_with("incremental")
+                                && incremental.is_none();
+                            incremental = Some(dir);
                         }
                         "link-arg" | "link-args" => {
                             native_link &= matches!(
@@ -241,6 +247,12 @@ impl Invocation {
         {
             return Err("linker");
         }
+        if executable
+            && let Some(dir) = &incremental
+            && !crate::native::fresh_incremental(dir, name)
+        {
+            return Err("active_incremental");
+        }
         if !kinds.contains(&"link") && !kinds.contains(&"metadata") {
             return Err("custom_output");
         }
@@ -263,6 +275,7 @@ impl Invocation {
             codegen: kinds.contains(&"link"),
             executable,
             linker,
+            incremental,
             deferred_links,
             source: source.ok_or("missing_source")?,
             externs,

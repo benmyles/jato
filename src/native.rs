@@ -37,6 +37,7 @@ struct Access {
     read: bool,
     list: bool,
     wrote: bool,
+    read_write_before_creation: bool,
     created_dir: bool,
     exclusive: bool,
     opened_as: Option<PathBuf>,
@@ -47,6 +48,34 @@ pub struct Observations {
     paths: BTreeMap<PathBuf, Access>,
     images: BTreeSet<PathBuf>,
     shared_listing: Option<(PathBuf, Digest)>,
+    hardlinks: Vec<(PathBuf, PathBuf)>,
+}
+
+fn crate_directory(name: &OsStr, krate: &str) -> bool {
+    name.as_bytes()
+        .strip_prefix(krate.as_bytes())
+        .and_then(|s| s.strip_prefix(b"-"))
+        .is_some_and(|id| !id.is_empty() && id.iter().all(u8::is_ascii_alphanumeric))
+}
+
+// Only learn a native result from an incremental session starting from
+// scratch. An active session takes the direct rustc path, without tracing.
+pub fn fresh_incremental(dir: &Path, krate: &str) -> bool {
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    if fs::canonicalize(parent).ok().as_deref() != Some(parent) {
+        return false;
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => fs::read_dir(dir).is_ok_and(|entries| {
+            entries.enumerate().all(|(index, e)| {
+                index < 16384 && e.is_ok_and(|e| !crate_directory(&e.file_name(), krate))
+            })
+        }),
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -480,6 +509,22 @@ impl Observations {
             ok || absent || already || nonlink,
             "unmodeled native lookup: {name} {result}"
         );
+        if name == "linkat" {
+            ensure!(
+                ok && self.hardlinks.len() < MAX_PATHS,
+                "unmodeled hard link"
+            );
+            let (src, rest) = argument(args, true, cwd)?;
+            let (dest, flags) = argument(
+                rest.strip_prefix(", ")
+                    .context("missing link destination")?,
+                true,
+                cwd,
+            )?;
+            ensure!(flags == ", 0", "unmodeled hard link flags");
+            self.hardlinks.push((src, dest));
+            return Ok(());
+        }
         let at = match name {
             "openat" | "newfstatat" | "statx" | "readlinkat" | "faccessat" | "faccessat2"
             | "unlinkat" | "mkdirat" | "fchmodat" | "fchmodat2" => true,
@@ -545,6 +590,10 @@ impl Observations {
                     || flags.contains("O_RDWR")
                     || flags.contains("O_CREAT")
                 {
+                    a.read_write_before_creation |= flags.contains("O_RDWR")
+                        && !flags.contains("O_TRUNC")
+                        && !flags.contains("O_EXCL")
+                        && !a.wrote;
                     a.wrote = true;
                     a.exclusive |= flags.contains("O_EXCL");
                 } else {
@@ -616,6 +665,38 @@ impl Observations {
             }
         }
         ensure!(linked, "no supported ELF linker observed");
+        let session = if let Some(dir) = &inv.incremental {
+            ensure!(
+                fs::canonicalize(dir)? == *dir,
+                "redirected incremental directory"
+            );
+            let mut created = self.paths.iter().filter(|(path, access)| {
+                access.created_dir
+                    && path.parent() == Some(dir)
+                    && path
+                        .file_name()
+                        .is_some_and(|n| crate_directory(n, &inv.name))
+            });
+            let (path, _) = created
+                .next()
+                .context("rustc reused existing incremental state")?;
+            ensure!(created.next().is_none(), "multiple incremental sessions");
+            Some(path.clone())
+        } else {
+            None
+        };
+        for (source, dest) in &self.hardlinks {
+            ensure!(
+                session.as_ref().is_some_and(|s| dest.starts_with(s))
+                    && dest.extension() == Some(OsStr::new("o"))
+                    && source.parent() == Some(&out)
+                    && source
+                        .file_name()
+                        .is_some_and(|n| n.as_bytes().ends_with(b".rcgu.o"))
+                    && self.paths.get(source).is_some_and(|a| a.wrote),
+                "hard link outside fresh compiler work products"
+            );
+        }
         let folders: Vec<_> = self
             .paths
             .iter()
@@ -637,6 +718,26 @@ impl Observations {
             shared_listing: self.shared_listing,
         };
         for (p, a) in self.paths {
+            if let (Some(dir), Some(unit)) = (&inv.incremental, &session)
+                && p.starts_with(dir)
+            {
+                // The compiler must have successfully created this crate's
+                // directory. Every read inside it must be of a directory it
+                // made. Reading another unit or a prior object declines reuse.
+                ensure!(
+                    (p == *dir && !a.read && !a.list && (!a.wrote || a.created_dir))
+                        || (p.starts_with(unit)
+                            && (!a.present || a.wrote)
+                            && (!a.read_write_before_creation
+                                || (p.parent() == Some(unit)
+                                    && p.extension() == Some(OsStr::new("lock"))))
+                            && (!(a.read || a.list) || a.created_dir)
+                            && a.opened_as.as_ref().is_none_or(|resolved| *resolved == p)),
+                    "pre-existing incremental input {}",
+                    p.display()
+                );
+                continue;
+            }
             if outputs.contains(&p) || folders.iter().any(|f| p.starts_with(f)) {
                 continue;
             }
