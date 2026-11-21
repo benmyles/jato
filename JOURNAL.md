@@ -1,5 +1,9 @@
 # Work journal
 
+## 2026-11-21 — concurrent builds and repeated validation
+
+- Started two clean regex worktrees against the same empty 0.4 cache. All six compiler units ran twice and produced six stored entries. The pair finished in 11.18 s.
+
 ## 2026-11-21 — worktrees and packed writes
 
 - Rebuilt the locked regex application in two target directories. All five registry libraries and their five metadata files were byte-identical, while their dep-info referred to different output paths. Jato 0.3 missed all five in the second target.

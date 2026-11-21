@@ -26,3 +26,9 @@
 - [x] Reuse builds across independent worktrees and target locations with verified, stable compiler inputs.
 - [x] Reduce repeated compression and bound per-entry indexing memory in packed storage.
 - [x] Exercise concurrent and changed checkouts, compare warm and relocated builds with peers, and qualify the installed release.
+
+## Concurrent builds and repeated validation
+
+- [ ] Coalesce matching compiler misses across independent Cargo builds and verify each follower’s own inputs.
+- [ ] Remove repeat validation work from native misses and recurring worktree restores.
+- [ ] Test failure, cancellation, divergent inputs and eviction, then compare CPU time, wall time and storage against the installed release and upstream peers.
