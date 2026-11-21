@@ -15,6 +15,8 @@ The comparison uses the installed Jato 0.3.0, Jato 0.2.0, the machine's kache 2.
 
 All three warm release trials favored Jato 0.3 over both Jato 0.2 and the installed kache. Cold checks were slower in this run. The numbers are wall-clock medians from three trials. [Interleaved build times and memory samples](ripgrep-0.3.json)
 
+All 299 upstream ripgrep integration tests also passed on a Rust 1.89 release build and against a separately confirmed cache hit for the Rust 1.100 executable.
+
 A separate 21-pair experiment compared only the two Jato versions with prefilled stores. The warm check medians were 161 ms for 0.3 and 156 ms for 0.2. The median difference **within each adjacent pair** was 0.17 ms, with 0.3 first in ten pairs and 0.2 first in eleven. [All matched check samples](paired-0.3.json)
 
 ### Upstream kache 2.2.0

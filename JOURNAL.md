@@ -17,6 +17,7 @@
 - Compared directly with the upstream kache 2.2.0 executable over three additional ripgrep trials. Jato's warm check and release medians were 148 ms and 173 ms. Kache's were 353 ms and 305 ms.
 - Warm zlib-backed release builds took 149 ms with Jato 0.3, 896 ms with 0.2, and 205 ms with upstream kache. The 12 MiB embedded-data release took 38 ms, 467 ms, and 131 ms respectively. Each executable's output was checked.
 - The locked regex application restored in 69 ms for release and 64 ms for check. A new edit took 51 ms and undo took 28 ms. Verified `jato --system-linker build --release -j1` through the machine's ordinary Cargo launcher.
+- Restored six legacy compiler entries after upgrading a live 0.2 cache. All 299 ripgrep integration tests passed on Rust 1.89 and against a confirmed restored Rust 1.100 executable. Verified the distributable 0.3.0 source package, documentation links, fixtures and benchmark samples.
 
 ## 2026-11-21
 

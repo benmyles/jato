@@ -19,4 +19,4 @@
 
 - [x] Shorten content verification on the last link while respecting Cargo's job limit.
 - [x] Reduce repeated store work on small artifacts and closely spaced saves.
-- [ ] Compare against the installed 0.2 release and peers, and qualify the installed update.
+- [x] Compare against the installed 0.2 release and peers, and qualify the installed update.
