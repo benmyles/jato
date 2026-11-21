@@ -15,6 +15,8 @@ These measurements compare Jato 0.2.0, the locally installed kache 2.1.1, upstre
 
 Jato's warm release samples ranged from 275 to 282 ms. kache's ranged from 241 to 351 ms. Two of three head-to-head release trials favored Jato. First builds favored kache for check and sccache for release. Machine load varied, especially during cold compiles. Each tool counts compiler work differently. Individual timings and tool-reported hits are in the [raw measurements](ripgrep-0.2.json).
 
+In a separate functional run, all 299 tests in ripgrep's upstream integration suite passed against the restored Rust 1.100 release executable. The suite also passed on a cold and a clean-target warm build using Rust 1.89.
+
 ### Release cache space and memory
 
 | Release workload | Store file lengths | Btrfs exclusive extents | Idle cache server RSS |
