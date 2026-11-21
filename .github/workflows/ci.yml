@@ -23,5 +23,5 @@ jobs:
           JATO_TEST_NATIVE_HITS: "1"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y strace
+          sudo apt-get install -y strace bubblewrap
           cargo +${{ matrix.rust }} test --locked

@@ -107,7 +107,7 @@ The compiler counters cover invocations that reach the wrapper after Cargo's fre
 
 Packed writes hash frames before compression and can reuse previously compressed frames across revisions. `packed_reused_bytes` in `jato stats --json` counts raw bytes whose compression was skipped by successful publications. Ordered frame descriptors share the bounded staging spool with new payloads. Distinct digest sets beyond 1,024 entries spill to a private temporary SQLite index. [SQLite temporary databases](https://www.sqlite.org/inmemorydb.html#temporary_databases)
 
-Jato 0.4 reads existing 0.3 entries and uses the same storage schema. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
+Jato 0.4 upgrades existing 0.3 caches in place. It uses the existing file and frame indexes to reclaim chunks when the last user disappears. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
 
 ## What can be reused
 

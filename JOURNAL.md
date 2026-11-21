@@ -12,6 +12,9 @@
 
 - Added a concurrent Cargo build with two different generated sources sharing one global target, a projected watch/interrupt regression, and a host ownership reply test. All 40 tests passed with native hits, sealed storage and worktree support required on Rust 1.89 and 1.100.
 
+- Avoided validating the native link closure twice when a checkout’s module directories change. Across seven alternating ripgrep pairs, the median fell from 319 ms to 289 ms. All 299 upstream integration tests passed against the restored executable.
+- Profiling 192 shared 256 KiB chunks exposed SQLite rewriting payload pages just to increment a reference count. Switched reclamation to the existing indexed single-file and ordered-frame references. Tested both deletion orders and a live schema upgrade without rewriting payloads.
+
 ## 2026-11-21 — profiling the 0.2 release
 
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.

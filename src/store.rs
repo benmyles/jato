@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -257,6 +257,11 @@ impl Store {
                         "ALTER TABLE plans ADD COLUMN manifest INTEGER REFERENCES manifests",
                     )?;
                 }
+                if version != 0 {
+                    tx.execute_batch(
+                        "DROP TRIGGER IF EXISTS drop_single; DROP TRIGGER IF EXISTS drop_part;",
+                    )?;
+                }
                 tx.execute_batch(SCHEMA)?;
                 tx.commit()?;
             }
@@ -420,6 +425,16 @@ impl Store {
             .conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM source_variants WHERE digest=?1)")?
             .query_row([digest], |r| r.get(0))?)
+    }
+
+    pub fn has_source_topology(&self, sources: &Digest, topology: &Digest) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM source_variants s JOIN plans p ON p.entry=s.entry
+             WHERE s.digest=?1 AND p.topology=?2)",
+            )?
+            .query_row(params![sources, topology], |r| r.get(0))?)
     }
 
     pub fn topology(&self, key: &Digest) -> Result<Option<Digest>> {
@@ -979,6 +994,77 @@ mod tests {
             assert_eq!(fs::read(&files[1])?, archive);
             assert_eq!(fs::read(&files[0])?, meta);
         }
+        store.prune(0)?;
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_payloads_survive_both_reference_kinds_without_blob_updates() -> Result<()> {
+        for remove_single_first in [true, false] {
+            let root = tempfile::tempdir()?;
+            let dir = root.path().join("cache");
+            let path = root.path().join("output");
+            let files = std::slice::from_ref(&path);
+            let raw = vec![11; CHUNK];
+            let mut store = Store::at(dir.clone(), 4 << 20)?;
+            fs::write(&path, &raw)?;
+            assert!(store.save(&[0; 32], &[1; 32], files, b"", 1, None)?);
+            store.conn.execute_batch("CREATE TRIGGER reject_payload_update BEFORE UPDATE ON chunks BEGIN SELECT RAISE(ABORT,'immutable chunk updated'); END;")?;
+            let double = raw.repeat(2);
+            fs::write(&path, &double)?;
+            assert!(store.save(&[0; 32], &[2; 32], files, b"", 1, None)?);
+            // The migration replaces reclamation triggers without reading or
+            // rewriting payloads. A v10 reader could still have written refs.
+            store.conn.execute_batch("PRAGMA user_version=10")?;
+            drop(store);
+            let mut store = Store::at(dir, 4 << 20)?;
+            let (evicted, kept, expected) = if remove_single_first {
+                (1u8, 2u8, &double)
+            } else {
+                (2u8, 1u8, &raw)
+            };
+            store
+                .conn
+                .execute("DELETE FROM entries WHERE key=?1", [[evicted; 32]])?;
+            assert_eq!(store.stats()?.chunks, 1);
+            assert!(store.restore(&[kept; 32], files)?.is_some());
+            assert_eq!(&fs::read(&path)?, expected);
+            store.prune(0)?;
+            assert_eq!(store.stats()?.charged_bytes, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "streams two 272 MiB artifacts for packed I/O qualification"]
+    fn large_packed_revision_spills_and_restores_exact_bytes() -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        const FRAMES: u64 = 1088;
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("large");
+        let mut store = Store::at(root.path().join("cache"), 8 << 20)?;
+        let file = File::create(&path)?;
+        file.set_len(FRAMES * CHUNK as u64)?;
+        for i in 0..FRAMES {
+            file.write_all_at(&i.to_le_bytes(), i * CHUNK as u64)?;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(File::open(&path)?)?;
+        let expected = hasher.finalize();
+        let outputs = std::slice::from_ref(&path);
+        assert!(store.save(&[0; 32], &[1; 32], outputs, b"", 1, None)?);
+        file.write_all_at(b"revision", 7)?;
+        assert!(store.save(&[0; 32], &[2; 32], outputs, b"", 1, None)?);
+        drop(file);
+        assert_eq!(
+            store.stats()?.counters["packed_reused_bytes"],
+            (FRAMES - 1) * CHUNK as u64
+        );
+        assert_eq!(store.stats()?.chunks, FRAMES + 1);
+        assert!(store.restore(&[1; 32], outputs)?.is_some());
+        hasher.reset().update_reader(File::open(&path)?)?;
+        assert_eq!(hasher.finalize(), expected);
         store.prune(0)?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         Ok(())

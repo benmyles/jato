@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS files(
     size INTEGER NOT NULL, mode INTEGER NOT NULL, single INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(entry,slot)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS artifacts ON files(digest);
+-- Keep the legacy refs column for existing databases. The files and parts
+-- indexes identify live users without dirtying a compressed payload.
 CREATE TABLE IF NOT EXISTS chunks(
     hash BLOB PRIMARY KEY, raw INTEGER NOT NULL, data BLOB NOT NULL, refs INTEGER NOT NULL
 ) WITHOUT ROWID;
@@ -33,8 +35,9 @@ CREATE TRIGGER IF NOT EXISTS drop_file AFTER DELETE ON files BEGIN
     UPDATE usage SET bytes=bytes-128;
 END;
 CREATE TRIGGER IF NOT EXISTS drop_single AFTER DELETE ON files WHEN OLD.single=1 BEGIN
-    UPDATE chunks SET refs=refs-1 WHERE hash=OLD.digest;
-    DELETE FROM chunks WHERE hash=OLD.digest AND refs=0;
+    DELETE FROM chunks WHERE hash=OLD.digest
+        AND NOT EXISTS(SELECT 1 FROM files WHERE digest=OLD.digest AND single=1)
+        AND NOT EXISTS(SELECT 1 FROM parts WHERE chunk=OLD.digest);
 END;
 CREATE TRIGGER IF NOT EXISTS add_chunk AFTER INSERT ON chunks BEGIN
     UPDATE usage SET bytes=bytes+96+length(NEW.data);
@@ -47,8 +50,9 @@ CREATE TRIGGER IF NOT EXISTS add_part AFTER INSERT ON parts BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS drop_part AFTER DELETE ON parts BEGIN
     UPDATE usage SET bytes=bytes-96;
-    UPDATE chunks SET refs=refs-1 WHERE hash=OLD.chunk;
-    DELETE FROM chunks WHERE hash=OLD.chunk AND refs=0;
+    DELETE FROM chunks WHERE hash=OLD.chunk
+        AND NOT EXISTS(SELECT 1 FROM files WHERE digest=OLD.chunk AND single=1)
+        AND NOT EXISTS(SELECT 1 FROM parts WHERE chunk=OLD.chunk);
 END;
 CREATE TABLE IF NOT EXISTS manifests(
     id INTEGER PRIMARY KEY, hash BLOB NOT NULL UNIQUE, data BLOB NOT NULL, refs INTEGER NOT NULL
@@ -109,4 +113,4 @@ CREATE INDEX IF NOT EXISTS source_keys ON source_variants(digest);
 CREATE TRIGGER IF NOT EXISTS add_variant AFTER INSERT ON source_variants BEGIN UPDATE usage SET bytes=bytes+96; END;
 CREATE TRIGGER IF NOT EXISTS drop_variant AFTER DELETE ON source_variants BEGIN UPDATE usage SET bytes=bytes-96; END;
 CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY,last_run INTEGER NOT NULL) WITHOUT ROWID;
-PRAGMA user_version=10;
+PRAGMA user_version=11;

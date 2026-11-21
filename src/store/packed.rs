@@ -12,8 +12,7 @@ use std::path::Path;
 const MEMORY_DIGESTS: usize = 1024;
 const EXISTING: u32 = u32::MAX;
 const PROBE_MIN: usize = 16 * 1024;
-const INSERT_CHUNK: &str =
-    "INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1";
+const INSERT_CHUNK: &str = "INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO NOTHING";
 
 // Preserve exact standalone admission accounting even when several GiB of
 // frames repeat in a different order. Only large distinct sets spill.
@@ -144,15 +143,16 @@ impl Recorder {
         let tag = u32::from_le_bytes(header[36..].try_into()?);
         ensure!(raw > 0 && raw <= buffer.len(), "invalid staged raw frame");
         let bytes = match tag {
-            0 | EXISTING => {
+            // A previous frame of this entry published the same hash in
+            // this transaction. Its ordered reference already owns the bytes.
+            0 => return Ok((digest, raw as u64)),
+            EXISTING => {
                 if tx
-                    .prepare_cached("UPDATE chunks SET refs=refs+1 WHERE hash=?1 AND raw=?2")?
-                    .execute(params![&digest, raw])?
-                    == 1
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM chunks WHERE hash=?1 AND raw=?2)")?
+                    .query_row(params![&digest, raw], |r| r.get::<_, bool>(0))?
                 {
                     return Ok((digest, raw as u64));
                 }
-                ensure!(tag == EXISTING, "missing earlier packed chunk");
                 // A GC or a concurrent writer evicted it between the probe
                 // and this write transaction. Recover only the original bytes.
                 let file = match source {
@@ -221,11 +221,7 @@ mod tests {
                 assert_eq!(recovered?, (hash, CHUNK as u64));
                 assert_eq!(record.reused, 0);
                 record.publish(&tx, &path, &mut source, CHUNK as u64, &mut buffer)?;
-                let (refs, data): (u32, Vec<u8>) =
-                    tx.query_row("SELECT refs,data FROM chunks", [], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })?;
-                assert_eq!(refs, 2);
+                let data: Vec<u8> = tx.query_row("SELECT data FROM chunks", [], |r| r.get(0))?;
                 assert_eq!(zstd::bulk::decompress(&data, CHUNK)?, raw);
             }
             tx.rollback()?;

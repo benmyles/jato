@@ -48,6 +48,8 @@ fn discover(
     }
     let start = SystemTime::now();
     let mut externs = None;
+    let projected_link = inv.observe_native
+        && env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1"));
     for encoded in plans {
         let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
         if inv.observe_native && plan.native.is_none() {
@@ -62,12 +64,26 @@ fn discover(
             continue;
         }
         let sources_checked = Instant::now();
+        let early = projected_link.then(|| inputs.topology(start)).transpose()?;
+        if let Some(current) = &early
+            && !store.has_source_topology(&inputs.sources, current)?
+        {
+            // A copied checkout needs fresh module resolution. Do it before
+            // reading the link closure, so even a large binary is hashed once.
+            if let Some(hit) = rediscover(store, compiler, inv, recipe, start, None, plan)? {
+                return Ok(Some(hit));
+            }
+            continue;
+        }
         let externs = match &externs {
             Some(key) => key,
             None => externs.insert(fingerprint::externs(inv, start, store, false)?.key),
         };
         let externs_checked = Instant::now();
-        let current = inputs.topology(start)?;
+        let current = match early {
+            Some(current) => current,
+            None => inputs.topology(start)?,
+        };
         let key = match inputs.key(&plan, recipe, inv, start, externs) {
             Ok(key) => key,
             Err(error) => {
@@ -95,12 +111,10 @@ fn discover(
         }
         // Familiar bytes with a changed module search directory need fresh
         // name resolution. Ordinary edits go directly to the actual compiler.
-        if plan.native.is_some()
-            && env::var_os("JATO_WORKTREE_ACTIVE").as_deref() != Some(OsStr::new("1"))
-        {
+        if plan.native.is_some() && !projected_link {
             continue;
         }
-        return rediscover(store, compiler, inv, recipe, start, externs, plan);
+        return rediscover(store, compiler, inv, recipe, start, Some(externs), plan);
     }
     trace(
         &inv.name,
@@ -115,7 +129,7 @@ fn rediscover(
     inv: &Invocation,
     recipe: &fingerprint::Recipe,
     start: SystemTime,
-    externs: &Digest,
+    externs: Option<&Digest>,
     recorded: fingerprint::Plan,
 ) -> Result<Option<Hit>> {
     let _ = store.count("discovery_probe", 1);
@@ -140,6 +154,14 @@ fn rediscover(
     }
     let inputs = plan.inputs(recipe, inv, start, false)?;
     let topology = inputs.topology(start)?;
+    let checked;
+    let externs = match externs {
+        Some(digest) => digest,
+        None => {
+            checked = fingerprint::externs(inv, start, store, false)?.key;
+            &checked
+        }
+    };
     let key = inputs.key(&plan, recipe, inv, start, externs)?;
     let restored = store.materialize(&key, &inv.outputs)?;
     if restored.is_some() {
