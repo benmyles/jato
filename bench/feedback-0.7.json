@@ -1,0 +1,40 @@
+{
+  "runs": 11,
+  "debounce_ms": null,
+  "save_to_diagnostic_ms": [
+    57.5,
+    63.1,
+    63.1,
+    60.1,
+    60.6,
+    61.7,
+    49.9,
+    61.0,
+    85.4,
+    80.5,
+    82.2
+  ],
+  "fix_to_workspace_green_ms": [
+    65.1,
+    60.0,
+    60.2,
+    65.0,
+    63.5,
+    63.2,
+    61.6,
+    71.9,
+    109.7,
+    115.4,
+    111.7
+  ],
+  "median_diagnostic_ms": 61.7,
+  "median_workspace_green_ms": 65.0,
+  "idle_watch_rss_kib": 4376,
+  "worktree": false,
+  "fast_profile": false,
+  "idle_tree_pss_kib": 2067,
+  "watched_leaf_directories": 0,
+  "start_to_watching_ms": 14.6,
+  "added_subtree_to_workspace_green_ms": [],
+  "median_subtree_ms": null
+}

@@ -8,88 +8,88 @@
       "version": "jato 0.7.0",
       "cold_packed": {
         "anonymous_staging_bytes_written": 0,
-        "sqlite_bytes_written": 70716968,
-        "compressed_payload_bytes": 34049094
+        "sqlite_bytes_written": 70745544,
+        "compressed_payload_bytes": 34049095
       },
       "builds": [
         {
-          "seconds": 2.183211,
-          "native_store_us": 55323
+          "seconds": 1.638923,
+          "native_store_us": 64532
         },
         {
-          "seconds": 0.33795,
-          "native_store_us": 10706
+          "seconds": 0.61664,
+          "native_store_us": 13358
         },
         {
-          "seconds": 0.353215,
-          "native_store_us": 10959
+          "seconds": 0.771896,
+          "native_store_us": 21569
         },
         {
-          "seconds": 0.288838,
-          "native_store_us": 11013
+          "seconds": 0.972899,
+          "native_store_us": 12476
         },
         {
-          "seconds": 0.404059,
-          "native_store_us": 11301
+          "seconds": 0.504037,
+          "native_store_us": 11923
         },
         {
-          "seconds": 0.371262,
-          "native_store_us": 12667
+          "seconds": 0.488367,
+          "native_store_us": 13074
         },
         {
-          "seconds": 0.329798,
-          "native_store_us": 12076
+          "seconds": 0.516474,
+          "native_store_us": 11928
         },
         {
-          "seconds": 0.415004,
-          "native_store_us": 12234
+          "seconds": 0.391349,
+          "native_store_us": 12131
         }
       ],
       "executable_sha256": "740a7de753a5d4644686afdb6697cfce4656a7964b626134636d6b183d719d51",
       "executable_bytes": 34009880,
       "sealed_reused_bytes": 238069160,
       "sealed_objects": 3,
-      "median_edit_seconds": 0.353215,
+      "median_edit_seconds": 0.516474,
       "restore_hits": 2
     },
     "previous_jato": {
       "version": "jato 0.6.0",
       "cold_packed": {
         "anonymous_staging_bytes_written": 34072742,
-        "sqlite_bytes_written": 70753736,
+        "sqlite_bytes_written": 70786504,
         "compressed_payload_bytes": 34049102
       },
       "builds": [
         {
-          "seconds": 1.349465
+          "seconds": 1.899531
         },
         {
-          "seconds": 0.346226
+          "seconds": 0.622965
         },
         {
-          "seconds": 0.304233
+          "seconds": 0.699547
         },
         {
-          "seconds": 0.312654
+          "seconds": 0.640012
         },
         {
-          "seconds": 0.55315
+          "seconds": 0.616701
         },
         {
-          "seconds": 0.402829
+          "seconds": 1.125917
         },
         {
-          "seconds": 0.407181
+          "seconds": 0.511903
         },
         {
-          "seconds": 0.458985
+          "seconds": 0.36237
         }
       ],
       "executable_sha256": "740a7de753a5d4644686afdb6697cfce4656a7964b626134636d6b183d719d51",
       "executable_bytes": 34009880,
       "sealed_reused_bytes": 0,
       "sealed_objects": 3,
-      "median_edit_seconds": 0.402829,
+      "median_edit_seconds": 0.622965,
       "restore_hits": 2
     }
   }

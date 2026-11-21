@@ -2,7 +2,7 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-Jato 0.6 restores an earlier executable when you undo an edit in a live incremental build. In seven ripgrep dev-profile trials, an undo took **161 ms** with Jato, **270 ms** with kache, and **604 ms** with sccache. After eight revisions inserting bytes into a 16 MiB embedded asset, Jato’s packed store occupied **23.0 MiB** of files. kache and sccache each retained about **384 MiB**. The benchmark report includes cold builds, new edits, cache I/O and the commands to reproduce each result. [Measurements and reproduction](bench/README.md)
+Jato 0.7 adds `jato dev` for fast first builds. Across three ripgrep cold builds per profile, Jato took **8.52 s** with the fast profile and **17.15 s** with ordinary dev. Across seven live fast-profile edits, an undo took **83 ms** with Jato, **183 ms** with kache and **485 ms** with sccache. The report includes identical-profile comparisons, fresh targets, new edits, memory and storage. [Measurements and reproduction](bench/README.md)
 
 ## Get started
 
@@ -29,7 +29,7 @@ The first compilation populates the cache. Cargo continues to skip fresh units a
 
 Use `jato dev` to build, `jato dev run` to start the application, or `jato dev test` to run its tests. `jato dev watch` uses the same profile for focused and workspace checks. For separate checkouts, use `jato dev worktree --root . run`.
 
-These commands select the Cargo profile `jato-dev`, which inherits the project’s `dev` profile. It uses 16 codegen units, emits line tables for workspace members, and requests no debug information for dependencies outside the workspace. Workspace backtraces retain source locations. Inspecting local variables in a debugger calls for a profile with full debug information, such as an ordinary `jato build` with Cargo’s defaults. Cargo writes the new profile to `target/jato-dev` and keeps its own incremental state there. Explicit `--profile` and `--release` options take precedence. [Cargo profiles and package overrides](https://doc.rust-lang.org/cargo/reference/profiles.html)
+These commands select the Cargo profile `jato-dev`, which inherits the project’s `dev` profile. It uses 16 codegen units, emits line tables for workspace members, and requests no debug information for dependencies outside the workspace. Workspace backtraces retain source locations. Inspecting local variables in a debugger calls for a profile with full debug information, such as an ordinary `jato build` with Cargo’s defaults. Cargo writes the new profile to `target/jato-dev` and keeps its own incremental state there. Keeping both profiles retains both sets of Cargo outputs. Use `jato dev cargo clean` to clear the fast profile. Explicit `--profile` and `--release` options take precedence. [Cargo profiles and package overrides](https://doc.rust-lang.org/cargo/reference/profiles.html)
 
 If `cc` on your PATH is a compiler launcher, choose the system C driver for a project that supports it. The option applies to this Cargo process.
 

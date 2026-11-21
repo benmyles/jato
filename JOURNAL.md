@@ -10,6 +10,8 @@
 - Traced the installed release on a cold 32 MiB packed asset. Anonymous staging writes fell from 34,072,742 bytes to zero. Seven byte-identical executable captures reused 238,069,160 bytes of authenticated objects. Downstream executables checked all embedded bytes, and both tools restored their originals.
 - Passed 55 tests on Rust 1.89 and 1.100 with native, sealed and worktree reuse required, plus the separate 272 MiB spill test. A migrated 0.6 release and a newly populated jato-dev cache each restored 39 ripgrep units in another checkout and passed all 299 upstream integration tests. Historical storage schemas reclaimed all charged bytes after GC.
 - Tested two distinct sealed artifacts with equal lengths and equal sampled bytes. A capture now looks up the exact object by full digest across size collisions. Confirmed that projected development builds accept ordinary build flags when the action is omitted.
+- The installed fast profile rebuilt ripgrep in 190 ms from a clean target, versus 583 ms with kache and 3.16 s with sccache using the same profile. Seven live undos took a median 83 ms, 183 ms and 485 ms respectively. All seven Jato undos used zero discovery probes.
+- kache led fast-profile cold builds at 7.12 s, followed by Jato at 8.52 s. Additional alternating ordinary-profile trials measured 24.44 CPU-seconds with 0.7 and 24.70 with 0.6. The report includes cold variability, the ordinary release control, all observed regressions, resource measurements and reproduction commands.
 
 ## 2026-11-21 — live incremental replay and shifted artifacts
 

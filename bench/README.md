@@ -1,112 +1,93 @@
-# Jato 0.6 measurements
+# Jato 0.7 measurements
 
-These tests ran the locally installed Jato 0.6.0 and compared it with Jato 0.5.0, upstream kache 2.2.0, upstream sccache 0.19.0 and Cargo without a wrapper. The machine was a shared Intel Core Ultra 7 356H running Fedora 45, Linux 7.3.4, Rust 1.100.0 and compressed Btrfs. Times include Cargo. Each tool had a private store and target, and the peer daemons had private sockets. Runs used four Cargo jobs unless indicated. [Previous release and concurrent-build results](0.5.md) · [kache release](https://github.com/kunobi-ninja/kache/releases/tag/v2.2.0) · [sccache release](https://github.com/mozilla/sccache/releases/tag/v0.19.0)
+The installed Jato 0.7.0, Jato 0.6.0, upstream kache 2.2.0, upstream sccache 0.19.0 and bare Cargo built ripgrep 14.1.1 on a shared Intel Core Ultra 7 356H. The workstation ran Fedora 45, Linux 7.3.4, Rust 1.100.0 and compressed Btrfs. Cargo had four jobs. Each contender used private cache state and each peer daemon had a private socket. [0.6 report and packed-storage comparisons](0.6.md) · [kache release](https://github.com/kunobi-ninja/kache/releases/tag/v2.2.0) · [sccache release](https://github.com/mozilla/sccache/releases/tag/v0.19.0)
 
-## Edits in a live incremental session
+## Cold builds, fresh targets and restores
 
-The harness builds revision A, runs Cargo again with the target fresh, then makes seven distinct edits and seven undos to A. It saves the source by rename, keeps each target and its incremental state, and rotates contender order each round. A branch in the application prints a different value for each revision. The harness executes every binary and checks the value outside the timer. The timings below are medians for edits and undos. Cold and fresh builds are single observations per contender.
+The two profiles use the same sources, target paths and toolchain. Every contender in the fast-profile group receives the settings used by the actual `jato dev build` command. The trials shared prefetched registry sources and the host’s filesystem page cache. Each trial starts with an empty store and target, runs the resulting `rg`, clears the target, rebuilds, runs `rg` again, and times a third build with Cargo's target already fresh. Contender order rotates. Times are medians of three trials per profile and contender.
 
-| ripgrep 14.1.1, dev profile | Jato 0.6 | Jato 0.5 | kache | sccache | Bare Cargo |
+| ripgrep with the jato-dev profile | Jato 0.7 | Jato 0.6 | kache | sccache | Bare Cargo |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Cold build | 11.05 s | 9.65 s | 6.74 s | 7.14 s | 8.83 s |
-| Fresh target | 39 ms | 43 ms | 83 ms | 64 ms | 62 ms |
-| New edit | 553 ms | 688 ms | 2.84 s | 566 ms | 578 ms |
-| Undo | **161 ms** | 591 ms | 270 ms | 604 ms | 606 ms |
+| Cold build | 8.52 s | 15.88 s | 7.12 s | 14.31 s | 7.51 s |
+| Clean-target rebuild | 190 ms | 220 ms | 583 ms | 3.16 s | 6.32 s |
+| Fresh target | 43 ms | 44 ms | 101 ms | 87 ms | 57 ms |
+| Store file lengths | 108.4 MiB | 108.4 MiB | 109.3 MiB | 23.6 MiB | — |
 
-Jato restored all seven undos from the executable recorded during the first build. rustc compiled each new edit with the live incremental state. kache also reported seven undo hits. The cold build includes recording and validating the first outputs. [ripgrep samples and hit counters](dev-ripgrep-0.6.json)
-
-| Locked regex application, dev profile | Jato 0.6 | Jato 0.5 | kache | sccache | Bare Cargo |
+| ripgrep with Cargo’s ordinary dev profile | Jato 0.7 | Jato 0.6 | kache | sccache | Bare Cargo |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Cold build | 9.12 s | 7.04 s | 3.29 s | 4.70 s | 4.63 s |
-| Fresh target | 26 ms | 35 ms | 66 ms | 48 ms | 44 ms |
-| New edit | 213 ms | 212 ms | 629 ms | 266 ms | 238 ms |
-| Undo | **74 ms** | 209 ms | 193 ms | 252 ms | 221 ms |
+| Cold build | 17.15 s | 12.93 s | 11.60 s | 10.91 s | 9.64 s |
+| Clean-target rebuild | 213 ms | 207 ms | 523 ms | 4.46 s | 9.10 s |
+| Fresh target | 42 ms | 40 ms | 109 ms | 70 ms | 59 ms |
+| Store file lengths | 204.2 MiB | 204.2 MiB | 203.5 MiB | 32.2 MiB | — |
 
-Both Jato releases had similar new-edit latency on the smaller application. On this machine the 0.6 executable restore took 38% of kache’s undo time and 29% of sccache’s. [Regex samples and hit counters](dev-regex-0.6.json)
+Jato recorded 39 compiler hits in each fast-profile clean rebuild. Peak RSS of the largest process in Jato 0.7’s timed cold command went from 351 MiB to 322 MiB across the two profiles. The local store includes sealed files that can share extents with the Cargo target. Host load varied. The three Jato 0.7 cold observations spanned 8.64–29.82 s with ordinary dev and 6.41–12.00 s with the fast profile. The raw samples include every contender. [Cold trials, RSS and Btrfs extent counts](dev-profiles-ripgrep-0.7.json)
 
-## Error feedback with a large tracked input
+Four additional ordinary-dev cold runs per Jato version alternated with private empty stores. Jato 0.7 took 9.60 s and 24.44 CPU-seconds for the Cargo process tree. Jato 0.6 took 11.10 s and 24.70 CPU-seconds. [Alternating cold controls and CPU totals](cold-cpu-0.7.json)
 
-A dependency-free library includes a 64 MiB file. It builds successfully once. An edit to its Rust source then introduces a compile error. Both versions returned Cargo’s failure status and the expected compiler diagnostic. The benchmark uses one Cargo job, alternates nine untraced edits, and traces a separate check per version to count only the wrapper’s reads of the asset.
+The profile choice came from three rotating cold builds per configuration using the 0.6 engine. In the same named profile with otherwise inherited defaults, ripgrep took a median 12.77 s and produced 205 MiB of tracked artifacts. Using 16 codegen units and line tables throughout gave 8.26 s and 146 MiB. Omitting debug data for non-workspace dependencies gave 7.49 s and 109 MiB. Workspace code retains line tables for backtraces. Applications that need full variable debugging can use their ordinary Cargo profile. [Profile selection trials](profile-selection-0.7.json) · [Cargo profile settings](https://doc.rust-lang.org/cargo/reference/profiles.html)
 
-| Failed release check | Jato 0.6 | Jato 0.5 |
+## Live editor saves
+
+The harness changes ripgrep’s entry point by atomic rename, makes seven different edits and returns to the original revision after each edit. Each program prints its expected revision after each build. All contenders keep their previous target and receive the same profile settings within a group. The table gives end-to-end medians.
+
+| ripgrep live builds | Jato 0.7 | Jato 0.6 | kache | sccache | Bare Cargo |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cargo dev, new edit | 579 ms | 579 ms | 2.49 s | 531 ms | 635 ms |
+| Cargo dev, undo | 88 ms | 155 ms | 250 ms | 534 ms | 526 ms |
+| jato-dev, new edit | 482 ms | 489 ms | 1.64 s | 493 ms | 491 ms |
+| jato-dev, undo | 83 ms | 139 ms | 183 ms | 485 ms | 501 ms |
+
+Jato 0.7 recorded seven verified live hits and zero rustc module-discovery probes for the seven undos in each profile. Jato 0.6 recorded seven hits and seven probes in each. The checked directory layout allows an atomic replacement of a fully verified source. Adding a competing module in an integration test still produced the expected compiler error. [Ordinary dev edits](dev-ripgrep-0.7.json) · [Fast-profile edits](fast-dev-ripgrep-0.7.json)
+
+## Recording large outputs
+
+A fresh release library embeds 32 MiB of deterministic incompressible data. A separate Linux syscall trace identifies the compiler wrapper by executable and crate name. It sums successful writes to the private store’s anonymous staging files and to the SQLite database and WAL. Both versions recorded the library.
+
+| Cold packed capture, bytes written by the wrapper | Jato 0.7 | Jato 0.6 |
 | --- | ---: | ---: |
-| Asset bytes read by the wrapper | **3,072** | 67,108,864 |
-| End-to-end median | **385 ms** | 438 ms |
+| Anonymous staging files | 0 | 34,072,742 |
+| SQLite database and WAL | 70,745,544 | 70,786,504 |
+| Compressed payload retained | 34,049,095 | 34,049,102 |
 
-rustc still processes its own inputs. The I/O reduction applies to the cache lookup. An integration test changes a byte outside the sample, verifies the new value came from compilation, and restores the original program after an undo. [Timing and byte counts](input-reads-0.6.json)
+New large raw frames can remain in the compiler output until publication. Jato rechecks each full frame before writing it to the store. SQLite still writes its database and transaction log. This measurement counts file writes and can differ from bytes written by the storage device.
 
-## Storage across artifact revisions
+A second test built a 34,009,880-byte executable and made seven distinct comment edits. The executable's complete SHA-256 stayed constant. Jato 0.7 matched 238,069,160 bytes to existing fs-verity objects. Each build ran a consumer that checked every embedded byte. Both versions restored the original library and executable after clearing their targets. Median end-to-end edit time was 516 ms with 0.7 and 623 ms with 0.6. [Capture timings, hashes and trace counts](capture-0.7.json)
 
-The fixture builds a Rust library that embeds a deterministic, incompressible 16 MiB asset. Seven revisions insert bytes 8 KiB into the asset. For each contender a separate downstream Rust program links every revision and checks every embedded byte. After the target is removed, the first archive must match its original SHA-256 and the consumer runs again. Every tool reported a cache hit on that restore. kache’s original archive had a different digest from the others and restored its own original exactly.
+The eight-revision packed histories retained 21.4 MiB for front insertions, 18.4 MiB for in-place edits and 15.2 MiB for Rust symbol edits in both versions. Each downstream consumer and original archive was verified. The insertion sequence used 1,449,440 Linux filesystem output blocks with 0.7 and 1,459,672 with 0.6. That sequence took 5.28 s and 5.68 s respectively. The zlib and embedded-asset fixtures also executed correctly on clean targets in automatic and packed modes. [Front insertions](insert-history-0.7.json) · [In-place edits](edit-history-0.7.json) · [Symbol changes](symbol-history-0.7.json) · [zlib](zlib-0.7.json) · [Embedded application](embedded-0.7.json)
 
-| Eight insertion revisions | Jato 0.6 packed | Jato 0.5 packed | kache | sccache |
-| --- | ---: | ---: | ---: | ---: |
-| Store file lengths | **23.0 MiB** | 258.2 MiB | 384.2 MiB | 384.1 MiB |
-| Btrfs exclusive extents | 23.0 MiB | 258.2 MiB | 336.3 MiB | 384.1 MiB |
-| Sum of eight Cargo build times | 5.39 s | 6.45 s | 5.13 s | 4.94 s |
-| Clean-target restore | 99 ms | 180 ms | 163 ms | 127 ms |
+## Worktrees and ordinary release builds
 
-File lengths count each store inode once after closing the private daemons. The restored Cargo target was still present. Btrfs reported 48.0 MiB of shared extents in kache’s store. The comparison uses `JATO_STORAGE=packed`. All contenders build the library and run the downstream checks at the same paths. Build and restore times come from one sequence per tool and exclude consumer verification. [All revision samples, hit counts, extent sizes and archive digests](insert-history-0.6.json)
+Three fast-profile trials alternated two physical checkouts of the locked regex application. Every restored program ran and its output was checked. A clean target in the other checkout took a median 102 ms with Jato 0.7, 171 ms with 0.6, 182 ms with kache and 3.44 s with sccache configured with all base directories. [Cold, same-target, new-target and copied-checkout trials](fast-worktrees-0.7.json)
 
-| Packed payload after eight revisions | Jato 0.6 | Jato 0.5 |
-| --- | ---: | ---: |
-| Insert bytes near the beginning of a 16 MiB asset | 21.4 MiB | 256.0 MiB |
-| Change a byte in place in a 16 MiB asset | 18.4 MiB | 37.3 MiB |
-| Change a Rust symbol beside a 4 MiB asset | 15.2 MiB | 90.9 MiB |
-
-Across the insertion builds Jato’s filesystem output fell from 2,927,800 to 1,465,736 Linux output blocks. The in-place and symbol workloads also verified all eight downstream programs and the restored original. [In-place edits](edit-history-0.6.json) · [Symbol edits](symbol-history-0.6.json)
-
-A separate store stress test wrote two revisions of a 272 MiB sparse artifact, spilled its index of distinct chunks to disk, restored the original and checked its digest. The unoptimized test process peaked at 8,396 KiB RSS. The embedded and zlib release fixtures also executed their restored binaries in automatic and packed mode. [Stress-test resource usage](packed-spill-0.6.json) · [Embedded release](embedded-0.6.json) · [zlib release](zlib-0.6.json)
-
-## System files in projected builds
-
-A warm packed ripgrep release restored all 39 compiler units with both versions. Under a private rootless mount, 0.5 made 189 connections to the host to verify system-file ownership. The 0.6 wrappers needed 33. The supervisor can return up to 32 previously authenticated inode identities, and each client checks its actual file's identity before using one. A separate checkout reused the migrated 0.5 cache and the restored binary passed all 299 upstream integration tests. [Connection counts and executable digest](worktree-owners-0.6.json)
-
-## Clean targets and concurrent builds
-
-Five trials alternated the original ripgrep checkout, a new target and another checkout. Jato used its projected worktree mode. sccache received all source and target roots through `SCCACHE_BASEDIRS` before the server started. Every release binary was run with `--version`.
-
-| Median warm ripgrep release | Jato 0.6 | Jato 0.5 | kache | sccache |
-| --- | ---: | ---: | ---: | ---: |
-| Original checkout, clean target | 211 ms | 213 ms | 344 ms | 4.78 s |
-| Original checkout, new target | 207 ms | 214 ms | 379 ms | 15.63 s |
-| Other checkout, empty target | 211 ms | 235 ms | 376 ms | 18.06 s |
-
-The cold priming builds took 39.61 s, 28.02 s, 39.36 s and 18.86 s in table order. These are single observations on the shared machine. Seven alternating trials on ordinary physical paths put 0.6 and 0.5 at 178 ms and 176 ms for a warm release, and 161 ms and 156 ms for a warm check. [Worktree trials, cold builds and hits](worktree-revisits-0.6.json) · [Ordinary-path paired controls](paired-0.6.json)
-
-Two simultaneous clean release builds of the regex application started from one empty store and independent checkouts. Each trial used four jobs per checkout, included the private servers and their descendants in resource accounting, and executed both binaries. The table shows medians over three trials.
-
-| Two cold regex builds | Jato 0.6 | Jato 0.5 | kache | sccache |
-| --- | ---: | ---: | ---: | ---: |
-| Time to both executables | 7.14 s | 7.93 s | 10.38 s | 8.51 s |
-| Total CPU-seconds | 21.78 | 23.55 | 24.62 | 52.08 |
-| Peak sampled process-tree PSS | 380 MiB | 366 MiB | 499 MiB | 820 MiB |
-| Store file lengths | 34.4 MiB | 34.4 MiB | 33.9 MiB | 20.0 MiB |
-
-Jato compiled six units and restored six counterparts in each trial. The recorded Jato 0.6 wall times include a 12.11 s trial. sccache had the smallest store on this workload. [Concurrent timings and memory samples](concurrent-regex-0.6.json)
+Seven alternating ordinary-path clean ripgrep targets took 165 ms for a check and 304 ms for a release build with Jato 0.7. Jato 0.6 took 160 ms and 280 ms. The harness verified the executable after every release build. [Paired ordinary-path controls](paired-0.7.json)
 
 ## Save to compiler feedback
 
-In eleven break/fix cycles on a two-package workspace, `jato watch` delivered the first compiler error in a median 53.1 ms and the next successful full workspace check in 53.9 ms. The idle process tree used 2,265 KiB of PSS. [Watch samples](feedback-0.6.json) · [Large-tree measurements from 0.5](0.5.md#save-to-compiler-feedback)
+Eleven break/fix cycles in a two-package workspace took a median 61.7 ms to the first compiler error and 65.0 ms to a successful workspace check with ordinary watch. With `jato dev watch`, the corresponding medians were 59.3 ms and 62.3 ms. [Ordinary watch](feedback-0.7.json) · [Fast-profile watch](fast-feedback-0.7.json)
+
+## Release qualification
+
+The stable and minimum supported toolchains, Rust 1.100.0 and 1.89.0, each passed 55 tests with native hits, sealed storage and worktree operation required. The separate 272 MiB packed capture/restore stress test passed. Two other checkouts restored all 39 ripgrep compiler units, one from a populated 0.6 packed release cache and one from a new automatic-storage jato-dev cache. Both resulting binaries passed the 299 upstream integration tests. Eviction reclaimed all charged bytes in both stores. [Upstream results and binary digests](upstream-0.7.json)
 
 ## Reproduce
 
-Prefetch locked dependencies, install strace and bubblewrap for native and worktree tests, and place the upstream peer binaries on PATH. The harnesses accept explicit executable paths and a disk-backed scratch directory. Use an unpacked copy of ripgrep from the published source archive. [ripgrep 14.1.1](https://crates.io/crates/ripgrep/14.1.1)
+Prefetch the locked dependencies, install strace and bubblewrap, and put the upstream peer executables on PATH. All harnesses accept a disk-backed `--scratch` directory. The profile comparisons use the published ripgrep source archive. [ripgrep 14.1.1](https://crates.io/crates/ripgrep/14.1.1)
 
 ```sh
-python3 bench/devloop.py --previous-jato /path/to/jato-0.5.0 --runs 7 \
-    --project /path/to/ripgrep-14.1.1 --source crates/core/main.rs --verify-bin rg
-python3 bench/devloop.py --previous-jato /path/to/jato-0.5.0 --runs 7
-python3 bench/input_reads.py --previous-jato /path/to/jato-0.5.0 --runs 9
-python3 bench/history.py --previous-jato /path/to/jato-0.5.0 --variants 8 --insert-asset --kache kache --sccache sccache
-python3 bench/history.py --previous-jato /path/to/jato-0.5.0 --variants 8 --edit-asset
-python3 bench/history.py --previous-jato /path/to/jato-0.5.0 --variants 8
-python3 bench/worktrees.py --tools worktree kache sccache_basedirs --previous-worktree /path/to/jato-0.5.0 \
-    --project /path/to/ripgrep-14.1.1 --verify-bin rg --revisit --runs 5
-python3 bench/compare.py --offline --previous-jato /path/to/jato-0.5.0 --paired-restores 7 \
-    --project /path/to/ripgrep-14.1.1 --verify-bin rg
-python3 bench/concurrent.py --previous-jato /path/to/jato-0.5.0 --copies 2 --jobs 4 --runs 3
+python3 bench/compare.py --offline --previous-jato /path/to/jato-0.6.0 \
+    --project /path/to/ripgrep-14.1.1 --verify-bin rg --workloads dev jato-dev --runs 3
+python3 bench/devloop.py --previous-jato /path/to/jato-0.6.0 --profile dev \
+    --project /path/to/ripgrep-14.1.1 --source crates/core/main.rs --verify-bin rg --runs 7
+python3 bench/devloop.py --previous-jato /path/to/jato-0.6.0 --profile jato-dev \
+    --project /path/to/ripgrep-14.1.1 --source crates/core/main.rs --verify-bin rg --runs 7
+python3 bench/capture.py --previous-jato /path/to/jato-0.6.0 --mib 32 --runs 7
+python3 bench/history.py --previous-jato /path/to/jato-0.6.0 --variants 8 --insert-asset
+python3 bench/compare.py --offline --tools jato --previous-jato /path/to/jato-0.6.0 \
+    --project /path/to/ripgrep-14.1.1 --verify-bin rg --workloads dev --runs 4
+python3 bench/compare.py --offline --previous-jato /path/to/jato-0.6.0 \
+    --project /path/to/ripgrep-14.1.1 --verify-bin rg --paired-restores 7
+python3 bench/worktrees.py --mode jato-dev --tools worktree kache sccache_basedirs --revisit --runs 3 \
+    --previous-worktree /path/to/jato-0.6.0
 python3 bench/feedback.py --runs 11
+python3 bench/feedback.py --dev --runs 11
 ```
-
-To count host connections separately from build latency, prime a projected release, run `jato worktree --root . cargo clean`, then run `strace -f -qq -e trace=connect -o owners.trace jato worktree --root . --system-linker build --release --locked -q`. Count lines containing `jato-view-` and check the difference in compiler hits with `jato stats --json`.

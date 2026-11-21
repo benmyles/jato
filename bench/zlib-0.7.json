@@ -12,41 +12,47 @@
     "jato": {
       "release": [
         {
-          "cold": 6.28121,
-          "cold_peak_process_rss_kib": 218464,
-          "warm": 0.18747,
-          "warm_peak_process_rss_kib": 29992,
-          "fresh": 0.04708,
-          "fresh_peak_process_rss_kib": 20520,
+          "cold": 2.90442,
+          "cold_peak_process_rss_kib": 217984,
+          "cold_cpu_seconds": 3.91,
+          "warm": 0.14327,
+          "warm_peak_process_rss_kib": 30056,
+          "warm_cpu_seconds": 0.17,
+          "fresh": 0.02471,
+          "fresh_peak_process_rss_kib": 20584,
+          "fresh_cpu_seconds": 0.01,
           "idle_server_rss_kib": 0,
           "sealed_bytes": 12421082,
-          "packed_bytes": 374868,
+          "packed_bytes": 374811,
           "probe_hits": 7,
           "hits": 12,
           "store_bytes": 14026714,
           "btrfs_total": 14020608,
           "btrfs_exclusive": 1605632,
-          "btrfs_set_shared": 12124160
+          "btrfs_set_shared": 12021760
         }
       ]
     },
     "jato_packed": {
       "release": [
         {
-          "cold": 2.79293,
-          "cold_peak_process_rss_kib": 215848,
-          "warm": 0.36109,
-          "warm_peak_process_rss_kib": 30056,
-          "fresh": 0.03052,
-          "fresh_peak_process_rss_kib": 20464,
+          "cold": 1.91302,
+          "cold_peak_process_rss_kib": 219824,
+          "cold_cpu_seconds": 3.41,
+          "warm": 0.23437,
+          "warm_peak_process_rss_kib": 30148,
+          "warm_cpu_seconds": 0.25,
+          "fresh": 0.02653,
+          "fresh_peak_process_rss_kib": 20672,
+          "fresh_cpu_seconds": 0.02,
           "idle_server_rss_kib": 0,
           "sealed_bytes": 0,
-          "packed_bytes": 3348907,
+          "packed_bytes": 3348880,
           "probe_hits": 7,
           "hits": 12,
-          "store_bytes": 4771840,
-          "btrfs_total": 4771840,
-          "btrfs_exclusive": 4771840,
+          "store_bytes": 4767744,
+          "btrfs_total": 4767744,
+          "btrfs_exclusive": 4767744,
           "btrfs_set_shared": 0
         }
       ]
@@ -55,39 +61,45 @@
   "median": {
     "jato": {
       "release": {
-        "cold": 6.28121,
-        "cold_peak_process_rss_kib": 218464,
-        "warm": 0.18747,
-        "warm_peak_process_rss_kib": 29992,
-        "fresh": 0.04708,
-        "fresh_peak_process_rss_kib": 20520,
+        "cold": 2.90442,
+        "cold_peak_process_rss_kib": 217984,
+        "cold_cpu_seconds": 3.91,
+        "warm": 0.14327,
+        "warm_peak_process_rss_kib": 30056,
+        "warm_cpu_seconds": 0.17,
+        "fresh": 0.02471,
+        "fresh_peak_process_rss_kib": 20584,
+        "fresh_cpu_seconds": 0.01,
         "idle_server_rss_kib": 0,
         "sealed_bytes": 12421082,
-        "packed_bytes": 374868,
+        "packed_bytes": 374811,
         "probe_hits": 7,
         "hits": 12,
         "store_bytes": 14026714,
         "btrfs_total": 14020608,
         "btrfs_exclusive": 1605632,
-        "btrfs_set_shared": 12124160
+        "btrfs_set_shared": 12021760
       }
     },
     "jato_packed": {
       "release": {
-        "cold": 2.79293,
-        "cold_peak_process_rss_kib": 215848,
-        "warm": 0.36109,
-        "warm_peak_process_rss_kib": 30056,
-        "fresh": 0.03052,
-        "fresh_peak_process_rss_kib": 20464,
+        "cold": 1.91302,
+        "cold_peak_process_rss_kib": 219824,
+        "cold_cpu_seconds": 3.41,
+        "warm": 0.23437,
+        "warm_peak_process_rss_kib": 30148,
+        "warm_cpu_seconds": 0.25,
+        "fresh": 0.02653,
+        "fresh_peak_process_rss_kib": 20672,
+        "fresh_cpu_seconds": 0.02,
         "idle_server_rss_kib": 0,
         "sealed_bytes": 0,
-        "packed_bytes": 3348907,
+        "packed_bytes": 3348880,
         "probe_hits": 7,
         "hits": 12,
-        "store_bytes": 4771840,
-        "btrfs_total": 4771840,
-        "btrfs_exclusive": 4771840,
+        "store_bytes": 4767744,
+        "btrfs_total": 4767744,
+        "btrfs_exclusive": 4767744,
         "btrfs_set_shared": 0
       }
     }
