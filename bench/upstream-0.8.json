@@ -1,0 +1,25 @@
+{
+  "upgrade_release": {
+    "restored_rg_sha256": "764646b26e0ea45c9f73c06a55fd2626b4b421355155681fcc510eacfb95ae3d",
+    "compiler_hits": 39,
+    "patches_at_rg_size": 0,
+    "integration_result": "test result: ok. 299 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s",
+    "new_frame_files": 28,
+    "legacy_inline_frames": 166,
+    "charged_after_gc": 0
+  },
+  "current_dev": {
+    "restored_rg_sha256": "d5f91aceba1548e6f27303b309db19b9fcb8125c89496a6fac3608da26067f7f",
+    "compiler_hits": 39,
+    "patches_at_rg_size": 1,
+    "integration_result": "test result: ok. 299 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s",
+    "charged_after_gc": 0
+  },
+  "ext4_fuse": {
+    "archive_sha256": "f0f112d9dd48acc64ed8ae537c342cebbac0b526170d76b9efec52d76be87cbd",
+    "frame_file_bytes": 4390533,
+    "sealed_objects": 0,
+    "restored_units": 1,
+    "charged_after_gc": 0
+  }
+}

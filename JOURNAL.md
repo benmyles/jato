@@ -11,6 +11,8 @@
 - Verified each packed shard once per writer, and prevented collection or publication through a redirected cache directory. The regression puts an unrelated pending file and a digest-shaped filename behind that redirect and checks that both survive.
 - The installed release restored the final in-place edited library after reading 2 MiB of staged data. A 32 MiB sparse fixture restored 100,670,966 logical bytes with 400,886 bytes written to target files. Both archive checksums matched their cold builds.
 - Verified both patch styles after an ordinary file copy removed the base’s verity attribute. A private ext4 image also exercised automatic packed storage, a cross-filesystem target restore and zero charged bytes after GC. The final 64 tests passed on Rust 1.89 and 1.100.
+- Seven four-consumer edit cycles produced a median error in 307 ms with 0.8, 427 ms with 0.7, 494 ms with kache and 736 ms with sccache. One failing consumer read 3,072 dependency bytes. The normal Cargo launcher restored and ran the installed build’s six-unit regex fixture.
+- A migrated cache and a newly populated cache each restored all 39 ripgrep compiler units in an independent checkout. The restored release and the patched development executable each passed 299 upstream tests. Recorded cold, warm, live, worktree, watch and concurrent comparisons, including faster cold builds with kache.
 
 ## 2026-11-21 — cold capture and editor saves
 

@@ -1,0 +1,365 @@
+{
+  "project": "locked regex application",
+  "mode": "jato-dev",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "jobs": 4,
+  "runs": 3,
+  "revisit": true,
+  "versions": {
+    "worktree": "jato 0.8.0",
+    "kache": "kache 2.2.0",
+    "sccache_basedirs": "sccache 0.19.0",
+    "previous_worktree": "jato 0.7.0"
+  },
+  "samples": {
+    "worktree": {
+      "cold": [
+        {
+          "seconds": 3.099496,
+          "peak_process_kib": 298848,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.033246,
+          "peak_process_kib": 21932,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.082449,
+          "peak_process_kib": 21656,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.081608,
+          "peak_process_kib": 21740,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.080922,
+          "peak_process_kib": 21968,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.087429,
+          "peak_process_kib": 21660,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.082422,
+          "peak_process_kib": 21592,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.090374,
+          "peak_process_kib": 21840,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "other_checkout": [
+        {
+          "seconds": 0.102837,
+          "peak_process_kib": 57480,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 1
+        },
+        {
+          "seconds": 0.079573,
+          "peak_process_kib": 22096,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.083234,
+          "peak_process_kib": 21888,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ]
+    },
+    "kache": {
+      "cold": [
+        {
+          "seconds": 2.757989,
+          "peak_process_kib": 298396,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.074329,
+          "peak_process_kib": 34996,
+          "hits": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.146047,
+          "peak_process_kib": 35124,
+          "hits": 6
+        },
+        {
+          "seconds": 0.151869,
+          "peak_process_kib": 35048,
+          "hits": 6
+        },
+        {
+          "seconds": 0.144487,
+          "peak_process_kib": 35024,
+          "hits": 6
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.139379,
+          "peak_process_kib": 34868,
+          "hits": 6
+        },
+        {
+          "seconds": 0.145364,
+          "peak_process_kib": 35132,
+          "hits": 6
+        },
+        {
+          "seconds": 0.137417,
+          "peak_process_kib": 34932,
+          "hits": 6
+        }
+      ],
+      "other_checkout": [
+        {
+          "seconds": 0.189354,
+          "peak_process_kib": 34980,
+          "hits": 6
+        },
+        {
+          "seconds": 0.142522,
+          "peak_process_kib": 35016,
+          "hits": 6
+        },
+        {
+          "seconds": 0.135904,
+          "peak_process_kib": 34872,
+          "hits": 6
+        }
+      ]
+    },
+    "sccache_basedirs": {
+      "cold": [
+        {
+          "seconds": 2.809603,
+          "peak_process_kib": 139032,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.045782,
+          "peak_process_kib": 34988,
+          "hits": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.57364,
+          "peak_process_kib": 137384,
+          "hits": 5
+        },
+        {
+          "seconds": 0.562375,
+          "peak_process_kib": 136860,
+          "hits": 5
+        },
+        {
+          "seconds": 0.546911,
+          "peak_process_kib": 137816,
+          "hits": 5
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 2.82638,
+          "peak_process_kib": 138908,
+          "hits": 0
+        },
+        {
+          "seconds": 3.246136,
+          "peak_process_kib": 147920,
+          "hits": 0
+        },
+        {
+          "seconds": 3.667475,
+          "peak_process_kib": 139444,
+          "hits": 0
+        }
+      ],
+      "other_checkout": [
+        {
+          "seconds": 2.721041,
+          "peak_process_kib": 139168,
+          "hits": 0
+        },
+        {
+          "seconds": 2.934017,
+          "peak_process_kib": 138704,
+          "hits": 0
+        },
+        {
+          "seconds": 3.085441,
+          "peak_process_kib": 139548,
+          "hits": 0
+        }
+      ]
+    },
+    "previous_worktree": {
+      "cold": [
+        {
+          "seconds": 2.978419,
+          "peak_process_kib": 297856,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.040765,
+          "peak_process_kib": 21520,
+          "hits": 0,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.089335,
+          "peak_process_kib": 21592,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.090385,
+          "peak_process_kib": 22236,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.096072,
+          "peak_process_kib": 21660,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.092528,
+          "peak_process_kib": 21752,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.089649,
+          "peak_process_kib": 21468,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.096487,
+          "peak_process_kib": 22408,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ],
+      "other_checkout": [
+        {
+          "seconds": 0.124027,
+          "peak_process_kib": 57832,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 1
+        },
+        {
+          "seconds": 0.09239,
+          "peak_process_kib": 21704,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        },
+        {
+          "seconds": 0.103757,
+          "peak_process_kib": 21776,
+          "hits": 6,
+          "live_incremental_hits": 0,
+          "discovery_probes": 0
+        }
+      ]
+    }
+  },
+  "median_seconds": {
+    "worktree": {
+      "cold": 3.099496,
+      "fresh": 0.033246,
+      "same_target": 0.081608,
+      "new_target": 0.087429,
+      "other_checkout": 0.083234
+    },
+    "kache": {
+      "cold": 2.757989,
+      "fresh": 0.074329,
+      "same_target": 0.146047,
+      "new_target": 0.139379,
+      "other_checkout": 0.142522
+    },
+    "sccache_basedirs": {
+      "cold": 2.809603,
+      "fresh": 0.045782,
+      "same_target": 0.562375,
+      "new_target": 3.246136,
+      "other_checkout": 2.934017
+    },
+    "previous_worktree": {
+      "cold": 2.978419,
+      "fresh": 0.040765,
+      "same_target": 0.090385,
+      "new_target": 0.092528,
+      "other_checkout": 0.103757
+    }
+  },
+  "store_bytes": {
+    "worktree": 48259745,
+    "kache": 47307774,
+    "sccache_basedirs": 72438448,
+    "previous_worktree": 48251561
+  }
+}
