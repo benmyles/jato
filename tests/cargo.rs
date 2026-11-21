@@ -576,6 +576,50 @@ fn damaged_shared_chunks_trigger_a_real_recompile_and_heal() {
     assert!(p.hits() > hits);
 }
 
+#[test]
+fn large_embedded_assets_restore_and_content_edits_invalidate() {
+    use std::os::unix::fs::FileExt;
+    let p = Project::new();
+    let asset = p.root.join("leaf/src/data.bin");
+    let file = fs::File::create(&asset).unwrap();
+    let len = (9 << 20) + 1;
+    file.set_len(len).unwrap();
+    file.write_all_at(b"link", 65537).unwrap();
+    file.write_all_at(&[255], len - 1).unwrap();
+    drop(file);
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        r#"pub fn value() -> u8 {
+        let i = std::env::args().count()-1;
+        include_bytes!("data.bin")[i]
+    }"#,
+    );
+    let run = || {
+        success(
+            p.command()
+                .env("JATO_LOG", "debug")
+                .args(["run", "--release"]),
+        )
+    };
+    assert_eq!(run().stdout, b"0\n");
+    p.clean();
+    let restored = run();
+    assert_eq!(restored.stdout, b"0\n");
+    assert!(
+        String::from_utf8_lossy(&restored.stderr).contains("jato [leaf] hit"),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .open(asset)
+        .unwrap()
+        .write_all_at(&[23], 0)
+        .unwrap();
+    p.clean();
+    assert_eq!(run().stdout, b"23\n");
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 fn make_archive(dir: &Path, value: i32) {
     write(

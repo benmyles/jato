@@ -1,6 +1,6 @@
 //! Native linkers can read startup objects, implicit archives, scripts and
 //! plugins which rustc does not put in its .d file. On Linux, learn the file
-//! lookups of an actual, unmodified nonincremental compilation. A later hit
+//! lookups of the original compiler during eligible links and archive builds. A later hit
 //! checks both successful reads and unsuccessful search candidates.
 use crate::fingerprint::{field, recent, stamp};
 use crate::invocation::Invocation;

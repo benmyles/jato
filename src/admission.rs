@@ -5,6 +5,7 @@ use anyhow::{Result, ensure};
 use memchr::memmem;
 use rustc_lexer::{TokenKind, tokenize};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
@@ -30,6 +31,51 @@ pub fn verify_bytes(bytes: &[u8], path: &Path, deferred_links: bool, observed: b
         anyhow::bail!("{reason} in {}", path.display());
     }
     Ok(())
+}
+
+// A dep-info file can be a Rust module or data for include_bytes!. A
+// successful stable compiler cannot have parsed invalid UTF-8 as source.
+// For oversized UTF-8 inputs, prove the absence of the two sensitive token
+// substrings. Keep three bytes across reads for both split UTF-8 and "link".
+pub fn large_input(mut file: impl Read, path: &Path) -> Result<blake3::Hash> {
+    let mut hash = blake3::Hasher::new();
+    let mut window = vec![0; 64 * 1024 + 3];
+    let mut prefix = 0;
+    let mut incomplete = 0;
+    let mut sensitive = false;
+    loop {
+        let n = match file.read(&mut window[prefix..]) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            read => read?,
+        };
+        if n == 0 {
+            ensure!(
+                incomplete != 0 || !sensitive,
+                "large UTF-8 input needs a full Rust admission scan: {}",
+                path.display()
+            );
+            break;
+        }
+        let end = prefix + n;
+        hash.update(&window[prefix..end]);
+        let utf8 = &window[prefix - incomplete..end];
+        incomplete = match std::str::from_utf8(utf8) {
+            Ok(_) => 0,
+            Err(e) if e.error_len().is_none() => utf8.len() - e.valid_up_to(),
+            Err(_) => {
+                hash.update_reader(file)?;
+                break;
+            }
+        };
+        if !sensitive {
+            sensitive = [b"asm".as_slice(), b"link"]
+                .iter()
+                .any(|word| memmem::find(&window[..end], word).is_some());
+        }
+        prefix = end.min(3);
+        window.copy_within(end - prefix..end, 0);
+    }
+    Ok(hash.finalize())
 }
 
 fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'static str> {
@@ -160,6 +206,23 @@ fn literal_link(input: &str) -> Option<LinkKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streaming_admission_handles_split_tokens_and_utf8() -> Result<()> {
+        let path = Path::new("asset");
+        let data = |a: &'static [u8], b: &'static [u8]| a.chain(b);
+        assert!(large_input(data(b"global_a", b"sm!"), path).is_err());
+        assert!(large_input(data(b"li", b"nk"), path).is_err());
+        assert!(large_input(data(b"asm\xe2", b"\x82\xac"), path).is_err());
+        assert_eq!(
+            large_input(data(b"asm\xe2", b"\xff"), path)?,
+            blake3::hash(b"asm\xe2\xff")
+        );
+        assert_eq!(
+            large_input(data(b"generated ", b"123"), path)?,
+            blake3::hash(b"generated 123")
+        );
+        Ok(())
+    }
     #[test]
     fn only_literal_linkage_deferred_to_the_native_linker_is_admitted() {
         for input in [

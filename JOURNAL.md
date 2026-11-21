@@ -5,6 +5,8 @@
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.
 - Borrowed up to three immediately available Cargo job slots for independent content reads. Five alternating restores gave medians of 234 ms for the prototype and 286 ms for 0.2. Each read retains content and file-replacement checks.
 - Added observed native archive inputs for Rust libraries with native-only search paths and ordinary static or dynamic link flags. Verified byte changes, search priority, removal and bundled link attributes using a real C archive.
+- Shared checked, compressed input manifests across source variants. Stored single-chunk artifacts directly by digest and joined artifact descriptors in one SQLite read. Tested shared-record corruption, eviction and recovery.
+- Added bounded parallel BLAKE3 subtrees for large single inputs and streaming admission for large embedded assets. Validated empty, partial and power-of-two boundaries against standard BLAKE3 and changed an embedded byte through a real Cargo release build.
 
 ## 2026-11-21
 

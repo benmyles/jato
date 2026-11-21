@@ -168,15 +168,21 @@ fn hash_open(
     );
     let digest = if let Some(buffer) = scan {
         const MAX: u64 = 8 << 20;
-        ensure!(before.len() <= MAX, "source exceeds admission scan limit");
-        buffer.clear();
-        f.take(MAX + 1).read_to_end(buffer)?;
-        ensure!(
-            buffer.len() as u64 <= MAX,
-            "source changed size during admission"
-        );
-        crate::admission::verify_bytes(buffer, path, deferred_links, observed)?;
-        blake3::hash(buffer)
+        if before.len() > MAX {
+            crate::admission::large_input(f.take(before.len() + 1), path)?
+        } else {
+            buffer.clear();
+            f.take(before.len() + 1).read_to_end(buffer)?;
+            ensure!(
+                buffer.len() as u64 == before.len(),
+                "source changed size during admission"
+            );
+            crate::admission::verify_bytes(buffer, path, deferred_links, observed)?;
+            blake3::hash(buffer)
+        }
+    } else if before.len() >= 4 << 20 {
+        let input = crate::content::Input::new(path, &before, since)?;
+        return Ok(crate::content::digests(&[input])?[0]);
     } else {
         let mut h = blake3::Hasher::new();
         h.update_reader(&mut f)?;
@@ -295,6 +301,7 @@ impl Plan {
         let mut namespace = BTreeSet::new();
         field(&mut hash, &recipe.key);
         let mut covered = BTreeSet::new();
+        let mut ancestors = BTreeSet::new();
         let mut scan = admit_codegen.then(Vec::new);
         let cwd = std::env::current_dir()?;
         for file in &self.files {
@@ -343,15 +350,18 @@ impl Plan {
             }
             if original != path {
                 for component in original.ancestors() {
-                    let m = fs::symlink_metadata(component)?;
-                    if m.is_symlink() {
-                        ensure!(
-                            !recent(&m, since),
-                            "input symlink changed during compilation"
-                        );
+                    if !ancestors.insert(component.to_owned()) {
+                        break;
                     }
                 }
             }
+        }
+        for p in ancestors {
+            let m = fs::symlink_metadata(p)?;
+            ensure!(
+                !m.is_symlink() || !recent(&m, since),
+                "input symlink changed during compilation"
+            );
         }
         ensure!(has_root, "crate root missing from dep-info");
         for name in &self.env {
