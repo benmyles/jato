@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,7 @@ def main():
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato", required=True)
     parser.add_argument("--variants", type=int, default=8)
+    parser.add_argument("--edit-asset", action="store_true", help="edit one byte of a 16 MiB static asset between builds")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     opts = parser.parse_args()
     if not 2 <= opts.variants <= 64:
@@ -42,9 +44,22 @@ def main():
         src = project / "src"
         src.mkdir(parents=True)
         (project / "Cargo.toml").write_text('[package]\nname="jato-history-bench"\nversion="0.1.0"\nedition="2021"\n')
-        (src / "table.bin").write_bytes(hashlib.shake_256(b"jato history v1").digest(4 * 1024 * 1024 + 19))
+        asset = src / "table.bin"
+        size = (16 if opts.edit_asset else 4) * 1024 * 1024 + 19
+        asset.write_bytes(hashlib.shake_256(b"jato history v1").digest(size))
         lib = src / "lib.rs"
-        lib.write_text(source(0))
+        if opts.edit_asset:
+            lib.write_text('pub static TABLE: &[u8] = include_bytes!("table.bin");')
+
+        def edit(revision):
+            if opts.edit_asset:
+                with asset.open("r+b") as file:
+                    file.seek(size // 2)
+                    file.write(bytes([revision]))
+            else:
+                lib.write_text(source(revision))
+
+        edit(0)
         target = root / "target"
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO_", "JATO_", "RUSTC_", "KACHE_", "RUSTFLAGS"))}
         env.update(CARGO_HOME=str(root / "cargo"), CARGO_NET_OFFLINE="true", CARGO_BUILD_JOBS="4",
@@ -62,19 +77,22 @@ def main():
             sample = []
             archive = target / "release/libjato_history_bench.rlib"
             for revision in range(opts.variants):
-                lib.write_text(source(revision))
+                edit(revision)
+                writes = resource.getrusage(resource.RUSAGE_CHILDREN).ru_oublock
                 start = time.perf_counter()
                 run(command, project, cfg)
                 seconds = time.perf_counter() - start
+                writes = resource.getrusage(resource.RUSAGE_CHILDREN).ru_oublock - writes
                 if revision == 0:
                     initial = hashlib.sha256(archive.read_bytes()).hexdigest()
                 stats = json.loads(run([binary, "stats", "--json"], project, cfg))
                 assert stats["entries"] == revision + 1, "a source revision was not stored"
                 sample.append({k: stats[k] for k in ("entries", "artifact_bytes", "compressed_bytes", "charged_bytes", "database_bytes")})
                 sample[-1]["seconds"] = round(seconds, 6)
+                sample[-1]["filesystem_output_blocks"] = writes
                 sample[-1]["packed_reused_bytes"] = stats["counters"].get("packed_reused_bytes", 0)
             shutil.rmtree(target)
-            lib.write_text(source(0))
+            edit(0)
             start = time.perf_counter()
             run(command, project, cfg)
             restore = time.perf_counter() - start
@@ -84,7 +102,7 @@ def main():
             report[label] = dict(version=run([binary, "--version"], project, cfg).decode().strip(),
                                  revisions=sample, restore_seconds=round(restore, 6), archive_sha256=initial)
         print(json.dumps(dict(rustc=run([rustc, "-V"], project, env).decode().strip(),
-                              variants=opts.variants, samples=report), indent=2))
+                              variants=opts.variants, edit_asset=opts.edit_asset, samples=report), indent=2))
 
 
 if __name__ == "__main__":

@@ -14,9 +14,26 @@ from threading import Thread
 import time
 
 
+def idle_tree_pss(pid):
+    """Account for shared code pages only once across the idle view and watcher."""
+    pending = [pid]
+    total = 0
+    try:
+        while pending:
+            proc = Path("/proc") / str(pending.pop())
+            rollup = (proc / "smaps_rollup").read_text().splitlines()
+            total += int(next(line.split()[1] for line in rollup if line.startswith("Pss:")))
+            for children in (proc / "task").glob("*/children"):
+                pending.extend(map(int, children.read_text().split()))
+    except (OSError, StopIteration):
+        return None
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jato", default="jato")
+    parser.add_argument("--worktree", action="store_true", help="run the watcher inside a projected checkout")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--debounce", type=int, help="override the installed watcher’s default")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
@@ -43,9 +60,10 @@ def main():
         env = dict(os.environ, JATO_CACHE_DIR=str(root / "cache"), CARGO_HOME=str(root / "cargo"),
                    CARGO_TARGET_DIR=str(root / "target"), CARGO_BUILD_BUILD_DIR=str(root / "target"),
                    CARGO_NET_OFFLINE="true", RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
-        subprocess.run([jato, "check", "--workspace", "-q"], cwd=workspace, env=env, check=True)
+        command = [jato, "worktree", "--root", "."] if options.worktree else [jato]
+        subprocess.run([*command, "check", "--workspace", "-q"], cwd=workspace, env=env, check=True)
         watch_args = [] if options.debounce is None else ["--debounce", str(options.debounce)]
-        proc = subprocess.Popen([jato, "watch", *watch_args], cwd=workspace,
+        proc = subprocess.Popen([*command, "watch", *watch_args], cwd=workspace,
                                 env=env, stderr=subprocess.PIPE, text=True)
         events = Queue()
 
@@ -76,6 +94,7 @@ def main():
             idle_kib = None
             if status.exists():
                 idle_kib = int(next(l for l in status.read_text().splitlines() if l.startswith("VmRSS:")).split()[1])
+            idle_pss = idle_tree_pss(proc.pid)
             for _ in range(options.runs):
                 start = time.perf_counter()
                 source.write_text("pub fn parse() -> u8 { missing_value() }")
@@ -96,7 +115,8 @@ def main():
         print(json.dumps(dict(runs=options.runs, debounce_ms=options.debounce,
                               save_to_diagnostic_ms=errors, fix_to_workspace_green_ms=fixes,
                               median_diagnostic_ms=statistics.median(errors),
-                              median_workspace_green_ms=statistics.median(fixes), idle_watch_rss_kib=idle_kib),
+                              median_workspace_green_ms=statistics.median(fixes), idle_watch_rss_kib=idle_kib,
+                              worktree=options.worktree, idle_tree_pss_kib=idle_pss),
                          indent=2))
 
 
