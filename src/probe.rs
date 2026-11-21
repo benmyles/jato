@@ -8,6 +8,12 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 
+fn target_setting(setting: &str) -> bool {
+    setting.starts_with("linker=")
+        || setting.starts_with("target-feature=")
+        || matches!(setting, "linker-features=-lld" | "link-arg=-fuse-ld=mold")
+}
+
 fn eligible(args: &[OsString]) -> bool {
     if args == ["-vV"] || args == ["--version"] {
         return true;
@@ -48,10 +54,8 @@ fn eligible(args: &[OsString]) -> bool {
                     .strip_prefix("-Z")
                     .is_some_and(crate::invocation::supported_unstable) => {}
             Some("-Wwarnings") => (),
-            Some("-C")
-                if it.next().flatten().is_some_and(|v| {
-                    v.starts_with("linker=") || v.starts_with("target-feature=")
-                }) => {}
+            Some("-C") if it.next().flatten().is_some_and(target_setting) => {}
+            Some(s) if s.strip_prefix("-C").is_some_and(target_setting) => {}
             Some(s)
                 if matches!(
                     s.strip_prefix("--print="),

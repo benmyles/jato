@@ -6,6 +6,8 @@
 - Distinguished a new publication from a repeat of an entry still waiting for dependency evidence. The repeat skips artifact capture. A regression removes the output before the second save and verifies that the quarantined entry stays unavailable.
 - Admitted closed register-only assembly templates and tracked documentation with a compiler-confirmed lexical error. Tests cover changed documentation, real Rust source named `.md`, opaque assembly and an edit after a restore.
 - Kept Cargo intermediates while changing Olo’s public target directories. All five executables and four sampled Rust libraries or metadata files matched. Deliveries took 0.51–0.67 s with Jato 0.9.0 and 0.56–0.81 s with kache 2.3.0.
+- Added `--keep-build` to coordinate ordinary Cargo output paths. Found that Cargo hardlinked Olo’s public executable across deliveries on the same filesystem. Managed Btrfs intermediates now use a subvolume, with a regression that overwrites one public program and validates an existing and a new delivery.
+- Reused the native fingerprint’s full read to authenticate each mold executable. A cold trial had 27 build-script links to a 42,246,008-byte linker. Skipping one duplicate read per script avoids 1.06 GiB of logical input reads on those links alone. Added early size rejection for large post-compile dependency sets and caching of Cargo’s empty target queries with Olo’s linker flags.
 
 ## 2026-11-21 — Olo nightly Cargo builds
 

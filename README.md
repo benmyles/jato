@@ -2,9 +2,9 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-Jato 0.9 supports eligible nightly builds with split library metadata and parallel compiler front ends. It also reuses confirmed sysroot lookups when Cargo finds rustc on PATH. When a pipelined producer finishes, Jato updates only the consumers waiting for its verified outputs. [Measurements, controls and reproduction commands](bench/README.md)
+Jato 0.10 can also accelerate Cargo when you need the same project in several ordinary target directories. It can verify links made by the upstream Linux x86-64 mold 3.0.0 release, including build scripts and procedural-macro libraries. [Measurements and reproduction commands](bench/README.md)
 
-On stable ripgrep, a clean-target development rebuild took a median 146 ms with Jato, 319 ms with kache and 1.62 s with sccache. Olo’s pinned nightly workload gave a different result. Jato restored 123 units and took 367 s in one clean-target rebuild. kache restored 304 and took 2.97 s. [Workloads, limitations and raw samples](bench/README.md)
+On stable ripgrep, Jato 0.9 restored a clean development build in a median 146 ms, versus 319 ms for kache and 1.62 s for sccache. Olo's pinned nightly project still favors kache for a full rebuild after deleting Cargo's intermediates. The measurements distinguish empty stores, full restores and new delivery directories with fresh Cargo state. [Benchmarks](bench/README.md)
 
 ## Get started
 
@@ -56,6 +56,21 @@ If `cc` on your PATH is a compiler launcher, choose the system C driver for a pr
 ```sh
 jato --system-linker build --release
 ```
+
+### Reuse Cargo's work in different target directories
+
+On Cargo 1.91 or newer, use `--keep-build` when a launcher or test harness needs a fresh `target/debug` or `target/release` in the same checkout.
+
+```sh
+jato --keep-build build --locked --target-dir outputs/a
+jato --keep-build build --locked --target-dir outputs/b
+```
+
+Cargo keeps one intermediate directory per physical workspace under `$CARGO_HOME/jato-build/v1`. It rechecks the workspace and delivers the requested executables to each ordinary target. This can reuse build-script, procedural-macro and incremental state across public directory changes. It also works with `dev`, `watch`, and `jato --keep-build cargo +toolchain …`. Older Cargo uses its usual target layout. [Cargo build cache](https://doc.rust-lang.org/cargo/reference/build-cache.html)
+
+An explicit `CARGO_BUILD_BUILD_DIR` takes precedence over Jato’s default. For tools that start Cargo directly, configure `build.build-dir` or set `CARGO_BUILD_BUILD_DIR='{cargo-cache-home}/jato-build/{workspace-path-hash}'`. Use `jato --keep-build cargo clean --target-dir outputs/a` to clear the selected workspace's intermediates and that delivery target. Cargo intermediates have separate disk usage from the `jato limit` compiler-artifact budget. [Cargo build-directory configuration](https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir)
+
+On Btrfs, Jato creates the managed intermediates in a subvolume when supported. Cargo’s copies across that boundary have independent inodes. Elsewhere, Cargo can hardlink a public binary to its intermediate on the same filesystem. Tools that modify deliverables in place can use a separate filesystem for intermediates or copy the binary before altering it.
 
 ## Reuse builds across worktrees
 
@@ -172,7 +187,9 @@ Cargo versions with a shared `target/*/deps` directory can have concurrent jobs 
 
 Ordinary builds preserve absolute compiler paths, including output paths. A different checkout or target location can therefore need a separate entry. Worktree mode gives Cargo repeatable paths before compilation. When a copied checkout has new directory identities, Jato can ask rustc to resolve its inputs again and revalidate the recorded native inputs before restoring an executable. An entry can remember the original directory layout and three additional layouts after successful checks. The extra layouts cost 192 charged bytes per entry and are added when the cache budget permits.
 
-Procedural-macro expansion can inspect arbitrary external state. A crate using such a macro, including through a re-export, takes the compiler path. Inline assembly and opaque code-generation inputs also take that path. Metadata-only results can certify other checks. Code generation requires its own evidence. Cargo can pipeline work normally, and Jato waits for matching producer evidence before serving a dependent entry. An existing incremental directory remains available. After a clean, rustc starts rebuilding incremental state on the next miss.
+Procedural-macro expansion can inspect arbitrary external state. A crate using such a macro, including through a re-export, takes the compiler path. Jato accepts direct inline assembly with closed, recognized instruction templates and register operands. Generated templates, external assembler directives and opaque code-generation inputs still run through rustc. A tracked documentation file that triggers the Rust syntax checks needs a compiler-confirmed lexical error before Jato treats it as data. Its full contents remain part of the key.
+
+Metadata-only results can certify other checks. Code generation requires its own evidence. Cargo can pipeline work normally, and Jato waits for matching producer evidence before serving a dependent entry. `stored` counts new retained entries. `repeat_pending` counts recompilations whose existing entry still needs dependency evidence. Jato skips reading the compiler outputs again in that case. An existing incremental directory remains available. After a clean, rustc starts rebuilding incremental state on the next miss.
 
 ## Design references
 

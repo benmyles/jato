@@ -99,7 +99,11 @@ fn config_value(key: &str, path: &Path) -> Result<OsString> {
 
 // Use Cargo's own config resolution, including workspace-relative build-dir
 // templates. Only inspect options before the program/test argument separator.
-fn locations(args: &[OsString], source: Option<&Path>) -> Result<Locations> {
+fn locations(
+    args: &[OsString],
+    source: Option<&Path>,
+    options: crate::CargoOptions,
+) -> Result<Locations> {
     // CI and build drivers commonly set both paths. Absolute literal paths
     // have no workspace templates or Cargo config left to resolve.
     if source.is_some_and(|p| {
@@ -124,6 +128,7 @@ fn locations(args: &[OsString], source: Option<&Path>) -> Result<Locations> {
         });
     }
     let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    options.set_build_dir(&mut cmd);
     if let Some(t) = args
         .first()
         .filter(|a| a.as_encoded_bytes().starts_with(b"+"))
@@ -321,6 +326,10 @@ pub fn run(args: &[OsString], mut options: crate::CargoOptions) -> Result<i32> {
                 options.system_linker = true;
                 args = &args[1..];
             }
+            Some("--keep-build") => {
+                options.keep_build = true;
+                args = &args[1..];
+            }
             Some("dev") => {
                 options.dev = true;
                 args = &args[1..];
@@ -366,7 +375,7 @@ pub fn run(args: &[OsString], mut options: crate::CargoOptions) -> Result<i32> {
         _ => args,
     };
     let cwd = env::current_dir()?;
-    let locations = locations(job, source.as_deref())?;
+    let locations = locations(job, source.as_deref(), options)?;
     let cache = crate::store::cache_dir()?;
     fs::DirBuilder::new()
         .mode(0o700)

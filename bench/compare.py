@@ -111,6 +111,8 @@ def paired_restores(options, tools, env, project, root, target):
             for name in names[iteration % len(names):] + names[:iteration % len(names)]:
                 cfg = dict(env, RUSTC_WRAPPER=str(tools[name]), JATO_CACHE_DIR=str(root / f"{name}-{mode}"),
                            JATO_MAX_SIZE=f"{options.cache_gib}GiB")
+                if options.retain_build_dir:
+                    cfg["CARGO_BUILD_BUILD_DIR"] = str(root / f"{name}-{mode}-intermediates")
                 if name.endswith("_packed"):
                     cfg["JATO_STORAGE"] = "packed"
                 if target.exists():
@@ -149,6 +151,8 @@ def main():
                         help="prime the two Jato versions and alternate N warm clean targets per version")
     parser.add_argument("--workloads", nargs="+", choices=["release","check","dev","jato-dev"], default=["check","release"])
     parser.add_argument("--kache", default="kache")
+    parser.add_argument("--kache-cargo-shim", action="store_true",
+                        help="also measure the kache Cargo shim with target seeding and its own private store")
     parser.add_argument("--local-kache", help="also compare a second installed kache with its own daemon")
     parser.add_argument("--sccache", default="sccache")
     parser.add_argument("--tools", nargs="+", choices=["cargo","jato","kache","sccache"],
@@ -156,6 +160,10 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--cache-gib", type=int, default=1, help="private cache budget per contender in GiB")
+    parser.add_argument("--retain-build-dir", action="store_true",
+                        help="remove only delivery targets between builds and retain each contender's Cargo intermediates")
+    parser.add_argument("--empty-wrapper-overrides", action="store_true",
+                        help="reproduce older comparisons that explicitly cleared Cargo's wrapper settings")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     options = parser.parse_args()
@@ -170,6 +178,8 @@ def main():
         tools = {name: None if name=="cargo" else binary(getattr(options,name)) for name in options.tools}
         if options.local_kache:
             tools["kache_local"] = binary(options.local_kache)
+        if options.kache_cargo_shim:
+            tools["kache_shim"] = binary(options.kache)
     if options.include_packed:
         tools["jato_packed"] = binary(options.jato)
     if options.previous_jato:
@@ -217,9 +227,11 @@ def main():
                if not k.startswith(("CARGO_", "KACHE_", "JATO_", "SCCACHE_", "RUSTC_", "RUSTFLAGS"))}
         env.update(CARGO=str(cargo), RUSTC=str(rustc), RUSTDOC=str(rustc.with_name("rustdoc")),
                    CARGO_HOME=str(cargo_home), CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(target),
-                   CARGO_BUILD_JOBS=str(options.jobs), RUSTC_WORKSPACE_WRAPPER="", RUSTC_WRAPPER="",
+                   CARGO_BUILD_JOBS=str(options.jobs),
                    PATH=os.pathsep.join([str(rustc.parent), "/usr/bin", "/bin", os.environ["PATH"]]),
                    CC="/usr/bin/cc", CXX="/usr/bin/c++", HOST_CC="/usr/bin/cc", HOST_CXX="/usr/bin/c++")
+        if options.empty_wrapper_overrides:
+            env.update(RUSTC_WORKSPACE_WRAPPER="", RUSTC_WRAPPER="")
         if options.compiler_path != "absolute":
             env.pop("RUSTC")
         if options.compiler_path == "rustup":
@@ -233,7 +245,7 @@ def main():
         run([cargo, "fetch", "--locked"], env, project)
         if options.paired_restores:
             result = paired_restores(options, tools, env, project, root, target)
-            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, project=project.name if options.project else options.fixture,
+            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, retained_build_dir=options.retain_build_dir, project=project.name if options.project else options.fixture,
                                   rustc=run([rustc, "-V"], env, project).decode().strip(), jobs=options.jobs,
                                   pairs=options.paired_restores, **result), indent=2))
             return
@@ -244,22 +256,32 @@ def main():
             for mode in (options.workloads if trial % 2 == 0 else reversed(options.workloads)):
                 for name in order[trial % len(order):] + order[:trial % len(order)]:
                     exe = tools[name]
-                    kind = "kache" if name=="kache_local" else name
+                    kind = "kache" if name in {"kache_local", "kache_shim"} else name
                     sample = {}
                     with tempfile.TemporaryDirectory(dir=root, prefix="s-") as private:
                         private = Path(private)
                         cache = private / "store"
-                        cfg = dict(env, RUSTC_WRAPPER=str(exe or ""), JATO_CACHE_DIR=str(cache),
+                        cfg = dict(env, JATO_CACHE_DIR=str(cache),
                                    JATO_MAX_SIZE=f"{options.cache_gib}GiB", KACHE_CACHE_DIR=str(cache),
                                    KACHE_RUNTIME_DIR=str(private / "run"), KACHE_SOCKET_PATH=str(private / "k.sock"),
                                    KACHE_CONFIG=str(config), KACHE_HOST_CONFIG="", KACHE_LOCAL_ONLY="1",
                                    KACHE_MAX_SIZE=f"{options.cache_gib}GiB", SCCACHE_DIR=str(cache), SCCACHE_CACHE_SIZE=f"{options.cache_gib}G",
                                    SCCACHE_SERVER_UDS=str(private / "s.sock"), SCCACHE_CONF=str(config),
                                    SCCACHE_ALLOW_INCREMENTAL="1")
+                        if exe:
+                            cfg["RUSTC_WRAPPER"] = str(exe)
                         if name in {"jato_packed", "previous_packed"}:
                             cfg["JATO_STORAGE"] = "packed"
                         assert len(os.fsencode(cfg["SCCACHE_SERVER_UDS"])) < 104, "use a shorter --scratch path"
-                        command = build_command(cargo, mode, exe if name in {"jato", "jato_packed"} else None) + options.package_args
+                        if options.retain_build_dir:
+                            cfg["CARGO_BUILD_BUILD_DIR"] = str(private / "intermediates")
+                        cargo_entry = cargo
+                        if name == "kache_shim":
+                            # kache dispatches by the invoked executable name.
+                            cargo_entry = private / "cargo"
+                            cargo_entry.symlink_to(exe)
+                            cfg["KACHE_REAL_CARGO"] = str(cargo)
+                        command = build_command(cargo_entry, mode, exe if name in {"jato", "jato_packed"} else None) + options.package_args
                         def measure(phase):
                             rss = private / "rss"
                             timed = ["/usr/bin/time", "-f", "%M %U %S", "-o", rss, *command] if Path("/usr/bin/time").is_file() else command
@@ -326,13 +348,15 @@ def main():
                             if server:
                                 run([exe, *server[1]], cfg, project)
                         sample["store_bytes"] = tree_bytes(cache)
+                        if options.retain_build_dir:
+                            sample["cargo_build_bytes"] = tree_bytes(private / "intermediates")
                         sample.update(extent_usage(cache))
                     results[name].setdefault(mode, []).append(sample)
                     print(trial + 1, mode, name, sample, file=sys.stderr, flush=True)
         medians = {k: {m: {key: statistics.median(s[key] for s in samples)
                            for key in samples[0] if all(s.get(key) is not None for s in samples)} for m, samples in modes.items()}
                    for k, modes in results.items()}
-        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
+        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, retained_build_dir=options.retain_build_dir, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
                               rustc=run([rustc, "-V"], env, project).decode().strip(),
                               jobs=options.jobs, runs=options.runs, samples=results, median=medians), indent=2))
 

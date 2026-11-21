@@ -91,6 +91,84 @@ fn success(cmd: &mut Command) -> Output {
 }
 
 #[test]
+fn kept_cargo_state_delivers_to_new_targets_and_rechecks_edits() {
+    let p = Project::new();
+    let a = p.temp.path().join("delivery a");
+    let b = p.temp.path().join("delivery b");
+    let command = |target: &Path| {
+        let mut cmd = p.command();
+        cmd.env_remove("CARGO_BUILD_BUILD_DIR")
+            .env("CARGO_TARGET_DIR", target)
+            .arg("--keep-build");
+        cmd
+    };
+    let metadata = |cmd: &mut Command| -> Value {
+        serde_json::from_slice(
+            &success(cmd.args(["cargo", "metadata", "--format-version=1", "--no-deps"])).stdout,
+        )
+        .unwrap()
+    };
+    let layout = metadata(&mut command(&a));
+    let Some(build) = layout["build_directory"].as_str().map(Path::new) else {
+        // Cargo before 1.91 uses its ordinary target layout.
+        assert_eq!(
+            success(command(&a).args(["run", "-q"])).stdout,
+            b"one:none\n"
+        );
+        return;
+    };
+    assert!(build.starts_with(p.temp.path().join("cargo/jato-build")));
+    assert_eq!(
+        metadata(&mut command(&b))["build_directory"],
+        layout["build_directory"]
+    );
+    let explicit = p.temp.path().join("explicit state");
+    assert_eq!(
+        metadata(command(&a).env("CARGO_BUILD_BUILD_DIR", &explicit))["build_directory"],
+        explicit.to_str().unwrap()
+    );
+    let other = Project::new();
+    let other_layout = metadata(command(&a).current_dir(&other.root));
+    assert_ne!(other_layout["build_directory"], layout["build_directory"]);
+    let build_at = |dir: &Path| {
+        let output = success(command(dir).args(["build", "--message-format=json"]));
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .map(|message| message["fresh"].as_bool().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(build_at(&a), [false, false]);
+    let original = fs::read(a.join("debug/app")).unwrap();
+    fs::remove_dir_all(&a).unwrap();
+    assert_eq!(build_at(&b), [true, true]);
+    assert_eq!(fs::read(b.join("debug/app")).unwrap(), original);
+    if std::env::var_os("JATO_TEST_SEALED").is_some() {
+        use std::os::unix::fs::FileExt;
+        assert_eq!(build_at(&a), [true, true]);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(a.join("debug/app"))
+            .unwrap()
+            .write_all_at(b"changed", 0)
+            .unwrap();
+        assert_eq!(fs::read(b.join("debug/app")).unwrap(), original);
+        let c = p.temp.path().join("delivery c");
+        assert_eq!(build_at(&c), [true, true]);
+        assert_eq!(fs::read(c.join("debug/app")).unwrap(), original);
+    }
+    write(p.root.join("leaf/src/text file"), "two");
+    assert_eq!(
+        success(command(&a).args(["run", "-q"])).stdout,
+        b"two:none\n"
+    );
+    success(command(&a).args(["cargo", "clean"]));
+    assert_eq!(build_at(&b), [false, false]);
+}
+
+#[test]
 fn rebuilds_variants_and_invalidates_includes_env_and_resolution() {
     let p = Project::new();
     assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
@@ -1203,6 +1281,27 @@ fn cargo_probe_cache_replays_exact_bytes_and_leaves_source_queries_alone() {
         assert_eq!(out.stderr, expected.stderr);
     }
     assert_eq!(p.stats()["counters"]["probe_hit"], 1);
+    let target = [
+        "-",
+        "--crate-name",
+        "___",
+        "--crate-type",
+        "bin",
+        "--print=file-names",
+        "--print=cfg",
+        "-Clinker-features=-lld",
+        "-C",
+        "link-arg=-fuse-ld=mold",
+    ];
+    let expected = success(Command::new(&rustc).args(target).stdin(Stdio::null()));
+    for _ in 0..2 {
+        let out = success(p.command().arg(&rustc).args(target).stdin(Stdio::null()));
+        assert_eq!(
+            (out.stdout, out.stderr),
+            (expected.stdout.clone(), expected.stderr.clone())
+        );
+    }
+    assert_eq!(p.stats()["counters"]["probe_hit"], 2);
     for name in ["first", "second"] {
         let mut cmd = p.command();
         let mut child = cmd

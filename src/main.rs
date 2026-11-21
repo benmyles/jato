@@ -6,6 +6,7 @@ mod dev;
 mod fingerprint;
 mod flight;
 mod invocation;
+mod keep;
 mod native;
 mod probe;
 mod sealed;
@@ -34,6 +35,7 @@ Usage
   jato stats [--json]              Show cache contents and compiler counters
   jato limit [SIZE|--unset]         Read or set this cache directory's shared budget
   jato gc [SIZE]                   Evict least-recently-used entries to SIZE
+  jato --keep-build build [...]    Retain Cargo intermediates when changing target directories
   jato --system-linker build [...]   Select /usr/bin/cc for x86_64 GNU host links
   jato --version
 
@@ -68,6 +70,15 @@ fn main() {
 struct CargoOptions {
     system_linker: bool,
     dev: bool,
+    keep_build: bool,
+}
+
+impl CargoOptions {
+    fn set_build_dir(self, cmd: &mut Command) {
+        if self.keep_build {
+            keep::configure(cmd);
+        }
+    }
 }
 
 fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
@@ -78,6 +89,7 @@ fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
         cmd.args(args);
     }
     cmd.env("RUSTC_WRAPPER", env::current_exe()?);
+    options.set_build_dir(&mut cmd);
     if options.system_linker {
         set_system_linker(&mut cmd)?;
     }
@@ -118,6 +130,7 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
     while let Some(flag) = args.first() {
         match flag.to_str() {
             Some("--system-linker") => options.system_linker = true,
+            Some("--keep-build") => options.keep_build = true,
             Some("dev") => options.dev = true,
             _ => break,
         }

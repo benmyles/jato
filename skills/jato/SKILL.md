@@ -28,4 +28,6 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 ## Explain cache behavior
 
+For several ordinary target directories in the same checkout with Cargo 1.91+ and Jato 0.10+, use `jato --keep-build build --target-dir outputs/a` and repeat with `outputs/b`. Cargo shares one workspace's intermediate state and writes each requested public target. To measure compiler-cache restoration after deleting all build state, use an isolated `CARGO_BUILD_BUILD_DIR` and remove it along with the test target. Check the project's Cargo version before choosing this workflow.
+
 Keep the target directory and incremental state between edits. Cargo skips fresh units and can replay their earlier debug lines. Compare `jato stats --json` before and after the workload for actual hits. Use `JATO_LOG=debug jato check` for per-crate decisions or `JATO_LOG=timings jato build` to distinguish compilation, validation and restore time. Cargo still runs build scripts and tests. A bypass delegates to the compiler. To inspect the shared cache budget, run `jato limit`. If asked to set it for all projects using that cache, use a command such as `jato limit 32GiB`. With no shared setting, a build can use `JATO_MAX_SIZE=512MiB`.
