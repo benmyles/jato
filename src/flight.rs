@@ -25,7 +25,12 @@ mod linux {
     }
 
     impl Ticket {
-        pub fn enter(dir: &Path, recipe: &Digest, root: &Path) -> Option<Self> {
+        pub fn enter(
+            dir: &Path,
+            recipe: &Digest,
+            root: &Path,
+            hint: Option<&Digest>,
+        ) -> Option<Self> {
             if std::env::var_os("JATO_COALESCE").as_deref() == Some(OsStr::new("0")) {
                 return None;
             }
@@ -34,15 +39,19 @@ mod linux {
             h.update(&cache.dev().to_le_bytes());
             h.update(&cache.ino().to_le_bytes());
             h.update(&unsafe { libc::geteuid() }.to_le_bytes());
-            // Different top-level edits can compile concurrently. The prefix
-            // is only a scheduling hint; full content determines every hit.
-            let mut prefix = [0; 4096];
-            let mut source = crate::content::open_with_flags(root, libc::O_NONBLOCK).ok()?;
-            if !source.metadata().ok()?.is_file() {
-                return None;
+            if let Some(verified) = hint {
+                h.update(b"known inputs").update(verified);
+            } else {
+                // The very first compile has no dep-info yet. Its prefix is
+                // only a scheduling hint; full content determines every hit.
+                let mut prefix = [0; 4096];
+                let mut source = crate::content::open_with_flags(root, libc::O_NONBLOCK).ok()?;
+                if !source.metadata().ok()?.is_file() {
+                    return None;
+                }
+                let n = source.read(&mut prefix).ok()?;
+                h.update(b"source prefix").update(&prefix[..n]);
             }
-            let n = source.read(&mut prefix).ok()?;
-            h.update(&prefix[..n]);
             let mut name = [0; 40];
             name[..8].copy_from_slice(b"jato-job");
             name[8..].copy_from_slice(h.finalize().as_bytes());
@@ -140,7 +149,7 @@ mod linux {
             const CHILD: &str = "JATO_TEST_FLIGHT_CHILD";
             if let Some(dir) = std::env::var_os(CHILD) {
                 let dir = Path::new(&dir);
-                let _owner = Ticket::enter(dir, &[7; 32], &dir.join("source")).unwrap();
+                let _owner = Ticket::enter(dir, &[7; 32], &dir.join("source"), None).unwrap();
                 std::fs::write(dir.join("ready"), []).unwrap();
                 // The parent kills this process so Rust destructors cannot
                 // run. EOF also bounds its lifetime if the parent exits.
@@ -166,11 +175,21 @@ mod linux {
                 assert!(owner.try_wait().unwrap().is_none() && Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let ticket = Ticket::enter(dir.path(), &[7; 32], &source).unwrap();
+            let ticket = Ticket::enter(dir.path(), &[7; 32], &source, None).unwrap();
             assert!(matches!(ticket.0, Role::Peer(_)));
+            let first = Ticket::enter(dir.path(), &[7; 32], &source, Some(&[1; 32])).unwrap();
+            let second = Ticket::enter(dir.path(), &[7; 32], &source, Some(&[2; 32])).unwrap();
+            assert!(first.is_owner() && second.is_owner());
+            assert!(
+                !Ticket::enter(dir.path(), &[7; 32], &source, Some(&[1; 32]))
+                    .unwrap()
+                    .is_owner()
+            );
             std::fs::write(&source, b"modified").unwrap();
             assert!(matches!(
-                Ticket::enter(dir.path(), &[7; 32], &source).unwrap().0,
+                Ticket::enter(dir.path(), &[7; 32], &source, None)
+                    .unwrap()
+                    .0,
                 Role::Owner { .. }
             ));
             std::fs::write(&source, b"original").unwrap();
@@ -181,7 +200,9 @@ mod linux {
                 assert!(waiter.join().unwrap());
             });
             assert!(matches!(
-                Ticket::enter(dir.path(), &[7; 32], &source).unwrap().0,
+                Ticket::enter(dir.path(), &[7; 32], &source, None)
+                    .unwrap()
+                    .0,
                 Role::Owner { .. }
             ));
         }
@@ -195,7 +216,7 @@ pub use linux::Ticket;
 pub struct Ticket;
 #[cfg(not(target_os = "linux"))]
 impl Ticket {
-    pub fn enter(_: &Path, _: &Digest, _: &Path) -> Option<Self> {
+    pub fn enter(_: &Path, _: &Digest, _: &Path, _: Option<&Digest>) -> Option<Self> {
         None
     }
     pub fn is_owner(&self) -> bool {

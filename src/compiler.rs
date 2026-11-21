@@ -37,6 +37,7 @@ fn discover(
     inv: &Invocation,
     recipe: &fingerprint::Recipe,
     plans: Vec<Vec<u8>>,
+    flight_hint: &mut Option<Digest>,
 ) -> Result<Option<Hit>> {
     let before = Instant::now();
     if plans.is_empty() {
@@ -58,6 +59,9 @@ fn discover(
         let Ok(inputs) = plan.inputs(recipe, inv, start, false) else {
             continue;
         };
+        // Reuse work already done for lookup to keep different branch
+        // edits out of the same wait queue.
+        flight_hint.get_or_insert(inputs.sources);
         // An edit with new source bytes cannot hit, even if all dependency
         // artifacts match. Send it to rustc before reading those artifacts.
         if !store.has_sources(&inputs.sources)? {
@@ -91,6 +95,7 @@ fn discover(
                 continue;
             }
         };
+        *flight_hint = Some(key);
         let Some(topology) = store.matches_topology(&key, &current)? else {
             continue;
         };
@@ -277,8 +282,10 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     let mut ticket = None;
     let mut waited = false;
     loop {
+        let mut flight_hint = None;
         let lookup = store.plans(&recipe.key).and_then(|(plans, version)| {
-            discover(&mut store, compiler, inv, &recipe, plans).map(|hit| (hit, version))
+            discover(&mut store, compiler, inv, &recipe, plans, &mut flight_hint)
+                .map(|hit| (hit, version))
         });
         let version = match lookup {
             Ok((Some(hit), _)) => {
@@ -294,7 +301,12 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 break;
             }
         };
-        ticket = crate::flight::Ticket::enter(&store.dir, &recipe.key, &inv.source);
+        ticket = crate::flight::Ticket::enter(
+            &store.dir,
+            &recipe.key,
+            &inv.source,
+            flight_hint.as_ref(),
+        );
         let Some(claim) = &ticket else { break };
         if claim.is_owner() {
             // Another compiler may have published between the first miss
