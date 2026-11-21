@@ -10,3 +10,5 @@
 - Use bench/compare.py for comparisons with other compiler caches. Isolate their daemons, configuration, stores and target directories, and verify the built program. Include cold builds, fresh builds and edits alongside warm restores.
 - For native cache changes, run the suite with JATO_TEST_NATIVE_HITS=1 on x86-64 GNU Linux with strace. Validate both shared and per-unit Cargo output layouts. For sealed storage changes, also set JATO_TEST_SEALED=1 on compressed Btrfs with fs-verity. A restored target must remain independently writable.
 - A native build using incremental mode needs an observed fresh compiler session before it can publish an entry. Exercise a live edit as well as a clean restore in the default dev profile.
+- Verify parallel digests against standard BLAKE3 at partial and power-of-two boundaries. Borrow only available Cargo job tokens and keep the serial path usable.
+- Treat archive boundaries as storage hints. Validate whole restored files and check shared chunk and manifest reclamation after eviction or corruption. Use the embedded and zlib fixtures plus bench/history.py when changing these paths.
