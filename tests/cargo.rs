@@ -727,6 +727,51 @@ fn damaged_shared_chunks_trigger_a_real_recompile_and_heal() {
 }
 
 #[test]
+fn unchanged_consumer_rejects_a_changed_large_dependency_before_hitting() {
+    let p = Project::new();
+    let leaf = p.root.join("leaf/src/lib.rs");
+    fs::write(p.root.join("leaf/src/data"), vec![13; 5 << 20]).unwrap();
+    let revise = |n: u8| {
+        write(
+            &leaf,
+            &format!("pub const DATA: &[u8]=include_bytes!(\"data\"); pub const REV: u8={n};"),
+        )
+    };
+    write(
+        p.root.join("src/main.rs"),
+        "const _: () = assert!(leaf::REV != 2, \"unexpected revision\"); fn main() {println!(\"{}\", leaf::DATA[900]);}",
+    );
+    let check = || {
+        p.command()
+            .env("JATO_LOG", "debug")
+            .args(["check", "--release", "-q"])
+            .output()
+            .unwrap()
+    };
+    revise(1);
+    assert!(check().status.success());
+    revise(2);
+    let failed = check();
+    let log = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        !failed.status.success() && log.contains("unexpected revision"),
+        "{log}"
+    );
+    assert!(
+        log.contains("[app] large input precheck ruled out"),
+        "{log}"
+    );
+    revise(1);
+    p.clean();
+    let restored = check();
+    let log = String::from_utf8_lossy(&restored.stderr);
+    assert!(
+        restored.status.success() && log.contains("[app] hit"),
+        "{log}"
+    );
+}
+
+#[test]
 fn large_embedded_assets_restore_and_content_edits_invalidate() {
     use std::os::unix::fs::FileExt;
     let p = Project::new();

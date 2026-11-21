@@ -215,6 +215,8 @@ pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub large_input: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_extern: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<crate::native::Manifest>,
 }
 
@@ -294,6 +296,7 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
         env,
         native: None,
         large_input: None,
+        large_extern: None,
     })
 }
 
@@ -318,6 +321,38 @@ fn tracked_env(hash: &mut blake3::Hasher, names: &BTreeSet<String>) {
     }
 }
 
+fn sample_file(
+    h: &mut blake3::Hasher,
+    path: &Path,
+    since: SystemTime,
+    buffer: &mut [u8],
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let file = crate::content::open_with_flags(path, libc::O_NONBLOCK)?;
+    let m = file.metadata()?;
+    ensure!(
+        m.is_file() && !recent(&m, since),
+        "sampled input changed during compilation"
+    );
+    field(h, path.as_os_str().as_bytes());
+    h.update(&m.len().to_le_bytes());
+    let width = m.len().min(buffer.len() as u64);
+    let tail = m.len() - width;
+    let mut previous = None;
+    for offset in [0, tail / 2, tail] {
+        if previous != Some(offset) {
+            file.read_exact_at(&mut buffer[..width as usize], offset)?;
+            h.update(&buffer[..width as usize]);
+        }
+        previous = Some(offset);
+    }
+    ensure!(
+        stamp(&m) == stamp(&fs::metadata(path)?),
+        "sampled input replaced during lookup"
+    );
+    Ok(())
+}
+
 impl Plan {
     pub fn same_rust_inputs(&self, other: &Self) -> bool {
         self.files == other.files && self.env == other.env
@@ -328,61 +363,48 @@ impl Plan {
     pub fn sample(
         &self,
         recipe: &Recipe,
-        source: &Path,
+        inv: &Invocation,
         since: SystemTime,
     ) -> Result<Option<Digest>> {
-        use std::os::unix::fs::FileExt;
-        let Some(index) = self.large_input else {
+        if self.large_input.is_none() && self.large_extern.is_none() {
             return Ok(None);
-        };
-        let large = self
-            .files
-            .iter()
-            .nth(index)
-            .context("invalid large input index")?;
-        let mut paths = vec![source];
-        if large != source {
-            paths.push(large);
-        }
-        for p in self
-            .files
-            .iter()
-            .filter(|p| p.extension() == Some(OsStr::new("rs")))
-            .take(8)
-        {
-            if p != source && p != large {
-                paths.push(p);
-            }
         }
         let mut h = blake3::Hasher::new_derive_key("jato bulk input precheck v1");
         field(&mut h, &recipe.key);
         let mut buffer = [0; 1024];
-        for path in paths {
-            let file = crate::content::open_with_flags(path, libc::O_NONBLOCK)?;
-            let m = file.metadata()?;
-            ensure!(
-                m.is_file() && !recent(&m, since),
-                "sampled input changed during compilation"
-            );
-            field(&mut h, path.as_os_str().as_bytes());
-            h.update(&m.len().to_le_bytes());
-            let width = m.len().min(buffer.len() as u64);
-            let tail = m.len() - width;
-            let mut previous = None;
-            for offset in [0, tail / 2, tail] {
-                if previous == Some(offset) {
-                    continue;
-                }
-                previous = Some(offset);
-                file.read_exact_at(&mut buffer[..width as usize], offset)?;
-                h.update(&buffer[..width as usize]);
+        sample_file(&mut h, &inv.source, since, &mut buffer)?;
+        if let Some(index) = self.large_input {
+            let large = self
+                .files
+                .iter()
+                .nth(index)
+                .context("invalid large input index")?;
+            if *large != inv.source {
+                sample_file(&mut h, large, since, &mut buffer)?;
             }
-            ensure!(
-                stamp(&m) == stamp(&fs::metadata(path)?),
-                "sampled input replaced during lookup"
-            );
+            for path in self
+                .files
+                .iter()
+                .filter(|p| p.extension() == Some(OsStr::new("rs")))
+                .take(8)
+            {
+                if *path != inv.source && path != large {
+                    sample_file(&mut h, path, since, &mut buffer)?;
+                }
+            }
         }
         tracked_env(&mut h, &self.env);
+        if let Some(index) = self.large_extern {
+            field(&mut h, b"compiled dependency precheck v1");
+            let large = inv
+                .externs
+                .get(index)
+                .context("invalid large extern index")?;
+            sample_file(&mut h, large, since, &mut buffer)?;
+            for p in inv.externs.iter().take(8).filter(|p| *p != large) {
+                sample_file(&mut h, p, since, &mut buffer)?;
+            }
+        }
         Ok(Some(*h.finalize().as_bytes()))
     }
 
@@ -611,6 +633,7 @@ impl Inputs {
 
 pub struct Externs {
     pub key: Digest,
+    pub largest: Option<usize>,
     pub needs: Vec<Digest>,
 }
 
@@ -690,6 +713,12 @@ pub fn certify_externs(
     }
     Ok(Externs {
         key: *hash.finalize().as_bytes(),
+        largest: inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.size() >= 4 << 20)
+            .max_by_key(|(_, input)| input.size())
+            .map(|(i, _)| i),
         needs,
     })
 }

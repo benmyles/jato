@@ -57,7 +57,7 @@ fn discover(
         if inv.observe_native && plan.native.is_none() {
             continue;
         }
-        if let Ok(Some(sample)) = plan.sample(recipe, &inv.source, start)
+        if let Ok(Some(sample)) = plan.sample(recipe, inv, start)
             && !store.may_match_sample(&recipe.key, &sample)?
         {
             flight_hint.get_or_insert(sample);
@@ -422,7 +422,8 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             );
             let inputs = plan.inputs(&recipe, inv, since, inv.codegen)?;
             plan.large_input = inputs.large_input;
-            let sample = plan.sample(&recipe, &inv.source, since).unwrap_or(None);
+            plan.large_extern = externs.largest;
+            let sample = plan.sample(&recipe, inv, since).unwrap_or(None);
             let sources = inputs.sources;
             let topology = inputs.topology(since)?;
             let editor = if inv.observe_native && inv.incremental.is_some() {
