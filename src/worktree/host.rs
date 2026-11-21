@@ -5,7 +5,7 @@
 use crate::fingerprint::stamp;
 use anyhow::{Context, Result, ensure};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
@@ -24,6 +24,9 @@ use std::time::Duration;
 const ENDPOINT: &str = "JATO_WORKTREE_HOST";
 const TIMEOUT: Duration = Duration::from_millis(250);
 const PATH_LIMIT: usize = 4096;
+const WANT_RECENT: u16 = 1 << 15;
+const MAX_RECENT: usize = 32;
+type EncodedStamp = [u8; 56];
 const FORWARDED: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 const UNBLOCK: &str = "JATO_WORKTREE_UNBLOCK";
 
@@ -112,7 +115,7 @@ impl Client {
         None
     }
 
-    fn ask(&self, path: &Path, identity: &[u64; 7]) -> io::Result<bool> {
+    fn ask(&mut self, path: &Path, identity: &[u64; 7]) -> io::Result<bool> {
         let bytes = path.as_os_str().as_bytes();
         if bytes.len() > PATH_LIMIT {
             return Ok(false);
@@ -125,11 +128,28 @@ impl Client {
         socket.set_read_timeout(Some(TIMEOUT))?;
         socket.set_write_timeout(Some(TIMEOUT))?;
         let mut request = Vec::with_capacity(bytes.len() + 2);
-        request.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        let warm = self.known.is_empty();
+        let size = bytes.len() as u16 | if warm { WANT_RECENT } else { 0 };
+        request.extend_from_slice(&size.to_le_bytes());
         request.extend_from_slice(bytes);
         socket.write_all(&request)?;
         let mut reply = [0u8; 57];
         socket.read_exact(&mut reply)?;
+        if warm && reply[0] == 1 {
+            let mut count = [0; 1];
+            socket.read_exact(&mut count)?;
+            let n = count[0] as usize;
+            if n > MAX_RECENT {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            let mut extra = [0u8; 56 * MAX_RECENT];
+            socket.read_exact(&mut extra[..56 * n])?;
+            for bytes in extra[..56 * n].as_chunks::<56>().0 {
+                let words: [u64; 7] =
+                    std::array::from_fn(|i| u64::from_le_bytes(bytes.as_chunks::<8>().0[i]));
+                self.known.insert(words, true);
+            }
+        }
         Ok(reply[0] == 1
             && identity
                 .iter()
@@ -162,7 +182,7 @@ pub fn system_owner(path: &Path, m: &Metadata) -> bool {
     })
 }
 
-fn serve(mut socket: UnixStream) -> io::Result<()> {
+fn serve(mut socket: UnixStream, recent: &mut VecDeque<EncodedStamp>) -> io::Result<()> {
     if peer(&socket)?.uid != unsafe { libc::geteuid() } {
         return Ok(());
     }
@@ -170,7 +190,8 @@ fn serve(mut socket: UnixStream) -> io::Result<()> {
     socket.set_write_timeout(Some(TIMEOUT))?;
     let mut size = [0u8; 2];
     socket.read_exact(&mut size)?;
-    let n = u16::from_le_bytes(size) as usize;
+    let size = u16::from_le_bytes(size);
+    let n = (size & !WANT_RECENT) as usize;
     if n == 0 || n > PATH_LIMIT {
         return Ok(());
     }
@@ -185,9 +206,32 @@ fn serve(mut socket: UnixStream) -> io::Result<()> {
         && m.uid() == 0
     {
         reply[0] = 1;
-        for (dst, val) in reply[1..].as_chunks_mut::<8>().0.iter_mut().zip(stamp(&m)) {
+        let mut encoded = [0u8; 56];
+        for (dst, val) in encoded.as_chunks_mut::<8>().0.iter_mut().zip(stamp(&m)) {
             dst.copy_from_slice(&val.to_le_bytes());
         }
+        reply[1..].copy_from_slice(&encoded);
+        // The first authenticated query from another wrapper can reuse these
+        // host-confirmed identities. A reader still compares its own complete
+        // inode stamp, and checks the canonical system path, before using one.
+        if size & WANT_RECENT != 0 {
+            let mut response = Vec::with_capacity(58 + 56 * recent.len());
+            response.extend_from_slice(&reply);
+            response.push(recent.len() as u8);
+            for previous in recent.iter() {
+                response.extend_from_slice(previous);
+            }
+            socket.write_all(&response)?;
+        } else {
+            socket.write_all(&reply)?;
+        }
+        if !recent.contains(&encoded) {
+            if recent.len() == MAX_RECENT {
+                recent.pop_front();
+            }
+            recent.push_back(encoded);
+        }
+        return Ok(());
     }
     socket.write_all(&reply)
 }
@@ -322,6 +366,7 @@ pub fn run(mut cmd: Command, payload: &[OsString]) -> Result<i32> {
     let mut reader = Some(reader);
     let mut info_bytes = Vec::new();
     let mut inner = None;
+    let mut recent = VecDeque::new();
     let result = (|| -> Result<i32> {
         loop {
             if let Some(status) = child.try_wait()? {
@@ -383,7 +428,7 @@ pub fn run(mut cmd: Command, payload: &[OsString]) -> Result<i32> {
             if fds[1].revents != 0
                 && let Ok((s, _)) = server.accept()
             {
-                let _ = serve(s);
+                let _ = serve(s, &mut recent);
             }
         }
     })();
@@ -397,6 +442,52 @@ pub fn run(mut cmd: Command, payload: &[OsString]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_wrapper_receives_only_previously_authenticated_inode_stamps() -> anyhow::Result<()> {
+        let first = fs::canonicalize("/usr/bin/env")?;
+        let second = fs::canonicalize("/usr/bin/ls")?;
+        let one = fs::metadata(&first)?;
+        let two = fs::metadata(&second)?;
+        if ![(&first, &one), (&second, &two)]
+            .iter()
+            .all(|(p, m)| crate::native::system_file(p) && m.uid() == 0)
+        {
+            return Ok(());
+        }
+        let name = format!("jato-test-owners-{}", std::process::id());
+        let listener = UnixListener::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes())?)?;
+        let new_client = || -> io::Result<Client> {
+            Ok(Client {
+                address: listener.local_addr()?,
+                pid: std::process::id() as i32,
+                known: HashMap::new(),
+            })
+        };
+        let mut a = new_client()?;
+        let mut b = new_client()?;
+        let mut c = new_client()?;
+        let server = std::thread::spawn(move || -> io::Result<_> {
+            let mut recent = VecDeque::new();
+            for _ in 0..3 {
+                serve(listener.accept()?.0, &mut recent)?;
+            }
+            Ok(recent.len())
+        });
+        assert!(a.ask(&first, &stamp(&one))?);
+        assert!(a.known.is_empty());
+        assert!(b.ask(&second, &stamp(&two))?);
+        assert_eq!(b.known.get(&stamp(&one)), Some(&true));
+        let mut different = stamp(&one);
+        different[4] ^= 1;
+        assert!(!b.known.contains_key(&different));
+        let temp = tempfile::NamedTempFile::new()?;
+        assert!(!c.ask(temp.path(), &stamp(&one))?);
+        assert!(c.known.is_empty());
+        assert_eq!(server.join().unwrap()?, 2);
+        Ok(())
+    }
+
     #[test]
     fn ownership_reply_is_bound_to_a_canonical_system_inode() -> anyhow::Result<()> {
         fn query(path: &Path) -> io::Result<[u8; 57]> {
@@ -404,7 +495,7 @@ mod tests {
             let bytes = path.as_os_str().as_bytes();
             client.write_all(&(bytes.len() as u16).to_le_bytes())?;
             client.write_all(bytes)?;
-            serve(server)?;
+            serve(server, &mut VecDeque::new())?;
             let mut out = [0; 57];
             client.read_exact(&mut out)?;
             Ok(out)

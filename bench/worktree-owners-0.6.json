@@ -1,0 +1,16 @@
+{
+  "previous_jato": {
+    "version": "jato 0.5.0",
+    "owner_connections": 189,
+    "compiler_hits": 39
+  },
+  "jato": {
+    "version": "jato 0.6.0",
+    "owner_connections": 33,
+    "compiler_hits": 39
+  },
+  "upstream_test_result": "test result: ok. 299 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s",
+  "restored_rg_sha256": "dc8bb2fefdb2c3b4c1b8071f83baeb92d6c0a17c37d06c81206fd76864231661",
+  "copied_checkout_compiler_hits": 39,
+  "upgraded_entries": 40
+}

@@ -10,6 +10,10 @@
 
 - Traced a failed Cargo check after a source edit beside a 64 MiB asset. The 0.5 wrapper read all 67,108,864 asset bytes before invoking rustc. A bounded rejection check read 3,072. An edit outside those reads still produced a new executable, and a byte-for-byte undo restored the original. Tested mixed legacy entries, sample accounting and eviction.
 
+- A warm projected ripgrep build made 189 host ownership connections. Returning up to 32 already authenticated system inode identities on a wrapper’s first successful query reduced that to 33. Both traces recorded 39 verified compiler hits.
+- Installed 0.6.0 and ran 50 tests each on Rust 1.89 and 1.100 with native, sealed and worktree hits required. The separate 272 MiB packed stress test passed. Upgraded nine populated historical schemas, restored a 0.5 packed ripgrep cache, wrote a new variant and reclaimed all charged bytes. A restored executable in another checkout passed all 299 upstream tests.
+- Timed seven atomic edits and undos per tool with Cargo’s dev profile. Ripgrep undos took a median 161 ms with 0.6, 591 ms with 0.5, 270 ms with kache 2.2 and 604 ms with sccache 0.19. Every measured executable printed its expected revision.
+
 ## 2026-11-21 — concurrent builds and repeated validation
 
 - Started two clean regex worktrees against the same empty 0.4 cache. All six compiler units ran twice and produced six stored entries. The pair finished in 11.18 s.
