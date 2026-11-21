@@ -18,10 +18,7 @@ from compare import binary, run
 from worktrees import cargo_environment, private_environment
 
 
-def packed_writes(exe, cargo, env, project, root):
-    command = [cargo, "build", "--release", "--lib", "--locked", "-q"]
-    env = dict(env, JATO_STORAGE="packed")
-    prefix = root / "trace"
+def wrapper_trace(exe, command, env, project, prefix):
     run(
         [
             "strace",
@@ -39,6 +36,22 @@ def packed_writes(exe, cargo, env, project, root):
         env,
         project,
     )
+    traces = []
+    for f in prefix.parent.glob(prefix.name + ".*"):
+        lines = f.read_text(errors="replace").splitlines()
+        if any(
+            line.startswith(f'execve("{exe}"') and '"--crate-name", "capture"' in line
+            for line in lines
+        ):
+            traces.append(lines)
+    assert len(traces) == 1, f"expected one compiler wrapper trace, found {len(traces)}"
+    return traces[0]
+
+
+def packed_writes(exe, cargo, env, project, root):
+    command = [cargo, "build", "--release", "--lib", "--locked", "-q"]
+    env = dict(env, JATO_STORAGE="packed")
+    cold = wrapper_trace(exe, command, env, project, root / "cold")
     store = re.escape(env["JATO_CACHE_DIR"])
     anonymous = re.compile(
         r"^(?:write|writev|pwrite64)\(\d+<"
@@ -51,27 +64,40 @@ def packed_writes(exe, cargo, env, project, root):
     frame = re.compile(
         r"^(?:write|pwrite64)\(\d+<" + store + r"/frames-v1/\.pending>.* = (\d+)$"
     )
-    traces = []
-    for f in root.glob("trace.*"):
-        lines = f.read_text(errors="replace").splitlines()
-        if any(
-            l.startswith(f'execve("{exe}"') and '"--crate-name", "capture"' in l
-            for l in lines
-        ):
-            traces.append(lines)
-    assert len(traces) == 1, f"expected one compiler wrapper trace, found {len(traces)}"
 
-    def total(pattern):
-        return sum(int(m[1]) for l in traces[0] if (m := pattern.match(l)))
+    def total(pattern, lines):
+        return sum(int(m[1]) for line in lines if (m := pattern.match(line)))
 
     stats = json.loads(run([exe, "stats", "--json"], env, project))
     assert stats["entries"] == 1
-    written = total(db)
-    payload = total(frame)
-    assert payload == stats.get("frame_file_bytes", 0), "frame writes missing from trace"
-    assert written + payload >= stats["compressed_bytes"], "payload writes missing from trace"
+    written = total(db, cold)
+    payload = total(frame, cold)
+    assert payload == stats.get("frame_file_bytes", 0), (
+        "frame writes missing from trace"
+    )
+    assert written + payload >= stats["compressed_bytes"], (
+        "payload writes missing from trace"
+    )
+    target = Path(env["CARGO_TARGET_DIR"])
+    archive = target / "release/libcapture.rlib"
+    with archive.open("rb") as stream:
+        expected = hashlib.file_digest(stream, "sha256")
+    shutil.rmtree(target)
+    warm = wrapper_trace(exe, command, env, project, root / "warm")
+    with archive.open("rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").digest() == expected.digest()
+    restored = json.loads(run([exe, "stats", "--json"], env, project))
+    assert restored["counters"].get("hit", 0) == 1
+    target_writes = re.compile(
+        r"^(?:write|writev|pwrite64)\(\d+<"
+        + re.escape(str(target))
+        + r"/[^>]+>.* = (\d+)$"
+    )
     return {
-        "anonymous_staging_bytes_written": total(anonymous),
+        "logical_restored_bytes": stats["artifact_bytes"],
+        "restore_output_bytes_written": total(target_writes, warm),
+        "restore_archive_sha256": expected.hexdigest(),
+        "anonymous_staging_bytes_written": total(anonymous, cold),
         "sqlite_bytes_written": written,
         "frame_file_bytes_written": payload,
         "compressed_payload_bytes": stats["compressed_bytes"],
@@ -83,6 +109,11 @@ def main():
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato", required=True)
     parser.add_argument("--mib", type=int, default=32)
+    parser.add_argument(
+        "--sparse",
+        action="store_true",
+        help="embed long zero regions separated by distinct marker bytes",
+    )
     parser.add_argument("--runs", type=int, default=7)
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR") or "/var/tmp")
     opts = parser.parse_args()
@@ -106,9 +137,16 @@ def main():
             '[package]\nname="capture"\nversion="0.1.0"\nedition="2021"\n'
         )
         asset = src / "asset.bin"
-        asset.write_bytes(
-            hashlib.shake_256(b"jato publication fixture").digest(opts.mib << 20)
-        )
+        if opts.sparse:
+            with asset.open("wb") as stream:
+                stream.truncate(opts.mib << 20)
+                for i in range(opts.mib):
+                    stream.seek((i << 20) + 19)
+                    stream.write(bytes([1 + i % 254]))
+        else:
+            asset.write_bytes(
+                hashlib.shake_256(b"jato publication fixture").digest(opts.mib << 20)
+            )
         (src / "lib.rs").write_text(
             'pub static ASSET: &[u8] = include_bytes!("asset.bin");'
         )
@@ -225,6 +263,7 @@ fn main(){
                     "kernel": platform.release(),
                     "runs": opts.runs,
                     "asset_bytes": asset.stat().st_size,
+                    "sparse": opts.sparse,
                     "samples": results,
                 },
                 indent=2,

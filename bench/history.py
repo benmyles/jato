@@ -108,8 +108,16 @@ def revisions(label, exe, project, target, env, edit, count, symbol):
             ):
                 row[key] = stats[key]
             row["packed_reused_bytes"] = stats["counters"].get("packed_reused_bytes", 0)
-        if revision == 0:
-            initial = archive_hash(archive)
+            row["sealed_bytes"] = stats["sealed_bytes"]
+            row["frame_file_bytes"] = stats.get("frame_file_bytes", 0)
+            row["patched_files"] = stats.get("patched_files", 0)
+            row["patch_bytes"] = stats.get("patch_bytes", 0)
+        if revision in {0, count - 1}:
+            checksum = archive_hash(archive)
+            if revision == 0:
+                initial = checksum
+            else:
+                last = checksum
         verify_library(project, archive, env, revision, symbol)
         rows.append(row)
     shutil.rmtree(target)
@@ -123,11 +131,27 @@ def revisions(label, exe, project, target, env, edit, count, symbol):
     verify_library(project, archive, env, 0, symbol)
     if jato:
         assert hits == 1, "the first source revision did not restore"
+    # Restore the edited artifact too. In automatic storage the first and
+    # last revisions can use different on-disk representations.
+    shutil.rmtree(target)
+    edit(count - 1)
+    before = counters(label, exe, env, project)["hits"]
+    start = time.perf_counter()
+    run(command, env, project)
+    latest = time.perf_counter() - start
+    assert archive_hash(archive) == last, "edited archive changed on restore"
+    latest_hits = counters(label, exe, env, project)["hits"] - before
+    if jato:
+        assert latest_hits == 1
+    verify_library(project, archive, env, count - 1, symbol)
     return {
         "version": run([exe, "--version"], env, project).decode().strip(),
         "revisions": rows,
         "restore_seconds": round(elapsed, 6),
         "restore_hits": hits,
+        "edited_restore_seconds": round(latest, 6),
+        "edited_restore_hits": latest_hits,
+        "edited_archive_sha256": last,
         "verified_revisions": count,
         "archive_sha256": initial,
     }

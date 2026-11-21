@@ -159,7 +159,7 @@ fn subtree(parts: &[Digest]) -> Digest {
     merge_subtrees_non_root(&subtree(left), &subtree(right), Mode::Hash)
 }
 
-fn root(parts: &[Digest]) -> Digest {
+pub(crate) fn root(parts: &[Digest]) -> Digest {
     if let [whole] = parts {
         return *whole;
     }

@@ -5,6 +5,8 @@
 - A real two-crate Cargo check changed a producer constant and kept the consumer source fixed. The 0.7 consumer wrapper read a 130,015,982-byte rmeta twice, for 260,031,964 bytes before and after rustc. A previous cold packed capture wrote more than 70 MiB to SQLite for a 32 MiB embedded asset.
 - Added compiled dependencies to the existing rejection-only input sample for large artifacts. The same successful consumer edit read 130,022,126 bytes, including two 3 KiB samples and one full certification. A changed producer also triggered its consumer’s expected compile error and reverting it restored the known result.
 - Moved large encoded frames into individually reclaimable files and kept their ordering, ownership and budget accounting transactional in SQLite. Packed restores can seek over zero pages and reuse a decompressed frame. Tested missing and corrupt shared payloads, interrupted publication, sparse EOFs and eviction during a reader’s WAL snapshot.
+- Eight 16 MiB asset revisions retained about 385 MiB with automatic storage in 0.7. A bounded byte comparison reused an authenticated base for 14 edited artifacts, retaining about 49 MiB. Verified inserts, deletions and overwrites with downstream consumers and full archive digests.
+- The first patch reader reread entire cloned results. For small in-place edits, the new reader validates the base’s standard BLAKE3 root and rehashes each changed stripe to validate the result’s root. Mostly shifted files can stream directly from authenticated ranges. Tests cover corrupt witnesses, incorrect result digests and a changed byte outside a literal in the same stripe.
 
 ## 2026-11-21 — cold capture and editor saves
 

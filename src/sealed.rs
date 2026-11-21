@@ -1,6 +1,9 @@
 //! Large artifacts on compressed Btrfs can keep their existing extents.
 //! fs-verity makes the cached inode immutable and authenticates its identity.
 //! A successful FICLONE snapshots those bytes into an independent writable file.
+pub(crate) mod delta;
+mod proof;
+
 use crate::store::{Damaged, Digest};
 use anyhow::{Context, Result, ensure};
 use std::fs::{self, File};
@@ -12,6 +15,8 @@ pub struct Object {
     pub verity: Digest,
     pub hash: Digest,
     pub reused: bool,
+    pub bytes: u64,
+    pub patch: Option<delta::Patch>,
 }
 
 pub fn path(dir: &Path, digest: &Digest) -> PathBuf {
@@ -141,6 +146,8 @@ mod linux {
             .finalize()
             .as_bytes();
         Ok(Object {
+            bytes: file.metadata()?.len(),
+            patch: None,
             file,
             verity,
             hash,
@@ -262,7 +269,55 @@ pub fn reuse(
         verity,
         hash,
         reused: true,
+        bytes: size,
+        patch: None,
     }))
+}
+
+// Only a base from the same compiler recipe and output slot is a candidate
+// for compact edits. Mounts without usable fs-verity use the packed path.
+pub fn revision(
+    source: &File,
+    dir: &Path,
+    size: u64,
+    unit: (&Digest, usize),
+    conn: &rusqlite::Connection,
+) -> Result<Option<Object>> {
+    use rusqlite::OptionalExtension;
+    if size < 4 << 20 {
+        return Ok(None);
+    }
+    let base: Option<(Digest,Digest,u64)> = conn.prepare_cached(
+        "SELECT o.hash,o.verity,o.bytes FROM entries e JOIN clones c ON c.entry=e.id
+         JOIN objects o ON o.hash=c.hash WHERE e.recipe=?1 AND c.slot=?2 AND o.bytes BETWEEN ?3 AND ?4
+         ORDER BY e.access DESC LIMIT 1"
+    )?.query_row(rusqlite::params![unit.0,unit.1,size.saturating_sub(delta::MAX_RESIZE),size.saturating_add(delta::MAX_RESIZE)],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((hash, verity, bytes)) = base else {
+        return Ok(None);
+    };
+    let file =
+        crate::content::open_with_flags(&path(dir, &hash), libc::O_NONBLOCK | libc::O_NOFOLLOW)?;
+    if file.metadata()?.len() != bytes || measure(&file)? != verity {
+        return Ok(None);
+    }
+    let Some(patch) = delta::capture(source, size, &file, bytes)? else {
+        return Ok(None);
+    };
+    let patch = (patch.result != hash).then_some(patch);
+    Ok(Some(Object {
+        file,
+        verity,
+        hash,
+        bytes,
+        reused: true,
+        patch,
+    }))
+}
+
+impl Object {
+    pub fn charge(&self) -> u64 {
+        self.bytes + 256 + self.patch.as_ref().map_or(0, |p| 96 + p.data.len() as u64)
+    }
 }
 
 fn same_sample(source: &File, candidate: &File, size: u64) -> std::io::Result<bool> {

@@ -178,8 +178,11 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
                     stats.charged_bytes, stats.limit_bytes
                 );
                 println!(
-                    "Payload   {} packed bytes + {} sealed bytes for {} artifact bytes",
-                    stats.compressed_bytes, stats.sealed_bytes, stats.artifact_bytes
+                    "Payload   {} packed bytes + {} sealed bytes + {} patch bytes for {} artifact bytes",
+                    stats.compressed_bytes,
+                    stats.sealed_bytes,
+                    stats.patch_bytes,
+                    stats.artifact_bytes
                 );
                 for (name, value) in stats.counters {
                     if name != "hit" && name != "miss" {

@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -118,6 +118,8 @@ pub struct Stats {
     pub chunks: u64,
     pub compressed_bytes: u64,
     pub frame_file_bytes: u64,
+    pub patched_files: u64,
+    pub patch_bytes: u64,
     pub sealed_objects: u64,
     pub sealed_bytes: u64,
     pub pending_entries: u64,
@@ -521,6 +523,7 @@ impl Store {
 
     fn sealed_output(
         &mut self,
+        unit: (&Digest, usize),
         path: &std::path::Path,
         source: &File,
         length: u64,
@@ -539,6 +542,13 @@ impl Store {
         if used != 0
             && let Ok(Some(object)) =
                 crate::sealed::reuse(source, path, &self.dir, length, &self.conn)
+        {
+            return Some(object);
+        }
+        if used != 0
+            && let Ok(Some(object)) =
+                crate::sealed::revision(source, &self.dir, length, unit, &self.conn)
+            && charge.saturating_add(object.charge()) <= self.limit
         {
             return Some(object);
         }
@@ -581,7 +591,7 @@ impl Store {
         let mut files = Vec::new();
         let mut packed = packed::Recorder::new(&self.dir, used != 0);
         let mut sidecar = None;
-        for path in outputs {
+        for (slot, path) in outputs.iter().enumerate() {
             let mut source =
                 File::open(path).with_context(|| format!("opening {}", path.display()))?;
             let metadata = source.metadata()?;
@@ -594,15 +604,17 @@ impl Store {
                 sealed: None,
             };
             let length = metadata.len();
-            if let Some(object) = self.sealed_output(path, &source, length, charge, used) {
+            if let Some(object) =
+                self.sealed_output((recipe, slot), path, &source, length, charge, used)
+            {
                 ensure!(
                     crate::fingerprint::stamp(&metadata)
                         == crate::fingerprint::stamp(&fs::metadata(path)?),
                     "compiler output changed during capture"
                 );
-                file.hash = object.hash;
+                file.hash = object.patch.as_ref().map_or(object.hash, |p| p.result);
                 file.size = length;
-                charge += length + 256;
+                charge += object.charge();
                 file.sealed = Some(object);
                 files.push(file);
                 continue;
@@ -676,13 +688,19 @@ impl Store {
                 params![entry, slot, &file.hash, file.size, file.mode, single],
             )?;
             if let Some(object) = &file.sealed {
-                crate::sealed::publish(object, &crate::sealed::path(&self.dir, &file.hash))?;
+                crate::sealed::publish(object, &crate::sealed::path(&self.dir, &object.hash))?;
                 tx.execute("INSERT INTO objects VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1",
-                    params![file.hash,object.verity,file.size])?;
+                    params![object.hash,object.verity,object.bytes])?;
                 tx.execute(
                     "INSERT INTO clones VALUES(?1,?2,?3)",
-                    params![entry, slot, file.hash],
+                    params![entry, slot, object.hash],
                 )?;
+                if let Some(patch) = &object.patch {
+                    tx.execute(
+                        "INSERT INTO patches VALUES(?1,?2,?3)",
+                        params![entry, slot, &patch.data],
+                    )?;
+                }
             }
             let mut source = None;
             let mut offset = 0;
@@ -701,7 +719,11 @@ impl Store {
         }
         let reused: u64 = files
             .iter()
-            .filter(|f| f.sealed.as_ref().is_some_and(|o| o.reused))
+            .filter(|f| {
+                f.sealed
+                    .as_ref()
+                    .is_some_and(|o| o.reused && o.patch.is_none())
+            })
             .map(|f| f.size)
             .sum();
         if reused > 0 {
@@ -781,13 +803,15 @@ impl Store {
             ensure!(blake3::hash(&stderr).as_bytes() == &hash, Damaged::Entry);
             let mut files = tx.prepare_cached(
                 "SELECT f.slot,f.digest,f.size,f.mode,f.single,o.verity,c.raw,
-                        CASE WHEN length(c.data)<=?2 THEN c.data END,c.external
-                 FROM files f LEFT JOIN clones x ON x.entry=f.entry AND x.slot=f.slot AND x.hash=f.digest
+                        CASE WHEN length(c.data)<=?2 THEN c.data END,c.external,o.hash,o.bytes,
+                        CASE WHEN length(d.data)<=?3 THEN d.data END
+                 FROM files f LEFT JOIN clones x ON x.entry=f.entry AND x.slot=f.slot
+                 LEFT JOIN patches d ON d.entry=x.entry AND d.slot=x.slot
                  LEFT JOIN objects o ON o.hash=x.hash
                  LEFT JOIN chunks c ON f.single=1 AND c.hash=f.digest
-                 WHERE f.entry=?1 ORDER BY f.slot"
+                 WHERE f.entry=?1 ORDER BY f.slot",
             )?;
-            let mut records = files.query(params![id, CHUNK])?;
+            let mut records = files.query(params![id, CHUNK, crate::sealed::delta::LIMIT])?;
             let mut staged = crate::staging::for_outputs(outputs)?;
             let mut decoder = Decoder::default();
             let mut frame = Vec::new();
@@ -821,15 +845,51 @@ impl Store {
                 }
                 let verity = row.get::<_, Option<Digest>>(5)?;
                 if let Some(verity) = verity {
-                    let path = crate::sealed::path(&self.dir, &digest);
+                    let base: Digest = row.get(9)?;
+                    let original_size: u64 = row.get(10)?;
+                    let path = crate::sealed::path(&self.dir, &base);
                     let mut source = crate::content::open(&path).map_err(|e| {
                         if e.kind() == std::io::ErrorKind::NotFound {
-                            anyhow::Error::new(Damaged::Object(digest))
+                            anyhow::Error::new(Damaged::Object(base))
                         } else {
                             e.into()
                         }
                     })?;
-                    crate::sealed::restore(&mut source, tmp, &verity, &digest, size)?;
+                    if base == digest {
+                        ensure!(
+                            original_size == size
+                                && matches!(row.get_ref(11)?, rusqlite::types::ValueRef::Null),
+                            Damaged::Entry
+                        );
+                        crate::sealed::restore(&mut source, tmp, &verity, &base, size)?;
+                    } else {
+                        let patch = row.get_ref(11)?.as_blob().map_err(|_| Damaged::Entry)?;
+                        if crate::sealed::delta::streams(patch)
+                            && crate::sealed::measure(&source).ok() == Some(verity)
+                        {
+                            ensure!(
+                                source.metadata()?.len() == original_size,
+                                Damaged::Object(base)
+                            );
+                        } else {
+                            crate::sealed::restore(
+                                &mut source,
+                                tmp,
+                                &verity,
+                                &base,
+                                original_size,
+                            )?;
+                        }
+                        crate::sealed::delta::apply(
+                            &source,
+                            tmp,
+                            size,
+                            original_size,
+                            patch,
+                            &digest,
+                            &base,
+                        )?;
+                    }
                     continue;
                 }
                 let mut hasher = blake3::Hasher::new();
@@ -983,6 +1043,8 @@ impl Store {
             sealed_bytes: scalar("SELECT COALESCE(SUM(bytes),0) FROM objects")?,
             compressed_bytes: scalar("SELECT COALESCE(SUM(length(data)+external),0) FROM chunks")?,
             frame_file_bytes: scalar("SELECT COALESCE(SUM(external),0) FROM chunks")?,
+            patched_files: scalar("SELECT COUNT(*) FROM patches")?,
+            patch_bytes: scalar("SELECT COALESCE(SUM(length(data)),0) FROM patches")?,
             artifact_bytes: scalar("SELECT COALESCE(SUM(size),0) FROM files")?,
             counters: events
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1169,6 +1231,42 @@ mod tests {
         let since = SystemTime::now();
         let pre = fingerprint::native_externs(&inv, since, &store)?;
         assert!(fingerprint::certify_externs(&pre, true, since, &store, false).is_err());
+        // A prior full producer certification cannot be inferred from matching
+        // samples, even for an edit buried in a same-length rlib.
+        use std::os::unix::fs::FileExt;
+        fs::write(&inv.source, b"fn main() {}")?;
+        fs::write(&extern_file, vec![7; 5 << 20])?;
+        let plan: fingerprint::Plan =
+            serde_json::from_str(r#"{"files":[],"env":[],"large_extern":0}"#)?;
+        let recipe = fingerprint::Recipe {
+            key: [7; 32],
+            toolchain: [9; 32],
+            root: dir.path().to_owned(),
+        };
+        let hint = plan.sample(&recipe, &inv, SystemTime::now())?.unwrap();
+        let evidence = Evidence {
+            sample: None,
+            inputs: b"proof",
+            needs: &[],
+            sources: &[3; 32],
+            topology: &[4; 32],
+            codegen: true,
+        };
+        store.save(
+            &[5; 32],
+            &[4; 32],
+            std::slice::from_ref(&extern_file),
+            b"",
+            1,
+            Some(evidence),
+        )?;
+        assert!(fingerprint::externs(&inv, SystemTime::now(), &store, false).is_ok());
+        File::options()
+            .write(true)
+            .open(&extern_file)?
+            .write_all_at(&[22], 123456)?;
+        assert_eq!(plan.sample(&recipe, &inv, SystemTime::now())?, Some(hint));
+        assert!(fingerprint::externs(&inv, SystemTime::now(), &store, false).is_err());
         Ok(())
     }
 
@@ -1640,6 +1738,60 @@ mod tests {
         fs::write(&orphan, b"aborted publish")?;
         store.prune(0)?;
         assert!(!orphan.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_revisions_share_the_original_across_eviction_and_validate_every_restore() -> Result<()>
+    {
+        let d = tempfile::tempdir()?;
+        let mut store = Store::at(d.path().join("cache"), 32 << 20)?;
+        store.allow_sealed = None;
+        let path = d.path().join("app");
+        let paths = std::slice::from_ref(&path);
+        let mut base = vec![0; 5 << 20];
+        blake3::Hasher::new()
+            .update(b"sealed variants")
+            .finalize_xof()
+            .fill(&mut base);
+        let mut shifted = base.clone();
+        shifted.splice(8194..8194, [4; 13]);
+        let mut edited = base.clone();
+        edited[183477] ^= 0xff;
+        for (i, bytes) in [&base, &shifted, &edited].into_iter().enumerate() {
+            fs::write(&path, bytes)?;
+            assert!(store.save(&[1; 32], &[i as u8; 32], paths, b"", 1, None)?);
+            if i == 0 && store.stats()?.sealed_objects == 0 {
+                ensure!(
+                    env::var_os("JATO_TEST_SEALED").is_none(),
+                    "expected fs-verity"
+                );
+                return Ok(());
+            }
+        }
+        let stats = store.stats()?;
+        assert_eq!((stats.sealed_objects, stats.patched_files), (1, 2));
+        assert!(stats.patch_bytes < 32 << 10);
+        store
+            .conn
+            .execute("DELETE FROM entries WHERE key=?1", [[0; 32]])?;
+        store.collect_objects(false)?;
+        for (i, bytes) in [(1, &shifted), (2, &edited)] {
+            fs::write(&path, b"live target")?;
+            assert!(store.restore(&[i; 32], paths)?.is_some());
+            assert_eq!(fs::read(&path)?, *bytes);
+        }
+        store.conn.execute("UPDATE patches SET data=zeroblob(length(data)) WHERE entry=(SELECT id FROM entries WHERE key=?1)",[[1;32]])?;
+        fs::write(&path, b"working copy")?;
+        assert!(store.restore(&[1; 32], paths).is_err());
+        assert_eq!(fs::read(&path)?, b"working copy");
+        assert_eq!(store.stats()?.patched_files, 1);
+        let object = crate::sealed::path(&store.dir, blake3::hash(&base).as_bytes());
+        fs::remove_file(object)?;
+        assert!(store.restore(&[2; 32], paths).is_err());
+        assert_eq!(fs::read(&path)?, b"working copy");
+        assert_eq!(store.stats()?.charged_bytes, 0);
         Ok(())
     }
 

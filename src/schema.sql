@@ -141,4 +141,14 @@ CREATE TRIGGER IF NOT EXISTS drop_frame_file AFTER DELETE ON chunks WHEN OLD.ext
     UPDATE usage SET bytes=bytes-((OLD.external+4095)/4096)*4096-256;
     INSERT OR IGNORE INTO retired_frames VALUES(OLD.hash);
 END;
-PRAGMA user_version=14;
+CREATE TABLE IF NOT EXISTS patches(
+    entry INTEGER NOT NULL, slot INTEGER NOT NULL, data BLOB NOT NULL,
+    PRIMARY KEY(entry,slot), FOREIGN KEY(entry,slot) REFERENCES clones(entry,slot) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS add_patch AFTER INSERT ON patches BEGIN
+    UPDATE usage SET bytes=bytes+96+length(NEW.data);
+END;
+CREATE TRIGGER IF NOT EXISTS drop_patch AFTER DELETE ON patches BEGIN
+    UPDATE usage SET bytes=bytes-96-length(OLD.data);
+END;
+PRAGMA user_version=15;
