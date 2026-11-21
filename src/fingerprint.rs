@@ -528,6 +528,85 @@ impl Inputs {
         }
         Ok(*topology.finalize().as_bytes())
     }
+
+    // Editors commonly replace a tracked file by rename. Its directory's
+    // timestamps change even if rustc sees the same names and file contents.
+    // Keep an independent witness only for small, ordinary source trees.
+    pub fn editor_topology(&self, since: SystemTime) -> Result<Digest> {
+        ensure!(self.namespace.len() <= 256, "large module search graph");
+        let mut h = blake3::Hasher::new_derive_key("jato local editor directory layout v1");
+        let mut remaining = 512usize;
+        for path in &self.namespace {
+            field(&mut h, path.as_os_str().as_bytes());
+            let m = match fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    field(&mut h, b"absent");
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            ensure!(!recent(&m, since), "module candidate changed");
+            if m.is_file() {
+                field(&mut h, b"file");
+                for word in stamp(&m) {
+                    h.update(&word.to_le_bytes());
+                }
+                continue;
+            }
+            ensure!(
+                m.is_dir() && fs::canonicalize(path)? == *path,
+                "redirected module directory"
+            );
+            field(&mut h, b"directory");
+            for n in [
+                m.dev(),
+                m.ino(),
+                m.mode() as u64,
+                m.uid() as u64,
+                m.gid() as u64,
+            ] {
+                h.update(&n.to_le_bytes());
+            }
+            let mut names = Vec::new();
+            for child in fs::read_dir(path)? {
+                remaining = remaining.checked_sub(1).context("large module directory")?;
+                names.push(child?.file_name());
+            }
+            names.sort_unstable();
+            h.update(&(names.len() as u64).to_le_bytes());
+            for name in names {
+                let child = path.join(&name);
+                let info = fs::symlink_metadata(&child)?;
+                ensure!(
+                    info.is_file() || info.is_dir(),
+                    "special entry in module directory"
+                );
+                field(&mut h, name.as_bytes());
+                h.update(&info.mode().to_le_bytes());
+                h.update(&info.uid().to_le_bytes());
+                h.update(&info.gid().to_le_bytes());
+                if (info.is_file() && self.covered.contains(&child))
+                    || (info.is_dir() && self.namespace.contains(&child))
+                {
+                    // The complete file content or directory layout is checked
+                    // separately as part of this exact compiler entry.
+                    field(&mut h, b"tracked");
+                } else {
+                    ensure!(!recent(&info, since), "untracked directory entry changed");
+                    field(&mut h, b"other");
+                    for n in stamp(&info) {
+                        h.update(&n.to_le_bytes());
+                    }
+                }
+            }
+            ensure!(
+                stamp(&m) == stamp(&fs::metadata(path)?),
+                "module directory changed during enumeration"
+            );
+        }
+        Ok(*h.finalize().as_bytes())
+    }
 }
 
 pub struct Externs {

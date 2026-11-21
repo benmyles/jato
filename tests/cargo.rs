@@ -930,6 +930,9 @@ fn clean_incremental_native_unit_restores_and_live_edits_keep_rustc_state() {
         String::from_utf8_lossy(&edit.stderr)
     );
     let replaced = source.with_extension("new");
+    let probes_before = p.stats()["counters"]["discovery_probe"]
+        .as_u64()
+        .unwrap_or(0);
     write(&replaced, &original);
     fs::rename(&replaced, &source).unwrap();
     let undo = run();
@@ -941,6 +944,13 @@ fn clean_incremental_native_unit_restores_and_live_edits_keep_rustc_state() {
             String::from_utf8_lossy(&undo.stderr)
         );
         assert_eq!(p.stats()["counters"]["live_incremental_hit"], 1);
+        assert_eq!(
+            p.stats()["counters"]["discovery_probe"]
+                .as_u64()
+                .unwrap_or(0),
+            probes_before,
+            "an atomic save of a tracked source should use its checked layout"
+        );
     }
     write(&source, "fn main() { println!(\"third\"); }");
     let next = run();
@@ -958,6 +968,42 @@ fn clean_incremental_native_unit_restores_and_live_edits_keep_rustc_state() {
             String::from_utf8_lossy(&restored.stderr)
         );
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
+fn live_native_module_resolution_rejects_an_added_alternative() {
+    let p = Project::new();
+    let main = p.root.join("src/main.rs");
+    let original = "mod word; fn main(){println!(\"{}\", word::TEXT);}";
+    write(&main, original);
+    write(
+        p.root.join("src/word.rs"),
+        "pub const TEXT: &str = \"first\";",
+    );
+    let run = || {
+        p.command()
+            .env("CARGO_INCREMENTAL", "1")
+            .env("JATO_LOG", "debug")
+            .args(["--system-linker", "run", "-q"])
+            .output()
+            .unwrap()
+    };
+    assert_eq!(run().stdout, b"first\n");
+    write(&main, "fn main(){println!(\"edit\");}");
+    assert_eq!(run().stdout, b"edit\n");
+    let replacement = main.with_extension("new");
+    write(&replacement, original);
+    fs::rename(replacement, &main).unwrap();
+    write(
+        p.root.join("src/word/mod.rs"),
+        "pub const TEXT: &str = \"second\";",
+    );
+    let ambiguous = run();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("E0761"));
+    fs::remove_file(p.root.join("src/word.rs")).unwrap();
+    assert_eq!(run().stdout, b"second\n");
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]

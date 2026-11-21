@@ -4,6 +4,7 @@
 
 - Added per-unit compile, validation and publication timings. On an isolated fresh incremental regex link, six runs put the bare compiler at 198 ms and its native observer at 479 ms. Switching from hexadecimal to printable trace strings took 541 ms.
 - A warm undo in the 0.6 live benchmark launched one additional rustc dependency probe on each atomic save. Packed capture also spooled new incompressible frames before writing the same bytes to SQLite.
+- Recorded a bounded directory layout for eligible incremental native units. The atomic-save undo and subsequent clean restore both hit, and adding a competing module still produced rustc error E0761. The undo used no discovery probe.
 
 ## 2026-11-21 — live incremental replay and shifted artifacts
 

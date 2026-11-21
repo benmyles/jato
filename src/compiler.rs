@@ -50,7 +50,7 @@ fn discover(
     let start = SystemTime::now();
     let mut externs = None;
     let recheck_link = inv.observe_native
-        && (inv.live_incremental
+        && (inv.incremental.is_some()
             || env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")));
     for encoded in plans {
         let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
@@ -79,16 +79,22 @@ fn discover(
             continue;
         }
         let sources_checked = Instant::now();
-        let early = recheck_link.then(|| inputs.topology(start)).transpose()?;
-        if let Some(current) = &early
+        let mut early = recheck_link.then(|| inputs.topology(start)).transpose()?;
+        if let Some(current) = &mut early
             && !store.has_source_topology(&inputs.sources, current)?
         {
-            // A new directory layout needs fresh module resolution. Do it before
-            // reading the link closure, so even a large binary is hashed once.
-            if let Some(hit) = rediscover(store, compiler, inv, recipe, start, None, plan)? {
-                return Ok(Some(hit));
+            if inv.incremental.is_some()
+                && let Ok(layout) = inputs.editor_topology(start)
+                && store.has_source_topology(&inputs.sources, &layout)?
+            {
+                *current = layout;
+            } else {
+                // Resolve unknown layouts before reading the link closure.
+                if let Some(hit) = rediscover(store, compiler, inv, recipe, start, None, plan)? {
+                    return Ok(Some(hit));
+                }
+                continue;
             }
-            continue;
         }
         let externs = match &externs {
             Some(key) => key,
@@ -419,6 +425,11 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             let sample = plan.sample(&recipe, &inv.source, since).unwrap_or(None);
             let sources = inputs.sources;
             let topology = inputs.topology(since)?;
+            let editor = if inv.observe_native && inv.incremental.is_some() {
+                inputs.editor_topology(since).ok()
+            } else {
+                None
+            };
             let key = inputs.key(&plan, &recipe, inv, since, &externs.key)?;
             let encoded = serde_json::to_vec(&plan)?;
             ensure!(
@@ -442,6 +453,9 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 }),
             )? {
                 bail!("entry exceeds cache budget");
+            }
+            if let Some(layout) = editor {
+                let _ = store.refresh_topology(&key, &layout, true);
             }
             if env::var_os("JATO_LOG").as_deref() == Some(OsStr::new("timings")) {
                 eprintln!(
