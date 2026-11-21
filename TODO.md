@@ -13,4 +13,4 @@
 - [x] Reduce compiler validation and artifact restore overhead.
 - [x] Accelerate eligible native executable builds with verified linker inputs.
 - [x] Reduce save-to-diagnostic latency and idle work in watch mode.
-- [ ] Qualify correctness, run repeated comparisons, and install the measured release.
+- [x] Qualify correctness, run repeated comparisons, and install the measured release.

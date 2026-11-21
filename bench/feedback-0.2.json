@@ -1,0 +1,89 @@
+{
+  "jato_0.2_default": {
+    "runs": 9,
+    "debounce_ms": null,
+    "save_to_diagnostic_ms": [
+      74.5,
+      73.5,
+      69.5,
+      71.0,
+      72.4,
+      70.2,
+      72.1,
+      73.0,
+      72.0
+    ],
+    "fix_to_workspace_green_ms": [
+      80.5,
+      77.1,
+      82.0,
+      81.8,
+      75.1,
+      77.3,
+      81.3,
+      80.8,
+      104.9
+    ],
+    "median_diagnostic_ms": 72.1,
+    "median_workspace_green_ms": 80.8,
+    "idle_watch_rss_kib": 4624
+  },
+  "jato_0.1_default": {
+    "runs": 9,
+    "debounce_ms": null,
+    "save_to_diagnostic_ms": [
+      176.6,
+      185.7,
+      182.8,
+      346.4,
+      192.1,
+      201.0,
+      203.7,
+      189.7,
+      187.5
+    ],
+    "fix_to_workspace_green_ms": [
+      261.3,
+      262.4,
+      261.8,
+      261.8,
+      302.3,
+      261.5,
+      261.3,
+      261.8,
+      261.4
+    ],
+    "median_diagnostic_ms": 189.7,
+    "median_workspace_green_ms": 261.8,
+    "idle_watch_rss_kib": 4244
+  },
+  "jato_0.1_16_ms": {
+    "runs": 9,
+    "debounce_ms": 16,
+    "save_to_diagnostic_ms": [
+      117.0,
+      109.2,
+      108.2,
+      112.0,
+      108.2,
+      128.2,
+      123.2,
+      125.4,
+      117.2
+    ],
+    "fix_to_workspace_green_ms": [
+      177.5,
+      218.6,
+      177.5,
+      177.8,
+      178.0,
+      217.7,
+      538.3,
+      178.9,
+      217.8
+    ],
+    "median_diagnostic_ms": 117.0,
+    "median_workspace_green_ms": 178.9,
+    "idle_watch_rss_kib": 4092
+  }
+}
