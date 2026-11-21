@@ -1,0 +1,50 @@
+# Build and feedback measurements
+
+Jato 0.1.0 was measured on an Intel Core Ultra 7 356H running Fedora Linux 45 x86-64, with Rust and Cargo 1.100.0. Each build used four Cargo jobs. The table shows median wall time across three runs on a shared development machine. Per-run durations, peak memory measurements, and cache counters are in the [raw results](results.json).
+
+## Clean targets
+
+| Project and command | Plain Cargo | First Jato build | Restored Jato build | Restore speedup |
+| --- | ---: | ---: | ---: | ---: |
+| ripgrep 14.1.1, release | 61.61 s | 54.31 s | 25.62 s | 2.4× |
+| ripgrep 14.1.1, check | 6.28 s | 8.28 s | 0.65 s | 9.6× |
+| Locked regex application, release | 10.01 s | 9.92 s | 0.97 s | 10.3× |
+| Locked regex application, check | 2.28 s | 2.24 s | 0.14 s | 16.5× |
+
+Plain ripgrep release samples ranged from 39.0 to 89.2 seconds as machine load varied. The release comparison starts from an empty target each time. The first Jato release build also has an empty Jato cache. The check comparison uses the second clean-target check, after the same command has run once. Cargo fetch runs before timing. Build scripts and final binaries still run through the normal toolchain. The harness checks the regex application’s answer and compares ripgrep’s version output after a restore.
+
+## Fresh builds and edits
+
+| Regex application | Plain Cargo | Jato |
+| --- | ---: | ---: |
+| Fresh release build | 54 ms | 53 ms |
+| Check after a one-line edit | 86 ms | 108 ms |
+| Check after undoing the edit | 85 ms | 71 ms |
+
+A separate two-member workspace measures the full watch loop. Over 5 edits, the median save-to-first-rustc-error time was **186 ms**, including the default 100 ms debounce. Fixing the error and finishing the workspace follow-up took **262 ms** from save. The idle watcher occupied 3.9 MiB RSS.
+
+## Storage and memory
+
+| Workload | Artifact bytes represented | Unique compressed payload | SQLite files | Plain check peak RSS | Restored check peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ripgrep | 116.1 MiB | 34.8 MiB | 36.0 MiB | 270.5 MiB | 131.6 MiB |
+| Regex application | 40.8 MiB | 13.9 MiB | 14.4 MiB | 251.1 MiB | 34.1 MiB |
+
+Storage figures describe the combined check and release cache at the end of the last run. Cargo’s live target directory is separate. GNU time reports the largest process RSS in the timed command tree. The numbers include Cargo and any rustc or linker that ran. A full release link can still dominate peak memory.
+
+## Reproduce
+
+Install the release binary from the repository, then run the bundled workload and the end-to-end watcher measurement.
+
+```sh
+python3 bench/run.py --jato jato --runs 3 --jobs 4
+python3 bench/feedback.py --jato jato --runs 5
+```
+
+For an existing Cargo project, give the harness the directory containing its Cargo.lock. The measured ripgrep source was the published 14.1.1 crate with SHA-256 `f77b8032dc584527975f34aa5a897d0ef5a785573fda778771a614ff9da501d9`. [ripgrep 14.1.1](https://crates.io/crates/ripgrep/14.1.1)
+
+```sh
+python3 bench/run.py --project /path/to/ripgrep-14.1.1 --verify-bin rg --runs 3 --jobs 4
+```
+
+Both harnesses use disposable target and cache directories under `--scratch`, `TMPDIR`, or `/var/tmp`. The external-project mode runs the project’s own build scripts with its existing lockfile. Source-edit measurements run only in the disposable fixture. Use `--offline` after fetching dependencies.
