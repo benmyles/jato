@@ -1,5 +1,5 @@
 //! Stage ordered frames without retaining a per-frame vector. The private
-//! spool holds either compressed bytes or a reference to an existing chunk.
+//! spool holds compressed bytes or descriptors for bytes available elsewhere.
 use super::{CHUNK, Digest};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -22,6 +22,7 @@ pub(super) fn cut(window: &[u8], remaining: u64) -> usize {
 
 const MEMORY_DIGESTS: usize = 1024;
 const EXISTING: u32 = u32::MAX;
+const RAW_SOURCE: u32 = u32::MAX - 1;
 const PROBE_MIN: usize = 16 * 1024;
 const INSERT_CHUNK: &str = "INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO NOTHING";
 
@@ -119,9 +120,15 @@ impl Recorder {
                 self.reused += raw.len() as u64;
             } else {
                 let bytes = self.encoder.encode(raw)?;
-                tag = bytes.len() as u32;
                 charge = bytes.len() + 96;
-                data = Some(bytes);
+                if bytes.len() == raw.len() && raw.len() >= PROBE_MIN {
+                    // The original file already holds the exact publication
+                    // payload. Verify it again before inserting it into SQLite.
+                    tag = RAW_SOURCE;
+                } else {
+                    tag = bytes.len() as u32;
+                    data = Some(bytes);
+                }
             }
         }
         let mut header = [0; 40];
@@ -157,18 +164,21 @@ impl Recorder {
             // A previous frame of this entry published the same hash in
             // this transaction. Its ordered reference already owns the bytes.
             0 => return Ok((digest, raw as u64)),
-            EXISTING => {
-                if tx
-                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM chunks WHERE hash=?1 AND raw=?2)")?
-                    .query_row(params![&digest, raw], |r| r.get::<_, bool>(0))?
+            EXISTING | RAW_SOURCE => {
+                if tag == EXISTING
+                    && tx
+                        .prepare_cached(
+                            "SELECT EXISTS(SELECT 1 FROM chunks WHERE hash=?1 AND raw=?2)",
+                        )?
+                        .query_row(params![&digest, raw], |r| r.get::<_, bool>(0))?
                 {
                     return Ok((digest, raw as u64));
                 }
-                // A GC or a concurrent writer evicted it between the probe
-                // and this write transaction. Recover only the original bytes.
+                // GC can evict an existing frame before publication. Both
+                // it and a raw-source descriptor require the captured bytes.
                 let file = match source {
                     Some(f) => f,
-                    None => source.insert(File::open(path)?),
+                    None => source.insert(crate::content::open_with_flags(path, libc::O_NONBLOCK)?),
                 };
                 let bytes = &mut buffer[..raw];
                 file.read_exact_at(bytes, offset)?;
@@ -176,8 +186,12 @@ impl Recorder {
                     blake3::hash(bytes).as_bytes() == &digest,
                     "compiler output changed before packed publication"
                 );
-                self.reused -= raw as u64;
-                self.encoder.encode(bytes)?
+                if tag == EXISTING {
+                    self.reused -= raw as u64;
+                    self.encoder.encode(bytes)?
+                } else {
+                    bytes
+                }
             }
             n => {
                 ensure!(n as usize <= raw, "invalid staged packed frame");
@@ -195,6 +209,45 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompressible_payloads_stay_in_the_source_until_verified_publication() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let path = d.path().join("output");
+        let mut store = super::super::Store::at(d.path().join("cache"), 4 << 20)?;
+        let mut raw = vec![0; CHUNK];
+        blake3::Hasher::new()
+            .update(b"raw frame")
+            .finalize_xof()
+            .fill(&mut raw);
+        let hash = *blake3::hash(&raw).as_bytes();
+        let mut buffer = vec![0; CHUNK];
+        for changed in [false, true] {
+            let mut record = Recorder::new(&store.dir, false);
+            assert_eq!(record.frame(&store.conn, hash, &raw)?, CHUNK as u64 + 96);
+            assert_eq!(record.spool.stream_position()?, 40);
+            record.rewind()?;
+            std::fs::write(&path, &raw)?;
+            if changed {
+                File::options()
+                    .write(true)
+                    .open(&path)?
+                    .write_all_at(&[!raw[77]], 77)?;
+            }
+            let tx = store.conn.transaction()?;
+            let result = record.publish(&tx, &path, &mut None, 0, &mut buffer);
+            if changed {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result?, (hash, CHUNK as u64));
+                let bytes: Vec<u8> = tx.query_row("SELECT data FROM chunks", [], |r| r.get(0))?;
+                assert_eq!(bytes, raw);
+            }
+            tx.rollback()?;
+            assert_eq!(store.stats()?.charged_bytes, 0);
+        }
+        Ok(())
+    }
 
     #[test]
     fn eviction_between_staging_and_publish_recovers_only_matching_bytes() -> Result<()> {

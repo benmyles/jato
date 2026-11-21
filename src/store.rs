@@ -509,6 +509,49 @@ impl Store {
         Ok(())
     }
 
+    fn sealed_output(
+        &mut self,
+        path: &std::path::Path,
+        source: &File,
+        length: u64,
+        charge: u64,
+        used: u64,
+    ) -> Result<Option<crate::sealed::Object>> {
+        let standalone = charge.saturating_add(length).saturating_add(256);
+        if length < CHUNK as u64
+            || standalone > self.limit
+            || !*self
+                .allow_sealed
+                .get_or_insert_with(|| crate::sealed::supported(&self.dir))
+        {
+            return Ok(None);
+        }
+        if used != 0 {
+            let candidate: Option<(Digest, Digest)> = self
+                .conn
+                .prepare_cached(
+                    "SELECT o.hash,o.verity FROM files f JOIN objects o ON o.hash=f.digest
+                 WHERE f.size=?1 AND o.bytes=?1 LIMIT 1",
+                )?
+                .query_row([length], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((hash, verity)) = candidate
+                && let Ok(Some(object)) =
+                    crate::sealed::reuse(source, path, &self.dir, length, hash, verity)
+            {
+                return Ok(Some(object));
+            }
+        }
+        if standalone > self.limit.saturating_sub(used) {
+            return Ok(None);
+        }
+        let object = crate::sealed::prepare(source, &self.dir).ok();
+        if object.is_none() {
+            self.allow_sealed = Some(false);
+        }
+        Ok(object)
+    }
+
     pub fn save(
         &mut self,
         recipe: &Digest,
@@ -535,7 +578,6 @@ impl Store {
         let used = self
             .conn
             .query_row("SELECT bytes FROM usage", [], |r| r.get::<_, u64>(0))?;
-        let headroom = self.limit.saturating_sub(used);
         let mut files = Vec::new();
         let mut packed = packed::Recorder::new(&self.dir, used != 0);
         let mut sidecar = None;
@@ -552,28 +594,18 @@ impl Store {
                 sealed: None,
             };
             let length = metadata.len();
-            if length >= CHUNK as u64
-                && charge.saturating_add(length).saturating_add(256) <= headroom
-                && *self
-                    .allow_sealed
-                    .get_or_insert_with(|| crate::sealed::supported(&self.dir))
-            {
-                if let Ok(object) = crate::sealed::prepare(&source, &self.dir) {
-                    ensure!(
-                        crate::fingerprint::stamp(&metadata)
-                            == crate::fingerprint::stamp(&fs::metadata(path)?),
-                        "compiler output changed during capture"
-                    );
-                    file.hash = object.hash;
-                    file.size = length;
-                    charge += length + 256;
-                    file.sealed = Some(object);
-                    files.push(file);
-                    continue;
-                }
-                // Cross-device targets and filesystems lacking verity retain
-                // the same compressed chunk cache as smaller artifacts.
-                self.allow_sealed = Some(false);
+            if let Some(object) = self.sealed_output(path, &source, length, charge, used)? {
+                ensure!(
+                    crate::fingerprint::stamp(&metadata)
+                        == crate::fingerprint::stamp(&fs::metadata(path)?),
+                    "compiler output changed during capture"
+                );
+                file.hash = object.hash;
+                file.size = length;
+                charge += length + 256;
+                file.sealed = Some(object);
+                files.push(file);
+                continue;
             }
             let mut hasher = blake3::Hasher::new();
             let mut boundaries = Vec::new();
@@ -666,6 +698,14 @@ impl Store {
         }
         if packed.reused > 0 {
             tx.execute("INSERT INTO counters VALUES('packed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [packed.reused])?;
+        }
+        let reused: u64 = files
+            .iter()
+            .filter(|f| f.sealed.as_ref().is_some_and(|o| o.reused))
+            .map(|f| f.size)
+            .sum();
+        if reused > 0 {
+            tx.execute("INSERT INTO counters VALUES('sealed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [reused])?;
         }
         if let (Some(plan), Some((hash, bytes))) = (plan, manifest) {
             let manifest: i64 = tx.query_row(
@@ -1463,6 +1503,7 @@ mod tests {
         let outputs = std::slice::from_ref(&path);
         for id in [1, 2] {
             store.save(&[0; 32], &[id; 32], outputs, &[], 0, None)?;
+            store.limit = original.len() as u64 + 2048;
         }
         if store.stats()?.sealed_objects == 0 {
             ensure!(
@@ -1474,6 +1515,10 @@ mod tests {
         let object = crate::sealed::path(&store.dir, blake3::hash(&original).as_bytes());
         assert_eq!(store.stats()?.sealed_objects, 1);
         assert_eq!(store.stats()?.chunks, 0);
+        assert_eq!(
+            store.stats()?.counters["sealed_reused_bytes"],
+            original.len() as u64
+        );
         fs::write(&path, b"changed source")?;
         assert!(store.restore(&[1; 32], outputs)?.is_some());
         assert_eq!(fs::read(&path)?, original);
@@ -1495,6 +1540,44 @@ mod tests {
         fs::write(&orphan, b"aborted publish")?;
         store.prune(0)?;
         assert!(!orphan.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sealed_reuse_validates_unsampled_bytes_and_survives_last_reference_eviction() -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let root = tempfile::tempdir()?;
+        let mut store = Store::at(root.path().join("cache"), 8 << 20)?;
+        store.allow_sealed = None;
+        let path = root.path().join("artifact");
+        let data = vec![17; CHUNK * 2];
+        fs::write(&path, &data)?;
+        let outputs = std::slice::from_ref(&path);
+        store.save(&[0; 32], &[1; 32], outputs, b"", 0, None)?;
+        if store.stats()?.sealed_objects == 0 {
+            ensure!(
+                env::var_os("JATO_TEST_SEALED").is_none(),
+                "expected fs-verity"
+            );
+            return Ok(());
+        }
+        let size = data.len() as u64;
+        let hash = *blake3::hash(&data).as_bytes();
+        let object = crate::sealed::path(&store.dir, &hash);
+        let verity = crate::sealed::measure(&File::open(&object)?)?;
+        let source = File::open(&path)?;
+        let held = crate::sealed::reuse(&source, &path, &store.dir, size, hash, verity)?.unwrap();
+        File::options()
+            .write(true)
+            .open(&path)?
+            .write_all_at(&[44], 17000)?;
+        assert!(crate::sealed::reuse(&source, &path, &store.dir, size, hash, verity)?.is_none());
+        store.prune(0)?;
+        assert!(!object.exists());
+        crate::sealed::publish(&held, &object)?;
+        assert_eq!(crate::sealed::measure(&File::open(&object)?)?, verity);
+        assert_eq!(fs::read(object)?, data);
         Ok(())
     }
 

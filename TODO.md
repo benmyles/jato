@@ -43,6 +43,6 @@
 
 ## Cold capture and editor saves
 
-- [ ] Reduce temporary writes during cold capture without changing restored bytes.
-- [ ] Avoid repeated module discovery when a verified live executable survives an editor rename.
+- [x] Reduce temporary writes during cold capture without changing restored bytes.
+- [x] Avoid repeated module discovery when a verified live executable survives an editor rename.
 - [ ] Measure cold builds and edit cycles against 0.6 and upstream caches, and qualify the installed release.

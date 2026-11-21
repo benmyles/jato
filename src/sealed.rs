@@ -11,6 +11,7 @@ pub struct Object {
     file: File,
     pub verity: Digest,
     pub hash: Digest,
+    pub reused: bool,
 }
 
 pub fn path(dir: &Path, digest: &Digest) -> PathBuf {
@@ -107,12 +108,12 @@ mod linux {
         })
     }
 
-    pub fn prepare(src: &File, dir: &Path) -> Result<Object> {
+    fn clone_sealed(src: &File, dir: &Path) -> Result<(File, Digest)> {
         // Anonymous until the database writer publishes it. An interrupted
         // compression/build therefore leaves no multi-megabyte staging file.
         let writer = crate::staging::anonymous(dir)?;
         clone_file(src, &writer)?;
-        let mut file = File::open(format!("/proc/self/fd/{}", writer.as_raw_fd()))?;
+        let file = File::open(format!("/proc/self/fd/{}", writer.as_raw_fd()))?;
         drop(writer); // fs-verity requires no writable handles
         let enable = Enable {
             version: 1,
@@ -131,20 +132,43 @@ mod linux {
             return Err(io::Error::last_os_error().into());
         }
         let verity = measure(&file)?;
+        Ok((file, verity))
+    }
+
+    pub fn prepare(src: &File, dir: &Path) -> Result<Object> {
+        let (mut file, verity) = clone_sealed(src, dir)?;
         let hash = *blake3::Hasher::new()
             .update_reader(&mut file)?
             .finalize()
             .as_bytes();
-        Ok(Object { file, verity, hash })
+        Ok(Object {
+            file,
+            verity,
+            hash,
+            reused: false,
+        })
     }
 
     pub fn publish(object: &Object, path: &Path) -> Result<()> {
-        fs::create_dir_all(path.parent().context("missing object directory")?)?;
+        let shard = path.parent().context("missing object directory")?;
+        fs::create_dir_all(shard)?;
         if let Ok(f) = File::open(path)
             && measure(&f).ok() == Some(object.verity)
         {
             return Ok(());
         }
+        // A concurrent prune can unlink the last name of a reused object.
+        // Its authenticated fd still provides the bytes for a new anonymous
+        // clone. Linux need not permit linking an already unlinked inode.
+        let replacement;
+        let source = if object.reused {
+            let (file, verity) = clone_sealed(&object.file, shard)?;
+            ensure!(verity == object.verity, "sealed clone measurement changed");
+            replacement = file;
+            &replacement
+        } else {
+            &object.file
+        };
         // This runs under SQLite's exclusive writer lease. The open fds of
         // concurrent readers still refer to the previous inode.
         match fs::remove_file(path) {
@@ -152,7 +176,7 @@ mod linux {
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
         }
-        crate::staging::link_file(&object.file, path)?;
+        crate::staging::link_file(source, path)?;
         Ok(())
     }
 
@@ -191,6 +215,50 @@ mod fallback {
 }
 #[cfg(not(target_os = "linux"))]
 pub use fallback::{copy, measure, prepare, publish, supported};
+
+pub fn reuse(
+    source: &File,
+    output: &Path,
+    dir: &Path,
+    size: u64,
+    hash: Digest,
+    verity: Digest,
+) -> Result<Option<Object>> {
+    use std::os::unix::fs::FileExt;
+    let file = crate::content::open(&path(dir, &hash))?;
+    if file.metadata()?.len() != size || measure(&file)? != verity {
+        return Ok(None);
+    }
+    // Common ELF headers can match across unrelated outputs of equal length.
+    // Samples are cheap rejection only. A complete digest binds the compiler
+    // output to the authenticated cache object before reuse.
+    let mut a = [0; 1024];
+    let mut b = [0; 1024];
+    let tail = size
+        .checked_sub(a.len() as u64)
+        .context("short sealed candidate")?;
+    for at in [tail / 2, tail, 0] {
+        source.read_exact_at(&mut a, at)?;
+        file.read_exact_at(&mut b, at)?;
+        if a != b {
+            return Ok(None);
+        }
+    }
+    let input = crate::content::Input::with_file(
+        output,
+        source.try_clone()?,
+        std::time::SystemTime::now(),
+    )?;
+    if crate::content::digests(&[input], 2 << 20)?[0] != hash {
+        return Ok(None);
+    }
+    Ok(Some(Object {
+        file,
+        verity,
+        hash,
+        reused: true,
+    }))
+}
 
 pub fn restore(
     source: &mut File,
