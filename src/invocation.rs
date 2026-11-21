@@ -8,6 +8,7 @@ pub struct Invocation {
     pub observe_native: bool,
     pub linker: Option<PathBuf>,
     pub incremental: Option<PathBuf>,
+    pub live_incremental: bool,
     pub deferred_links: bool,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
@@ -271,12 +272,12 @@ impl Invocation {
         {
             return Err("linker");
         }
-        if observe_native
-            && let Some(dir) = &incremental
-            && !crate::native::fresh_incremental(dir, name)
-        {
-            return Err("active_incremental");
-        }
+        let live_incremental = match (&incremental, observe_native) {
+            (Some(dir), true) => {
+                crate::native::active_incremental(dir, name).ok_or("active_incremental")?
+            }
+            _ => false,
+        };
         if !kinds.contains(&"link") && !kinds.contains(&"metadata") {
             return Err("custom_output");
         }
@@ -301,6 +302,7 @@ impl Invocation {
             observe_native,
             linker,
             incremental,
+            live_incremental,
             deferred_links,
             source: source.ok_or("missing_source")?,
             externs,

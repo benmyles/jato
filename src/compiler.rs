@@ -49,8 +49,9 @@ fn discover(
     }
     let start = SystemTime::now();
     let mut externs = None;
-    let projected_link = inv.observe_native
-        && env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1"));
+    let recheck_link = inv.observe_native
+        && (inv.live_incremental
+            || env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")));
     for encoded in plans {
         let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
         if inv.observe_native && plan.native.is_none() {
@@ -68,11 +69,11 @@ fn discover(
             continue;
         }
         let sources_checked = Instant::now();
-        let early = projected_link.then(|| inputs.topology(start)).transpose()?;
+        let early = recheck_link.then(|| inputs.topology(start)).transpose()?;
         if let Some(current) = &early
             && !store.has_source_topology(&inputs.sources, current)?
         {
-            // A copied checkout needs fresh module resolution. Do it before
+            // A new directory layout needs fresh module resolution. Do it before
             // reading the link closure, so even a large binary is hashed once.
             if let Some(hit) = rediscover(store, compiler, inv, recipe, start, None, plan)? {
                 return Ok(Some(hit));
@@ -116,7 +117,7 @@ fn discover(
         }
         // Familiar bytes with a changed module search directory need fresh
         // name resolution. Ordinary edits go directly to the actual compiler.
-        if plan.native.is_some() && !projected_link {
+        if plan.native.is_some() && !recheck_link {
             continue;
         }
         return rediscover(store, compiler, inv, recipe, start, Some(externs), plan);
@@ -290,11 +291,16 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         let version = match lookup {
             Ok((Some(hit), _)) => {
                 io::stderr().write_all(&hit.diagnostics)?;
-                let _ = store.record_hit(&hit, waited);
+                let event = if inv.live_incremental {
+                    Some("live_incremental_hit")
+                } else {
+                    waited.then_some("coalesced_hit")
+                };
+                let _ = store.record_hit(&hit, event);
                 trace(&inv.name, "hit");
                 return Ok(0);
             }
-            Ok((None, _)) if ticket.is_some() => break,
+            Ok((None, _)) if inv.live_incremental || ticket.is_some() => break,
             Ok((None, version)) => version,
             Err(e) => {
                 trace(&inv.name, format_args!("compile after lookup: {e:#}"));
@@ -320,6 +326,11 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 break;
             }
         }
+    }
+    if inv.live_incremental {
+        trace(&inv.name, "active_incremental");
+        let _ = store.count("bypass.active_incremental", 1);
+        return passthrough(original(compiler, args));
     }
     let _ = store.count("miss", 1);
     let since = SystemTime::now();

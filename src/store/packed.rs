@@ -9,6 +9,17 @@ use std::io::{Read, Seek, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+// Archive boundaries delimit independent regions. Inside a long region,
+// content-defined cuts can meet the same bytes again after an insertion.
+pub(super) fn cut(window: &[u8], remaining: u64) -> usize {
+    if remaining <= CHUNK as u64 {
+        return window.len();
+    }
+    fastcdc::v2020::FastCDC::new(window, CHUNK / 4, CHUNK / 2, CHUNK)
+        .cut(0, window.len())
+        .1
+}
+
 const MEMORY_DIGESTS: usize = 1024;
 const EXISTING: u32 = u32::MAX;
 const PROBE_MIN: usize = 16 * 1024;

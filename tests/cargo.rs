@@ -912,6 +912,23 @@ fn clean_incremental_native_unit_restores_and_live_edits_keep_rustc_state() {
         "{}",
         String::from_utf8_lossy(&edit.stderr)
     );
+    let replaced = source.with_extension("new");
+    write(&replaced, &original);
+    fs::rename(&replaced, &source).unwrap();
+    let undo = run();
+    assert_eq!(undo.stdout, cold.stdout);
+    if std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+        assert!(
+            String::from_utf8_lossy(&undo.stderr).contains("jato [app] hit"),
+            "{}",
+            String::from_utf8_lossy(&undo.stderr)
+        );
+        assert_eq!(p.stats()["counters"]["live_incremental_hit"], 1);
+    }
+    write(&source, "fn main() { println!(\"third\"); }");
+    let next = run();
+    assert_eq!(next.stdout, b"third\n");
+    assert!(String::from_utf8_lossy(&next.stderr).contains("active_incremental"));
     p.clean();
     write(&source, &original);
     let restored = run();

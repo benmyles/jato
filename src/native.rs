@@ -58,23 +58,28 @@ fn crate_directory(name: &OsStr, krate: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && id.iter().all(u8::is_ascii_alphanumeric))
 }
 
-// Only learn a native result from an incremental session starting from
-// scratch. An active session takes the direct rustc path, without tracing.
-pub fn fresh_incremental(dir: &Path, krate: &str) -> bool {
-    let Some(parent) = dir.parent() else {
-        return false;
-    };
+// An existing rustc session may consume a previously certified result.
+// Only a newly created session may supply a result for publication.
+pub fn active_incremental(dir: &Path, krate: &str) -> Option<bool> {
+    let parent = dir.parent()?;
     if fs::canonicalize(parent).ok().as_deref() != Some(parent) {
-        return false;
+        return None;
     }
     match fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() => fs::read_dir(dir).is_ok_and(|entries| {
-            entries.enumerate().all(|(index, e)| {
-                index < 16384 && e.is_ok_and(|e| !crate_directory(&e.file_name(), krate))
-            })
-        }),
-        Err(e) => e.kind() == io::ErrorKind::NotFound,
-        _ => false,
+        Ok(m) if m.is_dir() => {
+            for (i, entry) in fs::read_dir(dir).ok()?.enumerate() {
+                if i >= 16384 {
+                    return None;
+                }
+                let entry = entry.ok()?;
+                if crate_directory(&entry.file_name(), krate) {
+                    return entry.file_type().ok()?.is_dir().then_some(true);
+                }
+            }
+            Some(false)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some(false),
+        _ => None,
     }
 }
 

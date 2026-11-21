@@ -574,11 +574,14 @@ impl Store {
             if buffer.len() < window {
                 buffer.resize(window, 0);
             }
+            let mut buffered = 0;
             while file.size < length {
                 while boundaries.next_if_eq(&file.size).is_some() {}
                 let end = boundaries.peek().copied().unwrap_or(length);
-                let n = (end - file.size).min(CHUNK as u64) as usize;
-                source.read_exact(&mut buffer[..n])?;
+                let remaining = end - file.size;
+                let window = remaining.min(CHUNK as u64) as usize;
+                source.read_exact(&mut buffer[buffered..window])?;
+                let n = packed::cut(&buffer[..window], remaining);
                 let raw = &buffer[..n];
                 let digest = *blake3::hash(raw).as_bytes();
                 if length > CHUNK as u64 {
@@ -591,6 +594,10 @@ impl Store {
                 charge += packed.frame(&self.conn, digest, raw)?;
                 if charge > self.limit {
                     return Ok(false);
+                }
+                buffered = window - n;
+                if buffered != 0 {
+                    buffer.copy_within(n..window, 0);
                 }
             }
             ensure!(
@@ -825,7 +832,7 @@ impl Store {
         }))
     }
 
-    pub fn record_hit(&mut self, hit: &Hit, coalesced: bool) -> Result<()> {
+    pub fn record_hit(&mut self, hit: &Hit, extra: Option<&str>) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -834,8 +841,11 @@ impl Store {
             params![now(), hit.key],
         )?;
         tx.execute("INSERT INTO counters VALUES ('hit',1),('reused_compiler_ms',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [hit.compiler_ms])?;
-        if coalesced {
-            tx.execute("INSERT INTO counters VALUES('coalesced_hit',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[])?;
+        if let Some(event) = extra {
+            tx.execute(
+                "INSERT INTO counters VALUES(?1,1) ON CONFLICT(name) DO UPDATE SET value=value+1",
+                [event],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -967,7 +977,7 @@ mod tests {
             let Some(hit) = self.materialize(key, paths)? else {
                 return Ok(None);
             };
-            self.record_hit(&hit, false)?;
+            self.record_hit(&hit, None)?;
             Ok(Some(hit.diagnostics))
         }
     }
@@ -1039,6 +1049,7 @@ mod tests {
             observe_native: true,
             linker: None,
             incremental: None,
+            live_incremental: false,
             deferred_links: false,
             source: dir.path().join("main.rs"),
             externs: vec![extern_file.clone()],
@@ -1110,6 +1121,41 @@ mod tests {
             assert_eq!(store.restore(&[k; 32], &files)?, Some(vec![]));
             assert_eq!(fs::read(&files[1])?, archive);
             assert_eq!(fs::read(&files[0])?, meta);
+        }
+        store.prune(0)?;
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_insertions_and_deletions_reuse_frames_and_restore_every_revision() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let file = root.path().join("asset");
+        let outputs = std::slice::from_ref(&file);
+        let mut store = Store::at(root.path().join("cache"), 32 << 20)?;
+        let mut payload = vec![0; CHUNK * 24 + 19];
+        blake3::Hasher::new()
+            .update(b"shifted data")
+            .finalize_xof()
+            .fill(&mut payload);
+        let variants = [(83, 0usize), (83, 19), (CHUNK + 7, 911), (83, 1)];
+        let make = |(offset, n): (usize, usize)| {
+            let mut bytes = Vec::with_capacity(payload.len() + n);
+            bytes.extend_from_slice(&payload[..offset]);
+            bytes.resize(bytes.len() + n, 42);
+            bytes.extend_from_slice(&payload[offset..]);
+            bytes
+        };
+        for (i, variant) in variants.into_iter().enumerate() {
+            fs::write(&file, make(variant))?;
+            assert!(store.save(&[8; 32], &[i as u8; 32], outputs, b"", 1, None)?);
+        }
+        let stats = store.stats()?;
+        assert!(stats.compressed_bytes < (payload.len() * 2) as u64);
+        assert!(stats.counters["packed_reused_bytes"] > (payload.len() * 2) as u64);
+        for (i, variant) in variants.into_iter().enumerate() {
+            assert!(store.restore(&[i as u8; 32], outputs)?.is_some());
+            assert_eq!(fs::read(&file)?, make(variant));
         }
         store.prune(0)?;
         assert_eq!(store.stats()?.charged_bytes, 0);

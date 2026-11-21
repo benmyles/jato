@@ -36,6 +36,6 @@
 
 ## Live edits and shifted artifacts
 
-- [ ] Restore verified native results on live incremental hits and keep new edits on rustc’s normal incremental path.
-- [ ] Reuse packed data across insertions and deletions while preserving bounded capture and exact restoration.
+- [x] Restore verified native results on live incremental hits and keep new edits on rustc’s normal incremental path.
+- [x] Reuse packed data across insertions and deletions while preserving bounded capture and exact restoration.
 - [ ] Profile remaining verification costs, qualify the installed build, and compare edit and rebuild workloads with peers.

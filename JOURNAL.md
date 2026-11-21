@@ -5,6 +5,9 @@
 - A dev-profile edit and undo both bypassed the installed 0.5 cache because rustc’s incremental session was active. The original executable had already been recorded from a clean session.
 - Inserted one byte per revision near the front of a 16 MiB embedded asset. Four releases grew from 32.0 to 128.0 MiB of packed payload, with no prior frames reused across those revisions.
 
+- Moved the live incremental bypass behind verified native lookup. An atomic-save undo restored the clean-session executable and a subsequent new edit still used rustc’s live state. Fresh-session observation remains required for publication.
+- Applied FastCDC 2020 inside long packed archive regions while keeping a single 256 KiB input window. Across eight insertions the payload fell from 256.0 MiB to 21.4 MiB. The original archives matched by SHA-256, and the 272 MiB spill/restore test still passed.
+
 ## 2026-11-21 — concurrent builds and repeated validation
 
 - Started two clean regex worktrees against the same empty 0.4 cache. All six compiler units ran twice and produced six stored entries. The pair finished in 11.18 s.

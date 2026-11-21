@@ -1,6 +1,6 @@
 [package]
 name = "jato"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A bounded local Rust compiler cache and workspace edit runner"
@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 blake3 = "1.8"
+fastcdc = { version = "5.0", default-features = false }
 ctrlc = { version = "3.5", features = ["termination"] }
 ignore = "0.4"
 jobserver = "0.1.35"
