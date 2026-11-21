@@ -2,6 +2,7 @@ mod admission;
 mod archive;
 mod compiler;
 mod content;
+mod dev;
 mod fingerprint;
 mod flight;
 mod invocation;
@@ -27,6 +28,7 @@ Jato — a local Rust build cache and workspace edit runner
 Usage
   jato check|build|test|run|clippy [CARGO_ARGUMENTS...]
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
+  jato dev [ACTION] [ARGS...]       Use the fast development profile (default build)
   jato watch [OPTIONS]             Check on save, with changed packages first
   jato worktree [--root DIR] ACTION  Reuse builds across independent target directories
   jato stats [--json]              Show cache contents and compiler counters
@@ -61,10 +63,21 @@ fn main() {
     }
 }
 
-fn cargo_command(args: &[OsString], system_linker: bool) -> Result<Command> {
+#[derive(Clone, Copy, Default)]
+struct CargoOptions {
+    system_linker: bool,
+    dev: bool,
+}
+
+fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
     let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.args(args).env("RUSTC_WRAPPER", env::current_exe()?);
-    if system_linker {
+    if options.dev {
+        dev::args(&mut cmd, args);
+    } else {
+        cmd.args(args);
+    }
+    cmd.env("RUSTC_WRAPPER", env::current_exe()?);
+    if options.system_linker {
         set_system_linker(&mut cmd)?;
     }
     if env::var_os("JATO_CACHE_DIR").is_some() {
@@ -99,8 +112,34 @@ fn run() -> Result<i32> {
 }
 
 fn dispatch(args: &[OsString]) -> Result<i32> {
-    let system_linker = args.first().is_some_and(|a| a == "--system-linker");
-    let args = if system_linker { &args[1..] } else { args };
+    let mut options = CargoOptions::default();
+    let mut args = args;
+    while let Some(flag) = args.first() {
+        match flag.to_str() {
+            Some("--system-linker") => options.system_linker = true,
+            Some("dev") => options.dev = true,
+            _ => break,
+        }
+        args = &args[1..];
+    }
+    if options.dev {
+        if matches!(
+            args.first().and_then(|a| a.to_str()),
+            Some("-h" | "--help" | "help")
+        ) {
+            print!("{}", dev::HELP);
+            return Ok(0);
+        }
+        if args.is_empty()
+            || (args[0].as_encoded_bytes().starts_with(b"-")
+                && args[0] != "--version"
+                && args[0] != "-V")
+        {
+            let mut build = vec![OsString::from("build")];
+            build.extend_from_slice(args);
+            return compiler::passthrough(cargo_command(&build, options)?);
+        }
+    }
     let first = args.first().map(OsString::as_os_str);
     let verb = first.and_then(OsStr::to_str);
     match verb {
@@ -109,14 +148,14 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
             print!("{HELP}")
         }
         Some("check" | "build" | "test" | "run" | "clippy") => {
-            return compiler::passthrough(cargo_command(args, system_linker)?);
+            return compiler::passthrough(cargo_command(args, options)?);
         }
-        Some("watch") => return watch::run(&args[1..], system_linker),
+        Some("watch") => return watch::run(&args[1..], options),
         #[cfg(target_os = "linux")]
-        Some("worktree") => return worktree::run(&args[1..], system_linker),
+        Some("worktree") => return worktree::run(&args[1..], options),
         #[cfg(not(target_os = "linux"))]
         Some("worktree") => bail!("worktree views require Linux and bubblewrap"),
-        Some("cargo") => return compiler::passthrough(cargo_command(&args[1..], system_linker)?),
+        Some("cargo") => return compiler::passthrough(cargo_command(&args[1..], options)?),
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
             if args.len() == 2 {

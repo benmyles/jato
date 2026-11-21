@@ -15,6 +15,7 @@ cargo install --locked --path .
 From a Rust project, use the same arguments you would give Cargo.
 
 ```sh
+jato dev run
 jato check --all-targets
 jato build --release
 jato test -p parser -- --nocapture
@@ -23,6 +24,12 @@ jato stats
 ```
 
 The first compilation populates the cache. Cargo continues to skip fresh units and maintains its incremental data in the usual target directory. A restored unit can save an entire compiler invocation. An edit that produces new inputs still needs compilation.
+
+### Fast development builds
+
+Use `jato dev` to build, `jato dev run` to start the application, or `jato dev test` to run its tests. `jato dev watch` uses the same profile for focused and workspace checks. For separate checkouts, use `jato dev worktree --root . run`.
+
+These commands select the Cargo profile `jato-dev`, which inherits the project’s `dev` profile. It uses 16 codegen units, emits line tables for workspace members, and requests no debug information for dependencies outside the workspace. Workspace backtraces retain source locations. Inspecting local variables in a debugger calls for a profile with full debug information, such as an ordinary `jato build` with Cargo’s defaults. Cargo writes the new profile to `target/jato-dev` and keeps its own incremental state there. Explicit `--profile` and `--release` options take precedence. [Cargo profiles and package overrides](https://doc.rust-lang.org/cargo/reference/profiles.html)
 
 If `cc` on your PATH is a compiler launcher, choose the system C driver for a project that supports it. The option applies to this Cargo process.
 

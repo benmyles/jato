@@ -14,6 +14,7 @@ pub(crate) use host::system_owner;
 pub const HELP: &str = "\
 Usage
   jato worktree [--root DIR] [--system-linker] check|build|test|run|clippy [ARGS...]
+  jato worktree [--root DIR] dev [ACTION] [ARGS...]
   jato worktree [--root DIR] watch [WATCH_OPTIONS...]
   jato worktree [--root DIR] cargo [+toolchain] [CARGO_ARGS...]
   jato worktree [--root DIR] exec PROGRAM [ARGS...]
@@ -302,7 +303,8 @@ fn project_toolchain(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
+pub fn run(args: &[OsString], mut options: crate::CargoOptions) -> Result<i32> {
+    let default_build = [OsString::from("build")];
     let mut args = args;
     let mut source = None;
     loop {
@@ -317,8 +319,16 @@ pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
                 args = &args[2..];
             }
             Some("--system-linker") => {
-                system_linker = true;
+                options.system_linker = true;
                 args = &args[1..];
+            }
+            Some("dev") => {
+                options.dev = true;
+                args = &args[1..];
+            }
+            None if options.dev => {
+                args = &default_build;
+                break;
             }
             Some("-h" | "--help" | "help") | None => {
                 print!("{HELP}");
@@ -468,12 +478,15 @@ pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
         payload.push(exec.clone());
         payload.extend_from_slice(&args[2..]);
         cmd.env("RUSTC_WRAPPER", &jato);
-        if system_linker {
+        if options.system_linker {
             crate::set_system_linker(&mut cmd)?;
         }
     } else {
-        if system_linker {
+        if options.system_linker {
             payload.push("--system-linker".into());
+        }
+        if options.dev {
+            payload.push("dev".into());
         }
         if kind == "watch" {
             let boundary = args.iter().position(|a| a == "--");

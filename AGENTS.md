@@ -18,3 +18,5 @@
 - Use `bench/worktrees.py --revisit` for switching between familiar directories and `bench/feedback.py --directories 4096` for large watch trees. Exercise moved subtrees, ignore exceptions and newly discovered workspace members.
 - Sampling may reject a candidate. A matching sample must still pass whole-input checks. Exercise same-length changes outside the sampled regions and reachability of earlier unsampled entries. Use `bench/input_reads.py` to measure wrapper I/O separately from rustc.
 - For packed boundary changes, use `bench/history.py --insert-asset` and `--edit-asset` as well as source edits. Verify restored archives and exercise the large index spill.
+- Compare `jato dev` with peers using identical Cargo profile settings. Exercise project profile inheritance, explicit overrides, watch, worktrees and arguments after `--`. Use `bench/compare.py --workloads dev jato-dev` and `bench/devloop.py --profile jato-dev`.
+- Use `bench/capture.py` for packed staging writes and repeated byte-identical ELF captures. Verify complete contents after changing a byte outside the sample and after concurrent eviction of the last sealed reference.

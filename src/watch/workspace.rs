@@ -48,9 +48,9 @@ pub fn configuration(path: &Path) -> bool {
 /// own arguments following a second `--` are opaque to the watcher.
 fn metadata_command(
     job: &[OsString],
-    system_linker: bool,
+    cargo: crate::CargoOptions,
 ) -> Result<(std::process::Command, Vec<PathBuf>)> {
-    let mut cmd = cargo_command(&[], system_linker)?;
+    let mut cmd = cargo_command(&[], cargo)?;
     if let Some(toolchain) = job
         .first()
         .filter(|s| s.as_encoded_bytes().starts_with(b"+"))
@@ -88,7 +88,7 @@ fn metadata_command(
 
 impl Workspace {
     pub fn load(options: &super::Options) -> Result<Self> {
-        let (mut cmd, mut excluded) = metadata_command(&options.job, options.system_linker)?;
+        let (mut cmd, mut excluded) = metadata_command(&options.job, options.cargo)?;
         let out = cmd.output()?;
         ensure!(
             out.status.success(),

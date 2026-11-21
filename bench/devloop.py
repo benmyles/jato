@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from compare import binary, run
+from compare import binary, build_command, profile_directory, run
 from worktrees import cargo_environment, counters, private_environment
 
 
@@ -24,6 +24,7 @@ def main():
     for name in ["jato", "kache", "sccache"]:
         parser.add_argument("--" + name, default=name)
     parser.add_argument("--previous-jato")
+    parser.add_argument("--profile", choices=["dev", "jato-dev"], default="dev")
     parser.add_argument(
         "--tools",
         nargs="+",
@@ -103,7 +104,6 @@ def main():
             temporary.replace(source)
 
         base = cargo_environment(root, rustc, opts.jobs)
-        command = [cargo, "build", "--locked", "-q"]
         config = root / "empty.toml"
         config.touch()
         envs = {}
@@ -135,12 +135,13 @@ def main():
             env = envs[n]
             exe = tools[n]
             before = counters(n, exe, env, project)
+            command = build_command(cargo, opts.profile, exe if n == "jato" else None)
             start = time.perf_counter()
             run(command, env, project)
             elapsed = time.perf_counter() - start
             output = (
                 Path(env["CARGO_TARGET_DIR"])
-                / "debug"
+                / profile_directory(opts.profile)
                 / (opts.verify_bin or "jato-regex-bench")
             )
             assert (
@@ -178,6 +179,7 @@ def main():
             json.dumps(
                 {
                     "versions": versions,
+                    "profile": opts.profile,
                     "project": opts.project.name
                     if opts.project
                     else "locked regex application",

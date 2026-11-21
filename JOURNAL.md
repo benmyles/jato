@@ -6,6 +6,7 @@
 - A warm undo in the 0.6 live benchmark launched one additional rustc dependency probe on each atomic save. Packed capture also spooled new incompressible frames before writing the same bytes to SQLite.
 - Recorded a bounded directory layout for eligible incremental native units. The atomic-save undo and subsequent clean restore both hit, and adding a competing module still produced rustc error E0761. The undo used no discovery probe.
 - Reduced a new 256 KiB incompressible frame to a 40-byte staging descriptor. Publication rechecks the entire frame. Sealed capture can reuse a fully matched existing object even near the storage budget. Exercised changes outside the sample and eviction of the last reference before publication.
+- Compared four Cargo profile configurations in three rotating cold ripgrep builds each. Selected 16 codegen units, workspace line tables and dependency debug level zero for the explicit `jato dev` command. It inherits the project’s dev settings, and Cargo keeps a separate target profile. Verified explicit release selection, argument boundaries, test execution and watch feedback.
 
 ## 2026-11-21 — live incremental replay and shifted artifacts
 

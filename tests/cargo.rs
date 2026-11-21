@@ -176,19 +176,61 @@ fn forwarded_test_and_program_arguments_keep_their_boundaries() {
 }
 
 #[test]
+fn fast_development_profile_keeps_project_settings_and_argument_boundaries() {
+    let p = Project::new();
+    let manifest = p.root.join("Cargo.toml");
+    let mut contents = fs::read_to_string(&manifest).unwrap();
+    contents.push_str("\n[profile.dev]\nopt-level=1\n");
+    write(&manifest, &contents);
+    write(
+        p.root.join("src/main.rs"),
+        "fn main(){println!(\"{} {:?}\",cfg!(debug_assertions), std::env::args().skip(1).collect::<Vec<_>>());}",
+    );
+    let build = p.run(&["dev", "--message-format=json"]);
+    let app = String::from_utf8(build.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["reason"] == "compiler-artifact" && v["target"]["name"] == "app")
+        .unwrap();
+    assert_eq!(app["profile"]["opt_level"], "1");
+    assert_eq!(app["profile"]["debug_assertions"], true);
+    assert!(p.root.join("target/jato-dev/app").is_file());
+    assert_eq!(
+        p.run(&["dev", "run", "-q", "--", "--profile=release", "two words"])
+            .stdout,
+        b"true [\"--profile=release\", \"two words\"]\n"
+    );
+    assert_eq!(
+        p.run(&["dev", "cargo", "--offline", "run", "-qr"]).stdout,
+        b"false []\n"
+    );
+    assert!(p.root.join("target/release/app").is_file());
+    p.run(&["dev", "test", "-q", "--", "--list"]);
+    p.run(&["dev", "cargo", "clean"]);
+    assert!(!p.root.join("target/jato-dev/app").exists());
+    assert!(p.root.join("target/release/app").is_file());
+}
+
+#[test]
 fn watcher_checks_edited_package_then_workspace_and_ignores_build_outputs() {
-    check_watcher(false);
+    check_watcher(false, false);
+}
+
+#[test]
+fn fast_profile_watcher_runs_focused_and_workspace_checks() {
+    check_watcher(false, true);
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn projected_watcher_observes_physical_edits_and_ignores_output_aliases() {
     if worktree_available() {
-        check_watcher(true);
+        check_watcher(true, false);
     }
 }
 
-fn check_watcher(projected: bool) {
+fn check_watcher(projected: bool, fast: bool) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -209,6 +251,9 @@ fn check_watcher(projected: bool) {
     write(manifest, &contents);
     p.run(&["check", "--workspace"]); // establish lockfile and initial target
     let mut cmd = p.command();
+    if fast {
+        cmd.arg("dev");
+    }
     if projected {
         cmd.args(["worktree", "--root", "."]);
     }
@@ -249,6 +294,9 @@ fn check_watcher(projected: bool) {
         }
     };
     wait("finished in");
+    if fast {
+        assert!(p.root.join("target/jato-dev").is_dir());
+    }
     write(p.root.join("target/ignored"), "build output");
     assert!(recv.recv_timeout(Duration::from_millis(180)).is_err());
     write(p.root.join("leaf/src/text file"), "edited");

@@ -43,12 +43,12 @@ def tree_bytes(root):
 def server_rss(sock):
     """Identify only the server listening on this benchmark's private socket."""
     try:
-        rows = Path("/proc/net/unix").read_text().splitlines()
-        inodes = {row.split()[6] for row in rows if row.split()[-1] == str(sock)}
+        rows = (line.split(None, 7) for line in Path("/proc/net/unix").read_bytes().splitlines())
+        inodes = {row[6].decode("ascii") for row in rows if len(row) == 8 and row[7] == os.fsencode(sock)}
         wanted = {f"socket:[{inode}]" for inode in inodes}
         for proc in Path("/proc").glob("[0-9]*"):
             try:
-                if proc.joinpath("comm").read_text().strip() not in {"sccache", "kache-engine", "kache"}:
+                if proc.joinpath("comm").read_bytes().strip() not in {b"sccache", b"kache-engine", b"kache"}:
                     continue
                 if any(os.readlink(fd) in wanted for fd in proc.joinpath("fd").iterdir()):
                     rss = next(s for s in proc.joinpath("status").read_text().splitlines() if s.startswith("VmRSS:"))
@@ -81,11 +81,28 @@ def extent_usage(root):
     return dict(btrfs_total=total, btrfs_exclusive=exclusive, btrfs_set_shared=shared)
 
 
+def build_command(cargo, mode, jato=None):
+    if mode == "jato-dev":
+        if jato:
+            return [jato, "dev", "build", "--locked", "-q"]
+        # Give every peer the same Cargo profile used by the measured Jato CLI.
+        cfg = []
+        for setting in ['profile.jato-dev.inherits="dev"', 'profile.jato-dev.codegen-units=16',
+                        'profile.jato-dev.debug="line-tables-only"', 'profile.jato-dev.package."*".debug="none"']:
+            cfg.extend(["--config", setting])
+        return [cargo, *cfg, "build", "--locked", "-q", "--profile", "jato-dev"]
+    args = {"check": ["check"], "release": ["build", "--release"], "dev": ["build"]}
+    return [cargo, *args[mode], "--locked", "-q"]
+
+
+def profile_directory(mode):
+    return "debug" if mode == "dev" else mode
+
+
 def paired_restores(options, tools, env, project, root, target):
     samples = {}
     medians = {}
     for mode in options.workloads:
-        command = [env["CARGO"], *(["check"] if mode == "check" else ["build", "--release"]), "--locked", "-q"]
         timings = {name: [] for name in tools}
         expected = None
         names = list(tools)
@@ -98,12 +115,12 @@ def paired_restores(options, tools, env, project, root, target):
                 if target.exists():
                     shutil.rmtree(target)
                 start = time.perf_counter()
-                run(command, cfg, project)
+                run(build_command(env["CARGO"], mode, tools[name] if name in {"jato", "jato_packed"} else None), cfg, project)
                 elapsed = time.perf_counter() - start
                 if iteration:
                     timings[name].append(round(elapsed, 6))
-                if mode == "release" and (options.verify_bin or not options.project):
-                    output = run([target / "release" / (options.verify_bin or f"jato-{options.fixture}-bench"),
+                if mode != "check" and (options.verify_bin or not options.project):
+                    output = run([target / profile_directory(mode) / (options.verify_bin or f"jato-{options.fixture}-bench"),
                                   *(["--version"] if options.verify_bin else [])], cfg, project)
                     if expected is None:
                         expected = output
@@ -125,7 +142,7 @@ def main():
     parser.add_argument("--previous-packed", action="store_true", help="also measure --previous-jato in packed mode")
     parser.add_argument("--paired-restores", type=int, metavar="N",
                         help="prime the two Jato versions and alternate N warm clean targets per version")
-    parser.add_argument("--workloads", nargs="+", choices=["release","check"], default=["check","release"])
+    parser.add_argument("--workloads", nargs="+", choices=["release","check","dev","jato-dev"], default=["check","release"])
     parser.add_argument("--kache", default="kache")
     parser.add_argument("--local-kache", help="also compare a second installed kache with its own daemon")
     parser.add_argument("--sccache", default="sccache")
@@ -227,8 +244,7 @@ def main():
                         if name in {"jato_packed", "previous_packed"}:
                             cfg["JATO_STORAGE"] = "packed"
                         assert len(os.fsencode(cfg["SCCACHE_SERVER_UDS"])) < 104, "use a shorter --scratch path"
-                        command = [cargo, *(["check"] if mode == "check" else ["build", "--release"]),
-                                   "--locked", "-q"]
+                        command = build_command(cargo, mode, exe if name in {"jato", "jato_packed"} else None)
                         def measure(phase):
                             rss = private / "rss"
                             timed = ["/usr/bin/time", "-f", "%M", "-o", rss, *command] if Path("/usr/bin/time").is_file() else command
@@ -246,8 +262,8 @@ def main():
                                 if phase != "fresh" and target.exists():
                                     shutil.rmtree(target)
                                 measure(phase)
-                                if mode == "release" and (options.verify_bin or not options.project):
-                                    args = [target / "release" / (options.verify_bin or f"jato-{options.fixture}-bench")]
+                                if mode != "check" and (options.verify_bin or not options.project):
+                                    args = [target / profile_directory(mode) / (options.verify_bin or f"jato-{options.fixture}-bench")]
                                     if options.verify_bin:
                                         args.append("--version")
                                     output = run(args, cfg, project)
