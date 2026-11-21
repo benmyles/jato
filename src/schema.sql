@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS needs(
     entry INTEGER REFERENCES entries ON DELETE CASCADE, digest BLOB NOT NULL, codegen INTEGER NOT NULL,
     PRIMARY KEY(entry,digest)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS waiting_for_artifact ON needs(digest,codegen);
 CREATE TRIGGER IF NOT EXISTS add_need AFTER INSERT ON needs BEGIN UPDATE usage SET bytes=bytes+96; END;
 CREATE TRIGGER IF NOT EXISTS drop_need AFTER DELETE ON needs BEGIN UPDATE usage SET bytes=bytes-96; END;
 CREATE TABLE IF NOT EXISTS objects(hash BLOB PRIMARY KEY, verity BLOB NOT NULL, bytes INTEGER NOT NULL, refs INTEGER NOT NULL) WITHOUT ROWID;
@@ -151,4 +152,4 @@ END;
 CREATE TRIGGER IF NOT EXISTS drop_patch AFTER DELETE ON patches BEGIN
     UPDATE usage SET bytes=bytes-96-length(OLD.data);
 END;
-PRAGMA user_version=15;
+PRAGMA user_version=16;

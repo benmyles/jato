@@ -4,6 +4,7 @@
 
 - Traced a one-crate Cargo check on 0.8. When Cargo passed `rustc` by name, four extra compiler processes queried the sysroot. The rustup-launched Cargo control passed an absolute compiler and needed zero extra queries. Added both layouts and an explicit rustup proxy to the comparison harness.
 - Added confirmed sysroot reuse for physical Rust distributions. Jato asks the real compiler on first use, binds its answer to the toolchain and launcher identities, and asks rustup which compiler an override selects. A Cargo regression checks an unexecutable PATH entry and a custom driver whose answers change.
+- Measured 327,700 SQLite VM instructions to scan 32,768 unrelated pending inputs on 0.8. Added a reverse index and a transaction-local SQLite queue for newly verified outputs. Tested delayed publications, fan-in, cycles, self-dependencies, and independent metadata and code-generation evidence.
 
 ## 2026-11-21 — coding agent skill
 

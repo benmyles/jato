@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 16;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -753,27 +753,7 @@ impl Store {
                         params![entry, sample],
                     )?;
                 }
-                for digest in plan.needs {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO needs VALUES(?1,?2,?3)",
-                        params![entry, digest, plan.codegen],
-                    )?;
-                }
-                // Pipelined Cargo consumers may finish before their producer. Only
-                // expose a record after every missing input has independent proof.
-                loop {
-                    let changed = tx.execute(
-                        "DELETE FROM needs WHERE EXISTS (
-                    SELECT 1 FROM files f JOIN plans p ON p.entry=f.entry
-                    WHERE f.digest=needs.digest AND p.codegen>=needs.codegen
-                    AND NOT EXISTS(SELECT 1 FROM needs parent WHERE parent.entry=f.entry)
-                )",
-                        [],
-                    )?;
-                    if changed == 0 {
-                        break;
-                    }
-                }
+                certify_dependents(&tx, entry, plan.codegen, plan.needs)?;
             }
             let time = now();
             let sweep = (packed.has_files || files.iter().any(|f| f.sealed.is_some()))
@@ -1080,6 +1060,74 @@ fn probe_checksum(stdout: &[u8], stderr: &[u8]) -> Digest {
         .update(stderr)
         .finalize()
         .as_bytes()
+}
+
+// Pipelined Cargo consumers can finish before their producers. A verified
+// output can discharge only requirements for those exact bytes and proof level.
+fn certify_dependents(
+    tx: &Transaction<'_>,
+    entry: i64,
+    codegen: bool,
+    needs: &[Digest],
+) -> Result<()> {
+    let mut pending = false;
+    for digest in needs {
+        // A producer can commit between hashing the input and acquiring this
+        // writer. Exclude the entry under construction from its own evidence.
+        pending |= tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO needs SELECT ?1,?2,?3 WHERE NOT EXISTS (
+             SELECT 1 FROM files f JOIN plans p ON p.entry=f.entry
+             WHERE f.digest=?2 AND f.entry!=?1 AND p.codegen>=?3
+             AND NOT EXISTS(SELECT 1 FROM needs n WHERE n.entry=f.entry))",
+            )?
+            .execute(params![entry, digest, codegen])?
+            != 0;
+    }
+    if pending
+        || !tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM files f CROSS JOIN needs n
+         WHERE f.entry=?1 AND n.digest=f.digest AND n.codegen<=?2)",
+            )?
+            .query_row(params![entry, codegen], |r| r.get::<_, bool>(0))?
+    {
+        return Ok(());
+    }
+
+    // The queue lives in SQLite's temporary database so wide fan-out does not
+    // require a process-sized Rust collection. Pop before expanding a node.
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS proof_queue(entry INTEGER PRIMARY KEY)")?;
+    tx.execute("INSERT INTO temp.proof_queue VALUES(?1)", [entry])?;
+    let mut next = tx.prepare_cached(
+        "SELECT q.entry,p.codegen,NOT EXISTS(SELECT 1 FROM needs n WHERE n.entry=q.entry)
+         FROM temp.proof_queue q CROSS JOIN plans p WHERE p.entry=q.entry LIMIT 1",
+    )?;
+    let mut pop = tx.prepare_cached("DELETE FROM temp.proof_queue WHERE entry=?1")?;
+    let mut enqueue = tx.prepare_cached(
+        "INSERT OR IGNORE INTO temp.proof_queue SELECT n.entry FROM files f CROSS JOIN needs n
+         WHERE f.entry=?1 AND n.digest=f.digest AND n.codegen<=?2",
+    )?;
+    let mut release = tx.prepare_cached(
+        "DELETE FROM needs WHERE digest IN (SELECT digest FROM files WHERE entry=?1) AND codegen<=?2",
+    )?;
+    while let Some((id, strength, ready)) = next
+        .query_row([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })
+        .optional()?
+    {
+        pop.execute([id])?;
+        if ready {
+            enqueue.execute(params![id, strength])?;
+            release.execute(params![id, strength])?;
+        }
+    }
+    Ok(())
 }
 
 fn evict(tx: &Transaction<'_>, limit: u64) -> Result<u64> {
@@ -1776,6 +1824,27 @@ mod tests {
         save(&mut store, 4, b"producer", &[], true)?;
         assert!(!store.plans(&[2; 32])?.0.is_empty());
         assert!(store.knows_artifact(&b, true)?);
+
+        // The producer committed after the wrapper observed its input but
+        // before it published. Its existing independent proof still counts.
+        save(&mut store, 5, b"late", &[a, b], true)?;
+        assert!(!store.plans(&[5; 32])?.0.is_empty());
+
+        let left = *blake3::hash(b"left").as_bytes();
+        let right = *blake3::hash(b"right").as_bytes();
+        save(&mut store, 6, b"fan-in", &[left, right], true)?;
+        save(&mut store, 7, b"left", &[right], true)?;
+        save(&mut store, 8, b"right", &[left], true)?;
+        save(&mut store, 9, b"left", &[left], true)?;
+        for id in 6..=9 {
+            assert!(store.plans(&[id; 32])?.0.is_empty());
+        }
+        save(&mut store, 10, b"right", &[], false)?;
+        assert!(!store.knows_artifact(&left, true)?);
+        save(&mut store, 11, b"right", &[], true)?;
+        for id in 6..=9 {
+            assert!(!store.plans(&[id; 32])?.0.is_empty());
+        }
         Ok(())
     }
 
