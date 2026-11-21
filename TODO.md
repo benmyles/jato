@@ -47,3 +47,9 @@
 - [x] Avoid repeated module discovery when a verified live executable survives an editor rename.
 - [x] Select and expose a faster Cargo development profile with separate outputs and preserved project settings.
 - [x] Measure cold builds and edit cycles against 0.6 and upstream caches, and qualify the installed release.
+
+## Dependency changes and large packed frames
+
+- [ ] Reduce redundant whole-dependency reads when a producer changes under an otherwise unchanged consumer.
+- [ ] Reduce large packed payload writes and preserve bounded restoration, shared-frame eviction and corruption recovery.
+- [ ] Measure cold, restored and edited real Cargo builds, test upgrades and qualify the installed package.

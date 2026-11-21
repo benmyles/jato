@@ -1,5 +1,9 @@
 # Work journal
 
+## 2026-11-21 — dependency changes and large packed frames
+
+- A real two-crate Cargo check changed a producer constant and kept the consumer source fixed. The 0.7 consumer wrapper read a 130,015,982-byte rmeta twice, for 260,031,964 bytes before and after rustc. A previous cold packed capture wrote more than 70 MiB to SQLite for a 32 MiB embedded asset.
+
 ## 2026-11-21 — cold capture and editor saves
 
 - Added per-unit compile, validation and publication timings. On an isolated fresh incremental regex link, six runs put the bare compiler at 198 ms and its native observer at 479 ms. Switching from hexadecimal to printable trace strings took 541 ms.
