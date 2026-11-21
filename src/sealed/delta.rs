@@ -134,7 +134,7 @@ pub fn capture(
     let mut block = vec![0; WINDOW];
     let mut base = vec![0; WINDOW + 2 * RADIUS];
     let mut changes = Changes::default();
-    let mut witness = (size == original_size).then(|| proof::Builder::new(size));
+    let mut witness = (size == original_size && size >= 4 << 20).then(|| proof::Builder::new(size));
     let mut hash = blake3::Hasher::new();
     let mut shift = 0;
     let mut pos = 0;

@@ -7,6 +7,7 @@
 - Moved large encoded frames into individually reclaimable files and kept their ordering, ownership and budget accounting transactional in SQLite. Packed restores can seek over zero pages and reuse a decompressed frame. Tested missing and corrupt shared payloads, interrupted publication, sparse EOFs and eviction during a reader’s WAL snapshot.
 - Eight 16 MiB asset revisions retained about 385 MiB with automatic storage in 0.7. A bounded byte comparison reused an authenticated base for 14 edited artifacts, retaining about 49 MiB. Verified inserts, deletions and overwrites with downstream consumers and full archive digests.
 - The first patch reader reread entire cloned results. For small in-place edits, the new reader validates the base’s standard BLAKE3 root and rehashes each changed stripe to validate the result’s root. Mostly shifted files can stream directly from authenticated ranges. Tests cover corrupt witnesses, incorrect result digests and a changed byte outside a literal in the same stripe.
+- A failed publication now reclaims external files after transaction rollback while preserving concurrently committed objects. The release passed 63 tests on Rust 1.89 and 1.100 with native, sealed and worktree reuse required, plus the separate 272 MiB packed stress test.
 
 ## 2026-11-21 — cold capture and editor saves
 

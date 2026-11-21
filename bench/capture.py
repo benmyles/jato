@@ -48,7 +48,7 @@ def wrapper_trace(exe, command, env, project, prefix):
     return traces[0]
 
 
-def packed_writes(exe, cargo, env, project, root):
+def packed_writes(exe, cargo, env, project, root, runs):
     command = [cargo, "build", "--release", "--lib", "--locked", "-q"]
     env = dict(env, JATO_STORAGE="packed")
     cold = wrapper_trace(exe, command, env, project, root / "cold")
@@ -88,12 +88,22 @@ def packed_writes(exe, cargo, env, project, root):
         assert hashlib.file_digest(stream, "sha256").digest() == expected.digest()
     restored = json.loads(run([exe, "stats", "--json"], env, project))
     assert restored["counters"].get("hit", 0) == 1
+    times = []
+    for _ in range(runs):
+        shutil.rmtree(target)
+        start = time.perf_counter()
+        run(command, env, project)
+        times.append(round(time.perf_counter() - start, 6))
+        with archive.open("rb") as stream:
+            assert hashlib.file_digest(stream, "sha256").digest() == expected.digest()
     target_writes = re.compile(
         r"^(?:write|writev|pwrite64)\(\d+<"
         + re.escape(str(target))
         + r"/[^>]+>.* = (\d+)$"
     )
     return {
+        "untraced_restore_seconds": times,
+        "median_restore_seconds": statistics.median(times),
         "logical_restored_bytes": stats["artifact_bytes"],
         "restore_output_bytes_written": total(target_writes, warm),
         "restore_archive_sha256": expected.hexdigest(),
@@ -190,7 +200,7 @@ fn main(){
             envs[name] = dict(environment(private / "auto", exe), JATO_LOG="timings")
             results[name] = {
                 "version": run([exe, "--version"], base, project).decode().strip(),
-                "cold_packed": packed_writes(exe, cargo, trace_env, project, private),
+                "cold_packed": packed_writes(exe, cargo, trace_env, project, private, opts.runs),
                 "builds": [],
             }
         for revision in range(opts.runs + 1):

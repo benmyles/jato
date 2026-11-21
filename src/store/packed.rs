@@ -312,8 +312,8 @@ impl Recorder {
             .prepare_cached(INSERT_CHUNK)?
             .execute(params![&digest, raw, inline, external])?;
         if added != 0 && external != 0 {
-            write_frame(&self.dir, &digest, bytes)?;
             self.has_files = true;
+            write_frame(&self.dir, &digest, bytes)?;
         }
         Ok((digest, raw as u64))
     }

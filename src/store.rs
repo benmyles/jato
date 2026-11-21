@@ -672,121 +672,137 @@ impl Store {
             files.push(file);
         }
         packed.rewind()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let added = tx.execute("INSERT OR IGNORE INTO entries(key,recipe,access,stderr,stderr_hash,compile_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+        let mut publishing_sealed = false;
+        let publication = (|| -> Result<(bool, bool, bool)> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let added = tx.execute("INSERT OR IGNORE INTO entries(key,recipe,access,stderr,stderr_hash,compile_ms) VALUES(?1,?2,?3,?4,?5,?6)",
             params![key, recipe, now(), stderr, blake3::hash(stderr).as_bytes(), elapsed_ms])?;
-        if added == 0 {
-            return Ok(true);
-        }
-        let entry = tx.last_insert_rowid();
-        for (slot, file) in files.iter().enumerate() {
-            let single = file.frames == 1;
-            tx.execute(
+            if added == 0 {
+                return Ok((true, false, false));
+            }
+            let entry = tx.last_insert_rowid();
+            for (slot, file) in files.iter().enumerate() {
+                let single = file.frames == 1;
+                tx.execute(
                 "INSERT INTO files(entry,slot,digest,size,mode,single) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![entry, slot, &file.hash, file.size, file.mode, single],
             )?;
-            if let Some(object) = &file.sealed {
-                crate::sealed::publish(object, &crate::sealed::path(&self.dir, &object.hash))?;
-                tx.execute("INSERT INTO objects VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1",
+                if let Some(object) = &file.sealed {
+                    publishing_sealed = true;
+                    crate::sealed::publish(object, &crate::sealed::path(&self.dir, &object.hash))?;
+                    tx.execute("INSERT INTO objects VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1",
                     params![object.hash,object.verity,object.bytes])?;
-                tx.execute(
-                    "INSERT INTO clones VALUES(?1,?2,?3)",
-                    params![entry, slot, object.hash],
-                )?;
-                if let Some(patch) = &object.patch {
                     tx.execute(
-                        "INSERT INTO patches VALUES(?1,?2,?3)",
-                        params![entry, slot, &patch.data],
+                        "INSERT INTO clones VALUES(?1,?2,?3)",
+                        params![entry, slot, object.hash],
                     )?;
+                    if let Some(patch) = &object.patch {
+                        tx.execute(
+                            "INSERT INTO patches VALUES(?1,?2,?3)",
+                            params![entry, slot, &patch.data],
+                        )?;
+                    }
+                }
+                let mut source = None;
+                let mut offset = 0;
+                for ordinal in 0..file.frames {
+                    let (digest, raw) =
+                        packed.publish(&tx, &outputs[slot], &mut source, offset, &mut buffer)?;
+                    offset += raw;
+                    if !single {
+                        tx.prepare_cached("INSERT INTO parts VALUES(?1,?2,?3,?4)")?
+                            .execute(params![entry, slot, ordinal, &digest])?;
+                    }
                 }
             }
-            let mut source = None;
-            let mut offset = 0;
-            for ordinal in 0..file.frames {
-                let (digest, raw) =
-                    packed.publish(&tx, &outputs[slot], &mut source, offset, &mut buffer)?;
-                offset += raw;
-                if !single {
-                    tx.prepare_cached("INSERT INTO parts VALUES(?1,?2,?3,?4)")?
-                        .execute(params![entry, slot, ordinal, &digest])?;
-                }
+            if packed.reused > 0 {
+                tx.execute("INSERT INTO counters VALUES('packed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [packed.reused])?;
             }
-        }
-        if packed.reused > 0 {
-            tx.execute("INSERT INTO counters VALUES('packed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [packed.reused])?;
-        }
-        let reused: u64 = files
-            .iter()
-            .filter(|f| {
-                f.sealed
-                    .as_ref()
-                    .is_some_and(|o| o.reused && o.patch.is_none())
-            })
-            .map(|f| f.size)
-            .sum();
-        if reused > 0 {
-            tx.execute("INSERT INTO counters VALUES('sealed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [reused])?;
-        }
-        if let (Some(plan), Some((hash, bytes))) = (plan, manifest) {
-            let manifest: i64 = tx.query_row(
-                "INSERT INTO manifests(hash,data,refs) VALUES(?1,?2,1) ON CONFLICT(hash)
+            let reused: u64 = files
+                .iter()
+                .filter(|f| {
+                    f.sealed
+                        .as_ref()
+                        .is_some_and(|o| o.reused && o.patch.is_none())
+                })
+                .map(|f| f.size)
+                .sum();
+            if reused > 0 {
+                tx.execute("INSERT INTO counters VALUES('sealed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [reused])?;
+            }
+            if let (Some(plan), Some((hash, bytes))) = (plan, manifest) {
+                let manifest: i64 = tx.query_row(
+                    "INSERT INTO manifests(hash,data,refs) VALUES(?1,?2,1) ON CONFLICT(hash)
                  DO UPDATE SET refs=refs+1 RETURNING id",
-                params![hash, bytes],
-                |r| r.get(0),
-            )?;
-            tx.execute(
+                    params![hash, bytes],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
                 "INSERT INTO plans(entry,inputs,topology,codegen,manifest) VALUES(?1,x'',?2,?3,?4)",
                 params![entry, plan.topology, plan.codegen, manifest],
             )?;
-            tx.execute(
-                "INSERT INTO source_variants VALUES(?1,?2)",
-                params![entry, plan.sources],
-            )?;
-            if let Some(sample) = plan.sample {
                 tx.execute(
-                    "INSERT INTO input_samples VALUES(?1,?2)",
-                    params![entry, sample],
+                    "INSERT INTO source_variants VALUES(?1,?2)",
+                    params![entry, plan.sources],
                 )?;
-            }
-            for digest in plan.needs {
-                tx.execute(
-                    "INSERT OR IGNORE INTO needs VALUES(?1,?2,?3)",
-                    params![entry, digest, plan.codegen],
-                )?;
-            }
-            // Pipelined Cargo consumers may finish before their producer. Only
-            // expose a record after every missing input has independent proof.
-            loop {
-                let changed = tx.execute(
-                    "DELETE FROM needs WHERE EXISTS (
+                if let Some(sample) = plan.sample {
+                    tx.execute(
+                        "INSERT INTO input_samples VALUES(?1,?2)",
+                        params![entry, sample],
+                    )?;
+                }
+                for digest in plan.needs {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO needs VALUES(?1,?2,?3)",
+                        params![entry, digest, plan.codegen],
+                    )?;
+                }
+                // Pipelined Cargo consumers may finish before their producer. Only
+                // expose a record after every missing input has independent proof.
+                loop {
+                    let changed = tx.execute(
+                        "DELETE FROM needs WHERE EXISTS (
                     SELECT 1 FROM files f JOIN plans p ON p.entry=f.entry
                     WHERE f.digest=needs.digest AND p.codegen>=needs.codegen
                     AND NOT EXISTS(SELECT 1 FROM needs parent WHERE parent.entry=f.entry)
                 )",
-                    [],
-                )?;
-                if changed == 0 {
-                    break;
+                        [],
+                    )?;
+                    if changed == 0 {
+                        break;
+                    }
                 }
             }
-        }
-        let time = now();
-        let sweep = (packed.has_files || files.iter().any(|f| f.sealed.is_some()))
-            && tx.execute(
-                "INSERT INTO maintenance VALUES('objects',?1) ON CONFLICT(name)
+            let time = now();
+            let sweep = (packed.has_files || files.iter().any(|f| f.sealed.is_some()))
+                && tx.execute(
+                    "INSERT INTO maintenance VALUES('objects',?1) ON CONFLICT(name)
              DO UPDATE SET last_run=excluded.last_run WHERE last_run < ?2",
-                params![time, time - 3_600_000_000],
-            )? == 1;
-        let evicted = evict(&tx, self.limit)?;
-        let kept = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM entries WHERE id=?1)",
-            [entry],
-            |r| r.get(0),
-        )?;
-        tx.commit()?;
-        if evicted > 0 || sweep {
+                    params![time, time - 3_600_000_000],
+                )? == 1;
+            let evicted = evict(&tx, self.limit)?;
+            let kept = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE id=?1)",
+                [entry],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            Ok((kept, evicted > 0, sweep))
+        })();
+        let (kept, evicted, sweep) = match publication {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A rolled-back writer may already have renamed files. Under
+                // a fresh writer lock, remove only names still unreferenced.
+                if packed.has_files || publishing_sealed {
+                    let _ = self.collect_objects(true);
+                }
+                return Err(error);
+            }
+        };
+        if evicted || sweep {
             self.collect_objects(sweep)?;
         }
         Ok(kept)
@@ -848,13 +864,17 @@ impl Store {
                     let base: Digest = row.get(9)?;
                     let original_size: u64 = row.get(10)?;
                     let path = crate::sealed::path(&self.dir, &base);
-                    let mut source = crate::content::open(&path).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            anyhow::Error::new(Damaged::Object(base))
-                        } else {
-                            e.into()
-                        }
-                    })?;
+                    let mut source =
+                        crate::content::open_with_flags(&path, libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                            .map_err(|e| {
+                                if e.kind() == std::io::ErrorKind::NotFound
+                                    || e.raw_os_error() == Some(libc::ELOOP)
+                                {
+                                    anyhow::Error::new(Damaged::Object(base))
+                                } else {
+                                    e.into()
+                                }
+                            })?;
                     if base == digest {
                         ensure!(
                             original_size == size
@@ -1316,6 +1336,44 @@ mod tests {
             store.prune(0)?;
             assert!(!abandoned.exists() && !pending.exists() && unrelated.exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rolled_back_publication_leaves_existing_frames_and_no_new_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = Store::at(dir.path().join("cache"), 8 << 20)?;
+        let paths = [dir.path().join("rlib")];
+        let mut data = vec![0; CHUNK];
+        blake3::Hasher::new()
+            .update(b"rollback")
+            .finalize_xof()
+            .fill(&mut data);
+        fs::write(&paths[0], &data)?;
+        store.save(&[0; 32], &[1; 32], &paths, b"", 1, None)?;
+        let original = *blake3::hash(&data).as_bytes();
+        let charged = store.stats()?.charged_bytes;
+        data[917] ^= 1;
+        fs::write(&paths[0], &data)?;
+        let other = *blake3::hash(&data).as_bytes();
+        store.conn.execute_batch("CREATE TRIGGER interrupted BEFORE INSERT ON plans BEGIN SELECT RAISE(ABORT,'interrupted'); END")?;
+        let plan = Evidence {
+            sample: None,
+            inputs: b"plan",
+            sources: &[3; 32],
+            needs: &[],
+            topology: &[0; 32],
+            codegen: true,
+        };
+        assert!(
+            store
+                .save(&[0; 32], &[2; 32], &paths, b"", 1, Some(plan))
+                .is_err()
+        );
+        assert!(objects::Kind::Frame.path(&store.dir, &original).is_file());
+        assert!(!objects::Kind::Frame.path(&store.dir, &other).exists());
+        assert_eq!(store.stats()?.charged_bytes, charged);
+        assert!(store.restore(&[1; 32], &paths)?.is_some());
         Ok(())
     }
 

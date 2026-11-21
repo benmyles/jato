@@ -129,3 +129,39 @@ impl Proof {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    #[test]
+    fn witnesses_match_standard_hashes_at_stripe_and_final_block_boundaries() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("staged");
+        for size in [4 << 20, (4 << 20) + 1, (8 << 20) - 1, (8 << 20) + 1024] {
+            let mut bytes = vec![0; size];
+            blake3::Hasher::new()
+                .update(b"subtree proof")
+                .finalize_xof()
+                .fill(&mut bytes);
+            let base = *blake3::hash(&bytes).as_bytes();
+            let mut build = Builder::new(size as u64);
+            for (i, chunk) in bytes.chunks(64 << 10).enumerate() {
+                build.update((i as u64) << 16, chunk)
+            }
+            let mut program = vec![7];
+            build.prepend(&mut program, 2, 128 << 10);
+            let mut remaining = program.as_slice();
+            let mut proof = Proof::take(&mut remaining, size as u64, size as u64, &base)?.unwrap();
+            assert_eq!(remaining, [7]);
+            let edge = proof.width as usize;
+            bytes[edge - 1..edge + 1].fill(77);
+            bytes[size - 1] ^= 0xf0;
+            proof.changed((edge - 1) as u64, (edge + 1) as u64);
+            proof.changed((size - 1) as u64, size as u64);
+            fs::write(&path, &bytes)?;
+            proof.verify(&File::open(&path)?, blake3::hash(&bytes).as_bytes())?;
+        }
+        Ok(())
+    }
+}
