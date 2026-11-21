@@ -18,6 +18,8 @@
 
 - [x] Test the reported nightly options, split library metadata, shared cache budgeting and delivery to a conventional artifact directory.
 - [x] Measure the installed version on Olo protocol and system packages and report the results to the Olo developer.
+- [x] Qualify upstream mold 3.0.0 with a fresh linked executable and a procedural macro whose expansion reads an untracked file.
+- [x] Distinguish repeated quarantined records from actual stores and avoid reading their outputs again.
 - [ ] Close the fully emptied-target Olo performance gap while preserving correct behavior for changing procedural-macro inputs and native dependencies.
 
 ## Coding agent skill

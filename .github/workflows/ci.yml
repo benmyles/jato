@@ -28,6 +28,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y strace bubblewrap
           cargo +${{ matrix.rust }} test --locked
+      - name: Exercise upstream mold and real macro expansion
+        if: matrix.rust == 'stable'
+        run: |
+          archive="$RUNNER_TEMP/mold.tar.gz"
+          curl -fsSL --retry 3 https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz -o "$archive"
+          echo "6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189  $archive" | sha256sum -c -
+          tar -C "$RUNNER_TEMP" -xzf "$archive" mold-3.0.0-x86_64-linux/bin/mold
+          JATO_TEST_MOLD="$RUNNER_TEMP/mold-3.0.0-x86_64-linux/bin/mold" cargo +stable test --locked mold
       - name: Exercise pinned nightly Cargo artifacts
         if: matrix.rust == 'stable'
         run: |

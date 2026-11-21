@@ -99,28 +99,41 @@ pub(crate) fn recent(m: &fs::Metadata, since: SystemTime) -> bool {
         || m.modified().is_ok_and(|t| t >= since)
 }
 
+struct SourceCheck<'a> {
+    buffer: &'a mut Vec<u8>,
+    compiler: &'a OsStr,
+    inv: &'a Invocation,
+    observed: bool,
+    nightly_guards: Option<&'a mut Vec<String>>,
+}
+
 fn hash_open(
     mut f: File,
     path: &Path,
     since: SystemTime,
-    scan: Option<&mut Vec<u8>>,
-    inv: &Invocation,
-    observed: bool,
-    nightly_guards: Option<&mut Vec<String>>,
-) -> Result<(Digest, u64)> {
+    check: Option<SourceCheck<'_>>,
+) -> Result<(Digest, u64, bool)> {
     let before = f.metadata()?;
     ensure!(
         before.is_file() && !recent(&before, since),
         "input changed during compilation"
     );
-    let digest = if let Some(buffer) = scan {
+    let mut extended_admission = false;
+    let digest = if let Some(SourceCheck {
+        buffer,
+        compiler,
+        inv,
+        observed,
+        nightly_guards,
+    }) = check
+    {
         const MAX: u64 = 8 << 20;
         if before.len() > MAX {
             ensure!(nightly_guards.is_none(), "oversized nightly crate root");
             crate::admission::large_input(f.take(before.len() + 1), path)?
         } else {
             buffer.clear();
-            f.take(before.len() + 1).read_to_end(buffer)?;
+            (&mut f).take(before.len() + 1).read_to_end(buffer)?;
             ensure!(
                 buffer.len() as u64 == before.len(),
                 "source changed size during admission"
@@ -129,13 +142,33 @@ fn hash_open(
                 crate::admission::check_root(buffer, guards)?;
             }
             if inv.codegen {
-                crate::admission::verify_bytes(buffer, path, inv.deferred_links, observed)?;
+                extended_admission =
+                    match crate::admission::verify_bytes(buffer, path, inv.deferred_links, observed)
+                    {
+                        Ok(extended) => extended,
+                        Err(reason) => {
+                            if !crate::admission::data_only(
+                                compiler,
+                                &inv.probe_args,
+                                path,
+                                &mut f,
+                                buffer,
+                            ) {
+                                return Err(reason);
+                            }
+                            true
+                        }
+                    }
             }
             blake3::hash(buffer)
         }
     } else if before.len() >= 4 << 20 {
         let input = crate::content::Input::with_file(path, f, since)?;
-        return Ok((crate::content::digests(&[input], 2 << 20)?[0], before.len()));
+        return Ok((
+            crate::content::digests(&[input], 2 << 20)?[0],
+            before.len(),
+            false,
+        ));
     } else {
         let mut h = blake3::Hasher::new();
         h.update_reader(&mut f)?;
@@ -145,13 +178,15 @@ fn hash_open(
         stamp(&before) == stamp(&fs::metadata(path)?),
         "input changed while hashing"
     );
-    Ok((*digest.as_bytes(), before.len()))
+    Ok((*digest.as_bytes(), before.len(), extended_admission))
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nightly: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extended_admission: bool,
     files: BTreeSet<PathBuf>,
     env: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +267,7 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
     );
     Ok(Plan {
         nightly: false,
+        extended_admission: false,
         files: files
             .into_iter()
             .map(|s| PathBuf::from(s.replace("\\ ", " ")))
@@ -244,6 +280,7 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
 }
 
 pub struct Inputs {
+    pub extended_admission: bool,
     pub nightly_guards: Vec<String>,
     pub sources: Digest,
     pub large_input: Option<usize>,
@@ -357,7 +394,7 @@ impl Plan {
         recipe: &Recipe,
         inv: &Invocation,
         since: SystemTime,
-        recording: bool,
+        recording: Option<&OsStr>,
     ) -> Result<Inputs> {
         let root = fs::canonicalize(&inv.source)?;
         let mut has_root = false;
@@ -368,6 +405,7 @@ impl Plan {
         let mut ancestors = BTreeSet::new();
         let mut scan = Vec::new();
         let mut nightly_guards = Vec::new();
+        let mut extended_admission = false;
         let cwd = std::env::current_dir()?;
         let mut largest = None;
         let mut largest_size = 0;
@@ -392,16 +430,18 @@ impl Plan {
             field(&mut hash, b"source");
             field(&mut hash, file.as_os_str().as_bytes());
             field(&mut hash, path.as_os_str().as_bytes());
-            let nightly_root = recording && self.nightly && root == path;
-            let (digest, length) = hash_open(
-                opened,
-                file,
-                since,
-                (recording && (inv.codegen || nightly_root)).then_some(&mut scan),
-                inv,
-                self.native.is_some(),
-                nightly_root.then_some(&mut nightly_guards),
-            )?;
+            let nightly_root = self.nightly && root == path;
+            let check = recording
+                .filter(|_| inv.codegen || nightly_root)
+                .map(|compiler| SourceCheck {
+                    buffer: &mut scan,
+                    compiler,
+                    inv,
+                    observed: self.native.is_some(),
+                    nightly_guards: nightly_root.then_some(&mut nightly_guards),
+                });
+            let (digest, length, proved_data) = hash_open(opened, file, since, check)?;
+            extended_admission |= proved_data;
             field(&mut hash, &digest);
             if length >= 4 << 20 && length > largest_size {
                 largest_size = length;
@@ -438,6 +478,7 @@ impl Plan {
         ensure!(has_root, "crate root missing from dep-info");
         tracked_env(&mut hash, &self.env);
         Ok(Inputs {
+            extended_admission,
             nightly_guards,
             sources: *hash.finalize().as_bytes(),
             large_input: largest,
@@ -457,6 +498,9 @@ impl Inputs {
         externs: &Digest,
     ) -> Result<Digest> {
         let mut hash = blake3::Hasher::new_derive_key("jato verified compilation v3");
+        if plan.extended_admission {
+            field(&mut hash, b"jato checked assembly and text inputs v1");
+        }
         if plan.nightly {
             field(&mut hash, b"jato restricted nightly inputs v1");
         }

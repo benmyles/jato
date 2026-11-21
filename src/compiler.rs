@@ -41,10 +41,27 @@ fn discover(
 ) -> Result<Option<Hit>> {
     let before = Instant::now();
     if plans.is_empty() {
-        trace(
-            &inv.name,
-            "no previous entry for these compiler arguments and toolchain",
-        );
+        if env::var_os("JATO_LOG").as_deref() == Some(OsStr::new("debug")) {
+            if let Some((hash, strong)) = store.pending_requirement(&recipe.key)? {
+                let level = if strong {
+                    "code generation"
+                } else {
+                    "metadata"
+                };
+                trace(
+                    &inv.name,
+                    format_args!(
+                        "record awaits {level} proof for {}",
+                        blake3::Hash::from_bytes(hash)
+                    ),
+                );
+            } else {
+                trace(
+                    &inv.name,
+                    "no previous entry for these compiler arguments and toolchain",
+                );
+            }
+        }
         return Ok(None);
     }
     let start = SystemTime::now();
@@ -67,7 +84,7 @@ fn discover(
             );
             continue;
         }
-        let Ok(inputs) = plan.inputs(recipe, inv, start, false) else {
+        let Ok(inputs) = plan.inputs(recipe, inv, start, None) else {
             continue;
         };
         // Reuse work already done for lookup to keep different branch
@@ -167,6 +184,7 @@ fn rediscover(
     ensure!(status.success(), "input discovery failed");
     let mut plan = fingerprint::dependencies(probe.path())?;
     plan.nightly = recorded.nightly;
+    plan.extended_admission = recorded.extended_admission;
     if recorded.native.is_some() {
         // A copied source tree has new directory inodes. Ask this rustc to
         // resolve modules again before revalidating the observed link inputs.
@@ -175,7 +193,7 @@ fn rediscover(
         }
         plan.native = recorded.native;
     }
-    let inputs = plan.inputs(recipe, inv, start, false)?;
+    let inputs = plan.inputs(recipe, inv, start, None)?;
     let topology = inputs.topology(start)?;
     let checked;
     let externs = match externs {
@@ -430,7 +448,8 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 "unsupported compiler channel"
             );
             plan.nightly = channel == crate::admission::Channel::Nightly;
-            let inputs = plan.inputs(&recipe, inv, since, true)?;
+            let inputs = plan.inputs(&recipe, inv, since, Some(compiler))?;
+            plan.extended_admission = inputs.extended_admission;
             crate::admission::verify_conditions(compiler, inv, &store.dir, &inputs.nightly_guards)?;
             plan.large_input = inputs.large_input;
             plan.large_extern = externs.largest;
@@ -480,17 +499,12 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             }
             Ok(())
         })();
-        match result {
-            Ok(()) => {
-                let _ = store.count("stored", 1);
-            }
-            Err(e) => {
-                trace(
-                    &inv.name,
-                    format_args!("compile succeeded, skipping store: {e:#}"),
-                );
-                let _ = store.count("uncached", 1);
-            }
+        if let Err(e) = result {
+            trace(
+                &inv.name,
+                format_args!("compile succeeded, skipping store: {e:#}"),
+            );
+            let _ = store.count("uncached", 1);
         }
     }
     Ok(exit_code(status))

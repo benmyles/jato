@@ -1,33 +1,12 @@
 //! rustc collects language features from crate-root attributes before expansion.
 //! Only cfg predicates, never user items or macros, enter the isolated cfg probe.
+use super::Words;
 use crate::invocation::Invocation;
 use anyhow::{Context, Result, ensure};
-use rustc_lexer::{TokenKind, first_token};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-
-#[derive(Clone, Copy)]
-struct Words<'a>(&'a str);
-
-impl<'a> Iterator for Words<'a> {
-    type Item = &'a str;
-    fn next(&mut self) -> Option<Self::Item> {
-        while !self.0.is_empty() {
-            let t = first_token(self.0);
-            let (word, rest) = self.0.split_at(t.len);
-            self.0 = rest;
-            if !matches!(
-                t.kind,
-                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment { .. }
-            ) {
-                return Some(word);
-            }
-        }
-        None
-    }
-}
 
 fn ident(word: &str) -> &str {
     word.strip_prefix("r#").unwrap_or(word)
@@ -62,11 +41,19 @@ fn conditional(mut words: Words<'_>) -> Option<(String, Words<'_>)> {
     }
     let mut predicate = String::new();
     let mut depth = 0usize;
+    let mut previous = "";
     loop {
         let word = words.next()?;
         match word {
             "," if depth == 0 => break,
-            "(" => depth += 1,
+            "(" if matches!(
+                ident(previous),
+                "all" | "any" | "not" | "version" | "target"
+            ) =>
+            {
+                depth += 1;
+            }
+            "(" => return None,
             ")" => depth = depth.checked_sub(1)?,
             "," | "=" => (),
             _ if ident(word)
@@ -81,6 +68,7 @@ fn conditional(mut words: Words<'_>) -> Option<(String, Words<'_>)> {
         }
         predicate.push_str(word);
         predicate.push(' ');
+        previous = word;
         if predicate.len() > 1024 || depth > 32 {
             return None;
         }
@@ -183,6 +171,7 @@ mod tests {
         for source in [
             "#!/bin/sh /*\n#![feature(rustc_attrs)]",
             "#![cfg_attr(custom!(), feature(x))]",
+            "#![cfg_attr(custom(key), feature(x))]",
             "#![cfg_attr(outer, cfg_attr(inner, feature(x)))]",
             "#![feature(doc_cfg, rustc_attrs)]",
             "#![cfg_attr(docsrs,feature(x))]\n#![feature(y)]",

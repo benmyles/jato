@@ -3,14 +3,38 @@
 //! compilation's input set once, before admitting any of its artifacts.
 use anyhow::{Result, ensure};
 use memchr::memmem;
-use rustc_lexer::{TokenKind, tokenize};
+use rustc_lexer::{TokenKind, first_token, tokenize};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
+mod assembly;
 mod nightly;
+mod text;
 pub use nightly::{check_root, verify_conditions};
+pub(crate) use text::data_only;
+
+#[derive(Clone, Copy)]
+pub(super) struct Words<'a>(pub(super) &'a str);
+
+impl<'a> Iterator for Words<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.0.is_empty() {
+            let t = first_token(self.0);
+            let (word, rest) = self.0.split_at(t.len);
+            self.0 = rest;
+            if !matches!(
+                t.kind,
+                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment { .. }
+            ) {
+                return Some(word);
+            }
+        }
+        None
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -48,16 +72,21 @@ pub fn compiler_channel(compiler: &OsStr) -> Result<Channel> {
         .map_or(Channel::Unsupported, Channel::release))
 }
 
-pub fn verify_bytes(bytes: &[u8], path: &Path, deferred_links: bool, observed: bool) -> Result<()> {
+pub fn verify_bytes(
+    bytes: &[u8],
+    path: &Path,
+    deferred_links: bool,
+    observed: bool,
+) -> Result<bool> {
     if [b"asm".as_slice(), b"link"]
         .iter()
         .any(|p| memmem::find(bytes, p).is_some())
         && let Ok(src) = std::str::from_utf8(bytes)
-        && let Some(reason) = opaque_input(src, deferred_links, observed)
     {
-        anyhow::bail!("{reason} in {}", path.display());
+        return inspect_source(src, deferred_links, observed)
+            .map_err(|reason| anyhow::anyhow!("{reason} in {}", path.display()));
     }
-    Ok(())
+    Ok(false)
 }
 
 // A dep-info file can be a Rust module or data for include_bytes!. A
@@ -105,7 +134,12 @@ pub fn large_input(mut file: impl Read, path: &Path) -> Result<blake3::Hash> {
     Ok(hash.finalize())
 }
 
-fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'static str> {
+fn inspect_source(
+    source: &str,
+    deferred_links: bool,
+    observed: bool,
+) -> std::result::Result<bool, &'static str> {
+    let mut extended = false;
     let mut input = source;
     let mut prev = "";
     let mut sensitive = Vec::new();
@@ -123,18 +157,26 @@ fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'
                 // libc declares modules literally named asm. A module name or
                 // a namespace prefix in ordinary Rust cannot call or alias an
                 // assembly macro. Inside a macro token tree it could do either.
-                let mut next = tokenize(input).filter_map(|t| {
-                    (!matches!(t.kind, Whitespace | LineComment | BlockComment { .. }))
-                        .then_some(t.kind)
-                });
+                let mut next = Words(input);
+                let first = next.next();
+                let prefix = first == Some(":")
+                    && next.next() == Some(":")
+                    && next.next().is_some_and(|w| {
+                        matches!(first_token(w).kind, Ident | RawIdent)
+                            && !matches!(w, "self" | "super" | "crate" | "Self")
+                    });
                 let module = !sensitive.last().is_some_and(|&(group, _)| group)
-                    && match next.next() {
-                        Some(Semi | OpenBrace) if prev == "mod" => true,
-                        Some(Colon) => next.next() == Some(Colon),
-                        _ => false,
-                    };
+                    && (prev == "mod" && matches!(first, Some(";" | "{")) || prefix);
                 if !module {
-                    return Some("assembly input");
+                    let bare_import = prev == ":" && matches!(first, Some(";" | "," | "}"));
+                    if word == "asm"
+                        && !sensitive.last().is_some_and(|&(group, _)| group)
+                        && (bare_import || assembly::closed_template(input))
+                    {
+                        extended = true;
+                    } else {
+                        return Err("assembly input");
+                    }
                 }
             }
             Ident | RawIdent
@@ -149,7 +191,7 @@ fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'
                     None => false,
                 };
                 if !matches!(prev, "[" | ",") || !allowed {
-                    return Some("native link attribute");
+                    return Err("native link attribute");
                 }
             }
             Ident if word == "macro_rules" => macro_definition = true,
@@ -166,7 +208,12 @@ fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'
         }
         prev = word;
     }
-    None
+    Ok(extended)
+}
+
+#[cfg(test)]
+fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'static str> {
+    inspect_source(source, deferred_links, observed).err()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,7 +300,8 @@ mod tests {
         assert!(opaque_input("pub(crate) mod asm; use asm::types::*;", false, false).is_none());
         for source in [
             "use core::arch::asm as op;",
-            "core::arch::asm!(\"nop\")",
+            "pub use core::arch::asm::{self as op};",
+            "core::arch::asm!(include_str!(\"code.s\"))",
             "make!(mod asm;)",
             "macro_rules! m { () => { mod asm; } }",
         ] {

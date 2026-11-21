@@ -506,6 +506,17 @@ impl Store {
             .query_row(params![recipe, sample], |r| r.get(0))?)
     }
 
+    pub fn pending_requirement(&self, recipe: &Digest) -> Result<Option<(Digest, bool)>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT n.digest,n.codegen FROM entries e JOIN needs n ON n.entry=e.id
+            WHERE e.recipe=?1 ORDER BY e.access DESC LIMIT 1",
+            )?
+            .query_row([recipe], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
     pub fn has_sources(&self, digest: &Digest) -> Result<bool> {
         Ok(self
             .conn
@@ -625,6 +636,24 @@ impl Store {
     ) -> Result<bool> {
         // Compress in parallel with other compilers, outside SQLite's single writer.
         // Anonymous staging files are reclaimed by the OS even on process death.
+        let (used, limit, exists) = self.conn.query_row(
+            "SELECT bytes,(SELECT max_bytes FROM cache_settings WHERE singleton=1),
+             EXISTS(SELECT 1 FROM entries WHERE key=?1) FROM usage",
+            [key],
+            |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, Option<u64>>(1)?.unwrap_or(self.limit),
+                    r.get::<_, bool>(2)?,
+                ))
+            },
+        )?;
+        // A pending record forces rustc to run, but recording its same key
+        // again would only throw away all the prepared output. If GC removed
+        // it between the read and the atomic recheck, publish normally.
+        if exists && count_existing(&self.conn, key)? {
+            return Ok(true);
+        }
         let mut buffer = Vec::new();
         let manifest = plan.as_ref().map(|p| encode_plan(p.inputs)).transpose()?;
         let plan_cost = plan
@@ -634,16 +663,6 @@ impl Store {
                 272 + bytes.len() + 96 * p.needs.len() + if p.sample.is_some() { 128 } else { 0 }
             });
         let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
-        let (used, limit) = self.conn.query_row(
-            "SELECT bytes,(SELECT max_bytes FROM cache_settings WHERE singleton=1) FROM usage",
-            [],
-            |r| {
-                Ok((
-                    r.get::<_, u64>(0)?,
-                    r.get::<_, Option<u64>>(1)?.unwrap_or(self.limit),
-                ))
-            },
-        )?;
         if charge > limit || stderr.len() > DIAGNOSTIC_LIMIT {
             return Ok(false);
         }
@@ -744,6 +763,8 @@ impl Store {
             let added = tx.execute("INSERT OR IGNORE INTO entries(key,recipe,access,stderr,stderr_hash,compile_ms) VALUES(?1,?2,?3,?4,?5,?6)",
             params![key, recipe, now(), stderr, blake3::hash(stderr).as_bytes(), elapsed_ms])?;
             if added == 0 {
+                count_existing(&tx, key)?;
+                tx.commit()?;
                 return Ok((true, false, false));
             }
             let entry = tx.last_insert_rowid();
@@ -832,6 +853,9 @@ impl Store {
                 [entry],
                 |r| r.get(0),
             )?;
+            if kept {
+                tx.execute("INSERT INTO counters VALUES('stored',1) ON CONFLICT(name) DO UPDATE SET value=value+1", [])?;
+            }
             tx.commit()?;
             Ok((kept, evicted > 0, sweep))
         })();
@@ -1119,6 +1143,17 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?,
         })
     }
+}
+
+fn count_existing(conn: &Connection, key: &Digest) -> rusqlite::Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "INSERT INTO counters SELECT CASE WHEN EXISTS(SELECT 1 FROM needs WHERE entry=e.id)
+         THEN 'repeat_pending' ELSE 'repeat_record' END,1 FROM entries e WHERE e.key=?1
+         ON CONFLICT(name) DO UPDATE SET value=value+1",
+        )?
+        .execute([key])?
+        != 0)
 }
 
 fn stored_limit(conn: &Connection) -> rusqlite::Result<Option<u64>> {
@@ -1953,6 +1988,40 @@ mod tests {
         assert!(!old.save(&[1; 32], &[3; 32], &[file], &[], 1, None)?);
         old.prune(None)?;
         assert_eq!(old.stats()?.entries, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_pending_records_skip_capture_and_still_require_independent_proof() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::at(root.path().join("cache"), 1 << 20)?;
+        let output = root.path().join("output");
+        let paths = std::slice::from_ref(&output);
+        fs::write(&output, "compiler output")?;
+        let evidence = || Evidence {
+            inputs: b"{}",
+            needs: &[[7; 32]],
+            topology: &[0; 32],
+            sources: &[1; 32],
+            sample: None,
+            codegen: true,
+        };
+        assert!(store.save(&[2; 32], &[3; 32], paths, &[], 1, Some(evidence()))?);
+        fs::remove_file(&output)?;
+        assert!(store.save(&[2; 32], &[3; 32], paths, &[], 1, Some(evidence()))?);
+        assert!(store.restore(&[3; 32], paths)?.is_none());
+        assert_eq!(store.pending_requirement(&[2; 32])?, Some(([7; 32], true)));
+        let stats = store.stats()?;
+        assert_eq!(
+            (stats.counters["stored"], stats.counters["repeat_pending"]),
+            (1, 1)
+        );
+        store.prune(Some(0))?;
+        assert!(
+            store
+                .save(&[2; 32], &[3; 32], paths, &[], 1, Some(evidence()))
+                .is_err()
+        );
         Ok(())
     }
 

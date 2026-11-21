@@ -1,5 +1,12 @@
 # Work journal
 
+## 2026-11-21 — Olo's linked units and Cargo intermediates
+
+- Authenticated the upstream x86-64 mold 3.0.0 binary against Olo’s installation. Traced its fresh executable and proc-macro output paths. Both restored after deleting the target. After changing an untracked input to the restored macro, its consumer produced the new value.
+- Distinguished a new publication from a repeat of an entry still waiting for dependency evidence. The repeat skips artifact capture. A regression removes the output before the second save and verifies that the quarantined entry stays unavailable.
+- Admitted closed register-only assembly templates and tracked documentation with a compiler-confirmed lexical error. Tests cover changed documentation, real Rust source named `.md`, opaque assembly and an edit after a restore.
+- Kept Cargo intermediates while changing Olo’s public target directories. All five executables and four sampled Rust libraries or metadata files matched. Deliveries took 0.51–0.67 s with Jato 0.9.0 and 0.56–0.81 s with kache 2.3.0.
+
 ## 2026-11-21 — Olo nightly Cargo builds
 
 - Reproduced Olo’s zero-hit report on its pinned nightly. Cargo passed both the rlib stub and rmeta paths to downstream rustc. Jato now recognizes both spellings of the two reported unstable options, verifies both outputs and checks nightly crate-root feature gates. An unrecognized unstable option has a dedicated bypass counter.

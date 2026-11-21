@@ -1123,7 +1123,21 @@ fn live_native_module_resolution_rejects_an_added_alternative() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[test]
 fn compiled_proc_macro_is_reusable_but_its_expansion_runs_again() {
+    check_macro_expansion(None);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
+fn upstream_mold_restores_the_macro_library_and_reruns_its_consumer() {
+    if let Some(mold) = std::env::var_os("JATO_TEST_MOLD") {
+        check_macro_expansion(Some(&mold));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn check_macro_expansion(mold: Option<&OsStr>) {
     let p = Project::new();
+    let linker = mold.map(|path| mold_search_path(&p, path));
     write(
         p.root.join("m/Cargo.toml"),
         "[package]\nname='read_macro'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
@@ -1148,15 +1162,22 @@ fn compiled_proc_macro_is_reusable_but_its_expansion_runs_again() {
     for value in ["one", "two"] {
         write(&side, value);
         p.clean();
+        let mut cmd = p.command();
+        if let Some(search) = &linker {
+            cmd.env("PATH", search).env(
+                "RUSTFLAGS",
+                "-Clinker-features=-lld -Clink-arg=-fuse-ld=mold",
+            );
+        }
         let out = success(
-            p.command()
-                .env_remove("JATO_LINK_CACHE")
+            cmd.env_remove("JATO_LINK_CACHE")
                 .env("JATO_TEST_MACRO_INPUT", &side)
                 .env("JATO_LOG", "debug")
                 .args(["--system-linker", "run", "--release"]),
         );
         assert_eq!(out.stdout, format!("{value}\n").as_bytes());
-        if value == "two" && std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+        if value == "two" && (mold.is_some() || std::env::var_os("JATO_TEST_NATIVE_HITS").is_some())
+        {
             assert!(
                 String::from_utf8_lossy(&out.stderr).contains("jato [read_macro] hit"),
                 "{}",
@@ -1363,6 +1384,112 @@ fn nightly_split_metadata_threads_and_language_gates() {
             .unwrap()
             > 0
     );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn mold_search_path(p: &Project, mold: &OsStr) -> std::ffi::OsString {
+    let bin = p.temp.path().join("linker");
+    fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(mold, bin.join("ld.mold")).unwrap();
+    std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
+fn upstream_mold_restores_the_linked_executable() {
+    let Some(mold) = std::env::var_os("JATO_TEST_MOLD") else {
+        return;
+    };
+    let p = Project::new();
+    let search = mold_search_path(&p, &mold);
+    let build = || {
+        success(
+            p.command()
+                .env("PATH", &search)
+                .env("JATO_LOG", "debug")
+                .env(
+                    "RUSTFLAGS",
+                    "-Clinker=/usr/bin/cc -Clinker-features=-lld -Clink-arg=-fuse-ld=mold",
+                )
+                .args(["build", "--release"]),
+        )
+    };
+    build();
+    let exe = p.root.join("target/release/app");
+    let cold = blake3::hash(&fs::read(&exe).unwrap());
+    fs::remove_dir_all(p.root.join("target")).unwrap();
+    let warm = build();
+    assert!(
+        String::from_utf8_lossy(&warm.stderr).contains("jato [app] hit"),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(blake3::hash(&fs::read(&exe).unwrap()), cold);
+    assert_eq!(success(&mut Command::new(exe)).stdout, b"one:none\n");
+}
+
+#[test]
+fn tracked_text_needs_a_real_lexer_error_and_register_barriers_preserve_results() {
+    let p = Project::new();
+    let file = p.root.join("leaf/src/manual.md");
+    let lib = p.root.join("leaf/src/lib.rs");
+    write(
+        &file,
+        "first\nThe `global_asm!` macro is mentioned in this manual.\n",
+    );
+    write(
+        &lib,
+        "#![doc=include_str!(\"manual.md\")]\npub fn value()->String { include_str!(\"manual.md\").lines().next().unwrap().into() }",
+    );
+    assert_eq!(p.run(&["run", "--release", "-q"]).stdout, b"first\n");
+    p.clean();
+    let warm = success(
+        p.command()
+            .env("JATO_LOG", "debug")
+            .args(["run", "--release", "-q"]),
+    );
+    assert_eq!(warm.stdout, b"first\n");
+    assert!(String::from_utf8_lossy(&warm.stderr).contains("jato [leaf] hit"));
+    write(
+        &file,
+        "other\nThe `global_asm!` macro is mentioned in this manual.\n",
+    );
+    assert_eq!(p.run(&["run", "--release", "-q"]).stdout, b"other\n");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        write(
+            &lib,
+            "#[path=\"manual.md\"] mod text; pub fn value()->String { text::f().to_string() }",
+        );
+        write(
+            &file,
+            "pub fn f()->usize { let mut v=42usize; unsafe { core::arch::asm!(\"/*{}*/\", inout(reg) v) } v }",
+        );
+        assert_eq!(p.run(&["run", "--release", "-q"]).stdout, b"42\n");
+        p.clean();
+        let warm = success(
+            p.command()
+                .env("JATO_LOG", "debug")
+                .args(["run", "--release", "-q"]),
+        );
+        assert!(String::from_utf8_lossy(&warm.stderr).contains("jato [leaf] hit"));
+        write(
+            &file,
+            "/// A `comment` is valid Rust.\npub fn f()->usize { unsafe { core::arch::asm!(\".byte 0x90\") }; 7 }",
+        );
+        let original =
+            success(
+                p.command()
+                    .env("JATO_LOG", "debug")
+                    .args(["run", "--release", "-q"]),
+            );
+        assert_eq!(original.stdout, b"7\n");
+        assert!(String::from_utf8_lossy(&original.stderr).contains("assembly input in"));
+    }
 }
 
 #[cfg(target_os = "linux")]

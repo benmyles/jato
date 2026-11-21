@@ -26,6 +26,10 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
+#[cfg(target_os = "linux")]
+mod cwd;
+mod mold;
+
 const MAX_PATHS: usize = 4096;
 const MAX_LINE: usize = 1024 * 1024;
 
@@ -37,6 +41,7 @@ struct Access {
     read: bool,
     list: bool,
     wrote: bool,
+    fresh_truncate: bool,
     read_write_before_creation: bool,
     created_dir: bool,
     exclusive: bool,
@@ -45,6 +50,8 @@ struct Access {
 
 #[derive(Default)]
 pub struct Observations {
+    reentered: bool,
+    mold_output: Option<mold::Output>,
     paths: BTreeMap<PathBuf, Access>,
     images: BTreeSet<PathBuf>,
     shared_listing: Option<(PathBuf, Digest)>,
@@ -85,6 +92,8 @@ pub fn active_incremental(dir: &Path, krate: &str) -> Option<bool> {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Manifest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    verified_mold: bool,
     missing: Vec<(PathBuf, bool)>,
     lookup: Vec<PathBuf>,
     read: Vec<PathBuf>,
@@ -182,15 +191,16 @@ impl Capture {
         if !inv.executable {
             return Ok(());
         }
-        // An explicitly requested user-installed mold cannot supply a trusted
-        // native manifest. Skip tracing this miss when no system ld.mold is
-        // present. A previous hit is independently validated before this point.
+        // An unknown user launcher cannot supply a trusted manifest. A matching
+        // release size permits observation; publication checks the full image.
         if inv.mold
             && !Path::new("/usr/bin/ld.mold").is_file()
             && let Some(mold) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .map(|p| p.join("ld.mold"))
                 .find(|p| p.is_file())
-            && trusted_tool(&fs::canonicalize(mold)?, root)?.is_none()
+            && let mold = fs::canonicalize(mold)?
+            && !mold::candidate(&mold)
+            && trusted_tool(&mold, root)?.is_none()
         {
             bail!("user-installed mold: delegated native link");
         }
@@ -229,6 +239,14 @@ impl Capture {
                 .parent()
                 .context("missing output directory")?,
         )?;
+        let mold_output = if inv.executable && inv.mold {
+            inv.outputs
+                .last()
+                .and_then(|p| p.file_name())
+                .and_then(|name| mold::Output::new(dir.join(name)))
+        } else {
+            None
+        };
         let shared = dir.ends_with("deps").then(|| SharedDirectory {
             path: dir,
             outputs: inv.outputs.clone(),
@@ -265,6 +283,12 @@ impl Capture {
             });
         }
         let cwd = std::env::current_dir()?;
+        #[cfg(target_os = "linux")]
+        let mut guard = if inv.mold {
+            cwd::Guard::current(&cwd).ok()
+        } else {
+            None
+        };
         let activity = Arc::new(AtomicBool::new(false));
         let tracer = activity.clone();
         let worker = std::thread::Builder::new()
@@ -272,7 +296,19 @@ impl Capture {
             .stack_size(256 * 1024)
             .spawn(move || {
                 let mut reader = BufReader::new(reader);
-                let result = parse(&mut reader, &cwd, &tracer, shared);
+                let result = parse(&mut reader, &cwd, &tracer, shared, mold_output);
+                let result = result.and_then(|seen| {
+                    if seen.reentered {
+                        #[cfg(target_os = "linux")]
+                        guard
+                            .as_mut()
+                            .context("compiler directory was not monitored")?
+                            .check()?;
+                        #[cfg(not(target_os = "linux"))]
+                        bail!("compiler directory changes require Linux");
+                    }
+                    Ok(seen)
+                });
                 // A new strace dialect or an oversized manifest only prevents
                 // caching. Drain the stream so the original compiler can finish.
                 let _ = io::copy(&mut reader, &mut io::sink());
@@ -305,8 +341,12 @@ fn parse(
     cwd: &Path,
     started: &AtomicBool,
     mut shared: Option<SharedDirectory>,
+    mold_output: Option<mold::Output>,
 ) -> Result<Observations> {
-    let mut seen = Observations::default();
+    let mut seen = Observations {
+        mold_output,
+        ..Default::default()
+    };
     let mut spawn_channels = BTreeSet::new();
     let mut partial = BTreeMap::new();
     let mut pending_bytes = 0;
@@ -388,6 +428,9 @@ fn parse(
             }
             seen.paths.entry(path).or_default().list = true;
         } else {
+            if let Some(output) = &mut seen.mold_output {
+                output.observe(pid, name, args, result, cwd)?;
+            }
             seen.observe(name, args, result, cwd)?;
         }
         ensure!(
@@ -507,6 +550,15 @@ fn process_path(path: &Path) -> bool {
 
 impl Observations {
     fn observe(&mut self, name: &str, args: &str, result: &str, cwd: &Path) -> Result<()> {
+        if name == "chdir" {
+            let (dest, rest) = quoted(args)?;
+            ensure!(
+                result == "0" && rest.is_empty() && (dest == cwd || dest == Path::new(".")),
+                "native tool changed working directory"
+            );
+            self.reentered |= dest == cwd;
+            return Ok(());
+        }
         if name == "getcwd" {
             return Ok(());
         }
@@ -589,6 +641,7 @@ impl Observations {
             return Ok(());
         }
         let a = self.paths.entry(path.clone()).or_default();
+        let previously_present = a.present || a.wrote;
         a.present |= ok || already || nonlink;
         if absent {
             let not_directory = result.starts_with("-1 ENOTDIR ");
@@ -613,6 +666,7 @@ impl Observations {
                     || flags.contains("O_RDWR")
                     || flags.contains("O_CREAT")
                 {
+                    a.fresh_truncate = !previously_present && flags.contains("O_TRUNC");
                     a.read_write_before_creation |= flags.contains("O_RDWR")
                         && !flags.contains("O_TRUNC")
                         && !flags.contains("O_EXCL")
@@ -681,6 +735,7 @@ impl Observations {
         let compiler = fs::canonicalize(compiler)?;
         let mut compiled = false;
         let mut linked = false;
+        let mut verified_mold = false;
         for path in &self.images {
             let image = fs::canonicalize(path)?;
             if image == compiler {
@@ -690,8 +745,14 @@ impl Observations {
                     inv.executable,
                     "external tool during native library compilation"
                 );
-                linked |= trusted_tool(&image, root)?
+                let is_linker = trusted_tool(&image, root)?
                     .with_context(|| format!("unverified native tool {}", image.display()))?;
+                verified_mold |= is_linker
+                    && matches!(
+                        image.file_name().and_then(OsStr::to_str),
+                        Some("mold" | "ld.mold")
+                    );
+                linked |= is_linker;
             }
         }
         ensure!(compiled, "no stock compiler observed");
@@ -750,12 +811,14 @@ impl Observations {
             .map(|(p, _)| p.clone())
             .collect();
         let mut plan = Manifest {
+            verified_mold: verified_mold || self.reentered,
             missing: Vec::new(),
             lookup: Vec::new(),
             read: Vec::new(),
             listed: Vec::new(),
             shared_listing: self.shared_listing,
         };
+        let mold_temp = self.mold_output.as_ref().and_then(mold::Output::temporary);
         for (p, a) in self.paths {
             if let (Some(dir), Some(unit)) = (&inv.incremental, &session)
                 && p.starts_with(dir)
@@ -781,6 +844,15 @@ impl Observations {
                 continue;
             }
             if a.wrote {
+                if verified_mold
+                    && a.fresh_truncate
+                    && !a.read
+                    && !a.list
+                    && !a.read_write_before_creation
+                    && mold_temp == Some(p.as_path())
+                {
+                    continue;
+                }
                 let object = p.parent() == Some(&out)
                     && p.file_name()
                         .is_some_and(|n| n.as_bytes().ends_with(b".rcgu.o"));
@@ -872,7 +944,7 @@ fn trusted_tool(image: &Path, root: &Path) -> Result<Option<bool>> {
     if !image.starts_with(root)
         && !(system_file(image) && system_owner(image, &fs::metadata(image)?))
     {
-        return Ok(None);
+        return Ok(mold::verified(image)?.then_some(true));
     }
     let file = image.file_name().and_then(OsStr::to_str).unwrap_or("");
     let mut name = file;
@@ -889,7 +961,7 @@ fn trusted_tool(image: &Path, root: &Path) -> Result<Option<bool>> {
     }
     let ld = matches!(
         name,
-        "ld" | "ld.bfd" | "ld.gold" | "ld.lld" | "lld" | "rust-lld" | "mold"
+        "ld" | "ld.bfd" | "ld.gold" | "ld.lld" | "lld" | "rust-lld" | "mold" | "ld.mold"
     );
     if !ld && !matches!(name, "gcc" | "cc" | "clang" | "collect2") {
         return Ok(None);
@@ -929,6 +1001,9 @@ impl Manifest {
         outputs: &[PathBuf],
     ) -> Result<[u8; 32]> {
         let mut h = blake3::Hasher::new_derive_key("jato linux ELF input manifest v2");
+        if self.verified_mold {
+            field(&mut h, b"jato authenticated mold and cwd v1");
+        }
         let mut parents: BTreeMap<&Path, PathBuf> = BTreeMap::new();
         let mut hashes = BTreeMap::new();
         let mut content = Vec::new();
@@ -1135,6 +1210,7 @@ mod tests {
             &mut split.as_bytes(),
             Path::new("/"),
             &AtomicBool::new(false),
+            None,
             None,
         )
         .unwrap();
