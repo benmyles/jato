@@ -45,4 +45,5 @@
 
 - [x] Reduce temporary writes during cold capture without changing restored bytes.
 - [x] Avoid repeated module discovery when a verified live executable survives an editor rename.
+- [x] Select and expose a faster Cargo development profile with separate outputs and preserved project settings.
 - [ ] Measure cold builds and edit cycles against 0.6 and upstream caches, and qualify the installed release.

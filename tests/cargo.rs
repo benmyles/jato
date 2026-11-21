@@ -220,6 +220,17 @@ fn fast_development_profile_keeps_project_settings_and_argument_boundaries() {
     p.run(&["dev", "cargo", "clean"]);
     assert!(!p.root.join("target/jato-dev/app").exists());
     assert!(p.root.join("target/release/app").is_file());
+    #[cfg(target_os = "linux")]
+    if worktree_available() {
+        p.run(&["worktree", "--root", ".", "dev", "--locked", "-q"]);
+        let paths: Value =
+            serde_json::from_slice(&p.run(&["worktree", "--root", ".", "paths"]).stdout).unwrap();
+        assert!(
+            Path::new(paths["target_directory"].as_str().unwrap())
+                .join("jato-dev/app")
+                .is_file()
+        );
+    }
 }
 
 #[test]

@@ -216,40 +216,46 @@ mod fallback {
 #[cfg(not(target_os = "linux"))]
 pub use fallback::{copy, measure, prepare, publish, supported};
 
+// The size index cheaply rules out most new outputs. A different sample
+// excludes a match only if there is just one distinct object of this size.
 pub fn reuse(
     source: &File,
     output: &Path,
     dir: &Path,
     size: u64,
-    hash: Digest,
-    verity: Digest,
+    conn: &rusqlite::Connection,
 ) -> Result<Option<Object>> {
-    use std::os::unix::fs::FileExt;
-    let file = crate::content::open(&path(dir, &hash))?;
-    if file.metadata()?.len() != size || measure(&file)? != verity {
+    use rusqlite::OptionalExtension;
+    let mut query = conn.prepare_cached(
+        "SELECT DISTINCT o.hash FROM files f JOIN objects o ON o.hash=f.digest
+         WHERE f.size=?1 AND o.bytes=?1 LIMIT 2",
+    )?;
+    let mut candidates = query.query([size])?;
+    let Some(first) = candidates.next()? else {
+        return Ok(None);
+    };
+    let first: Digest = first.get(0)?;
+    let probe = crate::content::open_with_flags(&path(dir, &first), libc::O_NONBLOCK)
+        .and_then(|file| same_sample(source, &file, size));
+    if !probe.unwrap_or(false) && candidates.next()?.is_none() {
         return Ok(None);
     }
-    // Common ELF headers can match across unrelated outputs of equal length.
-    // Samples are cheap rejection only. A complete digest binds the compiler
-    // output to the authenticated cache object before reuse.
-    let mut a = [0; 1024];
-    let mut b = [0; 1024];
-    let tail = size
-        .checked_sub(a.len() as u64)
-        .context("short sealed candidate")?;
-    for at in [tail / 2, tail, 0] {
-        source.read_exact_at(&mut a, at)?;
-        file.read_exact_at(&mut b, at)?;
-        if a != b {
-            return Ok(None);
-        }
-    }
+    drop(candidates);
     let input = crate::content::Input::with_file(
         output,
         source.try_clone()?,
         std::time::SystemTime::now(),
     )?;
-    if crate::content::digests(&[input], 2 << 20)?[0] != hash {
+    let hash = crate::content::digests(&[input], 2 << 20)?[0];
+    let verity: Option<Digest> = conn
+        .prepare_cached("SELECT verity FROM objects WHERE hash=?1 AND bytes=?2")?
+        .query_row(rusqlite::params![hash, size], |r| r.get(0))
+        .optional()?;
+    let Some(verity) = verity else {
+        return Ok(None);
+    };
+    let file = crate::content::open_with_flags(&path(dir, &hash), libc::O_NONBLOCK)?;
+    if file.metadata()?.len() != size || measure(&file)? != verity {
         return Ok(None);
     }
     Ok(Some(Object {
@@ -258,6 +264,23 @@ pub fn reuse(
         hash,
         reused: true,
     }))
+}
+
+fn same_sample(source: &File, candidate: &File, size: u64) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let mut a = [0; 1024];
+    let mut b = [0; 1024];
+    let Some(tail) = size.checked_sub(a.len() as u64) else {
+        return Ok(false);
+    };
+    for at in [tail / 2, tail, 0] {
+        source.read_exact_at(&mut a, at)?;
+        candidate.read_exact_at(&mut b, at)?;
+        if a != b {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn restore(

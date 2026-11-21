@@ -304,7 +304,6 @@ fn project_toolchain(cmd: &mut Command) -> Result<()> {
 }
 
 pub fn run(args: &[OsString], mut options: crate::CargoOptions) -> Result<i32> {
-    let default_build = [OsString::from("build")];
     let mut args = args;
     let mut source = None;
     loop {
@@ -326,16 +325,24 @@ pub fn run(args: &[OsString], mut options: crate::CargoOptions) -> Result<i32> {
                 options.dev = true;
                 args = &args[1..];
             }
-            None if options.dev => {
-                args = &default_build;
-                break;
-            }
+            None if options.dev => break,
             Some("-h" | "--help" | "help") | None => {
                 print!("{HELP}");
                 return Ok(0);
             }
             _ => break,
         }
+    }
+    let build;
+    if options.dev
+        && args
+            .first()
+            .is_none_or(|a| a.as_encoded_bytes().starts_with(b"-"))
+    {
+        build = std::iter::once(OsString::from("build"))
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+        args = &build;
     }
     let kind = args[0].to_str().context("invalid worktree command")?;
     ensure!(

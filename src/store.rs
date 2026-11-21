@@ -516,7 +516,7 @@ impl Store {
         length: u64,
         charge: u64,
         used: u64,
-    ) -> Result<Option<crate::sealed::Object>> {
+    ) -> Option<crate::sealed::Object> {
         let standalone = charge.saturating_add(length).saturating_add(256);
         if length < CHUNK as u64
             || standalone > self.limit
@@ -524,32 +524,22 @@ impl Store {
                 .allow_sealed
                 .get_or_insert_with(|| crate::sealed::supported(&self.dir))
         {
-            return Ok(None);
+            return None;
         }
-        if used != 0 {
-            let candidate: Option<(Digest, Digest)> = self
-                .conn
-                .prepare_cached(
-                    "SELECT o.hash,o.verity FROM files f JOIN objects o ON o.hash=f.digest
-                 WHERE f.size=?1 AND o.bytes=?1 LIMIT 1",
-                )?
-                .query_row([length], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            if let Some((hash, verity)) = candidate
-                && let Ok(Some(object)) =
-                    crate::sealed::reuse(source, path, &self.dir, length, hash, verity)
-            {
-                return Ok(Some(object));
-            }
+        if used != 0
+            && let Ok(Some(object)) =
+                crate::sealed::reuse(source, path, &self.dir, length, &self.conn)
+        {
+            return Some(object);
         }
         if standalone > self.limit.saturating_sub(used) {
-            return Ok(None);
+            return None;
         }
         let object = crate::sealed::prepare(source, &self.dir).ok();
         if object.is_none() {
             self.allow_sealed = Some(false);
         }
-        Ok(object)
+        object
     }
 
     pub fn save(
@@ -594,7 +584,7 @@ impl Store {
                 sealed: None,
             };
             let length = metadata.len();
-            if let Some(object) = self.sealed_output(path, &source, length, charge, used)? {
+            if let Some(object) = self.sealed_output(path, &source, length, charge, used) {
                 ensure!(
                     crate::fingerprint::stamp(&metadata)
                         == crate::fingerprint::stamp(&fs::metadata(path)?),
@@ -1567,12 +1557,18 @@ mod tests {
         let object = crate::sealed::path(&store.dir, &hash);
         let verity = crate::sealed::measure(&File::open(&object)?)?;
         let source = File::open(&path)?;
-        let held = crate::sealed::reuse(&source, &path, &store.dir, size, hash, verity)?.unwrap();
+        let held = crate::sealed::reuse(&source, &path, &store.dir, size, &store.conn)?.unwrap();
         File::options()
             .write(true)
             .open(&path)?
             .write_all_at(&[44], 17000)?;
-        assert!(crate::sealed::reuse(&source, &path, &store.dir, size, hash, verity)?.is_none());
+        assert!(crate::sealed::reuse(&source, &path, &store.dir, size, &store.conn)?.is_none());
+        // Both candidates have the same length and sampled bytes. The later
+        // one can still be reused by its full digest.
+        store.save(&[0; 32], &[2; 32], outputs, b"", 0, None)?;
+        assert_eq!(store.stats()?.sealed_objects, 2);
+        store.save(&[0; 32], &[3; 32], outputs, b"", 0, None)?;
+        assert_eq!(store.stats()?.counters["sealed_reused_bytes"], size);
         store.prune(0)?;
         assert!(!object.exists());
         crate::sealed::publish(&held, &object)?;

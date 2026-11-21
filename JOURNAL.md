@@ -9,6 +9,7 @@
 - Compared four Cargo profile configurations in three rotating cold ripgrep builds each. Selected 16 codegen units, workspace line tables and dependency debug level zero for the explicit `jato dev` command. It inherits the project’s dev settings, and Cargo keeps a separate target profile. Verified explicit release selection, argument boundaries, test execution and watch feedback.
 - Traced the installed release on a cold 32 MiB packed asset. Anonymous staging writes fell from 34,072,742 bytes to zero. Seven byte-identical executable captures reused 238,069,160 bytes of authenticated objects. Downstream executables checked all embedded bytes, and both tools restored their originals.
 - Passed 55 tests on Rust 1.89 and 1.100 with native, sealed and worktree reuse required, plus the separate 272 MiB spill test. A migrated 0.6 release and a newly populated jato-dev cache each restored 39 ripgrep units in another checkout and passed all 299 upstream integration tests. Historical storage schemas reclaimed all charged bytes after GC.
+- Tested two distinct sealed artifacts with equal lengths and equal sampled bytes. A capture now looks up the exact object by full digest across size collisions. Confirmed that projected development builds accept ordinary build flags when the action is omitted.
 
 ## 2026-11-21 — live incremental replay and shifted artifacts
 
