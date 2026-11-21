@@ -17,6 +17,9 @@
 - Verified the installed release with the system’s normal Cargo launcher. The stable and minimum toolchain each passed all 47 standard tests with worktree, sealed and native hits required. The 272 MiB packed stress test also passed.
 - Migrated populated schema versions 1, 2, 3, 6, 8, 9, 10 and 11 and reclaimed all charged bytes. The 0.4 cache restored six real regex units after upgrading. A separate ripgrep checkout restored all 39 units, including the final executable, which passed all 299 upstream integration tests.
 
+- Verified that a second checkout with a different included source could finish compiling while the first checkout’s actual rustc process was suspended. Both binaries printed their intended values.
+- Three paired cold ripgrep trials finished in a median 25.92 s with the 0.5 engine, 59.96 s with 0.4, 31.63 s with upstream kache and 32.02 s with sccache. Jato used 77.05 CPU-seconds and 815 MiB sampled peak PSS. kache used less sampled memory.
+
 ## 2026-11-21 — worktrees and packed writes
 
 - Rebuilt the locked regex application in two target directories. All five registry libraries and their five metadata files were byte-identical, while their dep-info referred to different output paths. Jato 0.3 missed all five in the second target.
