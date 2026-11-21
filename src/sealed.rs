@@ -119,6 +119,12 @@ mod linux {
         clone_file(src, &writer)?;
         let file = File::open(format!("/proc/self/fd/{}", writer.as_raw_fd()))?;
         drop(writer); // fs-verity requires no writable handles
+        enable(&file)?;
+        let verity = measure(&file)?;
+        Ok((file, verity))
+    }
+
+    pub(super) fn enable(file: &File) -> io::Result<()> {
         let enable = Enable {
             version: 1,
             algorithm: 1,
@@ -133,10 +139,9 @@ mod linux {
             )
         };
         if result < 0 {
-            return Err(io::Error::last_os_error().into());
+            return Err(io::Error::last_os_error());
         }
-        let verity = measure(&file)?;
-        Ok((file, verity))
+        Ok(())
     }
 
     pub fn prepare(src: &File, dir: &Path) -> Result<Object> {
@@ -198,6 +203,11 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{copy, measure, prepare, publish, supported};
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn seal_fixture(path: &Path) -> std::io::Result<()> {
+    linux::enable(&File::open(path)?)
+}
 
 #[cfg(not(target_os = "linux"))]
 mod fallback {

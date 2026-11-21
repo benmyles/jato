@@ -10,6 +10,50 @@ use std::path::PathBuf;
 // The file length is only a negative filter. Admission checks the whole ELF.
 const BYTES: u64 = 42_246_008;
 const BLAKE3: &str = "81174f3352cee00d4bf323b8f3f56eab3543877c9f0211f66f7d6620961c3b7b";
+// SHA-256 fs-verity descriptor for the same upstream ELF, 4096-byte
+// blocks and no salt. Both pins describe the identical file contents.
+const VERITY: &str = "87faf70327bf78a89dda395a5135bc0d73750f967dedcabb4e6450814229e544";
+
+#[derive(Clone, Copy)]
+pub(super) enum InputDigest {
+    Read(usize),
+    SealedMold,
+}
+
+impl InputDigest {
+    pub fn value(self, digests: &[crate::store::Digest]) -> crate::store::Digest {
+        match self {
+            Self::Read(index) => digests[index],
+            Self::SealedMold => *blake3::Hash::from_hex(BLAKE3)
+                .expect("pinned release digest")
+                .as_bytes(),
+        }
+    }
+}
+
+pub(super) fn sealed(path: &Path, real: &Path, meta: &std::fs::Metadata) -> Result<bool> {
+    use crate::fingerprint::stamp;
+    if meta.len() != BYTES
+        || !matches!(
+            real.file_name().and_then(OsStr::to_str),
+            Some("mold" | "ld.mold")
+        )
+    {
+        return Ok(false);
+    }
+    let file = crate::content::open(path)?;
+    ensure!(
+        stamp(&file.metadata()?) == stamp(meta),
+        "linker changed before measurement"
+    );
+    let matches = crate::sealed::measure(&file)
+        .is_ok_and(|v| blake3::Hash::from_bytes(v).to_hex().as_str() == VERITY);
+    ensure!(
+        stamp(&std::fs::metadata(path)?) == stamp(meta),
+        "linker changed during measurement"
+    );
+    Ok(matches)
+}
 
 pub(super) fn candidate(path: &Path) -> bool {
     matches!(
@@ -184,6 +228,19 @@ mod tests {
             )
         };
         digest()?;
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("JATO_TEST_SEALED").is_some() {
+            let original = digest()?;
+            ensure!(!sealed(&path, &path, &path.metadata()?)?);
+            crate::sealed::seal_fixture(&path)?;
+            ensure!(sealed(&path, &path, &path.metadata()?)?);
+            assert_eq!(digest()?, original);
+            // The private fixture alone is immutable. Replace its name with a
+            // writable copy, as a package manager would during an upgrade.
+            let replacement = dir.path().join("replacement");
+            fs::copy(&path, &replacement)?;
+            fs::rename(replacement, &path)?;
+        }
         let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
         let mut byte = [0];
         file.read_exact_at(&mut byte, BYTES / 2)?;
@@ -192,6 +249,12 @@ mod tests {
         drop(file);
         assert!(candidate(&path));
         assert!(digest().is_err());
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("JATO_TEST_SEALED").is_some() {
+            crate::sealed::seal_fixture(&path)?;
+            ensure!(!sealed(&path, &path, &path.metadata()?)?);
+            assert!(digest().is_err());
+        }
         Ok(())
     }
 }

@@ -304,7 +304,10 @@ mod tests {
     fn a_reviewed_assembly_site_still_checks_native_link_attributes() {
         let src = r#"cfg_if! { if #[cfg(unix)] { pub use asm::socket::*; } }
                      #[link(name = "archive", kind = "static")] extern "C" {}"#;
-        assert_eq!(inspect_source(src, false, false, true), Err("native link attribute"));
+        assert_eq!(
+            inspect_source(src, false, false, true),
+            Err("native link attribute")
+        );
     }
     #[test]
     fn ordinary_asm_modules_do_not_hide_macros_or_aliases() {

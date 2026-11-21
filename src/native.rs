@@ -1144,9 +1144,14 @@ impl Manifest {
                         let index = match hashes.entry(stamp(&m)) {
                             std::collections::btree_map::Entry::Occupied(v) => *v.get(),
                             std::collections::btree_map::Entry::Vacant(v) => {
-                                let index = content.len();
-                                content.push(crate::content::Input::new(p, &m, since)?);
-                                *v.insert(index)
+                                let source = if self.verified_mold && mold::sealed(p, &real, &m)? {
+                                    mold::InputDigest::SealedMold
+                                } else {
+                                    let index = content.len();
+                                    content.push(crate::content::Input::new(p, &m, since)?);
+                                    mold::InputDigest::Read(index)
+                                };
+                                *v.insert(source)
                             }
                         };
                         field(&mut h, b"content");
@@ -1165,11 +1170,11 @@ impl Manifest {
             release_digests.len() == self.release_images.len()
                 && release_digests
                     .into_iter()
-                    .all(|i| mold::authentic(&digests[i])),
+                    .all(|i| mold::authentic(&i.value(&digests))),
             "unverified mold executable"
         );
         for index in occurrences {
-            field(&mut h, &digests[index]);
+            field(&mut h, &index.value(&digests));
         }
         Ok(*h.finalize().as_bytes())
     }

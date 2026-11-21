@@ -33,6 +33,7 @@ def main():
             '[package]\nname="review_consumer"\nversion="0.0.0"\nedition="2021"\n'
             '[dependencies]\nlibc={version="=0.2.191",features=["extra_traits"]}\ncmov="=0.5.4"\n'
             'num-bigint="=0.4.8"\nnum-traits={version="=0.2.19",features=["libm","i128"]}\n'
+            'num-integer={version="=0.1.47",features=["i128","std"]}\n'
             '[profile.dev]\nopt-level=3\ndebug-assertions=true\nincremental=false\n')
         home = root / "cargo"
         home.mkdir()

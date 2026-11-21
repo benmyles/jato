@@ -4,6 +4,7 @@
 
 - Reproduced Olo's 188 hits on 0.10. Four frequently compiled libraries use private macro-generated register instructions or Rust modules named `asm`. Compared their full active source sets with the crate archives authenticated by Olo’s lockfile.
 - Bound a narrow assembly exception to the complete source set, compiler options and extern bindings. Libraries with macro providers also require complete, checksummed producer provenance down to the reviewed leaves. A clean Cargo build of libc, cmov, num-bigint and rustix restored all four.
+- Validated the negative cases with real Cargo builds. An edited macro definition, an added cfg and a changed external supplier prevented the corresponding assembly-eligible library from being served. A private fs-verity copy of upstream mold reduced verifier reads from 42,246,008 bytes per link hit to zero in two traces per version; an unsealed or differently measured file still undergoes full hashing.
 
 ## 2026-11-21 — Olo's linked units and Cargo intermediates
 

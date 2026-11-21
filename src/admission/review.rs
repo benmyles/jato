@@ -285,11 +285,22 @@ mod tests {
         assert_eq!(audit.len(), CANDIDATES.len());
         for profile in CANDIDATES {
             visit(profile, &mut Vec::new());
-            let spec = audit.iter().find(|a| a["receipt"] == profile.digest).unwrap();
+            let spec = audit
+                .iter()
+                .find(|a| a["receipt"] == profile.digest)
+                .unwrap();
             assert_eq!(spec["files"], profile.count);
-            let externs: Vec<_> = spec["settings"].as_array().unwrap().iter().filter_map(|v| {
-                v.as_str()?.strip_prefix("--extern[")?.split_once("]=").map(|(_, name)| name)
-            }).collect();
+            let externs: Vec<_> = spec["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| {
+                    v.as_str()?
+                        .strip_prefix("--extern[")?
+                        .split_once("]=")
+                        .map(|(_, name)| name)
+                })
+                .collect();
             assert_eq!(externs, profile.deps);
             assert!(blake3::Hash::from_hex(profile.digest).is_ok());
         }

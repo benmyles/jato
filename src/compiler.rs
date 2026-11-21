@@ -186,14 +186,12 @@ fn rediscover(
     plan.nightly = recorded.nightly;
     plan.extended_admission = recorded.extended_admission;
     plan.reviewed_assembly = recorded.reviewed_assembly;
-    if recorded.native.is_some() {
-        // A copied source tree has new directory inodes. Ask this rustc to
-        // resolve modules again before revalidating the observed link inputs.
-        if !plan.same_rust_inputs(&recorded) {
-            return Ok(None);
-        }
-        plan.native = recorded.native;
+    // Both proofs are tied to the exact source closure. A changed closure
+    // requires admission through the actual compiler before it can be used.
+    if (recorded.native.is_some() || plan.reviewed_assembly) && !plan.same_rust_inputs(&recorded) {
+        return Ok(None);
     }
+    plan.native = recorded.native;
     let inputs = plan.inputs(recipe, inv, start, None)?;
     let topology = inputs.topology(start)?;
     let checked;
