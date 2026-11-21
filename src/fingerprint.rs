@@ -137,6 +137,7 @@ pub fn recipe(compiler: &OsStr, args: &[OsString], native: bool) -> Result<Recip
         field(&mut hash, mask.as_bytes());
     }
     if native {
+        field(&mut hash, b"native manifest v2");
         crate::native::environment(&mut hash);
     }
     Ok(Recipe {
@@ -152,20 +153,13 @@ pub(crate) fn recent(m: &fs::Metadata, since: SystemTime) -> bool {
         || m.modified().is_ok_and(|t| t >= since)
 }
 
-pub(crate) fn hash_file(
-    path: &Path,
-    since: SystemTime,
-    scan: Option<&mut Vec<u8>>,
-) -> Result<Digest> {
-    hash_open(File::open(path)?, path, since, scan, false)
-}
-
 fn hash_open(
     mut f: File,
     path: &Path,
     since: SystemTime,
     scan: Option<&mut Vec<u8>>,
     deferred_links: bool,
+    observed: bool,
 ) -> Result<Digest> {
     let before = f.metadata()?;
     ensure!(
@@ -181,7 +175,7 @@ fn hash_open(
             buffer.len() as u64 <= MAX,
             "source changed size during admission"
         );
-        crate::admission::verify_bytes(buffer, path, deferred_links)?;
+        crate::admission::verify_bytes(buffer, path, deferred_links, observed)?;
         blake3::hash(buffer)
     } else {
         let mut h = blake3::Hasher::new();
@@ -325,7 +319,14 @@ impl Plan {
             field(&mut hash, path.as_os_str().as_bytes());
             field(
                 &mut hash,
-                &hash_open(opened, file, since, scan.as_mut(), inv.deferred_links)?,
+                &hash_open(
+                    opened,
+                    file,
+                    since,
+                    scan.as_mut(),
+                    inv.deferred_links,
+                    self.native.is_some(),
+                )?,
             );
             // rustc can change module resolution when a second legal location
             // appears. Track the containing directories and the alternate name,
@@ -433,8 +434,12 @@ pub struct Externs {
 pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) -> Result<Externs> {
     let mut hash = blake3::Hasher::new_derive_key("jato extern closure v1");
     let mut needs = Vec::new();
-    for path in &inv.externs {
-        let digest = hash_file(path, since, None)?;
+    let inputs = inv
+        .externs
+        .iter()
+        .map(|path| crate::content::Input::new(path, &fs::metadata(path)?, since))
+        .collect::<Result<Vec<_>>>()?;
+    for (path, digest) in inv.externs.iter().zip(crate::content::digests(&inputs)?) {
         if !store.knows_artifact(&digest, inv.codegen)? {
             if !defer
                 || path.extension() != Some(OsStr::new("rmeta"))

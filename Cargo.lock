@@ -286,6 +286,7 @@ dependencies = [
  "blake3",
  "ctrlc",
  "ignore",
+ "jobserver",
  "libc",
  "memchr",
  "notify",

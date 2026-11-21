@@ -3,6 +3,8 @@
 ## 2026-11-21 — profiling the 0.2 release
 
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.
+- Borrowed up to three immediately available Cargo job slots for independent content reads. Five alternating restores gave medians of 234 ms for the prototype and 286 ms for 0.2. Each read retains content and file-replacement checks.
+- Added observed native archive inputs for Rust libraries with native-only search paths and ordinary static or dynamic link flags. Verified byte changes, search priority, removal and bundled link attributes using a real C archive.
 
 ## 2026-11-21
 

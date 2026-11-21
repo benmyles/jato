@@ -577,6 +577,24 @@ fn damaged_shared_chunks_trigger_a_real_recompile_and_heal() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn make_archive(dir: &Path, value: i32) {
+    write(
+        dir.join("value.c"),
+        &format!("int jato_test_value(void) {{return {value};}}"),
+    );
+    success(
+        Command::new("cc")
+            .current_dir(dir)
+            .args(["-c", "value.c", "-o", "value.o"]),
+    );
+    success(
+        Command::new("ar")
+            .current_dir(dir)
+            .args(["crs", "libjato_test_value.a", "value.o"]),
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[test]
 fn native_executable_tracks_archive_contents_and_negative_search_paths() {
     let p = Project::new();
@@ -593,22 +611,6 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
     fs::create_dir(&early).unwrap();
     fs::create_dir(&late).unwrap();
     let lib_path = std::env::join_paths([&early, &late]).unwrap();
-    let archive = |dir: &Path, v| {
-        write(
-            dir.join("value.c"),
-            &format!("int jato_test_value(void) {{return {v};}}"),
-        );
-        success(
-            Command::new("cc")
-                .current_dir(dir)
-                .args(["-c", "value.c", "-o", "value.o"]),
-        );
-        success(Command::new("ar").current_dir(dir).args([
-            "crs",
-            "libjato_test_value.a",
-            "value.o",
-        ]));
-    };
     let build = || {
         let mut cmd = p.command();
         let toolchain_bin = Path::new(env!("CARGO")).parent().unwrap().to_owned();
@@ -629,7 +631,7 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
         cmd.output().unwrap()
     };
     let output = p.root.join("target/release/app");
-    archive(&late, 1);
+    make_archive(&late, 1);
     let cold = build();
     assert!(
         cold.status.success(),
@@ -654,7 +656,7 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
             String::from_utf8_lossy(&warm.stderr)
         );
     }
-    archive(&early, 2);
+    make_archive(&early, 2);
     p.clean();
     let changed = build();
     assert!(
@@ -663,7 +665,7 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
         String::from_utf8_lossy(&changed.stderr)
     );
     assert_eq!(success(&mut Command::new(&output)).stdout, b"2\n");
-    archive(&early, 3);
+    make_archive(&early, 3);
     p.clean();
     assert!(build().status.success());
     assert_eq!(success(&mut Command::new(&output)).stdout, b"3\n");
@@ -686,6 +688,78 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
     fs::remove_file(late.join("libjato_test_value.a")).unwrap();
     p.clean();
     assert!(!build().status.success());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
+fn bundled_native_inputs_are_checked_before_restoring_the_rust_library() {
+    let p = Project::new();
+    let first = p.temp.path().join("first");
+    let second = p.temp.path().join("second");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    make_archive(&second, 1);
+    let native = "unsafe extern \"C\" { fn jato_test_value() -> i32; } pub fn value() -> i32 { unsafe { jato_test_value() } }";
+    let search = format!(
+        "println!(\"cargo:rustc-link-search=native={}\"); println!(\"cargo:rustc-link-search=native={}\");",
+        first.display(),
+        second.display()
+    );
+    write(
+        p.root.join("leaf/build.rs"),
+        &format!(
+            "fn main() {{ {search} println!(\"cargo:rustc-link-lib=static=jato_test_value\"); }}"
+        ),
+    );
+    write(p.root.join("leaf/src/lib.rs"), native);
+    let run = || {
+        p.command()
+            .env("JATO_LOG", "debug")
+            .env_remove("JATO_LINK_CACHE")
+            .args(["--system-linker", "run", "--release"])
+            .output()
+            .unwrap()
+    };
+    let verify = |value: i32, hit| {
+        p.clean();
+        let out = run();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, format!("{value}\n").as_bytes());
+        if hit && std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("jato [leaf] hit"),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    };
+    verify(1, false);
+    verify(1, true);
+    make_archive(&first, 2);
+    verify(2, false);
+    make_archive(&first, 3);
+    verify(3, false);
+    fs::remove_file(first.join("libjato_test_value.a")).unwrap();
+    fs::remove_file(first.join("value.c")).unwrap();
+    fs::remove_file(first.join("value.o")).unwrap();
+    verify(1, true);
+    write(
+        p.root.join("leaf/build.rs"),
+        &format!("fn main() {{ {search} }}"),
+    );
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        &format!("#[link(name=\"jato_test_value\",kind=\"static\")] {native}"),
+    );
+    verify(1, false);
+    verify(1, true);
+    fs::remove_file(second.join("libjato_test_value.a")).unwrap();
+    p.clean();
+    assert!(!run().status.success());
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]

@@ -50,7 +50,7 @@ fn discover(
     let mut externs = None;
     for encoded in plans {
         let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
-        if inv.executable && plan.native.is_none() {
+        if inv.observe_native && plan.native.is_none() {
             continue;
         }
         let Ok(inputs) = plan.inputs(recipe, inv, start, false) else {
@@ -217,6 +217,7 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     if let Some(code) = crate::probe::run(compiler, args)? {
         return Ok(code);
     }
+    crate::content::inherit_jobs();
     let invocation = match Invocation::parse(compiler, args) {
         Ok(v) => v,
         Err(reason) => {
@@ -230,8 +231,8 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         }
     };
     let inv = &invocation;
-    let setup =
-        Store::open().and_then(|s| Ok((s, fingerprint::recipe(compiler, args, inv.executable)?)));
+    let setup = Store::open()
+        .and_then(|s| Ok((s, fingerprint::recipe(compiler, args, inv.observe_native)?)));
     let (mut store, recipe) = match setup {
         Ok(v) => v,
         Err(e) => {
@@ -252,12 +253,16 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     let since = SystemTime::now();
     let timer = Instant::now();
     let mut native = None;
-    let cmd = if inv.executable {
+    let cmd = if inv.observe_native {
+        if let Err(e) = crate::native::Capture::available(inv, &recipe.root) {
+            trace(&inv.name, e);
+            return passthrough(original(compiler, args));
+        }
         if let Err(e) = fingerprint::externs(inv, since, &store, false) {
             trace(&inv.name, e);
             return passthrough(original(compiler, args));
         }
-        match crate::native::Capture::command(compiler, args, inv, &recipe.root) {
+        match crate::native::Capture::command(compiler, args, inv) {
             Ok((cmd, capture)) => {
                 native = Some(capture);
                 cmd
@@ -296,7 +301,7 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 inv.confirms_outputs(&log),
                 "compiler reported an unexpected artifact set"
             );
-            let externs = fingerprint::externs(inv, since, &store, !inv.executable)?;
+            let externs = fingerprint::externs(inv, since, &store, !inv.observe_native)?;
             let mut plan = fingerprint::dependencies(&inv.outputs[0])?;
             if let Some(observed) = observed {
                 plan.native =

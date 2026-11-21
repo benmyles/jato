@@ -5,6 +5,7 @@ pub struct Invocation {
     pub name: String,
     pub codegen: bool,
     pub executable: bool,
+    pub observe_native: bool,
     pub linker: Option<PathBuf>,
     pub incremental: Option<PathBuf>,
     pub deferred_links: bool,
@@ -44,6 +45,7 @@ impl Invocation {
         let mut test = false;
         let mut prefer_dynamic = false;
         let mut linker = None;
+        let mut native_flags = false;
         let mut incremental = None;
         let mut deferred_links = cfg!(all(
             target_arch = "x86_64",
@@ -70,7 +72,7 @@ impl Invocation {
             let (flag, inline) = if arg.starts_with("--") {
                 arg.split_once('=')
                     .map_or((arg, None), |(k, v)| (k, Some(v)))
-            } else if ["-C", "-L", "-A", "-W", "-D", "-F"]
+            } else if ["-C", "-L", "-l", "-A", "-W", "-D", "-F"]
                 .iter()
                 .any(|p| arg.starts_with(p))
             {
@@ -115,13 +117,34 @@ impl Invocation {
                     }
                     externs.push(path);
                 }
-                // dependency= serves transitive crates. Direct imports must
-                // come from --extern or the fingerprinted sysroot. A plain
-                // -L, crate=, or native= would allow undeclared inputs.
+                // A native-only search cannot introduce an undeclared Rust
+                // crate. Observe the compiler's native archive selections.
                 "-L" => {
-                    if !value()?.starts_with("dependency=") {
+                    let path = value()?;
+                    if path.strip_prefix("native=").is_some_and(|v| !v.is_empty()) {
+                        native_flags = true;
+                    } else if !path.starts_with("dependency=") {
                         return Err("native_search_path");
                     }
+                }
+                "-l" => {
+                    let lib = value()?;
+                    let name = match lib.split_once('=') {
+                        None => lib,
+                        Some(("dylib" | "static" | "static:+bundle" | "static:-bundle", name)) => {
+                            name
+                        }
+                        _ => return Err("native_library"),
+                    };
+                    if name.is_empty()
+                        || name.starts_with('-')
+                        || !name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(&b))
+                    {
+                        return Err("native_library");
+                    }
+                    native_flags = true;
                 }
                 "-C" => {
                     let option = value()?;
@@ -241,13 +264,14 @@ impl Invocation {
             return Err("crate_type");
         }
         let executable = kinds.contains(&"link") && (!library || test);
-        if executable
+        let observe_native = executable || native_flags;
+        if observe_native
             && (!native_link
                 || std::env::var_os("JATO_LINK_CACHE").as_deref() == Some(OsStr::new("0")))
         {
             return Err("linker");
         }
-        if executable
+        if observe_native
             && let Some(dir) = &incremental
             && !crate::native::fresh_incremental(dir, name)
         {
@@ -274,6 +298,7 @@ impl Invocation {
             name: name.into(),
             codegen: kinds.contains(&"link"),
             executable,
+            observe_native,
             linker,
             incremental,
             deferred_links,

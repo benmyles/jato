@@ -20,19 +20,19 @@ pub fn stable_compiler(compiler: &OsStr) -> Result<bool> {
         .is_some_and(|s| s.bytes().all(|c| c.is_ascii_digit() || c == b'.')))
 }
 
-pub fn verify_bytes(bytes: &[u8], path: &Path, deferred_links: bool) -> Result<()> {
+pub fn verify_bytes(bytes: &[u8], path: &Path, deferred_links: bool, observed: bool) -> Result<()> {
     if [b"asm".as_slice(), b"link"]
         .iter()
         .any(|p| memmem::find(bytes, p).is_some())
         && let Ok(src) = std::str::from_utf8(bytes)
-        && let Some(reason) = opaque_input(src, deferred_links)
+        && let Some(reason) = opaque_input(src, deferred_links, observed)
     {
         anyhow::bail!("{reason} in {}", path.display());
     }
     Ok(())
 }
 
-fn opaque_input(source: &str, deferred_links: bool) -> Option<&'static str> {
+fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'static str> {
     let mut input = source;
     let mut prev = "";
     let mut sensitive = Vec::new();
@@ -50,18 +50,25 @@ fn opaque_input(source: &str, deferred_links: bool) -> Option<&'static str> {
                 return Some("assembly input");
             }
             Ident | RawIdent
-                if word == "link" && prev != "." && sensitive.last() == Some(&true) =>
+                if word == "link"
+                    && prev != "."
+                    && sensitive.last().is_some_and(|&(group, _)| group) =>
             {
-                if !deferred_links || !matches!(prev, "[" | ",") || !unbundled_link(input) {
+                let in_macro = sensitive.last().is_some_and(|&(_, macros)| macros);
+                let allowed = match literal_link(input) {
+                    Some(LinkKind::Deferred) => deferred_links || observed && !in_macro,
+                    Some(LinkKind::Bundled) => observed && !in_macro,
+                    None => false,
+                };
+                if !matches!(prev, "[" | ",") || !allowed {
                     return Some("native link attribute");
                 }
             }
             Ident if word == "macro_rules" => macro_definition = true,
             OpenBrace | OpenBracket | OpenParen => {
-                let group = macro_definition
-                    || matches!(prev, "#" | "!")
-                    || sensitive.last() == Some(&true);
-                sensitive.push(group);
+                let (outer, in_macro) = sensitive.last().copied().unwrap_or((false, false));
+                let macros = macro_definition || prev == "!" || in_macro;
+                sensitive.push((macros || outer || prev == "#", macros));
                 macro_definition = false;
             }
             CloseParen | CloseBrace | CloseBracket => {
@@ -74,75 +81,80 @@ fn opaque_input(source: &str, deferred_links: bool) -> Option<&'static str> {
     None
 }
 
-// An rlib records dynamic libraries and explicitly unbundled static libraries
-// by name. Only final linking opens them. Require literal, unambiguous fields
-// and continue to decline bundled archives and synthesized attributes.
-fn unbundled_link(input: &str) -> bool {
-    fn parse(input: &str) -> Option<bool> {
-        use TokenKind::*;
-        let mut tail = input;
-        let mut tokens = tokenize(input).filter_map(|t| {
-            let (word, next) = tail.split_at(t.len);
-            tail = next;
-            (!matches!(t.kind, Whitespace | LineComment | BlockComment { .. })).then_some(word)
-        });
-        if tokens.next()? != "(" {
-            return None;
-        }
-        let (mut name, mut kind, mut modifiers) = (None, None, None);
-        loop {
-            let key = tokens.next()?;
-            if key == ")" {
-                break;
-            }
-            if key == "cfg" {
-                if tokens.next()? != "(" {
-                    return None;
-                }
-                let mut depth = 1;
-                while depth > 0 {
-                    match tokens.next()? {
-                        "(" => depth += 1,
-                        ")" => depth -= 1,
-                        "$" | "!" | "[" | "]" | "{" | "}" => return None,
-                        _ => (),
-                    }
-                }
-            } else {
-                let slot = match key {
-                    "name" => &mut name,
-                    "kind" => &mut kind,
-                    "modifiers" => &mut modifiers,
-                    _ => return None,
-                };
-                if tokens.next()? != "=" {
-                    return None;
-                }
-                let text = tokens.next()?.strip_prefix('"')?.strip_suffix('"')?;
-                if slot.replace(text).is_some()
-                    || text.is_empty()
-                    || !text
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_+.-".contains(&b))
-                {
-                    return None;
-                }
-            }
-            match tokens.next()? {
-                "," => (),
-                ")" => break,
-                _ => return None,
-            }
-        }
-        Some(
-            !name?.starts_with('-')
-                && matches!(
-                    (kind, modifiers),
-                    (None | Some("dylib"), None) | (Some("static"), Some("-bundle"))
-                ),
-        )
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkKind {
+    Deferred,
+    Bundled,
+}
+
+// Bundled archives enter an rlib during compilation. An observed invocation
+// can certify that read, but cannot certify a future expansion of an exported macro.
+fn literal_link(input: &str) -> Option<LinkKind> {
+    use TokenKind::*;
+    let mut tail = input;
+    let mut tokens = tokenize(input).filter_map(|t| {
+        let (word, next) = tail.split_at(t.len);
+        tail = next;
+        (!matches!(t.kind, Whitespace | LineComment | BlockComment { .. })).then_some(word)
+    });
+    if tokens.next()? != "(" {
+        return None;
     }
-    parse(input) == Some(true)
+    let (mut name, mut kind, mut modifiers) = (None, None, None);
+    loop {
+        let key = tokens.next()?;
+        if key == ")" {
+            break;
+        }
+        if key == "cfg" {
+            if tokens.next()? != "(" {
+                return None;
+            }
+            let mut depth = 1;
+            while depth > 0 {
+                match tokens.next()? {
+                    "(" => depth += 1,
+                    ")" => depth -= 1,
+                    "$" | "!" | "[" | "]" | "{" | "}" => return None,
+                    _ => (),
+                }
+            }
+        } else {
+            let slot = match key {
+                "name" => &mut name,
+                "kind" => &mut kind,
+                "modifiers" => &mut modifiers,
+                _ => return None,
+            };
+            if tokens.next()? != "=" {
+                return None;
+            }
+            let text = tokens.next()?.strip_prefix('"')?.strip_suffix('"')?;
+            if slot.replace(text).is_some()
+                || text.is_empty()
+                || !text
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_+.-".contains(&b))
+            {
+                return None;
+            }
+        }
+        match tokens.next()? {
+            "," => (),
+            ")" => break,
+            _ => return None,
+        }
+    }
+    if name?.starts_with('-') {
+        return None;
+    }
+    match (kind, modifiers) {
+        (None | Some("dylib"), None) | (Some("static"), Some("-bundle")) => {
+            Some(LinkKind::Deferred)
+        }
+        (Some("static"), None | Some("+bundle")) => Some(LinkKind::Bundled),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -154,7 +166,7 @@ mod tests {
             r#"(name="c")"#,
             r#"(name="rt",kind="static",modifiers="-bundle",cfg(not(target_feature="crt-static")))"#,
         ] {
-            assert!(unbundled_link(input));
+            assert!(literal_link(input) == Some(LinkKind::Deferred));
         }
         for input in [
             r#"(name="x",kind="static")"#,
@@ -163,7 +175,18 @@ mod tests {
             r#"(name="/some/file")"#,
             r#"(name="c",kind="dylib",kind="static")"#,
         ] {
-            assert!(!unbundled_link(input));
+            assert!(literal_link(input) != Some(LinkKind::Deferred));
         }
+        let bundled = r#"#[link(name="x", kind="static")] extern "C" {}"#;
+        assert!(opaque_input(bundled, true, false).is_some());
+        assert!(opaque_input(bundled, true, true).is_none());
+        assert!(
+            opaque_input(
+                &format!("macro_rules! export {{ () => {{ {bundled} }} }}"),
+                true,
+                true
+            )
+            .is_some()
+        );
     }
 }

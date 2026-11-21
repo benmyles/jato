@@ -2,7 +2,7 @@
 //! plugins which rustc does not put in its .d file. On Linux, learn the file
 //! lookups of an actual, unmodified nonincremental compilation. A later hit
 //! checks both successful reads and unsuccessful search candidates.
-use crate::fingerprint::{field, hash_file, recent, stamp};
+use crate::fingerprint::{field, recent, stamp};
 use crate::invocation::Invocation;
 use crate::store::Digest;
 use anyhow::{Context, Result, bail, ensure};
@@ -163,17 +163,20 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn command(
-        compiler: &OsStr,
-        args: &[OsString],
-        inv: &Invocation,
-        root: &Path,
-    ) -> Result<(Command, Self)> {
+    pub fn available(inv: &Invocation, root: &Path) -> Result<()> {
         let exe = Path::new("/usr/bin/strace");
         ensure!(
             cfg!(all(target_os = "linux", target_arch = "x86_64")) && exe.is_file(),
             "native input tracing unavailable"
         );
+        let debugged = fs::read_to_string("/proc/self/status")?.lines().any(|l| {
+            l.strip_prefix("TracerPid:")
+                .is_some_and(|n| n.trim() != "0")
+        });
+        ensure!(!debugged, "compiler already under a tracer");
+        if !inv.executable {
+            return Ok(());
+        }
         let linker = inv.linker.as_deref().unwrap_or_else(|| Path::new("cc"));
         let candidate = if linker.components().count() > 1 {
             linker.to_owned()
@@ -193,14 +196,17 @@ impl Capture {
             "{} is a custom linker or launcher. --system-linker selects /usr/bin/cc",
             candidate.display()
         );
-        let debugged = fs::read_to_string("/proc/self/status")?.lines().any(|l| {
-            l.strip_prefix("TracerPid:")
-                .is_some_and(|n| n.trim() != "0")
-        });
-        ensure!(!debugged, "compiler already under a tracer");
+        Ok(())
+    }
+
+    pub fn command(
+        compiler: &OsStr,
+        args: &[OsString],
+        inv: &Invocation,
+    ) -> Result<(Command, Self)> {
         let (reader, writer) = io::pipe()?;
         let fd = writer.as_raw_fd();
-        let mut cmd = Command::new(exe);
+        let mut cmd = Command::new("/usr/bin/strace");
         let dir = fs::canonicalize(
             inv.outputs[0]
                 .parent()
@@ -656,15 +662,26 @@ impl Observations {
             .collect::<io::Result<_>>()?;
         let temp = std::env::temp_dir();
         let compiler = fs::canonicalize(compiler)?;
+        let mut compiled = false;
         let mut linked = false;
         for path in &self.images {
             let image = fs::canonicalize(path)?;
-            if image != compiler {
+            if image == compiler {
+                compiled = true;
+            } else {
+                ensure!(
+                    inv.executable,
+                    "external tool during native library compilation"
+                );
                 linked |= trusted_tool(&image, root)?
                     .with_context(|| format!("unverified native tool {}", image.display()))?;
             }
         }
-        ensure!(linked, "no supported ELF linker observed");
+        ensure!(compiled, "no stock compiler observed");
+        ensure!(
+            !inv.executable || linked,
+            "no supported ELF linker observed"
+        );
         let session = if let Some(dir) = &inv.incremental {
             ensure!(
                 fs::canonicalize(dir)? == *dir,
@@ -704,7 +721,12 @@ impl Observations {
                 a.created_dir
                     && (p.parent() == Some(&out) || p.parent() == Some(temp.as_path()))
                     && p.file_name().is_some_and(|n| {
-                        n.as_bytes().starts_with(b"rustc") || n.as_bytes().starts_with(b"rmeta")
+                        n.as_bytes().starts_with(b"rustc")
+                            || n.as_bytes().starts_with(b"rmeta")
+                            || (!inv.executable
+                                && p.parent() == Some(&out)
+                                && n.as_bytes().starts_with(b".tmp")
+                                && n.as_bytes().ends_with(b".temp-archive"))
                     })
                     && !p.exists()
             })
@@ -879,9 +901,11 @@ impl Manifest {
         covered: &BTreeSet<PathBuf>,
         outputs: &[PathBuf],
     ) -> Result<[u8; 32]> {
-        let mut h = blake3::Hasher::new_derive_key("jato linux ELF input manifest v1");
+        let mut h = blake3::Hasher::new_derive_key("jato linux ELF input manifest v2");
         let mut parents: BTreeMap<&Path, PathBuf> = BTreeMap::new();
         let mut hashes = BTreeMap::new();
+        let mut content = Vec::new();
+        let mut occurrences = Vec::new();
         let mut symlinks = BTreeSet::new();
         for (p, not_directory) in &self.missing {
             let expected = if *not_directory {
@@ -997,18 +1021,25 @@ impl Manifest {
                             h.update(&n.to_le_bytes());
                         }
                     } else if !covered.contains(&real) {
-                        let digest = match hashes.entry(stamp(&m)) {
+                        let index = match hashes.entry(stamp(&m)) {
                             std::collections::btree_map::Entry::Occupied(v) => *v.get(),
                             std::collections::btree_map::Entry::Vacant(v) => {
-                                *v.insert(hash_file(p, since, None)?)
+                                let index = content.len();
+                                content.push(crate::content::Input::new(p, &m, since)?);
+                                *v.insert(index)
                             }
                         };
-                        field(&mut h, &digest);
+                        field(&mut h, b"content");
+                        occurrences.push(index);
                     }
                 } else {
                     bail!("non-regular native input {}", p.display());
                 }
             }
+        }
+        let digests = crate::content::digests(&content)?;
+        for index in occurrences {
+            field(&mut h, &digests[index]);
         }
         Ok(*h.finalize().as_bytes())
     }
