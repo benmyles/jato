@@ -14,6 +14,9 @@
 - Registered and polled Linux inotify watches directly. The watcher retains matchers only where ignore rules exist, shares directory paths, and attaches new subtrees in place after Cargo confirms workspace ownership. Tests move a populated subtree with ignore exceptions and add a workspace member with a previously unwatched external dependency.
 - Across three launches and fifteen edits with 4,096 extra leaf directories, median time to start watching fell from 302 ms to 56.6 ms. Subtree arrival to workspace success fell from 346 ms to 70.9 ms, and idle process-tree PSS fell from 5,986 to 3,039 KiB.
 
+- Verified the installed release with the system’s normal Cargo launcher. The stable and minimum toolchain each passed all 47 standard tests with worktree, sealed and native hits required. The 272 MiB packed stress test also passed.
+- Migrated populated schema versions 1, 2, 3, 6, 8, 9, 10 and 11 and reclaimed all charged bytes. The 0.4 cache restored six real regex units after upgrading. A separate ripgrep checkout restored all 39 units, including the final executable, which passed all 299 upstream integration tests.
+
 ## 2026-11-21 — worktrees and packed writes
 
 - Rebuilt the locked regex application in two target directories. All five registry libraries and their five metadata files were byte-identical, while their dep-info referred to different output paths. Jato 0.3 missed all five in the second target.
