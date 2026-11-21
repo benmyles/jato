@@ -12,3 +12,5 @@
 - A native build using incremental mode needs an observed fresh compiler session before it can publish an entry. Exercise a live edit as well as a clean restore in the default dev profile.
 - Verify parallel digests against standard BLAKE3 at partial and power-of-two boundaries. Borrow only available Cargo job tokens and keep the serial path usable.
 - Treat archive boundaries as storage hints. Validate whole restored files and check shared chunk and manifest reclamation after eviction or corruption. Use the embedded and zlib fixtures plus bench/history.py when changing these paths.
+- Qualify worktree changes with `JATO_TEST_WORKTREE=1` on Linux with working bubblewrap. Exercise shared global targets, independent checkouts, path-valued macros, configuration overrides, signals and watch events. Use `bench/worktrees.py` to time same-target, new-target and copied-checkout builds separately.
+- Packed write changes must preserve byte verification when GC runs between preparation and publication. Keep frame metadata and the exact deduplication index bounded and exercise their spill paths.

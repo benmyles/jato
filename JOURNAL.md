@@ -10,6 +10,8 @@
 
 - Packed writes now spool frame descriptors, skip compression for matching stored chunks, and spill the exact deduplication index after 1,024 distinct digests. Verified recovery when GC removes a chunk between staging and publication, including rejection of a changed compiler output.
 
+- Added a concurrent Cargo build with two different generated sources sharing one global target, a projected watch/interrupt regression, and a host ownership reply test. All 40 tests passed with native hits, sealed storage and worktree support required on Rust 1.89 and 1.100.
+
 ## 2026-11-21 — profiling the 0.2 release
 
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.

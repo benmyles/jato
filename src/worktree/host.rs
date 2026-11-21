@@ -364,3 +364,34 @@ pub fn run(mut cmd: Command, payload: &[OsString]) -> Result<i32> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ownership_reply_is_bound_to_a_canonical_system_inode() -> anyhow::Result<()> {
+        fn query(path: &Path) -> io::Result<[u8; 57]> {
+            let (mut client, server) = UnixStream::pair()?;
+            let bytes = path.as_os_str().as_bytes();
+            client.write_all(&(bytes.len() as u16).to_le_bytes())?;
+            client.write_all(bytes)?;
+            serve(server)?;
+            let mut out = [0; 57];
+            client.read_exact(&mut out)?;
+            Ok(out)
+        }
+        let temp = tempfile::NamedTempFile::new()?;
+        assert_eq!(query(temp.path())?, [0; 57]);
+        let path = fs::canonicalize("/usr/bin/env")?;
+        let m = fs::metadata(&path)?;
+        if m.uid() == 0 && crate::native::system_file(&path) {
+            let reply = query(&path)?;
+            assert_eq!(reply[0], 1);
+            for (word, num) in reply[1..].as_chunks::<8>().0.iter().zip(stamp(&m)) {
+                assert_eq!(*word, num.to_le_bytes());
+            }
+            assert_eq!(query(&Path::new("/usr/lib/../bin").join("env"))?, [0; 57]);
+        }
+        Ok(())
+    }
+}

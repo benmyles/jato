@@ -29,6 +29,7 @@ Use paths for their physical locations or cargo clean to remove their artifacts.
 
 #[derive(Deserialize)]
 struct Locations {
+    workspace_root: Option<PathBuf>,
     target_directory: PathBuf,
     build_directory: Option<PathBuf>,
 }
@@ -97,22 +98,26 @@ fn config_value(key: &str, path: &Path) -> Result<OsString> {
 
 // Use Cargo's own config resolution, including workspace-relative build-dir
 // templates. Only inspect options before the program/test argument separator.
-fn locations(args: &[OsString]) -> Result<Locations> {
+fn locations(args: &[OsString], source: Option<&Path>) -> Result<Locations> {
     // CI and build drivers commonly set both paths. Absolute literal paths
     // have no workspace templates or Cargo config left to resolve.
-    if !args
-        .iter()
-        .take_while(|a| *a != "--")
-        .any(|a| value(a, "--config").is_some() || value(a, "--target-dir").is_some())
-        && let (Some(target), Some(build)) = (
-            env::var_os("CARGO_TARGET_DIR"),
-            env::var_os("CARGO_BUILD_BUILD_DIR"),
-        )
-        && Path::new(&target).is_absolute()
+    if source.is_some_and(|p| {
+        !p.ancestors()
+            .skip(1)
+            .any(|d| d.join("Cargo.toml").is_file())
+    }) && !args.iter().take_while(|a| *a != "--").any(|a| {
+        ["--config", "--target-dir", "--manifest-path", "-m"]
+            .iter()
+            .any(|n| value(a, n).is_some())
+    }) && let (Some(target), Some(build)) = (
+        env::var_os("CARGO_TARGET_DIR"),
+        env::var_os("CARGO_BUILD_BUILD_DIR"),
+    ) && Path::new(&target).is_absolute()
         && Path::new(&build).is_absolute()
         && !build.as_encoded_bytes().contains(&b'{')
     {
         return Ok(Locations {
+            workspace_root: None,
             target_directory: target.into(),
             build_directory: Some(build.into()),
         });
@@ -226,6 +231,11 @@ fn view_args(args: &[OsString], view: &View, target: &Path, build: &Path) -> Res
 }
 
 fn ancestor_settings(start: &Path) -> Vec<PathBuf> {
+    let home = env::var_os("CARGO_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|p| Path::new(&p).join(".cargo")))
+        .and_then(|p| fs::canonicalize(p).ok());
     start
         .ancestors()
         .flat_map(|dir| {
@@ -238,6 +248,15 @@ fn ancestor_settings(start: &Path) -> Vec<PathBuf> {
             .into_iter()
             .map(move |name| dir.join(name))
             .filter(|p| p.is_file())
+        })
+        .filter(|p| {
+            !p.parent().is_some_and(|parent| {
+                home.as_deref() == Some(parent)
+                    && matches!(
+                        p.file_name().and_then(OsStr::to_str),
+                        Some("config" | "config.toml")
+                    )
+            })
         })
         .collect()
 }
@@ -330,7 +349,7 @@ pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
         _ => args,
     };
     let cwd = env::current_dir()?;
-    let locations = locations(job)?;
+    let locations = locations(job, source.as_deref())?;
     let cache = crate::store::cache_dir()?;
     fs::DirBuilder::new()
         .mode(0o700)
@@ -354,6 +373,13 @@ pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
         ensure!(
             p.is_dir() && cwd.starts_with(p),
             "--root must contain the working directory"
+        );
+        ensure!(
+            locations
+                .workspace_root
+                .as_ref()
+                .is_none_or(|workspace| workspace.starts_with(p)),
+            "--root must include the Cargo workspace root"
         );
         let parent = p
             .parent()
@@ -381,9 +407,12 @@ pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
     // independent even when the caller sets one global CARGO_TARGET_DIR.
     let mut layout = blake3::Hasher::new_derive_key("jato physical worktree layout v1");
     crate::fingerprint::field(&mut layout, cache.as_os_str().as_encoded_bytes());
-    if let Some(p) = &source {
-        crate::fingerprint::field(&mut layout, p.as_os_str().as_encoded_bytes());
-    }
+    let owner = source
+        .as_ref()
+        .or(locations.workspace_root.as_ref())
+        .context("missing Cargo workspace root")?;
+    layout.update(&[u8::from(source.is_some())]);
+    crate::fingerprint::field(&mut layout, owner.as_os_str().as_encoded_bytes());
     layout.update(&[u8::from(physical_build != physical_target)]);
     let name = layout.finalize().to_hex();
     let scope = Path::new(".jato-worktree").join(&name[..24]);
@@ -448,7 +477,14 @@ pub fn run(args: &[OsString], mut system_linker: bool) -> Result<i32> {
         }
         if kind == "watch" {
             let boundary = args.iter().position(|a| a == "--");
-            payload.extend_from_slice(&args[..boundary.unwrap_or(args.len())]);
+            let mut opts = args[..boundary.unwrap_or(args.len())].iter();
+            while let Some(arg) = opts.next() {
+                payload.push(arg.clone());
+                if arg == "--watch" {
+                    let path = opts.next().context("--watch needs a path")?;
+                    payload.push(view.map(Path::new(path)).into_os_string());
+                }
+            }
             if let Some(i) = boundary {
                 payload.push("--".into());
                 payload.extend(view_args(&args[i + 1..], &view, &target, &build)?);

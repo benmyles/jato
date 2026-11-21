@@ -30,6 +30,23 @@ If `cc` on your PATH is a compiler launcher, choose the system C driver for a pr
 jato --system-linker build --release
 ```
 
+## Reuse builds across worktrees
+
+On Linux, install the distribution’s `bubblewrap` package and use the same private `JATO_CACHE_DIR` across builds. For registry dependencies shared by different projects, run `jato worktree build --release`. Source paths keep their usual meaning. For multiple copies or Git worktrees of the same workspace, run these commands from each checkout:
+
+```sh
+jato worktree --root . build --release
+jato worktree --root . watch
+jato worktree --root . paths
+jato worktree --root . cargo clean
+```
+
+Each invocation starts Cargo in a private mount namespace. Cargo sees the same target and build paths across runs. With `--root`, it also sees the source at a stable path. Choose a root containing the workspace and any inputs reached via relative paths. Jato checks ancestor configuration before moving the source. The cache directory must be outside the projected source. The host must permit bubblewrap to create its mount namespace. [Bubblewrap](https://github.com/containers/bubblewrap) · [Cargo configuration discovery](https://doc.rust-lang.org/cargo/reference/config.html)
+
+Writable outputs live in a checkout-specific `.jato-worktree` subdirectory under Cargo’s configured target and build directories. This keeps Cargo’s freshness and incremental state independent, including when multiple checkouts share a global `CARGO_TARGET_DIR`. `paths` prints the physical directories as JSON and accepts the same `--target-dir`, `--manifest-path`, and `--config` options as the build. `jato worktree … cargo clean` clears that view’s build outputs. Ordinary `cargo clean` can clear the entire configured target directory.
+
+Compiler diagnostics, Cargo JSON, debug information and path-valued macros such as `env!("CARGO_MANIFEST_DIR")` and `env!("OUT_DIR")` can contain view paths. Use `jato worktree --root . run` or `jato worktree --root . exec PROGRAM [ARGS...]` when a program or debugger needs to open those paths. Programs that need the host checkout path embedded in a shipped binary can use ordinary `jato build`. Separate caches, toolchains, features and differing inputs still affect reuse.
+
 ## Work on save
 
 | Command | Behavior |
@@ -88,7 +105,9 @@ SQLite publishes each complete artifact set in a transaction. Hits verify the re
 
 The compiler counters cover invocations that reach the wrapper after Cargo's freshness check. `reused_compiler_ms` sums earlier compiler durations, which can overlap during parallel builds. `probe_hit` counts replayed compiler version and target queries separately.
 
-Jato 0.3 migrates earlier caches in place. Compatible Rust records remain available. Native recipes populate under the new verification key. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
+Packed writes hash frames before compression and can reuse previously compressed frames across revisions. `packed_reused_bytes` in `jato stats --json` counts raw bytes whose compression was skipped by successful publications. Ordered frame descriptors share the bounded staging spool with new payloads. Distinct digest sets beyond 1,024 entries spill to a private temporary SQLite index. [SQLite temporary databases](https://www.sqlite.org/inmemorydb.html#temporary_databases)
+
+Jato 0.4 reads existing 0.3 entries and uses the same storage schema. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
 
 ## What can be reused
 
@@ -104,7 +123,7 @@ Cargo's default release profile can reuse eligible native outputs. Its default d
 
 Cargo versions with a shared `target/*/deps` directory can have concurrent jobs changing a directory as the linker searches it. Jato requires the observed search to validate and lets rustc finish such a link when the directory has changed.
 
-Jato preserves absolute paths, including output paths. Reuse works with a stable checkout and target location across cleans, edits, and branch switches. Separate worktrees and relocated target directories generally produce separate entries. The artifact store still deduplicates identical chunks.
+Ordinary builds preserve absolute compiler paths, including output paths. A different checkout or target location can therefore need a separate entry. Worktree mode gives Cargo repeatable paths before compilation. When a copied checkout has new directory identities, Jato can ask rustc to resolve its inputs again and revalidate the recorded native inputs before restoring an executable.
 
 Procedural-macro expansion can inspect arbitrary external state. A crate using such a macro, including through a re-export, takes the compiler path. Inline assembly and opaque code-generation inputs also take that path. Metadata-only results can certify other checks. Code generation requires its own evidence. Cargo can pipeline work normally, and Jato waits for matching producer evidence before serving a dependent entry. An existing incremental directory remains available. After a clean, rustc starts rebuilding incremental state on the next miss.
 

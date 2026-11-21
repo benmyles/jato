@@ -177,6 +177,18 @@ fn forwarded_test_and_program_arguments_keep_their_boundaries() {
 
 #[test]
 fn watcher_checks_edited_package_then_workspace_and_ignores_build_outputs() {
+    check_watcher(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_watcher_observes_physical_edits_and_ignores_output_aliases() {
+    if worktree_available() {
+        check_watcher(true);
+    }
+}
+
+fn check_watcher(projected: bool) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -187,8 +199,11 @@ fn watcher_checks_edited_package_then_workspace_and_ignores_build_outputs() {
     contents.push_str("\n[workspace]\nmembers=['leaf']\n");
     write(manifest, &contents);
     p.run(&["check", "--workspace"]); // establish lockfile and initial target
-    let mut child = p
-        .command()
+    let mut cmd = p.command();
+    if projected {
+        cmd.args(["worktree", "--root", "."]);
+    }
+    let mut child = cmd
         .args(["watch", "--debounce", "40"])
         .stderr(Stdio::piped())
         .spawn()
@@ -1021,7 +1036,7 @@ fn projected_commands_have_private_mounts_and_forward_exit_status() {
         let mut cmd = p.command();
         cmd.env("JATO_CACHE_DIR",a.temp.path().join("cache"))
             .args(["worktree","--root",".","exec","/bin/sh","-ec",
-                r#"echo "$1" > "$CARGO_TARGET_DIR/marker"; touch "$2"; while test ! -f "$3"; do sleep .01; done; test "$(cat "$CARGO_TARGET_DIR/marker")" = "$1"; exit 17"#,
+                r#"echo "$1" > "$CARGO_TARGET_DIR/marker"; touch "$2"; i=0; while test ! -f "$3" && test "$i" -lt 500; do sleep .01; i=$((i+1)); done; test -f "$3"; test "$(cat "$CARGO_TARGET_DIR/marker")" = "$1"; exit 17"#,
                 "sh",label])
             .arg(p.temp.path().join("ready"))
             .arg(if label=="left" {b.temp.path()}else{a.temp.path()}.join("ready"));
@@ -1151,4 +1166,53 @@ fn projected_cargo_obeys_config_and_target_overrides() {
                     || build_dir.join("release/build").is_dir())
         );
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn concurrent_worktrees_keep_generated_files_private_in_a_global_target() {
+    if !worktree_available() {
+        return;
+    }
+    let a = Project::new();
+    let b = Project::new();
+    let common = a.temp.path().join("global-target");
+    let mut children = Vec::new();
+    for (p, word) in [(&a, "alpha"), (&b, "bravo")] {
+        write(
+            p.root.join("build.rs"),
+            r#"fn main(){
+            println!("cargo:rerun-if-changed=input");
+            let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+            std::fs::write(out.join("generated"),std::fs::read("input").unwrap()).unwrap();
+        }"#,
+        );
+        write(p.root.join("input"), word);
+        write(
+            p.root.join("src/main.rs"),
+            r#"fn main(){ print!("{}",include_str!(concat!(env!("OUT_DIR"),"/generated"))); }"#,
+        );
+        let mut cmd = p.command();
+        cmd.env("CARGO_TARGET_DIR", &common)
+            .env("CARGO_BUILD_BUILD_DIR", &common)
+            .env("JATO_CACHE_DIR", a.temp.path().join("cache"))
+            .env("CARGO_HOME", a.temp.path().join("cargo"))
+            .args(["worktree", "--root", ".", "run", "-q"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        children.push((cmd.spawn().unwrap(), word));
+    }
+    for (child, word) in children {
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, word.as_bytes());
+    }
+    assert_eq!(
+        fs::read_dir(common.join(".jato-worktree")).unwrap().count(),
+        2
+    );
 }
