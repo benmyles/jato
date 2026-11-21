@@ -38,6 +38,15 @@ fn eligible(args: &[OsString]) -> bool {
                             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
                 }) => {}
             Some("--cfg") if it.next().flatten().is_some() => (),
+            Some("-Z")
+                if it
+                    .next()
+                    .flatten()
+                    .is_some_and(crate::invocation::supported_unstable) => {}
+            Some(arg)
+                if arg
+                    .strip_prefix("-Z")
+                    .is_some_and(crate::invocation::supported_unstable) => {}
             Some("-Wwarnings") => (),
             Some("-C")
                 if it.next().flatten().is_some_and(|v| {
@@ -91,7 +100,7 @@ pub fn run(compiler_path: &OsStr, args: &[OsString]) -> Result<Option<i32>> {
         {
             let _ = store.record_compiler(
                 &recipe.toolchain,
-                release.bytes().all(|b| b.is_ascii_digit() || b == b'.'),
+                crate::admission::Channel::release(release),
             );
         }
     }

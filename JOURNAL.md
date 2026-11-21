@@ -1,5 +1,12 @@
 # Work journal
 
+## 2026-11-21 — Olo nightly Cargo builds
+
+- Reproduced Olo’s zero-hit report on its pinned nightly. Cargo passed both the rlib stub and rmeta paths to downstream rustc. Jato now recognizes both spellings of the two reported unstable options, verifies both outputs and checks nightly crate-root feature gates. An unrecognized unstable option has a dedicated bypass counter.
+- A clean nightly library restore reproduced both files byte-for-byte. A downstream program returned its new value after an edit. Added CI coverage for the pinned compiler, active cfg-gated features, unknown options and ordinary Rust modules named `asm`.
+- Added a persistent per-cache budget. Publishers read the shared policy inside the write transaction and explicit GC targets leave it in place. A smaller project setting and a second project's GC both honored the configured budget.
+- Confirmed two separate issues from the report. A fresh Cargo check replayed two previous hit lines with zero new hits. Nightly Cargo exported the same runnable binary to a conventional release directory after switching both physical build directories and restoring both units.
+
 ## 2026-11-21 — compiler discovery and cache publication
 
 - Traced a one-crate Cargo check on 0.8. When Cargo passed `rustc` by name, four extra compiler processes queried the sysroot. The rustup-launched Cargo control passed an absolute compiler and needed zero extra queries. Added both layouts and an explicit rustup proxy to the comparison harness.

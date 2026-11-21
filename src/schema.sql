@@ -152,4 +152,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS drop_patch AFTER DELETE ON patches BEGIN
     UPDATE usage SET bytes=bytes-96-length(OLD.data);
 END;
-PRAGMA user_version=16;
+CREATE TABLE IF NOT EXISTS cache_settings(
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    max_bytes INTEGER NOT NULL CHECK(max_bytes>=0)
+);
+PRAGMA user_version=17;

@@ -20,7 +20,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
-use store::{Store, cache_dir, cache_limit, parse_size};
+use store::{Store, cache_dir, parse_size};
 
 const HELP: &str = "\
 Jato — a local Rust build cache and workspace edit runner
@@ -32,6 +32,7 @@ Usage
   jato watch [OPTIONS]             Check on save, with changed packages first
   jato worktree [--root DIR] ACTION  Reuse builds across independent target directories
   jato stats [--json]              Show cache contents and compiler counters
+  jato limit [SIZE|--unset]         Read or set this cache directory's shared budget
   jato gc [SIZE]                   Evict least-recently-used entries to SIZE
   jato --system-linker build [...]   Select /usr/bin/cc for x86_64 GNU host links
   jato --version
@@ -44,7 +45,7 @@ Examples
 
 Environment
   JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
-  JATO_MAX_SIZE     Persistent cache budget, default 1GiB
+  JATO_MAX_SIZE     Fallback cache budget, default 1GiB
   JATO_LOG=debug    Explain each cache decision on stderr
   JATO_LOG=timings  Time compiler runs, input validation, storage and restores
   JATO_STORAGE=packed  Use compressed chunks for all new artifacts
@@ -191,12 +192,22 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
                 }
             }
         }
+        Some("limit") if args.len() <= 2 => {
+            let mut store = Store::open()?;
+            let size = match args.get(1) {
+                None => store.budget()?,
+                Some(arg) if arg == "--unset" => store.set_budget(None)?,
+                Some(arg) => store.set_budget(Some(parse_size(
+                    arg.to_str().context("size must be UTF-8")?,
+                )?))?,
+            };
+            println!("{size} bytes");
+        }
         Some("gc") if args.len() <= 2 => {
             let limit = args
                 .get(1)
                 .map(|a| parse_size(a.to_str().context("size must be UTF-8")?))
-                .transpose()?
-                .unwrap_or(cache_limit()?);
+                .transpose()?;
             println!("Evicted {} entries", Store::open()?.prune(limit)?);
         }
         None if first.is_none() => print!("{HELP}"),

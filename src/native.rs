@@ -182,6 +182,18 @@ impl Capture {
         if !inv.executable {
             return Ok(());
         }
+        // An explicitly requested user-installed mold cannot supply a trusted
+        // native manifest. Skip tracing this miss when no system ld.mold is
+        // present. A previous hit is independently validated before this point.
+        if inv.mold
+            && !Path::new("/usr/bin/ld.mold").is_file()
+            && let Some(mold) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|p| p.join("ld.mold"))
+                .find(|p| p.is_file())
+            && trusted_tool(&fs::canonicalize(mold)?, root)?.is_none()
+        {
+            bail!("user-installed mold: delegated native link");
+        }
         let linker = inv.linker.as_deref().unwrap_or_else(|| Path::new("cc"));
         let candidate = if linker.components().count() > 1 {
             linker.to_owned()

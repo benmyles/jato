@@ -1257,6 +1257,114 @@ fn named_rustc_honors_path_order_and_keeps_custom_drivers_out_of_the_cache() {
     }
 }
 
+#[test]
+fn shared_budget_survives_smaller_project_settings_and_explicit_gc() {
+    let p = Project::new();
+    p.run(&["limit", "16MiB"]);
+    let other = |args: &[&str]| success(p.command().env("JATO_MAX_SIZE", "0").args(args));
+    other(&["check"]);
+    assert!(p.stats()["entries"].as_u64().unwrap() > 0);
+    other(&["gc"]);
+    let stats: Value = serde_json::from_slice(&other(&["stats", "--json"]).stdout).unwrap();
+    assert_eq!(stats["limit_bytes"], 16 << 20);
+    assert!(stats["entries"].as_u64().unwrap() > 0);
+    other(&["gc", "0"]);
+    assert_eq!(p.stats()["entries"], 0);
+    assert_eq!(other(&["limit"]).stdout, b"16777216 bytes\n");
+    assert_eq!(other(&["limit", "--unset"]).stdout, b"0 bytes\n");
+}
+
+#[test]
+fn nightly_split_metadata_threads_and_language_gates() {
+    let Some(compiler) = std::env::var_os("JATO_TEST_NIGHTLY") else {
+        return;
+    };
+    let rustc = Path::new(&compiler);
+    let p = Project::new();
+    let cargo = |flags: &str, args: &[&str]| {
+        success(
+            p.command()
+                .env("RUSTC", rustc)
+                .env("CARGO", rustc.with_file_name("cargo"))
+                .env("RUSTDOC", rustc.with_file_name("rustdoc"))
+                .env("CARGO_ENCODED_RUSTFLAGS", flags)
+                .env("JATO_LOG", "debug")
+                .args(args),
+        )
+    };
+    let lib = p.root.join("leaf/src/lib.rs");
+    write(
+        &lib,
+        "#![cfg_attr(any(doc, custom_gate), feature(rustc_attrs))]\npub fn value() -> String { \"first\".into() }",
+    );
+    let flags = "-Zthreads=2";
+    let build = ["build", "--release", "--manifest-path", "leaf/Cargo.toml"];
+    let target = p.root.join("target/release");
+    let artifacts = || {
+        let mut files = std::collections::BTreeMap::new();
+        let mut dirs = vec![target.clone()];
+        while let Some(dir) = dirs.pop() {
+            for file in fs::read_dir(dir).unwrap() {
+                let file = file.unwrap();
+                if file.file_type().unwrap().is_dir() {
+                    dirs.push(file.path());
+                } else if file.file_name().as_encoded_bytes().starts_with(b"libleaf")
+                    && matches!(
+                        file.path().extension().and_then(OsStr::to_str),
+                        Some("rlib" | "rmeta")
+                    )
+                {
+                    files.insert(file.path(), blake3::hash(&fs::read(file.path()).unwrap()));
+                }
+            }
+        }
+        files
+    };
+    cargo(flags, &build);
+    let original = artifacts();
+    assert!(
+        original
+            .keys()
+            .any(|p| p.extension() == Some(OsStr::new("rmeta")))
+    );
+    assert!(
+        original
+            .keys()
+            .any(|p| p.extension() == Some(OsStr::new("rlib")))
+    );
+    let hits = p.hits();
+    fs::remove_dir_all(&target).unwrap();
+    cargo(flags, &build);
+    assert!(p.hits() > hits);
+    assert_eq!(artifacts(), original);
+    assert_eq!(cargo(flags, &["run", "--release", "-q"]).stdout, b"first\n");
+    write(&lib, "pub fn value() -> String { \"second\".into() }");
+    assert_eq!(
+        cargo("-Z\x1fthreads=2", &["run", "--release", "-q"]).stdout,
+        b"second\n"
+    );
+
+    write(
+        &lib,
+        "#![cfg_attr(custom_gate, feature(rustc_attrs))]\npub fn value() {}",
+    );
+    let active = cargo(
+        "-Zthreads=2\x1f--cfg\x1fcustom_gate",
+        &["check", "--manifest-path", "leaf/Cargo.toml"],
+    );
+    assert!(String::from_utf8_lossy(&active.stderr).contains("nightly_feature"));
+    cargo(
+        "-Zmir-opt-level=1",
+        &["check", "--manifest-path", "leaf/Cargo.toml"],
+    );
+    assert!(
+        p.stats()["counters"]["bypass.unstable_option"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn worktree_available() -> bool {
     let available = Command::new("bwrap")

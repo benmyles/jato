@@ -104,8 +104,9 @@ fn hash_open(
     path: &Path,
     since: SystemTime,
     scan: Option<&mut Vec<u8>>,
-    deferred_links: bool,
+    inv: &Invocation,
     observed: bool,
+    nightly_guards: Option<&mut Vec<String>>,
 ) -> Result<(Digest, u64)> {
     let before = f.metadata()?;
     ensure!(
@@ -115,6 +116,7 @@ fn hash_open(
     let digest = if let Some(buffer) = scan {
         const MAX: u64 = 8 << 20;
         if before.len() > MAX {
+            ensure!(nightly_guards.is_none(), "oversized nightly crate root");
             crate::admission::large_input(f.take(before.len() + 1), path)?
         } else {
             buffer.clear();
@@ -123,7 +125,12 @@ fn hash_open(
                 buffer.len() as u64 == before.len(),
                 "source changed size during admission"
             );
-            crate::admission::verify_bytes(buffer, path, deferred_links, observed)?;
+            if let Some(guards) = nightly_guards {
+                crate::admission::check_root(buffer, guards)?;
+            }
+            if inv.codegen {
+                crate::admission::verify_bytes(buffer, path, inv.deferred_links, observed)?;
+            }
             blake3::hash(buffer)
         }
     } else if before.len() >= 4 << 20 {
@@ -143,6 +150,8 @@ fn hash_open(
 
 #[derive(Serialize, Deserialize)]
 pub struct Plan {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nightly: bool,
     files: BTreeSet<PathBuf>,
     env: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +231,7 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
         "incomplete dep-info input list"
     );
     Ok(Plan {
+        nightly: false,
         files: files
             .into_iter()
             .map(|s| PathBuf::from(s.replace("\\ ", " ")))
@@ -234,6 +244,7 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
 }
 
 pub struct Inputs {
+    pub nightly_guards: Vec<String>,
     pub sources: Digest,
     pub large_input: Option<usize>,
     namespace: BTreeSet<PathBuf>,
@@ -346,7 +357,7 @@ impl Plan {
         recipe: &Recipe,
         inv: &Invocation,
         since: SystemTime,
-        admit_codegen: bool,
+        recording: bool,
     ) -> Result<Inputs> {
         let root = fs::canonicalize(&inv.source)?;
         let mut has_root = false;
@@ -355,7 +366,8 @@ impl Plan {
         field(&mut hash, &recipe.key);
         let mut covered = BTreeSet::new();
         let mut ancestors = BTreeSet::new();
-        let mut scan = admit_codegen.then(Vec::new);
+        let mut scan = Vec::new();
+        let mut nightly_guards = Vec::new();
         let cwd = std::env::current_dir()?;
         let mut largest = None;
         let mut largest_size = 0;
@@ -380,13 +392,15 @@ impl Plan {
             field(&mut hash, b"source");
             field(&mut hash, file.as_os_str().as_bytes());
             field(&mut hash, path.as_os_str().as_bytes());
+            let nightly_root = recording && self.nightly && root == path;
             let (digest, length) = hash_open(
                 opened,
                 file,
                 since,
-                scan.as_mut(),
-                inv.deferred_links,
+                (recording && (inv.codegen || nightly_root)).then_some(&mut scan),
+                inv,
                 self.native.is_some(),
+                nightly_root.then_some(&mut nightly_guards),
             )?;
             field(&mut hash, &digest);
             if length >= 4 << 20 && length > largest_size {
@@ -424,6 +438,7 @@ impl Plan {
         ensure!(has_root, "crate root missing from dep-info");
         tracked_env(&mut hash, &self.env);
         Ok(Inputs {
+            nightly_guards,
             sources: *hash.finalize().as_bytes(),
             large_input: largest,
             namespace,
@@ -442,6 +457,9 @@ impl Inputs {
         externs: &Digest,
     ) -> Result<Digest> {
         let mut hash = blake3::Hasher::new_derive_key("jato verified compilation v3");
+        if plan.nightly {
+            field(&mut hash, b"jato restricted nightly inputs v1");
+        }
         field(&mut hash, &self.sources);
         field(&mut hash, externs);
         if let Some(native) = &plan.native {

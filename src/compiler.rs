@@ -166,6 +166,7 @@ fn rediscover(
         .status()?;
     ensure!(status.success(), "input discovery failed");
     let mut plan = fingerprint::dependencies(probe.path())?;
+    plan.nightly = recorded.nightly;
     if recorded.native.is_some() {
         // A copied source tree has new directory inodes. Ask this rustc to
         // resolve modules again before revalidating the observed link inputs.
@@ -314,8 +315,13 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 } else {
                     waited.then_some("coalesced_hit")
                 };
-                let _ = store.record_hit(&hit, event);
-                trace(&inv.name, "hit");
+                match store.record_hit(&hit, event) {
+                    Ok(()) => trace(&inv.name, "hit"),
+                    Err(error) => trace(
+                        &inv.name,
+                        format_args!("hit (statistics update failed: {error})"),
+                    ),
+                }
                 return Ok(0);
             }
             Ok((None, _)) if inv.live_incremental || ticket.is_some() => break,
@@ -418,11 +424,14 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 plan.native =
                     Some(observed?.manifest(inv, &recipe.root, &recipe.root.join("bin/rustc"))?);
             }
+            let channel = store.compiler_channel(compiler, &recipe.toolchain)?;
             ensure!(
-                store.stable_compiler(compiler, &recipe.toolchain)?,
-                "prerelease or custom compiler"
+                channel != crate::admission::Channel::Unsupported,
+                "unsupported compiler channel"
             );
-            let inputs = plan.inputs(&recipe, inv, since, inv.codegen)?;
+            plan.nightly = channel == crate::admission::Channel::Nightly;
+            let inputs = plan.inputs(&recipe, inv, since, true)?;
+            crate::admission::verify_conditions(compiler, inv, &store.dir, &inputs.nightly_guards)?;
             plan.large_input = inputs.large_input;
             plan.large_extern = externs.largest;
             let sample = plan.sample(&recipe, inv, since).unwrap_or(None);

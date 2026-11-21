@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -53,7 +53,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
         .context("cache size too large")
 }
 
-pub fn cache_limit() -> Result<u64> {
+fn cache_limit() -> Result<u64> {
     env::var("JATO_MAX_SIZE").map_or_else(|_| Ok(DEFAULT_LIMIT), |s| parse_size(&s))
 }
 
@@ -205,7 +205,16 @@ fn decode_plan(stored: &[u8]) -> Result<Vec<u8>> {
 
 impl Store {
     pub fn open() -> Result<Self> {
-        let mut store = Self::at(cache_dir()?, cache_limit()?)?;
+        let fallback = cache_limit();
+        let mut store = Self::at(
+            cache_dir()?,
+            fallback.as_ref().copied().unwrap_or(DEFAULT_LIMIT),
+        )?;
+        if let Err(error) = fallback
+            && stored_limit(&store.conn)?.is_none()
+        {
+            return Err(error);
+        }
         store.allow_sealed = match env::var("JATO_STORAGE").as_deref() {
             Ok("packed") => Some(false),
             Err(_) | Ok("auto") => None,
@@ -287,27 +296,65 @@ impl Store {
         })
     }
 
-    pub fn stable_compiler(&self, compiler: &std::ffi::OsStr, identity: &Digest) -> Result<bool> {
-        if let Some(stable) = self
+    pub fn budget(&self) -> Result<u64> {
+        Ok(stored_limit(&self.conn)?.unwrap_or(self.limit))
+    }
+
+    pub fn set_budget(&mut self, size: Option<u64>) -> Result<u64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(size) = size {
+            ensure!(
+                size <= i64::MAX as u64,
+                "cache limit exceeds SQLite's integer range"
+            );
+            tx.execute(
+                "INSERT INTO cache_settings VALUES(1,?1) ON CONFLICT(singleton)
+                DO UPDATE SET max_bytes=excluded.max_bytes",
+                [size],
+            )?;
+        } else {
+            tx.execute("DELETE FROM cache_settings", [])?;
+        }
+        tx.commit()?;
+        self.budget()
+    }
+
+    pub fn compiler_channel(
+        &self,
+        compiler: &std::ffi::OsStr,
+        identity: &Digest,
+    ) -> Result<crate::admission::Channel> {
+        use crate::admission::Channel;
+        let saved = self
             .conn
             .query_row(
                 "SELECT stable FROM compilers WHERE identity=?1",
                 [identity],
                 |r| r.get(0),
             )
-            .optional()?
-        {
-            return Ok(stable);
+            .optional()?;
+        match saved {
+            Some(1i64) => return Ok(Channel::Stable),
+            Some(2) => return Ok(Channel::Nightly),
+            Some(3) => return Ok(Channel::Unsupported),
+            _ => (), // Older stores recorded every non-stable compiler as zero.
         }
-        let stable = crate::admission::stable_compiler(compiler)?;
-        self.record_compiler(identity, stable)?;
-        Ok(stable)
+        let channel = crate::admission::compiler_channel(compiler)?;
+        self.record_compiler(identity, channel)?;
+        Ok(channel)
     }
 
-    pub fn record_compiler(&self, identity: &Digest, stable: bool) -> Result<()> {
+    pub fn record_compiler(
+        &self,
+        identity: &Digest,
+        channel: crate::admission::Channel,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO compilers VALUES(?1,?2,?3)",
-            params![identity, stable, now()],
+            "INSERT INTO compilers VALUES(?1,?2,?3) ON CONFLICT(identity) DO UPDATE
+             SET stable=excluded.stable,seen=excluded.seen WHERE compilers.stable=0",
+            params![identity, channel as i64, now()],
         )?;
         Ok(())
     }
@@ -340,15 +387,18 @@ impl Store {
     }
 
     pub fn save_probe(&mut self, key: &Digest, stdout: &[u8], stderr: &[u8]) -> Result<()> {
-        let budget = (self.limit / 32).min(256 * 1024);
-        if stdout.len() + stderr.len() > 65536
-            || (stdout.len() + stderr.len() + 160) as u64 > budget
-        {
+        const MAX_PROBES: u64 = 256 * 1024;
+        if stdout.len() + stderr.len() > 65536 {
             return Ok(());
         }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let limit = stored_limit(&tx)?.unwrap_or(self.limit);
+        let budget = (limit / 32).min(MAX_PROBES);
+        if (stdout.len() + stderr.len() + 160) as u64 > budget {
+            return Ok(());
+        }
         tx.execute(
             "INSERT OR IGNORE INTO probes VALUES(?1,?2,?3,?4,?5)",
             params![key, stdout, stderr, probe_checksum(stdout, stderr), now()],
@@ -359,7 +409,7 @@ impl Store {
         )? {
             tx.execute("DELETE FROM probes WHERE key=(SELECT key FROM probes ORDER BY seen LIMIT 1)", [])?;
         }
-        let evicted = evict(&tx, self.limit)?;
+        let evicted = evict(&tx, limit)?;
         tx.commit()?;
         if evicted != 0 {
             self.collect_objects(false)?;
@@ -489,10 +539,11 @@ impl Store {
             self.conn.execute(
                 "INSERT INTO worktree_topologies(entry,latest)
                  SELECT e.id,?2 FROM entries e JOIN plans p ON p.entry=e.id WHERE e.key=?1 AND p.topology<>?2 AND
-                 ((SELECT bytes FROM usage)+192<=?3 OR EXISTS(SELECT 1 FROM worktree_topologies w WHERE w.entry=e.id))
+                 ((SELECT bytes FROM usage)+192<=COALESCE((SELECT max_bytes FROM cache_settings WHERE singleton=1),?3)
+                  OR EXISTS(SELECT 1 FROM worktree_topologies w WHERE w.entry=e.id))
                  ON CONFLICT(entry) DO UPDATE SET oldest=previous,previous=latest,latest=excluded.latest
                  WHERE latest<>excluded.latest AND previous IS NOT excluded.latest AND oldest IS NOT excluded.latest",
-                params![key,topology,self.limit]
+                params![key,topology,self.limit.min(i64::MAX as u64)]
             )?;
         } else {
             self.conn.execute(
@@ -528,11 +579,12 @@ impl Store {
         source: &File,
         length: u64,
         charge: u64,
-        used: u64,
+        budget: (u64, u64),
     ) -> Option<crate::sealed::Object> {
+        let (used, limit) = budget;
         let standalone = charge.saturating_add(length).saturating_add(256);
         if length < CHUNK as u64
-            || standalone > self.limit
+            || standalone > limit
             || !*self
                 .allow_sealed
                 .get_or_insert_with(|| crate::sealed::supported(&self.dir))
@@ -548,11 +600,11 @@ impl Store {
         if used != 0
             && let Ok(Some(object)) =
                 crate::sealed::revision(source, &self.dir, length, unit, &self.conn)
-            && charge.saturating_add(object.charge()) <= self.limit
+            && charge.saturating_add(object.charge()) <= limit
         {
             return Some(object);
         }
-        if standalone > self.limit.saturating_sub(used) {
+        if standalone > limit.saturating_sub(used) {
             return None;
         }
         let object = crate::sealed::prepare(source, &self.dir).ok();
@@ -582,12 +634,19 @@ impl Store {
                 272 + bytes.len() + 96 * p.needs.len() + if p.sample.is_some() { 128 } else { 0 }
             });
         let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
-        if charge > self.limit || stderr.len() > DIAGNOSTIC_LIMIT {
+        let (used, limit) = self.conn.query_row(
+            "SELECT bytes,(SELECT max_bytes FROM cache_settings WHERE singleton=1) FROM usage",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, Option<u64>>(1)?.unwrap_or(self.limit),
+                ))
+            },
+        )?;
+        if charge > limit || stderr.len() > DIAGNOSTIC_LIMIT {
             return Ok(false);
         }
-        let used = self
-            .conn
-            .query_row("SELECT bytes FROM usage", [], |r| r.get::<_, u64>(0))?;
         let mut files = Vec::new();
         let mut packed = packed::Recorder::new(&self.dir, used != 0);
         let mut sidecar = None;
@@ -605,7 +664,7 @@ impl Store {
             };
             let length = metadata.len();
             if let Some(object) =
-                self.sealed_output((recipe, slot), path, &source, length, charge, used)
+                self.sealed_output((recipe, slot), path, &source, length, charge, (used, limit))
             {
                 ensure!(
                     crate::fingerprint::stamp(&metadata)
@@ -652,7 +711,7 @@ impl Store {
                 file.frames += 1;
                 file.hash = digest;
                 charge += packed.frame(&self.conn, digest, raw)?;
-                if charge > self.limit {
+                if charge > limit {
                     return Ok(false);
                 }
                 buffered = window - n;
@@ -677,6 +736,11 @@ impl Store {
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Another process can set the cache-wide policy while rustc runs.
+            let limit = stored_limit(&tx)?.unwrap_or(self.limit);
+            if charge > limit {
+                return Ok((false, false, false));
+            }
             let added = tx.execute("INSERT OR IGNORE INTO entries(key,recipe,access,stderr,stderr_hash,compile_ms) VALUES(?1,?2,?3,?4,?5,?6)",
             params![key, recipe, now(), stderr, blake3::hash(stderr).as_bytes(), elapsed_ms])?;
             if added == 0 {
@@ -762,7 +826,7 @@ impl Store {
              DO UPDATE SET last_run=excluded.last_run WHERE last_run < ?2",
                     params![time, time - 3_600_000_000],
                 )? == 1;
-            let evicted = evict(&tx, self.limit)?;
+            let evicted = evict(&tx, limit)?;
             let kept = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM entries WHERE id=?1)",
                 [entry],
@@ -995,11 +1059,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn prune(&mut self, limit: u64) -> Result<u64> {
+    pub fn prune(&mut self, requested: Option<u64>) -> Result<u64> {
         crate::staging::clean(&self.dir)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let limit = match requested {
+            Some(limit) => limit,
+            None => stored_limit(&tx)?.unwrap_or(self.limit),
+        };
         let removed = evict(&tx, limit)?;
         tx.commit()?;
         self.collect_objects(true)?;
@@ -1032,7 +1100,7 @@ impl Store {
         .sum();
         Ok(Stats {
             directory: self.dir.clone(),
-            limit_bytes: self.limit,
+            limit_bytes: stored_limit(&conn)?.unwrap_or(self.limit),
             charged_bytes: scalar("SELECT bytes FROM usage")?,
             database_bytes,
             entries: scalar("SELECT COUNT(*) FROM entries")?,
@@ -1051,6 +1119,12 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?,
         })
     }
+}
+
+fn stored_limit(conn: &Connection) -> rusqlite::Result<Option<u64>> {
+    conn.prepare_cached("SELECT max_bytes FROM cache_settings WHERE singleton=1")?
+        .query_row([], |r| r.get(0))
+        .optional()
 }
 
 fn probe_checksum(stdout: &[u8], stderr: &[u8]) -> Digest {
@@ -1196,7 +1270,7 @@ mod tests {
         assert!(store.save(&recipe, &first, &files, b"", 5, Some(evidence(None)))?);
         let unsampled = store.stats()?.charged_bytes;
         assert!(store.may_match_sample(&recipe, &other)?);
-        store.prune(0)?;
+        store.prune(Some(0))?;
         store.limit = unsampled;
         assert!(!store.save(&recipe, &first, &files, b"", 5, Some(evidence(Some(first))))?);
         store.limit += 128;
@@ -1207,7 +1281,7 @@ mod tests {
         store.limit = 1 << 20;
         assert!(store.save(&recipe, &other, &files, b"", 5, Some(evidence(None)))?);
         assert!(store.may_match_sample(&recipe, &other)?);
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         assert!(!store.may_match_sample(&recipe, &first)?);
         Ok(())
@@ -1246,7 +1320,7 @@ mod tests {
                 Some(n == 0 || n >= 5)
             );
         }
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         assert_eq!(store.matches_topology(&key, &[7; 32])?, None);
         Ok(())
@@ -1276,6 +1350,8 @@ mod tests {
             Some(ev)
         )?);
         let inv = Invocation {
+            source_arg: 0,
+            mold: false,
             name: "unit".into(),
             codegen: true,
             executable: true,
@@ -1381,7 +1457,7 @@ mod tests {
             fs::write(&pending, b"unfinished")?;
             let unrelated = abandoned.with_file_name("unrelated");
             fs::write(&unrelated, b"keep")?;
-            store.prune(0)?;
+            store.prune(Some(0))?;
             assert!(!abandoned.exists() && !pending.exists() && unrelated.exists());
         }
         Ok(())
@@ -1413,7 +1489,7 @@ mod tests {
                 .save(&[2; 32], &[3; 32], &[input], b"", 1, None)
                 .is_err()
         );
-        assert!(store.prune(0).is_err());
+        assert!(store.prune(Some(0)).is_err());
         assert_eq!(fs::read(other.join(".pending"))?, b"keep");
         assert_eq!(fs::read(outside)?, b"keep");
         Ok(())
@@ -1473,7 +1549,7 @@ mod tests {
         let tx = first.conn.transaction()?;
         let _: u64 = tx.query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;
         let mut second = Store::at(cache, 2 << 20)?;
-        second.prune(0)?;
+        second.prune(Some(0))?;
         second.save(&[1; 32], &[2; 32], &paths, b"", 1, None)?;
         let version = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
         tx.commit()?;
@@ -1559,7 +1635,7 @@ mod tests {
             assert_eq!(fs::read(&files[1])?, archive);
             assert_eq!(fs::read(&files[0])?, meta);
         }
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         Ok(())
     }
@@ -1594,7 +1670,7 @@ mod tests {
             assert!(store.restore(&[i as u8; 32], outputs)?.is_some());
             assert_eq!(fs::read(&file)?, make(variant));
         }
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         Ok(())
     }
@@ -1630,7 +1706,7 @@ mod tests {
             assert_eq!(store.stats()?.chunks, 1);
             assert!(store.restore(&[kept; 32], files)?.is_some());
             assert_eq!(&fs::read(&path)?, expected);
-            store.prune(0)?;
+            store.prune(Some(0))?;
             assert_eq!(store.stats()?.charged_bytes, 0);
         }
         Ok(())
@@ -1665,7 +1741,7 @@ mod tests {
         assert!(store.restore(&[1; 32], outputs)?.is_some());
         hasher.reset().update_reader(File::open(&path)?)?;
         assert_eq!(hasher.finalize(), expected);
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         Ok(())
     }
@@ -1714,7 +1790,7 @@ mod tests {
         assert!(store.save(&[8; 32], &[1; 32], &outputs, b"", 1, Some(evidence()))?);
         assert_eq!(store.plans(&[8; 32])?.0, [inputs]);
         assert_eq!(store.restore(&[1; 32], &outputs)?, Some(vec![]));
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert_eq!(store.stats()?.charged_bytes, 0);
         Ok(())
     }
@@ -1738,7 +1814,7 @@ mod tests {
         );
         assert_eq!(fs::read(&output)?, vec![7; CHUNK * 3]);
         let size = store.stats()?.charged_bytes;
-        assert_eq!(store.prune(size - 1)?, 1);
+        assert_eq!(store.prune(Some(size - 1))?, 1);
         assert!(store.restore(&[2; 32], &files)?.is_none());
         fs::write(&output, b"old")?;
         store
@@ -1895,7 +1971,7 @@ mod tests {
         let orphan = crate::sealed::path(&store.dir, &[9; 32]);
         fs::create_dir_all(orphan.parent().unwrap())?;
         fs::write(&orphan, b"aborted publish")?;
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert!(!orphan.exists());
         Ok(())
     }
@@ -1998,7 +2074,7 @@ mod tests {
         assert_eq!(store.stats()?.sealed_objects, 2);
         store.save(&[0; 32], &[3; 32], outputs, b"", 0, None)?;
         assert_eq!(store.stats()?.counters["sealed_reused_bytes"], size);
-        store.prune(0)?;
+        store.prune(Some(0))?;
         assert!(!object.exists());
         crate::sealed::publish(&held, &object)?;
         assert_eq!(crate::sealed::measure(&File::open(&object)?)?, verity);

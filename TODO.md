@@ -14,6 +14,11 @@
 - [x] Measure publication costs as unresolved Cargo dependencies accumulate and address verified bottlenecks.
 - [ ] Compare clean builds, warm targets and live edits with upstream caches and qualify the installed update.
 
+## Olo and nightly Cargo
+
+- [x] Test the reported nightly options, split library metadata, shared cache budgeting and delivery to a conventional artifact directory.
+- [ ] Measure the installed version on Olo protocol and system packages and report the results to the Olo developer.
+
 ## Coding agent skill
 
 - [x] Write a portable Jato skill and exercise its Cargo commands in a Rust workspace.

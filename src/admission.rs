@@ -9,16 +9,43 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
-pub fn stable_compiler(compiler: &OsStr) -> Result<bool> {
-    // Stable rejects active feature gates. Documentation-only cfg_attr gates
-    // are common and do not make a successful stable compilation opaque.
+mod nightly;
+pub use nightly::{check_root, verify_conditions};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Stable = 1,
+    Nightly = 2,
+    Unsupported = 3,
+}
+
+impl Channel {
+    pub fn release(version: &str) -> Self {
+        let number = version.strip_suffix("-nightly").unwrap_or(version);
+        let mut parts = number.split('.');
+        if !(0..3).all(|_| {
+            parts
+                .next()
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+        }) || parts.next().is_some()
+        {
+            Self::Unsupported
+        } else if number == version {
+            Self::Stable
+        } else {
+            Self::Nightly
+        }
+    }
+}
+
+pub fn compiler_channel(compiler: &OsStr) -> Result<Channel> {
     let version = Command::new(compiler).arg("-V").output()?;
     let output = std::str::from_utf8(&version.stdout)?;
     ensure!(version.status.success(), "could not identify rustc version");
     Ok(output
         .strip_prefix("rustc ")
         .and_then(|v| v.split_whitespace().next())
-        .is_some_and(|s| s.bytes().all(|c| c.is_ascii_digit() || c == b'.')))
+        .map_or(Channel::Unsupported, Channel::release))
 }
 
 pub fn verify_bytes(bytes: &[u8], path: &Path, deferred_links: bool, observed: bool) -> Result<()> {
@@ -93,7 +120,22 @@ fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'
         let word = spelling.strip_prefix("r#").unwrap_or(spelling);
         match token.kind {
             Ident | RawIdent if matches!(word, "asm" | "global_asm" | "llvm_asm" | "naked_asm") => {
-                return Some("assembly input");
+                // libc declares modules literally named asm. A module name or
+                // a namespace prefix in ordinary Rust cannot call or alias an
+                // assembly macro. Inside a macro token tree it could do either.
+                let mut next = tokenize(input).filter_map(|t| {
+                    (!matches!(t.kind, Whitespace | LineComment | BlockComment { .. }))
+                        .then_some(t.kind)
+                });
+                let module = !sensitive.last().is_some_and(|&(group, _)| group)
+                    && match next.next() {
+                        Some(Semi | OpenBrace) if prev == "mod" => true,
+                        Some(Colon) => next.next() == Some(Colon),
+                        _ => false,
+                    };
+                if !module {
+                    return Some("assembly input");
+                }
             }
             Ident | RawIdent
                 if word == "link"
@@ -206,6 +248,18 @@ fn literal_link(input: &str) -> Option<LinkKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_asm_modules_do_not_hide_macros_or_aliases() {
+        assert!(opaque_input("pub(crate) mod asm; use asm::types::*;", false, false).is_none());
+        for source in [
+            "use core::arch::asm as op;",
+            "core::arch::asm!(\"nop\")",
+            "make!(mod asm;)",
+            "macro_rules! m { () => { mod asm; } }",
+        ] {
+            assert!(opaque_input(source, false, false).is_some(), "{source}");
+        }
+    }
     #[test]
     fn streaming_admission_handles_split_tokens_and_utf8() -> Result<()> {
         let path = Path::new("asset");

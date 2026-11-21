@@ -1,17 +1,26 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+pub fn supported_unstable(option: &str) -> bool {
+    matches!(option, "embed-metadata=yes" | "embed-metadata=no")
+        || option.strip_prefix("threads=").is_some_and(|n| {
+            n.bytes().all(|c| c.is_ascii_digit()) && n.parse::<std::num::NonZeroUsize>().is_ok()
+        })
+}
+
 pub struct Invocation {
     pub name: String,
     pub codegen: bool,
     pub executable: bool,
     pub observe_native: bool,
     pub linker: Option<PathBuf>,
+    pub mold: bool,
     pub incremental: Option<PathBuf>,
     pub live_incremental: bool,
     pub deferred_links: bool,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
+    pub source_arg: usize,
     pub outputs: Vec<PathBuf>, // dep-info is always first
     pub probe_args: Vec<OsString>,
 }
@@ -46,7 +55,9 @@ impl Invocation {
         let mut test = false;
         let mut prefer_dynamic = false;
         let mut linker = None;
+        let mut mold = false;
         let mut native_flags = false;
+        let mut split_metadata = false;
         let mut incremental = None;
         let mut deferred_links = cfg!(all(
             target_arch = "x86_64",
@@ -64,6 +75,7 @@ impl Invocation {
         let mut out_dir = None;
         let mut source = None;
         let mut externs = Vec::new();
+        let mut source_arg = 0;
         let mut probe_args = Vec::new();
         let mut i = 0;
         while i < args.len() {
@@ -73,7 +85,7 @@ impl Invocation {
             let (flag, inline) = if arg.starts_with("--") {
                 arg.split_once('=')
                     .map_or((arg, None), |(k, v)| (k, Some(v)))
-            } else if ["-C", "-L", "-l", "-A", "-W", "-D", "-F"]
+            } else if ["-C", "-L", "-l", "-A", "-W", "-D", "-F", "-Z"]
                 .iter()
                 .any(|p| arg.starts_with(p))
             {
@@ -94,6 +106,15 @@ impl Invocation {
             };
             let mut probe = true;
             match flag {
+                "-Z" => {
+                    let option = value().map_err(|_| "unstable_option")?;
+                    if !supported_unstable(option) {
+                        return Err("unstable_option");
+                    }
+                    if option.starts_with("embed-metadata=") {
+                        split_metadata = option == "embed-metadata=no";
+                    }
+                }
                 "--crate-name" if name.is_none() => name = Some(value()?),
                 "--crate-type" if crate_type.is_none() => crate_type = Some(value()?),
                 "--emit" if emit.is_none() => {
@@ -165,6 +186,7 @@ impl Invocation {
                             incremental = Some(dir);
                         }
                         "link-arg" | "link-args" => {
+                            mold = v == "-fuse-ld=mold";
                             native_link &= matches!(
                                 v,
                                 "-fuse-ld=lld" | "-fuse-ld=bfd" | "-fuse-ld=gold" | "-fuse-ld=mold"
@@ -203,6 +225,7 @@ impl Invocation {
                         return Err("custom_target");
                     }
                 }
+
                 "--cfg" | "--check-cfg" | "--edition" | "--cap-lints" | "--allow" | "--warn"
                 | "--deny" | "--forbid" | "--force-warn" | "-A" | "-W" | "-D" | "-F"
                 | "--color" | "--diagnostic-width" => {
@@ -232,6 +255,7 @@ impl Invocation {
                 }
                 "-vV" | "--version" | "--print" => return Err("compiler_query"),
                 _ if !arg.starts_with(['-', '@']) && arg.ends_with(".rs") && source.is_none() => {
+                    source_arg = probe_args.len();
                     source = Some(PathBuf::from(arg))
                 }
                 _ => return Err("unknown_arguments"),
@@ -257,6 +281,9 @@ impl Invocation {
             return Err("custom_output");
         }
         let library = matches!(crate_type, Some("lib" | "rlib"));
+        if split_metadata && library && kinds.contains(&"link") && !kinds.contains(&"metadata") {
+            return Err("split_metadata_without_sidecar");
+        }
         let proc_macro = crate_type == Some("proc-macro");
         if prefer_dynamic && !proc_macro {
             return Err("codegen_option");
@@ -301,11 +328,13 @@ impl Invocation {
             executable,
             observe_native,
             linker,
+            mold,
             incremental,
             live_incremental,
             deferred_links,
             source: source.ok_or("missing_source")?,
             externs,
+            source_arg,
             outputs,
             probe_args,
         })

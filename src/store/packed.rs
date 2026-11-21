@@ -401,7 +401,7 @@ mod tests {
             record.frame(&store.conn, hash, &raw)?;
             assert_eq!(record.reused, CHUNK as u64);
             record.rewind()?;
-            store.prune(0)?;
+            store.prune(Some(0))?;
             if changed {
                 std::fs::write(&path, vec![24; CHUNK])?;
             }
