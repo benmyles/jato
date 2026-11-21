@@ -173,7 +173,7 @@ fn hash_open(
     scan: Option<&mut Vec<u8>>,
     deferred_links: bool,
     observed: bool,
-) -> Result<Digest> {
+) -> Result<(Digest, u64)> {
     let before = f.metadata()?;
     ensure!(
         before.is_file() && !recent(&before, since),
@@ -195,7 +195,7 @@ fn hash_open(
         }
     } else if before.len() >= 4 << 20 {
         let input = crate::content::Input::with_file(path, f, since)?;
-        return Ok(crate::content::digests(&[input], 2 << 20)?[0]);
+        return Ok((crate::content::digests(&[input], 2 << 20)?[0], before.len()));
     } else {
         let mut h = blake3::Hasher::new();
         h.update_reader(&mut f)?;
@@ -205,13 +205,15 @@ fn hash_open(
         stamp(&before) == stamp(&fs::metadata(path)?),
         "input changed while hashing"
     );
-    Ok(*digest.as_bytes())
+    Ok((*digest.as_bytes(), before.len()))
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Plan {
     files: BTreeSet<PathBuf>,
     env: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_input: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<crate::native::Manifest>,
 }
@@ -291,18 +293,97 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
             .collect(),
         env,
         native: None,
+        large_input: None,
     })
 }
 
 pub struct Inputs {
     pub sources: Digest,
+    pub large_input: Option<usize>,
     namespace: BTreeSet<PathBuf>,
     covered: BTreeSet<PathBuf>,
+}
+
+fn tracked_env(hash: &mut blake3::Hasher, names: &BTreeSet<String>) {
+    for name in names {
+        field(hash, b"env");
+        field(hash, name.as_bytes());
+        match env::var_os(name) {
+            Some(value) => {
+                field(hash, b"set");
+                field(hash, value.as_bytes());
+            }
+            None => field(hash, b"unset"),
+        }
+    }
 }
 
 impl Plan {
     pub fn same_rust_inputs(&self, other: &Self) -> bool {
         self.files == other.files && self.env == other.env
+    }
+
+    // A sample can only reject a candidate. Even a perfect match goes
+    // through the original whole-file hashes, extern proof and native checks.
+    pub fn sample(
+        &self,
+        recipe: &Recipe,
+        source: &Path,
+        since: SystemTime,
+    ) -> Result<Option<Digest>> {
+        use std::os::unix::fs::FileExt;
+        let Some(index) = self.large_input else {
+            return Ok(None);
+        };
+        let large = self
+            .files
+            .iter()
+            .nth(index)
+            .context("invalid large input index")?;
+        let mut paths = vec![source];
+        if large != source {
+            paths.push(large);
+        }
+        for p in self
+            .files
+            .iter()
+            .filter(|p| p.extension() == Some(OsStr::new("rs")))
+            .take(8)
+        {
+            if p != source && p != large {
+                paths.push(p);
+            }
+        }
+        let mut h = blake3::Hasher::new_derive_key("jato bulk input precheck v1");
+        field(&mut h, &recipe.key);
+        let mut buffer = [0; 1024];
+        for path in paths {
+            let file = crate::content::open_with_flags(path, libc::O_NONBLOCK)?;
+            let m = file.metadata()?;
+            ensure!(
+                m.is_file() && !recent(&m, since),
+                "sampled input changed during compilation"
+            );
+            field(&mut h, path.as_os_str().as_bytes());
+            h.update(&m.len().to_le_bytes());
+            let width = m.len().min(buffer.len() as u64);
+            let tail = m.len() - width;
+            let mut previous = None;
+            for offset in [0, tail / 2, tail] {
+                if previous == Some(offset) {
+                    continue;
+                }
+                previous = Some(offset);
+                file.read_exact_at(&mut buffer[..width as usize], offset)?;
+                h.update(&buffer[..width as usize]);
+            }
+            ensure!(
+                stamp(&m) == stamp(&fs::metadata(path)?),
+                "sampled input replaced during lookup"
+            );
+        }
+        tracked_env(&mut h, &self.env);
+        Ok(Some(*h.finalize().as_bytes()))
     }
 
     pub fn inputs(
@@ -321,7 +402,9 @@ impl Plan {
         let mut ancestors = BTreeSet::new();
         let mut scan = admit_codegen.then(Vec::new);
         let cwd = std::env::current_dir()?;
-        for file in &self.files {
+        let mut largest = None;
+        let mut largest_size = 0;
+        for (index, file) in self.files.iter().enumerate() {
             let opened = crate::content::open(file)
                 .with_context(|| format!("opening {}", file.display()))?;
             #[cfg(target_os = "linux")]
@@ -342,17 +425,19 @@ impl Plan {
             field(&mut hash, b"source");
             field(&mut hash, file.as_os_str().as_bytes());
             field(&mut hash, path.as_os_str().as_bytes());
-            field(
-                &mut hash,
-                &hash_open(
-                    opened,
-                    file,
-                    since,
-                    scan.as_mut(),
-                    inv.deferred_links,
-                    self.native.is_some(),
-                )?,
-            );
+            let (digest, length) = hash_open(
+                opened,
+                file,
+                since,
+                scan.as_mut(),
+                inv.deferred_links,
+                self.native.is_some(),
+            )?;
+            field(&mut hash, &digest);
+            if length >= 4 << 20 && length > largest_size {
+                largest_size = length;
+                largest = Some(index);
+            }
             // rustc can change module resolution when a second legal location
             // appears. Track the containing directories and the alternate name,
             // even when the alternate directory or file does not yet exist.
@@ -382,19 +467,10 @@ impl Plan {
             );
         }
         ensure!(has_root, "crate root missing from dep-info");
-        for name in &self.env {
-            field(&mut hash, b"env");
-            field(&mut hash, name.as_bytes());
-            match env::var_os(name) {
-                Some(value) => {
-                    field(&mut hash, b"set");
-                    field(&mut hash, value.as_bytes());
-                }
-                None => field(&mut hash, b"unset"),
-            }
-        }
+        tracked_env(&mut hash, &self.env);
         Ok(Inputs {
             sources: *hash.finalize().as_bytes(),
+            large_input: largest,
             namespace,
             covered,
         })

@@ -8,6 +8,8 @@
 - Moved the live incremental bypass behind verified native lookup. An atomic-save undo restored the clean-session executable and a subsequent new edit still used rustc’s live state. Fresh-session observation remains required for publication.
 - Applied FastCDC 2020 inside long packed archive regions while keeping a single 256 KiB input window. Across eight insertions the payload fell from 256.0 MiB to 21.4 MiB. The original archives matched by SHA-256, and the 272 MiB spill/restore test still passed.
 
+- Traced a failed Cargo check after a source edit beside a 64 MiB asset. The 0.5 wrapper read all 67,108,864 asset bytes before invoking rustc. A bounded rejection check read 3,072. An edit outside those reads still produced a new executable, and a byte-for-byte undo restored the original. Tested mixed legacy entries, sample accounting and eviction.
+
 ## 2026-11-21 — concurrent builds and repeated validation
 
 - Started two clean regex worktrees against the same empty 0.4 cache. All six compiler units ran twice and produced six stored entries. The pair finished in 11.18 s.

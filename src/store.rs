@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -73,6 +73,7 @@ impl std::error::Error for Damaged {}
 pub struct Evidence<'a> {
     pub inputs: &'a [u8],
     pub sources: &'a Digest,
+    pub sample: Option<Digest>,
     pub needs: &'a [Digest],
     pub topology: &'a Digest,
     pub codegen: bool,
@@ -430,6 +431,19 @@ impl Store {
         Ok((plans, version))
     }
 
+    pub fn may_match_sample(&self, recipe: &Digest, sample: &Digest) -> Result<bool> {
+        // A legacy or unsampled entry must remain discoverable. The sample
+        // includes the recipe, so a positive global index lookup is enough.
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM input_samples WHERE digest=?2)
+            OR EXISTS(SELECT 1 FROM entries e JOIN plans p ON p.entry=e.id WHERE e.recipe=?1
+                AND NOT EXISTS(SELECT 1 FROM input_samples s WHERE s.entry=e.id))",
+            )?
+            .query_row(params![recipe, sample], |r| r.get(0))?)
+    }
+
     pub fn has_sources(&self, digest: &Digest) -> Result<bool> {
         Ok(self
             .conn
@@ -511,7 +525,9 @@ impl Store {
         let plan_cost = plan
             .as_ref()
             .zip(manifest.as_ref())
-            .map_or(0, |(p, (_, bytes))| 272 + bytes.len() + 96 * p.needs.len());
+            .map_or(0, |(p, (_, bytes))| {
+                272 + bytes.len() + 96 * p.needs.len() + if p.sample.is_some() { 128 } else { 0 }
+            });
         let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
         if charge > self.limit || stderr.len() > DIAGNOSTIC_LIMIT {
             return Ok(false);
@@ -666,6 +682,12 @@ impl Store {
                 "INSERT INTO source_variants VALUES(?1,?2)",
                 params![entry, plan.sources],
             )?;
+            if let Some(sample) = plan.sample {
+                tx.execute(
+                    "INSERT INTO input_samples VALUES(?1,?2)",
+                    params![entry, sample],
+                )?;
+            }
             for digest in plan.needs {
                 tx.execute(
                     "INSERT OR IGNORE INTO needs VALUES(?1,?2,?3)",
@@ -983,6 +1005,43 @@ mod tests {
     }
 
     #[test]
+    fn large_input_samples_respect_legacy_entries_budget_and_eviction() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let files = [dir.path().join("file")];
+        fs::write(&files[0], b"output")?;
+        let mut store = Store::at(dir.path().join("cache"), 1 << 20)?;
+        let recipe = [7; 32];
+        let evidence = |sample| Evidence {
+            sample,
+            inputs: b"plan",
+            sources: &[1; 32],
+            needs: &[],
+            topology: &[0; 32],
+            codegen: true,
+        };
+        let first = [8; 32];
+        let other = [9; 32];
+        assert!(store.save(&recipe, &first, &files, b"", 5, Some(evidence(None)))?);
+        let unsampled = store.stats()?.charged_bytes;
+        assert!(store.may_match_sample(&recipe, &other)?);
+        store.prune(0)?;
+        store.limit = unsampled;
+        assert!(!store.save(&recipe, &first, &files, b"", 5, Some(evidence(Some(first))))?);
+        store.limit += 128;
+        assert!(store.save(&recipe, &first, &files, b"", 5, Some(evidence(Some(first))))?);
+        assert_eq!(store.stats()?.charged_bytes, unsampled + 128);
+        assert!(store.may_match_sample(&recipe, &first)?);
+        assert!(!store.may_match_sample(&recipe, &other)?);
+        store.limit = 1 << 20;
+        assert!(store.save(&recipe, &other, &files, b"", 5, Some(evidence(None)))?);
+        assert!(store.may_match_sample(&recipe, &other)?);
+        store.prune(0)?;
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        assert!(!store.may_match_sample(&recipe, &first)?);
+        Ok(())
+    }
+
+    #[test]
     fn extra_topologies_are_bounded_charged_and_evicted_with_the_entry() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let files = [dir.path().join("file")];
@@ -991,6 +1050,7 @@ mod tests {
         let key = [8; 32];
         let sources = [9; 32];
         let ev = Evidence {
+            sample: None,
             inputs: b"manifest",
             sources: &sources,
             needs: &[],
@@ -1028,6 +1088,7 @@ mod tests {
         fs::write(&extern_file, b"valid")?;
         let mut store = Store::at(dir.path().join("cache"), 1 << 20)?;
         let ev = Evidence {
+            sample: None,
             inputs: b"manifest",
             sources: &[2; 32],
             needs: &[],
@@ -1241,6 +1302,7 @@ mod tests {
         fs::write(&outputs[0], b"shared output")?;
         let inputs = b"repeated/source/path.rs ".repeat(1000);
         let evidence = || Evidence {
+            sample: None,
             inputs: &inputs,
             sources: &[6; 32],
             needs: &[],
@@ -1319,6 +1381,7 @@ mod tests {
         let output = root.path().join("lib.rmeta");
         fs::write(&output, b"metadata")?;
         let proof = Evidence {
+            sample: None,
             inputs: b"{}",
             sources: &[7; 32],
             needs: &[],
@@ -1352,6 +1415,7 @@ mod tests {
             |store: &mut Store, id: u8, bytes: &[u8], needs: &[Digest], codegen| -> Result<()> {
                 fs::write(&file, bytes)?;
                 let proof = Evidence {
+                    sample: None,
                     inputs: b"{}",
                     sources: &[7; 32],
                     topology: &[1; 32],

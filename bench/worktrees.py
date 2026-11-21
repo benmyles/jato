@@ -323,6 +323,7 @@ def counters(name, exe, env, project):
         return {"hits": sum(stats["stats"]["cache_hits"]["counts"].values())}
     return {
         "hits": stats["counters"].get("hit", 0),
+        "live_incremental_hits": stats["counters"].get("live_incremental_hit", 0),
         "discovery_probes": stats["counters"].get("discovery_probe", 0),
     }
 

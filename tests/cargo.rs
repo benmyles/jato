@@ -672,7 +672,7 @@ fn large_embedded_assets_restore_and_content_edits_invalidate() {
         p.root.join("leaf/src/lib.rs"),
         r#"pub fn value() -> u8 {
         let i = std::env::args().count()-1;
-        include_bytes!("data.bin")[i]
+        include_bytes!("data.bin")[i + 90001]
     }"#,
     );
     let run = || {
@@ -691,14 +691,31 @@ fn large_embedded_assets_restore_and_content_edits_invalidate() {
         "{}",
         String::from_utf8_lossy(&restored.stderr)
     );
-    fs::OpenOptions::new()
-        .write(true)
-        .open(asset)
-        .unwrap()
-        .write_all_at(&[23], 0)
-        .unwrap();
+    let asset = fs::OpenOptions::new().write(true).open(asset).unwrap();
+    // A matching sample still needs the unsampled bytes to match exactly.
+    asset.write_all_at(&[23], 90001).unwrap();
     p.clean();
-    assert_eq!(run().stdout, b"23\n");
+    let edited = run();
+    assert_eq!(edited.stdout, b"23\n");
+    let log = String::from_utf8_lossy(&edited.stderr);
+    assert!(!log.contains("[leaf] hit"), "{log}");
+    assert!(!log.contains("[leaf] large input precheck"), "{log}");
+    // A sampled change can reject every recorded variant immediately.
+    asset.write_all_at(&[7], 0).unwrap();
+    p.clean();
+    let rejected = run();
+    assert_eq!(rejected.stdout, b"23\n");
+    let log = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        log.contains("[leaf] large input precheck ruled out"),
+        "{log}"
+    );
+    asset.write_all_at(&[0], 0).unwrap();
+    asset.write_all_at(&[0], 90001).unwrap();
+    p.clean();
+    let original = run();
+    assert_eq!(original.stdout, b"0\n");
+    assert!(String::from_utf8_lossy(&original.stderr).contains("[leaf] hit"));
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]

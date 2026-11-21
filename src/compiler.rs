@@ -57,6 +57,16 @@ fn discover(
         if inv.observe_native && plan.native.is_none() {
             continue;
         }
+        if let Ok(Some(sample)) = plan.sample(recipe, &inv.source, start)
+            && !store.may_match_sample(&recipe.key, &sample)?
+        {
+            flight_hint.get_or_insert(sample);
+            trace(
+                &inv.name,
+                "large input precheck ruled out recorded variants",
+            );
+            continue;
+        }
         let Ok(inputs) = plan.inputs(recipe, inv, start, false) else {
             continue;
         };
@@ -404,6 +414,8 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 "prerelease or custom compiler"
             );
             let inputs = plan.inputs(&recipe, inv, since, inv.codegen)?;
+            plan.large_input = inputs.large_input;
+            let sample = plan.sample(&recipe, &inv.source, since).unwrap_or(None);
             let sources = inputs.sources;
             let topology = inputs.topology(since)?;
             let key = inputs.key(&plan, &recipe, inv, since, &externs.key)?;
@@ -423,6 +435,7 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                     needs: &externs.needs,
                     topology: &topology,
                     sources: &sources,
+                    sample,
                     codegen: inv.codegen,
                 }),
             )? {

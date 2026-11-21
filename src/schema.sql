@@ -125,4 +125,8 @@ CREATE TRIGGER IF NOT EXISTS drop_worktree_topology AFTER DELETE ON worktree_top
     UPDATE usage SET bytes=bytes-192;
 END;
 CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY,last_run INTEGER NOT NULL) WITHOUT ROWID;
-PRAGMA user_version=12;
+CREATE TABLE IF NOT EXISTS input_samples(entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, digest BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS sample_keys ON input_samples(digest);
+CREATE TRIGGER IF NOT EXISTS add_input_sample AFTER INSERT ON input_samples BEGIN UPDATE usage SET bytes=bytes+128; END;
+CREATE TRIGGER IF NOT EXISTS drop_input_sample AFTER DELETE ON input_samples BEGIN UPDATE usage SET bytes=bytes-128; END;
+PRAGMA user_version=13;
