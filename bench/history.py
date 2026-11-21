@@ -72,6 +72,7 @@ def main():
                 assert stats["entries"] == revision + 1, "a source revision was not stored"
                 sample.append({k: stats[k] for k in ("entries", "artifact_bytes", "compressed_bytes", "charged_bytes", "database_bytes")})
                 sample[-1]["seconds"] = round(seconds, 6)
+                sample[-1]["packed_reused_bytes"] = stats["counters"].get("packed_reused_bytes", 0)
             shutil.rmtree(target)
             lib.write_text(source(0))
             start = time.perf_counter()

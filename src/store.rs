@@ -1,8 +1,10 @@
+mod packed;
+
 use crate::staging::Output;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -128,17 +130,11 @@ fn now() -> i64 {
         .as_micros() as i64
 }
 
-struct Frame {
-    hash: Digest,
-    raw: usize,
-    packed: Option<usize>,
-}
-
 struct Prepared {
     hash: Digest,
     size: u64,
     mode: u32,
-    frames: Vec<Frame>,
+    frames: usize,
     sealed: Option<crate::sealed::Object>,
 }
 
@@ -467,10 +463,7 @@ impl Store {
     ) -> Result<bool> {
         // Compress in parallel with other compilers, outside SQLite's single writer.
         // Anonymous staging files are reclaimed by the OS even on process death.
-        let mut spool = tempfile::spooled_tempfile_in(CHUNK, &self.dir);
-        let mut compressed = Vec::new();
         let mut buffer = Vec::new();
-        let mut compressor = None;
         let manifest = plan.as_ref().map(|p| encode_plan(p.inputs)).transpose()?;
         let plan_cost = plan
             .as_ref()
@@ -485,7 +478,7 @@ impl Store {
             .query_row("SELECT bytes FROM usage", [], |r| r.get::<_, u64>(0))?;
         let headroom = self.limit.saturating_sub(used);
         let mut files = Vec::new();
-        let mut known_frames = HashSet::new();
+        let mut packed = packed::Recorder::new(&self.dir, used != 0);
         let mut sidecar = None;
         for path in outputs {
             let mut source =
@@ -496,7 +489,7 @@ impl Store {
                 hash: [0; 32],
                 size: 0,
                 mode: metadata.permissions().mode() & 0o777,
-                frames: Vec::new(),
+                frames: 0,
                 sealed: None,
             };
             let length = metadata.len();
@@ -550,43 +543,12 @@ impl Store {
                     charge += 96; // one ordered part reference
                 }
                 file.size += n as u64;
-                if !known_frames.insert(digest) {
-                    if charge > self.limit {
-                        return Ok(false);
-                    }
-                    file.frames.push(Frame {
-                        hash: digest,
-                        raw: n,
-                        packed: None,
-                    });
-                    continue;
-                }
-                let packed = if n >= 64 {
-                    let encoder = match &mut compressor {
-                        Some(encoder) => encoder,
-                        None => compressor.insert(zstd::bulk::Compressor::new(1)?),
-                    };
-                    compressed.clear();
-                    compressed.reserve(zstd::zstd_safe::compress_bound(n));
-                    encoder.compress_to_buffer(raw, &mut compressed)?;
-                    if compressed.len() < n {
-                        compressed.as_slice()
-                    } else {
-                        raw
-                    }
-                } else {
-                    raw
-                };
-                charge += (packed.len() + 96) as u64;
+                file.frames += 1;
+                file.hash = digest;
+                charge += packed.frame(&self.conn, digest, raw)?;
                 if charge > self.limit {
                     return Ok(false);
                 }
-                spool.write_all(packed)?;
-                file.frames.push(Frame {
-                    hash: digest,
-                    raw: n,
-                    packed: Some(packed.len()),
-                });
             }
             ensure!(
                 file.size == metadata.len()
@@ -594,14 +556,12 @@ impl Store {
                         == crate::fingerprint::stamp(&fs::metadata(path)?),
                 "compiler output changed while recording"
             );
-            file.hash = if file.frames.len() == 1 {
-                file.frames[0].hash
-            } else {
-                *hasher.finalize().as_bytes()
-            };
+            if file.frames != 1 {
+                file.hash = *hasher.finalize().as_bytes();
+            }
             files.push(file);
         }
-        spool.rewind()?;
+        packed.rewind()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -612,7 +572,7 @@ impl Store {
         }
         let entry = tx.last_insert_rowid();
         for (slot, file) in files.iter().enumerate() {
-            let single = file.frames.len() == 1;
+            let single = file.frames == 1;
             tx.execute(
                 "INSERT INTO files(entry,slot,digest,size,mode,single) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![entry, slot, &file.hash, file.size, file.mode, single],
@@ -626,23 +586,20 @@ impl Store {
                     params![entry, slot, file.hash],
                 )?;
             }
-            for (ordinal, frame) in file.frames.iter().enumerate() {
-                if let Some(size) = frame.packed {
-                    let packed = &mut buffer[..size];
-                    spool.read_exact(packed)?;
-                    tx.prepare_cached("INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1")?
-                        .execute(params![&frame.hash, frame.raw, &*packed])?;
-                } else {
-                    let updated = tx
-                        .prepare_cached("UPDATE chunks SET refs=refs+1 WHERE hash=?1")?
-                        .execute([frame.hash])?;
-                    ensure!(updated == 1, "missing earlier packed chunk");
-                }
+            let mut source = None;
+            let mut offset = 0;
+            for ordinal in 0..file.frames {
+                let (digest, raw) =
+                    packed.publish(&tx, &outputs[slot], &mut source, offset, &mut buffer)?;
+                offset += raw;
                 if !single {
                     tx.prepare_cached("INSERT INTO parts VALUES(?1,?2,?3,?4)")?
-                        .execute(params![entry, slot, ordinal, &frame.hash])?;
+                        .execute(params![entry, slot, ordinal, &digest])?;
                 }
             }
+        }
+        if packed.reused > 0 {
+            tx.execute("INSERT INTO counters VALUES('packed_reused_bytes',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [packed.reused])?;
         }
         if let (Some(plan), Some((hash, bytes))) = (plan, manifest) {
             let manifest: i64 = tx.query_row(
