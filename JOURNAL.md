@@ -8,6 +8,9 @@
 - Kept Cargo intermediates while changing Olo’s public target directories. All five executables and four sampled Rust libraries or metadata files matched. Deliveries took 0.51–0.67 s with Jato 0.9.0 and 0.56–0.81 s with kache 2.3.0.
 - Added `--keep-build` to coordinate ordinary Cargo output paths. Found that Cargo hardlinked Olo’s public executable across deliveries on the same filesystem. Managed Btrfs intermediates now use a subvolume, with a regression that overwrites one public program and validates an existing and a new delivery.
 - Reused the native fingerprint’s full read to authenticate each mold executable. A cold trial had 27 build-script links to a 42,246,008-byte linker. Skipping one duplicate read per script avoids 1.06 GiB of logical input reads on those links alone. Added early size rejection for large post-compile dependency sets and caching of Cargo’s empty target queries with Olo’s linker flags.
+- Rebuilt both Olo packages with the release binary. Full restore produced 188 hits, 62 misses and 26 opaque macro consumers, taking 188.92 s. The kache wrapper took 2.97 s and its Cargo shim took 5.55 s into an emptied target with a primed store. Retaining Cargo state gave Jato 0.67–0.83 s delivery with independently writable Btrfs copies.
+- Counted bytes read by a real consumer wrapper after evicting its producer. Version 0.9 read 16,255,732 bytes of old metadata. Version 0.10 read zero and rustc produced the expected downstream type. A migrated ripgrep build restored 39 units, reproduced the executable and passed 299 upstream tests.
+- Checked Cargo's nightly scheduling on two simultaneous builds with 800 ms build scripts. Default locking serialized the scripts. Fine-grained locking overlapped them by 765 and 769 ms. A separate experimental resolver run produced the same Olo unit graph while changing lockfile semantics, so the normal CLI keeps Cargo’s selected resolver.
 
 ## 2026-11-21 — Olo nightly Cargo builds
 

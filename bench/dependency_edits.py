@@ -243,6 +243,27 @@ def main():
                 if phase == "successful":
                     metadata(project, rustc, envs[n], msg, clients[:1], rev)
                 report[n][phase + "_consumer_rmeta_bytes_read"] = amount
+            # Cargo may already have a usable external crate whose Jato producer
+            # record was evicted. An older rmeta cannot be a current pipeline
+            # publication. Both wrappers must hand the consumer back to rustc.
+            env = envs[n]
+            edit(101)
+            producer_messages = run([*command, "-p", "producer"], env, project)
+            files = [
+                Path(path)
+                for line in producer_messages.splitlines()
+                if (m := json.loads(line)).get("reason") == "compiler-artifact"
+                for path in m["filenames"] if path.endswith(".rmeta")
+            ]
+            assert len(files) == 1
+            run([tools[n], "gc", "0"], env, project)
+            old = time.time() - 300
+            os.utime(files[0], (old, old))
+            amount, messages = trace(tools[n], command, env, project, root / n / "uncertified", False)
+            assert any(m.get("reason") == "compiler-artifact" and m["target"]["name"] == "producer" and m["fresh"]
+                       for m in map(json.loads, messages.splitlines()))
+            metadata(project, rustc, env, messages, clients[:1], 101)
+            report[n]["uncertified_consumer_rmeta_bytes_read"] = amount
         for row in report.values():
             row["median_seconds"] = {
                 k: statistics.median(t["seconds"] for t in v)

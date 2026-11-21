@@ -1,0 +1,147 @@
+{
+  "revision": "cb35992a5c0bcf9c9c44c7ef72a1748f50f9342c",
+  "toolchain": "nightly-2026-11-14",
+  "packages": [
+    "olo-protocol",
+    "olo-system"
+  ],
+  "jobs": 4,
+  "conditions": "Prebuilt Cargo intermediates; files in ordinary public target directories. Each phase is one observation.",
+  "jato_0_9_same_filesystem": {
+    "artifact_sha256": {
+      "nm-fake": "8b0ca0fce6b03b6ef52674f1f067a4e094721d435a567b1f748178e589014ec5",
+      "olo-gpu-tune": "d4f03d0e6a176aea7d689a8d4b6a85d579c4e1f3783e4993dd70e7a542d3350b",
+      "olo-net-admin": "b575902da97eb8cdb689a2b6bdc1bb13c649e043bcd60616d4290f2d3729ba0f",
+      "phone-standin": "fdbd282f75c24a5e56196b8374384b84e8c42d391ff610bfe5697820a180850c",
+      "udisks-fake": "452d3ac92d61e1aa19da89b2a52a87573d4b8698aaa1faffdf8af45432b0c4ae",
+      "libolo_protocol-3ad64b655e308755.rlib": "7e481f010c10911c6f183477e88e338a7e0ccb21c29db7193b681b871337cee2",
+      "libolo_protocol-3ad64b655e308755.rmeta": "81474f4975c2217c1e0cc472598ec94543b6b67b23546dabf7ac24f551e82559",
+      "libolo_system-7913f710b05752ec.rlib": "44451d09e37fc5db1764fc3748edd2cfa53696a19a1da6f644d77003f2779f46",
+      "libolo_system-7913f710b05752ec.rmeta": "707e6b8a15c4aaf5888710c4d07668cd96d5b5e377eb42398e4cb72d2b85d479"
+    },
+    "samples": {
+      "prime": {
+        "seconds": 0.6944,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "new-A": {
+        "seconds": 0.5143,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "new-B": {
+        "seconds": 0.6686,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "removed-A": {
+        "seconds": 0.5895,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "fresh-A": {
+        "seconds": 0.6482,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      }
+    }
+  },
+  "kache_2_3_same_filesystem": {
+    "artifact_sha256": {
+      "nm-fake": "f8398265e3e8a161132f9184b61084fa4b6e021f4f30a53e03cb2fd1d88035cd",
+      "olo-gpu-tune": "5f5c9ed78f1673cb82e6e224e7359a144c2c5bdb105ba217ea6b3392261e8ed9",
+      "olo-net-admin": "62bb16580ea056763ff5148fc66646ca39a793c7478e85a2a087b383b5ffe8a2",
+      "phone-standin": "d56a9ce75f4c404505ba71995cc559543a907de99e747e1c459fa14016676849",
+      "udisks-fake": "1a46c9a9ab319d2d965fcd1e8fdc7ea5e89a6e5ff1cd288aacd5ef8929603348",
+      "libolo_protocol-3ad64b655e308755.rlib": "ed718f6480e630c190ff3e207e4b3383a166a51c39fd523e78ec9350ccdeda6a",
+      "libolo_protocol-3ad64b655e308755.rmeta": "b4dd15cfb355da62375a41b975f077923c9e3ccf77b3d2cc74b449cbf748648b",
+      "libolo_system-7913f710b05752ec.rlib": "409b371b2e28ea0a42984213ec6da2424cc02593109da19ed81aeedabc38ed8a",
+      "libolo_system-7913f710b05752ec.rmeta": "80181066be8e0d3f2562e52aa0d13c6d963a76ce8fee2605b4bc063e40161afb"
+    },
+    "samples": {
+      "prime": {
+        "seconds": 0.623,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "new-A": {
+        "seconds": 0.8137,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "new-B": {
+        "seconds": 0.7003,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "removed-A": {
+        "seconds": 0.5643,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "fresh-A": {
+        "seconds": 0.5318,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      }
+    }
+  },
+  "jato_0_10_cross_subvolume": {
+    "artifact_sha256": {
+      "nm-fake": "8b0ca0fce6b03b6ef52674f1f067a4e094721d435a567b1f748178e589014ec5",
+      "olo-gpu-tune": "d4f03d0e6a176aea7d689a8d4b6a85d579c4e1f3783e4993dd70e7a542d3350b",
+      "olo-net-admin": "b575902da97eb8cdb689a2b6bdc1bb13c649e043bcd60616d4290f2d3729ba0f",
+      "phone-standin": "fdbd282f75c24a5e56196b8374384b84e8c42d391ff610bfe5697820a180850c",
+      "udisks-fake": "452d3ac92d61e1aa19da89b2a52a87573d4b8698aaa1faffdf8af45432b0c4ae",
+      "libolo_protocol-3ad64b655e308755.rlib": "e0832ced3fdae74038231ccb220ebfb8802cae33b0e7933b623796cdc4636136",
+      "libolo_protocol-3ad64b655e308755.rmeta": "94c51820cdb1afa8b3bd6a234017503672eb29474c3272b467f70b9fe44a59da",
+      "libolo_system-7913f710b05752ec.rlib": "c14a4f73a56b46798b396955d4d28e7d2e452546f56aa1bf695f907b4c2dc982",
+      "libolo_system-7913f710b05752ec.rmeta": "1fb012982c8373a342373baf475d8eee3ea21e2c3dfb4b264b777905035aae1a"
+    },
+    "samples": {
+      "new-a": {
+        "seconds": 0.8269,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "new-b": {
+        "seconds": 0.6657,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "recreated-a": {
+        "seconds": 0.7215,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "fresh-a": {
+        "seconds": 0.7063,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      },
+      "after-edit-new-c": {
+        "seconds": 0.7807,
+        "fresh": 276,
+        "total": 276,
+        "matching_files": 9
+      }
+    }
+  },
+  "distinct_public_inodes": true,
+  "preserved_after_in_place_edit": true
+}

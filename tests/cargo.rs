@@ -1242,10 +1242,8 @@ fn check_macro_expansion(mold: Option<&OsStr>) {
         p.clean();
         let mut cmd = p.command();
         if let Some(search) = &linker {
-            cmd.env("PATH", search).env(
-                "RUSTFLAGS",
-                "-Clinker-features=-lld -Clink-arg=-fuse-ld=mold",
-            );
+            cmd.env("PATH", search)
+                .env("RUSTFLAGS", "-Clink-arg=-fuse-ld=mold");
         }
         let out = success(
             cmd.env_remove("JATO_LINK_CACHE")
@@ -1293,15 +1291,31 @@ fn cargo_probe_cache_replays_exact_bytes_and_leaves_source_queries_alone() {
         "-C",
         "link-arg=-fuse-ld=mold",
     ];
-    let expected = success(Command::new(&rustc).args(target).stdin(Stdio::null()));
+    let expected = Command::new(&rustc)
+        .args(target)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     for _ in 0..2 {
-        let out = success(p.command().arg(&rustc).args(target).stdin(Stdio::null()));
+        let out = p
+            .command()
+            .arg(&rustc)
+            .args(target)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status, expected.status);
         assert_eq!(
             (out.stdout, out.stderr),
             (expected.stdout.clone(), expected.stderr.clone())
         );
     }
-    assert_eq!(p.stats()["counters"]["probe_hit"], 2);
+    // Rust 1.89 rejects linker-features. Its real diagnostic is replayed by
+    // the compiler on both calls; only successful queries may be stored.
+    assert_eq!(
+        p.stats()["counters"]["probe_hit"],
+        1 + u64::from(expected.status.success())
+    );
     for name in ["first", "second"] {
         let mut cmd = p.command();
         let mut child = cmd
@@ -1509,10 +1523,7 @@ fn upstream_mold_restores_the_linked_executable() {
             p.command()
                 .env("PATH", &search)
                 .env("JATO_LOG", "debug")
-                .env(
-                    "RUSTFLAGS",
-                    "-Clinker=/usr/bin/cc -Clinker-features=-lld -Clink-arg=-fuse-ld=mold",
-                )
+                .env("RUSTFLAGS", "-Clinker=/usr/bin/cc -Clink-arg=-fuse-ld=mold")
                 .args(["build", "--release"]),
         )
     };

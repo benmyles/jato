@@ -245,7 +245,7 @@ def main():
         run([cargo, "fetch", "--locked"], env, project)
         if options.paired_restores:
             result = paired_restores(options, tools, env, project, root, target)
-            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, retained_build_dir=options.retain_build_dir, project=project.name if options.project else options.fixture,
+            print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, retained_build_dir=options.retain_build_dir, empty_wrapper_overrides=options.empty_wrapper_overrides, project=project.name if options.project else options.fixture,
                                   rustc=run([rustc, "-V"], env, project).decode().strip(), jobs=options.jobs,
                                   pairs=options.paired_restores, **result), indent=2))
             return
@@ -356,7 +356,7 @@ def main():
         medians = {k: {m: {key: statistics.median(s[key] for s in samples)
                            for key in samples[0] if all(s.get(key) is not None for s in samples)} for m, samples in modes.items()}
                    for k, modes in results.items()}
-        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, retained_build_dir=options.retain_build_dir, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
+        print(json.dumps(dict(versions=versions, compiler_path=options.compiler_path, packages=options.package, cache_gib=options.cache_gib, retained_build_dir=options.retain_build_dir, empty_wrapper_overrides=options.empty_wrapper_overrides, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
                               rustc=run([rustc, "-V"], env, project).decode().strip(),
                               jobs=options.jobs, runs=options.runs, samples=results, median=medians), indent=2))
 

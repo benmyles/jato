@@ -22,6 +22,8 @@
 - [x] Distinguish repeated quarantined records from actual stores and avoid reading their outputs again.
 - [x] Reuse Cargo intermediates across public target paths. Exercise clean, edits, workspace isolation and independent delivery files on Btrfs.
 - [ ] Close the fully emptied-target Olo performance gap while preserving correct behavior for changing procedural-macro inputs and native dependencies.
+- [ ] Qualify any proposed macro-consumer reuse against changed unreported files, environment, native-library initialization and re-exports. Measure actual coverage across the Olo dependency graph.
+- [ ] Measure whether sharing validated linker and extern digests within one Cargo invocation pays for a helper process. Include concurrent writes, shared mappings, renames, helper failure, memory use and the already-fresh build.
 
 ## Coding agent skill
 

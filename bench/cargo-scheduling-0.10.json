@@ -1,0 +1,27 @@
+{
+  "cargo": "cargo 1.102.0-nightly (ede6cefea 2026-11-11)",
+  "jato": "jato 0.10.0",
+  "script_sleep_ms": 800,
+  "samples": {
+    "standard": [
+      {
+        "seconds": 6.0979,
+        "script_overlap_ms": 0
+      },
+      {
+        "seconds": 4.7275,
+        "script_overlap_ms": 0
+      }
+    ],
+    "fine-grain": [
+      {
+        "seconds": 3.5243,
+        "script_overlap_ms": 765
+      },
+      {
+        "seconds": 3.0215,
+        "script_overlap_ms": 769
+      }
+    ]
+  }
+}

@@ -72,6 +72,8 @@ An explicit `CARGO_BUILD_BUILD_DIR` takes precedence over Jato’s default. For 
 
 On Btrfs, Jato creates the managed intermediates in a subvolume when supported. Cargo’s copies across that boundary have independent inodes. Elsewhere, Cargo can hardlink a public binary to its intermediate on the same filesystem. Tools that modify deliverables in place can use a separate filesystem for intermediates or copy the binary before altering it.
 
+For concurrent jobs on a nightly Cargo that supports fine-grained locking, give each job its own public target and pass `-Zfine-grain-locking` to Cargo. For example, start `jato --keep-build cargo +nightly -Zfine-grain-locking build -p parser --target-dir outputs/parser` alongside the equivalent command for another package. Cargo can build independent units concurrently while coordinating shared ones. [Concurrency measurements](bench/README.md#concurrent-cargo-jobs)
+
 ## Reuse builds across worktrees
 
 On Linux, install the distribution’s `bubblewrap` package and use the same private `JATO_CACHE_DIR` across builds. For registry dependencies shared by different projects, run `jato worktree build --release`. Source paths keep their usual meaning. For multiple copies or Git worktrees of the same workspace, run the following commands from each checkout.
@@ -165,9 +167,11 @@ When a compiler emits an identical file, Jato can reuse a sealed object after ch
 
 For a small in-place change, Jato can clone the authenticated base, rehash each modified region, and recompute the standard BLAKE3 root for the entire result. When much of a file shifted, it can reconstruct and hash the bytes in one pass. All paths check the complete result before publication. `patched_files` and `patch_bytes` report the number and size of revision patches. `frame_file_bytes` is the file-backed portion of `compressed_bytes`.
 
-Jato 0.9 upgrades earlier local caches in place. To move a cache, copy its entire directory when builds are idle so the SQLite files, frames, sealed objects and shared budget travel together. Old fixed-size chunks and new content-defined chunks can coexist. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
+Jato 0.10 reads 0.9 caches and upgrades earlier local caches in place. To move a cache, copy its entire directory when builds are idle so the SQLite files, frames, sealed objects and shared budget travel together. Old fixed-size chunks and new content-defined chunks can coexist. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
 
 ## What can be reused
+
+For a user-installed mold, the qualified upstream x86-64 Linux 3.0.0 executable has SHA-256 `ada05c08a5686fdc8cf047f946f6c9b5163b7181ee7c500f7a904bcb750642a3`. Jato authenticates its full contents while fingerprinting the observed native inputs. A different user-built linker delegates to the compiler. [Upstream mold release](https://github.com/rui314/mold/releases/tag/v3.0.0)
 
 Jato caches eligible Rust metadata checks and libraries. Keys include the working directory, compiler arguments, toolchain and sysroot identities, compiler environment, source and included-file contents, rustc's tracked environment inputs, and dependency artifact hashes. A new source edit can go directly to rustc before Jato reads its compiled dependencies. A hit requires the complete key. Changes to module search directories trigger fresh resolution.
 

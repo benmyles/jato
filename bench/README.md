@@ -1,65 +1,60 @@
-# Jato 0.9 measurements
+# Jato 0.10 measurements
 
-The installed Jato 0.9.0, Jato 0.8.0, kache 2.3.0, sccache 0.19.0 and bare Cargo ran on a shared Intel Core Ultra 7 356H, Fedora 45, Linux 7.3.4 and compressed Btrfs. Trials used private stores, targets and daemon sockets with prefetched dependencies. Kernel page cache and machine load were shared. [0.8 storage and worktree measurements](0.8.md) · [kache 2.3.0](https://github.com/kunobi-ninja/kache/releases/tag/v2.3.0) · [sccache 0.19.0](https://github.com/mozilla/sccache/releases/tag/v0.19.0)
+Benchmarks ran on a shared Intel Core Ultra 7 356H with Fedora 45, Linux 7.3.4 and compressed Btrfs. Each contender had a private artifact store, target directory and daemon socket. The machine's load varied substantially. The Olo table contains individual runs. [Previous release measurements](0.9.md)
 
-## Olo with split Rust metadata and mold
+## Fully rebuilding Olo
 
-Built Olo commit `cb35992a5c0b` with its pinned `nightly-2026-11-14`, normal development profile, workspace feature unification, mold flags and eight rustc front-end threads. One Cargo invocation selected both `olo-protocol` and `olo-system` with four jobs. Each contender started with an empty 12 GiB-budget store. The second build removed the entire target, including Cargo’s intermediate directory. The third kept the target. Each cell is one observation.
+The workload built both `olo-protocol` and `olo-system` at Olo commit `cb35992a5c0b`. It used four Cargo jobs, the normal Olo profile, workspace feature unification, upstream mold 3.0.0 and the pinned `nightly-2026-11-14` with `-Zthreads=8`. Stores began empty with a 12 GiB budget. The second run removed both target and intermediate files. The third kept both. Each tool ran through the pinned Cargo binary with its compiler wrapper. An explicit empty workspace-wrapper override matched the earlier trials. Cargo can repeat compiler-info queries with that override.
 
-| Olo | Jato 0.9 | kache 2.3 |
-| --- | ---: | ---: |
-| Cold | 289.14 s | 313.60 s |
-| Clean-target rebuild | 366.72 s | 2.97 s |
-| Already fresh | 0.72 s | 0.42 s |
-| New hits on the clean rebuild | 123 | 304 |
+| Olo | Jato 0.9.0 | Jato 0.10.0 | kache 2.3.0 |
+| --- | ---: | ---: | ---: |
+| Empty store and target | 289.14 s | 834.30 s | 313.60 s |
+| Populated store, target and intermediates removed | 366.72 s | 188.92 s | 2.97 s |
+| Already fresh | 0.72 s | 0.51 s | 0.42 s |
+| Tool-reported hits during the full restore | 123 | 188 | 304 |
 
-Jato’s warm build still compiled 127 units after lookup and bypassed another 26 with opaque macro dependencies. It delegated native links through the user-installed mold. Cargo changed some just-produced dependencies during downstream compilation. These prevent reuse even when the source checkout stays fixed. Eighteen of 20 sampled files matched their cold SHA-256 with Jato. The two independently recompiled Olo rlibs differed. All 20 matched with kache. The Olo protocol library subsequently passed 75 tests with Jato in an isolated environment. An independent Olo run with a working checkout also favored kache, with 97–127 s for Jato’s two rebuilds and 2.0 s for kache 2.1.1. [Measured builds, file digests and counters](olo-0.9.json)
+Jato 0.10 still bypassed 26 direct macro consumers and missed on 62 further units. It recompiled 26 units whose previously captured output was still awaiting producer evidence. It skipped recapturing those outputs. Eighteen of 20 sampled library or metadata files matched the cold build. The two recompiled Olo libraries varied. The full restore left 230 MiB charged to Jato's artifact budget. GNU time reported a maximum individual process RSS of 1.09 GiB, which includes rustc. An earlier development build took 344.50 s cold and 120.20 s to restore, with 180 hits. Workstation load and compiler parallelism make wall-time differences between these individual runs hard to assign to a particular change. [0.10 timings, counters, CPU, memory and digests](olo-0.10.json) · [0.9 and kache controls](olo-0.9.json)
 
-## Rust compiler discovery and ripgrep
+The upstream kache **Cargo shim** also ran with its already populated private store, into a target path it had never seen. It took 5.55 s on the first delivery, 5.55 s after the target and build directory were removed, and 0.99 s with an existing target. The shim seeded 22 Cargo-fresh artifacts on each cleared build. An independent Olo run with kache 2.1.1 reported 2.0 s, versus 97–127 s with Jato 0.9, for `olo-system` alone. Olo's fully cleared rebuild continues to favor kache. [Shim samples](olo-0.10.json) · [How kache seeds targets](https://github.com/kunobi-ninja/kache/blob/v2.1.1/docs/getting-started/worktrees.mdx)
 
-Ran the published ripgrep 14.1.1 project on stable Rust 1.100 with identical jato-dev settings for every contender. The first three rows are medians from three rotating trials where Cargo resolved rustc on PATH. The last two rows come from seven atomic edits and undos with an absolute compiler. Every built executable ran, including a revision-specific behavior check after each edit and undo. [Cold, warm and fresh samples](named-ripgrep-0.9.json) · [Live edit samples](dev-ripgrep-0.9.json)
+## Changing public target directories
 
-| ripgrep | Jato 0.9 | Jato 0.8 | kache 2.3 | sccache 0.19 | Bare Cargo |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Cold build | 4.56 s | 4.61 s | 4.18 s | 4.30 s | 4.07 s |
-| Clean-target rebuild | 146 ms | 252 ms | 319 ms | 1,623 ms | 4,147 ms |
-| Already fresh | 33 ms | 57 ms | 79 ms | 52 ms | 48 ms |
-| New edit | 463 ms | 470 ms | 1,558 ms | 467 ms | 463 ms |
-| Undo | 65 ms | 63 ms | 159 ms | 459 ms | 484 ms |
+A retained Cargo build directory lets Cargo preserve its own fingerprints, build-script results and incremental state. Olo had 276 Cargo-fresh artifacts when delivering to each new public target. The five executables and four sampled Rust artifacts all matched their primed digests.
 
-Jato had zero idle cache-daemon RSS. kache and sccache had 18,744 and 17,336 KiB respectively. Median store file lengths were 108.4 MiB for Jato, 109.3 MiB for kache and 23.6 MiB for sccache. Sealed Btrfs files can share physical extents with target files. [Resource and extent measurements](named-ripgrep-0.9.json)
+| Elapsed time | New target A | New target B | Removed and recreated A | Existing A |
+| --- | ---: | ---: | ---: | ---: |
+| Jato 0.9, ordinary retained directory | 0.51 s | 0.67 s | 0.59 s | 0.65 s |
+| kache 2.3, ordinary retained directory | 0.81 s | 0.70 s | 0.56 s | 0.53 s |
+| Jato 0.10, Btrfs subvolume boundary | 0.83 s | 0.67 s | 0.72 s | 0.71 s |
 
-A serial one-library check under 0.8 launched four extra rustc processes to query the sysroot. Version 0.9 used one on the first build and zero on restore. With a rustup proxy on PATH, 0.9 still asks rustup which compiler it selected. Changing the project toolchain file or setting an environment override returned the corresponding compiler's exact version output. In five paired ripgrep runs the absolute-compiler dev restore was 212 ms with 0.9 and 206 ms with 0.8. With an explicit rustup proxy the corresponding restores were 1.83 s and 1.91 s. [Discovery traces and toolchain switches](discovery-0.9.json) · [Absolute compiler](absolute-ripgrep-0.9.json) · [Rustup proxy](proxy-ripgrep-0.9.json)
+Cargo hardlinked copies of `nm-fake` across the two same-filesystem targets. On opposite sides of a Btrfs subvolume boundary, the public targets had distinct inodes. Overwriting A in place preserved B and the next delivery to C. C took 0.78 s. The Olo trial reused an existing physical intermediate directory and put public output on a new subvolume. The CLI regression exercises newly managed intermediates on their own subvolume. [Delivery timings and byte checks](cargo-delivery-0.10.json) · [Cargo build cache](https://doc.rust-lang.org/cargo/reference/build-cache.html)
 
-## Waiting for pipelined dependencies
+## Concurrent Cargo jobs
 
-A real Cargo library published into three private SQLite fixtures. The larger fixtures contained 16,384 synthetic outstanding dependency records. The last also contained a chain of 64 entries whose ultimate producer was that real library. The harness alternated binaries for seven trials, verified the real rmeta by SHA-256, compiled an independent consumer, and checked the final number of outstanding dependencies. Synthetic entries supplied graph structure only. [Raw samples and check configuration](publication-0.9.json)
+Two concurrent builds selected separate packages and delivery targets in one workspace using `jato --keep-build`. Each build script slept for 800 ms. With default locking their script intervals had zero overlap in both trials. Olo's pinned Cargo with `-Zfine-grain-locking` overlapped them by 765 and 769 ms. Both delivered programs ran with their expected output. This exercises Cargo's scheduling behavior on a controlled fixture. [Timing and overlap samples](cargo-scheduling-0.10.json) · [Benchmark](cargo_scheduling.py)
 
-| Median publication time | Jato 0.9 | Jato 0.8 |
-| --- | ---: | ---: |
-| Empty graph | 0.51 ms | 0.54 ms |
-| Unrelated pending records | 2.21 ms | 8.08 ms |
-| Release the dependent chain | 3.46 ms | 283.64 ms |
+We also timed five alternating Olo unit-graph constructions with nightly's experimental `-Zavoid-dev-deps`. The canonical graphs matched for all 304 units and dependency edges. Median graph generation was 0.57 s normally and 0.48 s with the flag. That flag changes how Cargo handles development dependency resolution and the lockfile. Jato leaves it to the caller. [Unit-graph samples](resolver-0.10.json)
 
-End-to-end Cargo check times for the chain were 57 ms and 340 ms respectively. The reverse index visits actual consumers and a transaction-local SQLite table holds the work queue. Metadata-only producers can discharge only metadata requirements. [Benchmark implementation](publication.py)
+## Compiler input reads and correctness
+
+Jato authenticates the user-installed mold executable while hashing it for the native-input fingerprint. On 27 observed build-script links, one fewer 42,246,008-byte read per link avoids 1.06 GiB of logical reads. The same-size modified-linker regression still rejects publication. For a linked macro library, an external input was changed after cleaning the target. The library hit and its consumer generated the new value.
+
+A separate serial Cargo test retained a 15.5 MiB dependency in the target and evicted the producer's Jato entry. The dependency was too old to have a publication in flight. On that consumer the 0.9 wrapper read 16,255,732 dependency bytes. The 0.10 wrapper read zero, and rustc produced metadata with the expected value. Source edits, failing consumers and reversions are separate cases in the harness. A 0.9 store also restored all 39 ripgrep units under 0.10. Its executable matched SHA-256 and passed 299 upstream tests. [Uncertified dependency trace](uncertified-extern-0.10.json) · [Cache migration and upstream tests](upstream-0.10.json)
 
 ## Save-to-compiler feedback
 
-Seven two-package break/fix cycles took a median 45.8 ms from save to compiler error and 45.5 ms from fix to a successful workspace check. The idle watcher tree used 2,197 KiB PSS. A separate regex run exercised ordinary cold, restored, fresh and edited builds. [Watch samples](feedback-0.9.json) · [Ordinary Cargo control](regex-0.9.json)
+The preceding release measured seven atomic break/fix cycles. Median save-to-error and fix-to-success were 46 ms each. [Watch measurements](0.9.md#save-to-compiler-feedback)
 
 ## Reproduction
 
-Use prefetched dependencies and a disk-backed scratch directory. Run the Olo comparison on its pinned nightly with the existing C driver and mold on PATH. The native macro and assembly boundaries affect which workloads can hit.
+Use prefetched dependencies and a disk-backed scratch directory. The head-to-head harness defaults to clearing Cargo intermediates along with the public target. Add `--retain-build-dir` to measure Cargo's retained state. Add `--empty-wrapper-overrides` to reproduce the explicit empty workspace wrapper used in earlier releases.
 
 ```sh
 python3 bench/compare.py --offline --project /path/to/ripgrep-14.1.1 --verify-bin rg \
-    --previous-jato /path/to/jato-0.8 --compiler-path path --workloads jato-dev --runs 3
-python3 bench/compare.py --offline --project /path/to/olo --package olo-protocol --package olo-system \
-    --tools jato kache --workloads dev --cache-gib 12 --runs 1
-python3 bench/publication.py --previous-jato /path/to/jato-0.8 --pending 16384 --depth 64 --runs 7
-python3 bench/devloop.py --previous-jato /path/to/jato-0.8 --profile jato-dev \
-    --project /path/to/ripgrep-14.1.1 --source crates/core/main.rs --verify-bin rg --runs 7
-python3 bench/feedback.py --dev --runs 7
+    --compiler-path path --workloads jato-dev --runs 3 --kache-cargo-shim
+rustup run nightly-2026-11-14 python3 bench/compare.py --offline --project /path/to/olo \
+    --package olo-protocol --package olo-system --tools jato kache --kache-cargo-shim \
+    --workloads dev --cache-gib 12 --runs 1
+python3 bench/dependency_edits.py --jato /path/to/jato --previous-jato /path/to/jato-0.9
+rustup run nightly-2026-11-14 python3 bench/cargo_scheduling.py --jato /path/to/jato
 ```
-
-A 0.8 store migrated from schema 15 to 17 and restored all 39 ripgrep units. The restored binary matched the cold SHA-256 and passed all 299 upstream integration tests. A separate two-crate trace distinguished cached Cargo stderr from actual new compiler hits. [Upgrade and upstream checks](upstream-0.9.json) · [Debug replay counts](debug-replay-0.9.json)

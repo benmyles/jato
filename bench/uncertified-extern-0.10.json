@@ -1,0 +1,88 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "asset_mib": 4,
+  "consumers": 1,
+  "runs": 1,
+  "jobs": 4,
+  "tools": {
+    "jato": {
+      "version": "jato 0.10.0",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 0.220245,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.166925,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.139626,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.040874,
+            "hits": 2
+          }
+        ]
+      },
+      "producer_metadata_bytes": 16255730,
+      "successful_consumer_rmeta_bytes_read": 16261876,
+      "failed_consumer_rmeta_bytes_read": 3072,
+      "uncertified_consumer_rmeta_bytes_read": 0,
+      "median_seconds": {
+        "cold": 0.220245,
+        "edit": 0.166925,
+        "error": 0.139626,
+        "undo": 0.040874
+      }
+    },
+    "previous_jato": {
+      "version": "jato 0.9.0",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 0.199486,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.169282,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.162192,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.053117,
+            "hits": 2
+          }
+        ]
+      },
+      "producer_metadata_bytes": 16255730,
+      "successful_consumer_rmeta_bytes_read": 16261876,
+      "failed_consumer_rmeta_bytes_read": 3072,
+      "uncertified_consumer_rmeta_bytes_read": 16255732,
+      "median_seconds": {
+        "cold": 0.199486,
+        "edit": 0.169282,
+        "error": 0.162192,
+        "undo": 0.053117
+      }
+    }
+  }
+}
