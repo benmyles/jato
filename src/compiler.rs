@@ -1,6 +1,6 @@
 use crate::fingerprint;
 use crate::invocation::Invocation;
-use crate::store::{DIAGNOSTIC_LIMIT, Digest, Store};
+use crate::store::{DIAGNOSTIC_LIMIT, Digest, Evidence, Store};
 use anyhow::{Context, Result, bail, ensure};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -39,6 +39,10 @@ fn discover(
 ) -> Result<Option<Vec<u8>>> {
     let plans = store.plans(recipe)?;
     if plans.is_empty() {
+        trace(
+            &inv.name,
+            "no previous entry for these compiler arguments and toolchain",
+        );
         return Ok(None);
     }
     let start = SystemTime::now();
@@ -58,6 +62,10 @@ fn discover(
         // name resolution. Ordinary edits go directly to the actual compiler.
         return rediscover(store, compiler, inv, recipe, start, &externs);
     }
+    trace(
+        &inv.name,
+        "tracked inputs changed or previous entry was evicted",
+    );
     Ok(None)
 }
 
@@ -70,10 +78,7 @@ fn rediscover(
     externs: &Digest,
 ) -> Result<Option<Vec<u8>>> {
     let _ = store.count("discovery_probe", 1);
-    let probe = tempfile::Builder::new()
-        .prefix("discover-")
-        .suffix(".d")
-        .tempfile_in(&store.dir)?;
+    let probe = crate::staging::file(&store.dir)?;
     let mut emit = OsString::from("--emit=dep-info=");
     emit.push(probe.path());
     let status = Command::new(compiler)
@@ -122,6 +127,9 @@ fn compile(compiler: &OsStr, args: &[OsString]) -> Result<(ExitStatus, Option<Ve
 }
 
 pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
+    if env::var_os("JATO_DISABLE").as_deref() == Some(OsStr::new("1")) {
+        return passthrough(original(compiler, args));
+    }
     let crate_name = env::var("CARGO_CRATE_NAME").unwrap_or_default();
     let invocation = match Invocation::parse(compiler, args) {
         Ok(v) => v,
@@ -162,7 +170,7 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             trace(&inv.name, "hit");
             return Ok(0);
         }
-        Ok(None) => trace(&inv.name, "miss"),
+        Ok(None) => (),
         Err(e) => trace(&inv.name, format_args!("compile after lookup: {e:#}")),
     }
     let _ = store.count("miss", 1);
@@ -173,9 +181,13 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     if status.success() {
         let result = (|| -> Result<()> {
             let log = diagnostics.context("diagnostics exceed recording limit")?;
+            ensure!(
+                inv.confirms_outputs(&log),
+                "compiler reported an unexpected artifact set"
+            );
             let externs = fingerprint::extern_key(inv, since, &store)?;
             let plan = fingerprint::dependencies(&inv.outputs[0])?;
-            plan.verify_admission(inv, compiler)?;
+            plan.verify_admission(compiler, inv.codegen)?;
             let snapshot = plan.snapshot(&recipe, inv, since, &externs)?;
             let encoded = serde_json::to_vec(&plan)?;
             ensure!(
@@ -188,7 +200,11 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 &inv.outputs,
                 &log,
                 elapsed,
-                Some((&encoded, &snapshot.topology)),
+                Some(Evidence {
+                    inputs: &encoded,
+                    topology: &snapshot.topology,
+                    codegen: inv.codegen,
+                }),
             )? {
                 bail!("entry exceeds cache budget");
             }

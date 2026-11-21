@@ -2,7 +2,7 @@ use crate::{cargo_command, store};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
@@ -44,11 +44,49 @@ pub fn configuration(path: &Path) -> bool {
         )
 }
 
+/// Carry location-changing options over to Cargo metadata. The program's
+/// own arguments following a second `--` are opaque to the watcher.
+fn metadata_command(job: &[OsString]) -> Result<(std::process::Command, Vec<PathBuf>)> {
+    let mut cmd = cargo_command(&[])?;
+    if let Some(toolchain) = job
+        .first()
+        .filter(|s| s.as_encoded_bytes().starts_with(b"+"))
+    {
+        cmd.arg(toolchain);
+    }
+    cmd.args(["metadata", "--format-version", "1", "--no-deps"]);
+    let mut excluded = Vec::new();
+    let mut args = job.iter().take_while(|a| *a != "--");
+    while let Some(arg) = args.next() {
+        let (option, inline) = arg
+            .to_str()
+            .and_then(|a| a.split_once('='))
+            .map_or((arg.as_os_str(), None), |(k, v)| {
+                (OsStr::new(k), Some(OsStr::new(v)))
+            });
+        if matches!(
+            option.to_str(),
+            Some("--manifest-path" | "--config" | "--target-dir")
+        ) {
+            let value = inline
+                .or_else(|| args.next().map(OsString::as_os_str))
+                .context("missing Cargo option value")?;
+            if option == "--target-dir" {
+                excluded.push(std::path::absolute(value)?);
+            } else {
+                cmd.arg(option).arg(value);
+            }
+        } else if matches!(option.to_str(), Some("--offline" | "--locked" | "--frozen")) {
+            cmd.arg(option);
+        }
+    }
+    Ok((cmd, excluded))
+}
+
 impl Workspace {
-    pub fn load(extra: &[PathBuf]) -> Result<Self> {
-        let out = cargo_command(&[])?
-            .args(["metadata", "--format-version", "1", "--no-deps"])
-            .output()?;
+    pub fn load(options: &super::Options) -> Result<Self> {
+        let (mut cmd, mut excluded) = metadata_command(&options.job)?;
+        let out = cmd.output()?;
         ensure!(
             out.status.success(),
             "cargo metadata failed\n{}",
@@ -70,14 +108,28 @@ impl Workspace {
                 roots.insert(dep);
             }
         }
-        for dir in extra {
+        for dir in &options.extra {
             roots.insert(
                 std::fs::canonicalize(dir)
                     .with_context(|| format!("watching {}", dir.display()))?,
             );
         }
         members.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
-        let mut excluded = vec![meta.target_directory, store::cache_dir()?];
+        excluded.push(meta.target_directory);
+        let cache = store::cache_dir()?;
+        if roots.iter().any(|r| r.starts_with(&cache)) {
+            for name in [
+                "artifacts-v1.sqlite3",
+                "artifacts-v1.sqlite3-wal",
+                "artifacts-v1.sqlite3-shm",
+                "schema.lock",
+                ".jato-staging-v1",
+            ] {
+                excluded.push(cache.join(name));
+            }
+        } else {
+            excluded.push(cache);
+        }
         excluded.extend(meta.build_directory);
         Ok(Self {
             roots,

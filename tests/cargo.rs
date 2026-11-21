@@ -44,10 +44,16 @@ impl Project {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_jato"));
+        self.command_for(env!("CARGO_BIN_EXE_jato"))
+    }
+
+    fn command_for(&self, program: &str) -> Command {
+        let mut cmd = Command::new(program);
         cmd.current_dir(&self.root)
             .env("CARGO_HOME", self.temp.path().join("cargo"))
             .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env("CARGO_BUILD_BUILD_DIR", self.root.join("target"))
+            .env_remove("JATO_DISABLE")
             .env("JATO_CACHE_DIR", self.temp.path().join("cache"))
             .env("CARGO_NET_OFFLINE", "true")
             .env("CARGO", env!("CARGO"))
@@ -304,6 +310,7 @@ fn two_cargo_targets_can_publish_to_one_cache_while_it_is_pruned() {
     let mut b = p
         .command()
         .env("CARGO_TARGET_DIR", p.temp.path().join("second target"))
+        .env("CARGO_BUILD_BUILD_DIR", p.temp.path().join("second target"))
         .args(["check", "-q"])
         .spawn()
         .unwrap();
@@ -340,9 +347,158 @@ fn assembly_includes_are_left_to_the_compiler() {
             blob.display()
         ),
     );
+    // Even with the assembler file absent, metadata emission can succeed.
+    // The resulting check record must never authorize a codegen cache hit.
+    p.run(&["check"]);
+    p.clean();
+    p.run(&["check"]);
+    assert!(p.hits() > 0);
+    let fail = p.command().arg("build").output().unwrap();
+    assert!(!fail.status.success());
     for v in *b"AB" {
         fs::write(&blob, [v]).unwrap();
         p.clean();
         assert_eq!(p.run(&["run", "-q"]).stdout, format!("{v}\n").as_bytes());
     }
+}
+
+#[test]
+fn standard_wrapper_restores_the_exact_artifacts_and_side_outputs_bypass() {
+    fn collect(path: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for e in fs::read_dir(path).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                collect(&e.path(), files);
+            } else if e.file_name().to_string_lossy().contains("leaf")
+                && matches!(
+                    e.path().extension().and_then(OsStr::to_str),
+                    Some("rlib" | "rmeta" | "d")
+                )
+            {
+                files.insert(e.path(), fs::read(e.path()).unwrap());
+            }
+        }
+    }
+    let p = Project::new();
+    let build = || {
+        success(
+            p.command_for(env!("CARGO"))
+                .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_jato"))
+                .args(["build", "-q"]),
+        );
+        let mut files = Default::default();
+        collect(&p.root.join("target"), &mut files);
+        files
+    };
+    let cold = build();
+    assert!(
+        cold.keys()
+            .any(|p| p.extension() == Some(OsStr::new("rlib")))
+    );
+    p.clean();
+    assert_eq!(cold, build());
+    assert!(p.hits() > 0);
+    let hits = p.hits();
+    p.clean();
+    success(p.command().env("RUSTFLAGS", "--emit=llvm-ir").arg("build"));
+    assert_eq!(p.hits(), hits);
+}
+
+#[test]
+fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let p = Project::new();
+    let log = p.temp.path().join("starts");
+    let source = p.root.join("src/main.rs");
+    let main = r#"use std::{env, fs::OpenOptions, io::Write, time::Duration};
+        fn main() {
+            let mut log = OpenOptions::new().append(true).create(true).open(env::var_os("WATCH_STARTS").unwrap()).unwrap();
+            writeln!(log, "{} {}", std::process::id(), env::args().nth(1).unwrap()).unwrap();
+            std::thread::sleep(Duration::from_secs(12));
+        }"#;
+    write(&source, main);
+    p.run(&["build", "-q"]);
+    let mut child = p
+        .command()
+        .env("WATCH_STARTS", &log)
+        .args([
+            "watch",
+            "--debounce",
+            "25",
+            "--",
+            "run",
+            "-q",
+            "--",
+            "two words",
+        ])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    struct StopOnDrop(u32);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe {
+                    libc::kill(self.0 as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+    let mut guard = StopOnDrop(child.id());
+    let wait_for_runs = |count| {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = fs::read_to_string(&log).unwrap_or_default();
+            if runs.lines().count() >= count {
+                return runs;
+            }
+            assert!(Instant::now() < end, "watch did not start run {count}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for_runs(1);
+    write(&source, &format!("{main}\n// save"));
+    let runs = wait_for_runs(2);
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    guard.0 = 0;
+    for run in runs.lines() {
+        let (pid, arg) = run.split_once(' ').unwrap();
+        assert_eq!(arg, "two words");
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            assert!(stat.contains(") Z "), "program still running: {stat}");
+        }
+    }
+}
+
+#[test]
+fn nested_workspace_wrapper_runs_with_original_compiler_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Project::new();
+    let helper = p.temp.path().join("my-driver");
+    let log = p.temp.path().join("driver-ran");
+    write(
+        &helper,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$DRIVER_LOG\"\nexec \"$@\"\n",
+    );
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![p.temp.path().to_owned()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    success(
+        p.command()
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("RUSTC_WORKSPACE_WRAPPER", "my-driver")
+            .env("DRIVER_LOG", &log)
+            .arg("check"),
+    );
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .any(|p| Path::new(p).file_name() == Some(OsStr::new("rustc")))
+    );
 }

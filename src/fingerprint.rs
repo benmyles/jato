@@ -61,7 +61,7 @@ pub fn recipe(compiler: &OsStr, args: &[OsString]) -> Result<Digest> {
             PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end())
         }
     };
-    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v3");
+    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v4");
     let executable = if bin.components().count() > 1 {
         cwd.join(bin)
     } else {
@@ -233,8 +233,8 @@ pub struct Snapshot {
 }
 
 impl Plan {
-    pub fn verify_admission(&self, inv: &Invocation, compiler: &OsStr) -> Result<()> {
-        crate::admission::verify(self.files.iter(), inv, compiler)
+    pub fn verify_admission(&self, compiler: &OsStr, codegen: bool) -> Result<()> {
+        crate::admission::verify(self.files.iter(), compiler, codegen)
     }
 
     pub fn snapshot(
@@ -332,7 +332,7 @@ pub fn extern_key(inv: &Invocation, since: SystemTime, store: &Store) -> Result<
         let digest = hash_file(path, since)?;
         // A pure-looking rlib can re-export a procedural macro. Trust only a
         // dependency chain whose outputs Jato previously admitted itself.
-        if !store.knows_artifact(&digest)? {
+        if !store.knows_artifact(&digest, inv.codegen)? {
             bail!("unverified extern {}", path.display());
         }
         field(&mut hash, b"extern");

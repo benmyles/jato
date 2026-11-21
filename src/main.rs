@@ -2,6 +2,7 @@ mod admission;
 mod compiler;
 mod fingerprint;
 mod invocation;
+mod staging;
 mod store;
 mod watch;
 
@@ -33,6 +34,7 @@ Environment
   JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
   JATO_MAX_SIZE     Persistent cache budget, default 1GiB
   JATO_LOG=debug    Explain each cache decision on stderr
+  JATO_DISABLE=1    Run the compiler directly
 ";
 
 fn main() {
@@ -58,23 +60,9 @@ fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let first = args.first().map(OsString::as_os_str);
     let verb = first.and_then(OsStr::to_str);
-    if let Some(driver) = first
-        && (Path::new(driver).components().count() > 1
-            || driver == "rustc"
-            || env::var_os("RUSTC_WORKSPACE_WRAPPER").as_deref() == Some(driver)
-            || env::var_os("RUSTC").as_deref() == Some(driver)
-            || (env::var_os("CARGO").is_some()
-                && args.get(1).is_some_and(|s| {
-                    s == "-vV"
-                        || s == "--crate-name"
-                        || Path::new(s).file_name() == Some(OsStr::new("rustc"))
-                })))
-    {
-        return compiler::wrap(driver, &args[1..]);
-    }
     match verb {
         Some("--version" | "-V") => println!("jato {}", env!("CARGO_PKG_VERSION")),
-        Some("--help" | "-h" | "help") | None => {
+        Some("--help" | "-h" | "help") => {
             print!("{HELP}")
         }
         Some("check" | "build" | "test" | "run" | "clippy") => {
@@ -87,7 +75,14 @@ fn run() -> Result<i32> {
             if args.len() == 2 {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
+                let hits = stats.counters.get("hit").copied().unwrap_or(0);
+                let misses = stats.counters.get("miss").copied().unwrap_or(0);
                 println!("Cache     {}", stats.directory.display());
+                println!("Lookups   {hits} hits, {misses} compiler runs after lookup");
+                println!(
+                    "On disk   {:.2} MiB including SQLite files",
+                    stats.database_bytes as f64 / 1048576.0
+                );
                 println!(
                     "Entries   {} ({} unique chunks)",
                     stats.entries, stats.chunks
@@ -101,7 +96,9 @@ fn run() -> Result<i32> {
                     stats.compressed_bytes, stats.artifact_bytes
                 );
                 for (name, value) in stats.counters {
-                    println!("{name:<20} {value}");
+                    if name != "hit" && name != "miss" {
+                        println!("{name:<20} {value}");
+                    }
                 }
             }
         }
@@ -112,6 +109,24 @@ fn run() -> Result<i32> {
                 .transpose()?
                 .unwrap_or(cache_limit()?);
             println!("Evicted {} entries", Store::open()?.prune(limit)?);
+        }
+        None if first.is_none() => print!("{HELP}"),
+        _ if first.is_some_and(|driver| {
+            Path::new(driver).components().count() > 1
+                || driver == "rustc"
+                || env::var_os("RUSTC_WORKSPACE_WRAPPER").as_deref() == Some(driver)
+                || env::var_os("RUSTC").as_deref() == Some(driver)
+                || (env::var_os("CARGO").is_some()
+                    && args[1..].iter().any(|a| {
+                        a == "-vV"
+                            || a == "--crate-name"
+                            || a == "--print"
+                            || a.as_encoded_bytes().starts_with(b"--print=")
+                            || Path::new(a).file_name() == Some(OsStr::new("rustc"))
+                    }))
+        }) =>
+        {
+            return compiler::wrap(first.unwrap(), &args[1..]);
         }
         _ => bail!("unknown command or arguments. Run jato --help"),
     }

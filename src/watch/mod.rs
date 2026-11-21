@@ -194,7 +194,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         signal.stop.store(true, Ordering::Release);
         let _ = signal.wake.try_send(());
     })?;
-    let mut workspace = Workspace::load(&options.extra)?;
+    let mut workspace = Workspace::load(&options)?;
     let mut tree = Tree::new(&workspace, inbox.clone())?;
     eprintln!("jato watch: watching {}", env::current_dir()?.display());
     let mut batch = Changes::default();
@@ -226,7 +226,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
                 || batch.paths.iter().any(|p| configuration(p))
                 || tree.topology_changed(&batch.paths)
             {
-                match Workspace::load(&options.extra)
+                match Workspace::load(&options)
                     .and_then(|ws| Ok((Tree::new(&ws, inbox.clone())?, ws)))
                 {
                     Ok((new_tree, ws)) => {

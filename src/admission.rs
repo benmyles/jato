@@ -1,7 +1,6 @@
 //! rustc dep-info describes Rust inputs. Assembly and native link attributes
 //! can open additional files behind rustc's back. Inspect the successful
 //! compilation's input set once, before admitting any of its artifacts.
-use crate::invocation::Invocation;
 use anyhow::{Result, ensure};
 use memchr::memmem;
 use rustc_lexer::{TokenKind, tokenize};
@@ -13,8 +12,8 @@ use std::process::Command;
 
 pub fn verify<'a>(
     files: impl Iterator<Item = &'a PathBuf>,
-    inv: &Invocation,
     compiler: &OsStr,
+    codegen: bool,
 ) -> Result<()> {
     // Stable rejects active feature gates. Documentation-only cfg_attr gates
     // are common and do not make a successful stable compilation opaque.
@@ -28,6 +27,11 @@ pub fn verify<'a>(
                 .is_some_and(|s| s.bytes().all(|c| c.is_ascii_digit() || c == b'.')),
         "prerelease or custom compiler"
     );
+    // Metadata emission neither assembles LLVM code nor bundles native archives.
+    // Store records of this class can only vouch for another metadata-only job.
+    if !codegen {
+        return Ok(());
+    }
     const MAX: u64 = 8 << 20;
     let mut bytes = Vec::new();
     for path in files {
@@ -42,11 +46,11 @@ pub fn verify<'a>(
             bytes.len() <= MAX as usize,
             "source changed size during admission"
         );
-        if [b"asm".as_slice(), b"link", b"extern"]
+        if [b"asm".as_slice(), b"link"]
             .iter()
             .any(|p| memmem::find(&bytes, p).is_some())
             && let Ok(src) = std::str::from_utf8(&bytes)
-            && let Some(reason) = opaque_input(src, inv)
+            && let Some(reason) = opaque_input(src)
         {
             anyhow::bail!("{reason} in {}", path.display());
         }
@@ -54,10 +58,9 @@ pub fn verify<'a>(
     Ok(())
 }
 
-fn opaque_input(source: &str, inv: &Invocation) -> Option<&'static str> {
+fn opaque_input(source: &str) -> Option<&'static str> {
     let mut input = source;
     let mut prev = "";
-    let mut before = "";
     let mut sensitive = Vec::new();
     let mut macro_definition = false;
     for token in tokenize(source) {
@@ -68,9 +71,6 @@ fn opaque_input(source: &str, inv: &Invocation) -> Option<&'static str> {
             continue;
         }
         let word = spelling.strip_prefix("r#").unwrap_or(spelling);
-        if before == "extern" && prev == "crate" && !inv.has_extern(word) {
-            return Some("undeclared extern");
-        }
         match token.kind {
             Ident | RawIdent if matches!(word, "asm" | "global_asm" | "llvm_asm" | "naked_asm") => {
                 return Some("assembly input");
@@ -93,7 +93,6 @@ fn opaque_input(source: &str, inv: &Invocation) -> Option<&'static str> {
             }
             _ => (),
         }
-        before = prev;
         prev = word;
     }
     None

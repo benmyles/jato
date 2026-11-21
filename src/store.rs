@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
@@ -62,6 +62,12 @@ impl std::fmt::Display for Damaged {
 }
 impl std::error::Error for Damaged {}
 
+pub struct Evidence<'a> {
+    pub inputs: &'a [u8],
+    pub topology: &'a Digest,
+    pub codegen: bool,
+}
+
 pub struct Store {
     conn: Connection,
     pub dir: PathBuf,
@@ -114,24 +120,37 @@ impl Store {
         let mut conn = Connection::open(dir.join("artifacts-v1.sqlite3"))?;
         conn.busy_timeout(Duration::from_secs(3))?;
         conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA synchronous=NORMAL;",
+            "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=4194304;",
         )?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < 2 {
+        ensure!(version <= 3, "unrecognized Jato cache format {version}");
+        if version < 3 {
+            let init = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join("schema.lock"))?;
+            init.lock()?;
+            let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
             if version == 0 {
                 conn.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL;")?;
             }
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(SCHEMA)?;
-            tx.commit()?;
-        } else {
-            ensure!(version == 2, "unrecognized Jato cache format {version}");
+            if version < 3 {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if version == 2 {
+                    tx.execute_batch(
+                        "ALTER TABLE plans ADD COLUMN codegen INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                tx.execute_batch(SCHEMA)?;
+                tx.commit()?;
+            }
         }
         Ok(Self { conn, dir, limit })
     }
 
     pub fn plans(&self, recipe: &Digest) -> Result<Vec<Vec<u8>>> {
-        let mut q = self.conn.prepare_cached("SELECT inputs FROM entries JOIN plans ON entry=id WHERE recipe=?1 ORDER BY access DESC LIMIT 4")?;
+        let mut q = self.conn.prepare_cached("SELECT inputs FROM entries JOIN plans ON entry=id WHERE recipe=?1 AND length(inputs)<=262144 ORDER BY access DESC LIMIT 4")?;
         let mut plans = Vec::new();
         for row in q.query_map([recipe], |r| r.get::<_, Vec<u8>>(0))? {
             let bytes = row?;
@@ -161,10 +180,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn knows_artifact(&self, digest: &Digest) -> Result<bool> {
+    pub fn knows_artifact(&self, digest: &Digest, codegen: bool) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE digest=?1)",
-            [digest],
+            "SELECT EXISTS(SELECT 1 FROM files JOIN plans ON plans.entry=files.entry WHERE digest=?1 AND (?2=0 OR codegen=1))",
+            params![digest,codegen],
             |r| r.get(0),
         )?)
     }
@@ -181,14 +200,14 @@ impl Store {
         outputs: &[PathBuf],
         stderr: &[u8],
         elapsed_ms: u64,
-        plan: Option<(&[u8], &Digest)>,
+        plan: Option<Evidence<'_>>,
     ) -> Result<bool> {
         // Compress in parallel with other compilers, outside SQLite's single writer.
         // Anonymous staging files are reclaimed by the OS even on process death.
         let mut spool = tempfile::tempfile_in(&self.dir)?;
         let mut buffer = vec![0; CHUNK];
         let mut compressor = zstd::bulk::Compressor::new(1)?;
-        let plan_cost = plan.map_or(0, |(bytes, _)| 80 + bytes.len());
+        let plan_cost = plan.as_ref().map_or(0, |p| 80 + p.inputs.len());
         let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
         if charge > self.limit || stderr.len() > DIAGNOSTIC_LIMIT {
             return Ok(false);
@@ -265,10 +284,10 @@ impl Store {
                     .execute(params![entry, slot, ordinal, &frame.hash])?;
             }
         }
-        if let Some((bytes, topology)) = plan {
+        if let Some(plan) = plan {
             tx.execute(
-                "INSERT INTO plans VALUES(?1,?2,?3)",
-                params![entry, bytes, topology],
+                "INSERT INTO plans VALUES(?1,?2,?3,?4)",
+                params![entry, plan.inputs, plan.topology, plan.codegen],
             )?;
         }
         evict(&tx, self.limit)?;
@@ -309,15 +328,15 @@ impl Store {
                     },
                 )?;
                 let mut tmp =
-                    NamedTempFile::new_in(path.parent().context("output lacks a directory")?)?;
+                    crate::staging::file(path.parent().context("output lacks a directory")?)?;
                 let mut hasher = blake3::Hasher::new();
                 let mut written = 0u64;
-                let mut stmt = tx.prepare_cached("SELECT c.hash,c.raw,c.data FROM parts p JOIN chunks c ON c.hash=p.chunk WHERE entry=?1 AND slot=?2 ORDER BY ordinal")?;
+                let mut stmt = tx.prepare_cached("SELECT c.hash,c.raw,CASE WHEN length(c.data)<=262144 THEN c.data END FROM parts p JOIN chunks c ON c.hash=p.chunk WHERE entry=?1 AND slot=?2 ORDER BY ordinal")?;
                 let mut rows = stmt.query(params![id, slot])?;
                 while let Some(row) = rows.next()? {
                     let hash: Digest = row.get(0)?;
                     let raw: usize = row.get(1)?;
-                    let packed = row.get_ref(2)?.as_blob()?;
+                    let packed = row.get_ref(2)?.as_blob().map_err(|_| Damaged(Some(hash)))?;
                     ensure!(raw <= CHUNK && packed.len() <= raw, Damaged(Some(hash)));
                     let decoded;
                     let bytes = if packed.len() == raw {
@@ -367,16 +386,23 @@ impl Store {
             tmp.persist(path)?;
         }
         // A failed statistics update cannot invalidate already verified outputs.
-        let _ = self.conn.execute(
-            "UPDATE entries SET access=?1 WHERE key=?2",
-            params![now(), key],
-        );
-        let _ = self.count("hit", 1);
-        let _ = self.count("reused_compiler_ms", ms);
+        let _ = (|| -> Result<()> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE entries SET access=?1 WHERE key=?2",
+                params![now(), key],
+            )?;
+            tx.execute("INSERT INTO counters VALUES ('hit',1),('reused_compiler_ms',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [ms])?;
+            tx.commit()?;
+            Ok(())
+        })();
         Ok(Some(stderr))
     }
 
     pub fn prune(&mut self, limit: u64) -> Result<u64> {
+        crate::staging::clean(&self.dir)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -386,7 +412,7 @@ impl Store {
     }
 
     pub fn stats(&self) -> Result<Stats> {
-        let conn = &self.conn;
+        let conn = self.conn.unchecked_transaction()?;
         let scalar = |q| -> rusqlite::Result<u64> { conn.query_row(q, [], |r| r.get(0)) };
         let mut events = conn.prepare("SELECT name,value FROM counters ORDER BY name")?;
         let database_bytes = [
@@ -462,6 +488,35 @@ mod tests {
         assert!(store.restore(&[1; 32], &files).is_err());
         assert_eq!(fs::read(output)?, b"old");
         assert_eq!(store.stats()?.charged_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn check_metadata_cannot_certify_codegen_and_destination_failure_keeps_data() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::at(root.path().join("cache"), 1 << 20)?;
+        let output = root.path().join("lib.rmeta");
+        fs::write(&output, b"metadata")?;
+        let proof = Evidence {
+            inputs: b"{}",
+            topology: &[0; 32],
+            codegen: false,
+        };
+        store.save(
+            &[0; 32],
+            &[1; 32],
+            std::slice::from_ref(&output),
+            &[],
+            0,
+            Some(proof),
+        )?;
+        let digest = *blake3::hash(b"metadata").as_bytes();
+        assert!(store.knows_artifact(&digest, false)?);
+        assert!(!store.knows_artifact(&digest, true)?);
+        let impossible = output.join("not-a-directory");
+        assert!(store.restore(&[1; 32], &[impossible]).is_err());
+        assert_eq!(store.stats()?.entries, 1);
+        assert!(store.restore(&[1; 32], &[output])?.is_some());
         Ok(())
     }
 

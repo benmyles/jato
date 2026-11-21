@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS entries(
     id INTEGER PRIMARY KEY, key BLOB UNIQUE NOT NULL, recipe BLOB NOT NULL,
     access INTEGER NOT NULL, stderr BLOB NOT NULL, stderr_hash BLOB NOT NULL, compile_ms INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS recipes ON entries(recipe);
+CREATE INDEX IF NOT EXISTS recipes ON entries(recipe,access DESC);
 CREATE INDEX IF NOT EXISTS lru ON entries(access);
 CREATE TABLE IF NOT EXISTS files(
     entry INTEGER REFERENCES entries ON DELETE CASCADE, slot INTEGER, digest BLOB NOT NULL,
@@ -47,7 +47,7 @@ CREATE TRIGGER IF NOT EXISTS drop_part AFTER DELETE ON parts BEGIN
     DELETE FROM chunks WHERE hash=OLD.chunk AND refs=0;
 END;
 CREATE TABLE IF NOT EXISTS plans(
-    entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, inputs BLOB NOT NULL, topology BLOB NOT NULL
+    entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, inputs BLOB NOT NULL, topology BLOB NOT NULL, codegen INTEGER NOT NULL DEFAULT 0
 );
 CREATE TRIGGER IF NOT EXISTS add_plan AFTER INSERT ON plans BEGIN
     UPDATE usage SET bytes=bytes+80+length(NEW.inputs);
@@ -55,4 +55,4 @@ END;
 CREATE TRIGGER IF NOT EXISTS drop_plan AFTER DELETE ON plans BEGIN
     UPDATE usage SET bytes=bytes-80-length(OLD.inputs);
 END;
-PRAGMA user_version=2;
+PRAGMA user_version=3;

@@ -3,19 +3,31 @@ use std::path::{Path, PathBuf};
 
 pub struct Invocation {
     pub name: String,
+    pub codegen: bool,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
-    extern_names: Vec<String>,
     pub outputs: Vec<PathBuf>, // dep-info is always first
     pub probe_args: Vec<OsString>,
 }
 
 impl Invocation {
-    pub fn has_extern(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "self" | "core" | "alloc" | "std" | "test" | "proc_macro"
-        ) || self.extern_names.iter().any(|s| s == name)
+    pub fn confirms_outputs(&self, diagnostics: &[u8]) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        for line in diagnostics
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+                return false;
+            };
+            if message["$message_type"] == "artifact" {
+                let Some(path) = message["artifact"].as_str() else {
+                    return false;
+                };
+                seen.insert(PathBuf::from(path));
+            }
+        }
+        seen.len() == self.outputs.len() && self.outputs.iter().all(|p| seen.contains(p))
     }
 
     pub fn parse(compiler: &OsStr, args: &[OsString]) -> Result<Self, &'static str> {
@@ -27,10 +39,11 @@ impl Invocation {
         let mut crate_type = None;
         let mut test = false;
         let mut emit = None;
+        let mut json_errors = false;
+        let mut artifacts = false;
         let mut out_dir = None;
         let mut source = None;
         let mut externs = Vec::new();
-        let mut extern_names = Vec::new();
         let mut probe_args = Vec::new();
         let mut i = 0;
         while i < args.len() {
@@ -61,13 +74,13 @@ impl Invocation {
             };
             let mut probe = true;
             match flag {
-                "--crate-name" => name = Some(value()?),
-                "--crate-type" => crate_type = Some(value()?),
-                "--emit" => {
+                "--crate-name" if name.is_none() => name = Some(value()?),
+                "--crate-type" if crate_type.is_none() => crate_type = Some(value()?),
+                "--emit" if emit.is_none() => {
                     emit = Some(value()?);
                     probe = false;
                 }
-                "--out-dir" => out_dir = Some(PathBuf::from(value()?)),
+                "--out-dir" if out_dir.is_none() => out_dir = Some(PathBuf::from(value()?)),
                 "--test" => test = true,
                 "--extern" => {
                     let arg = value()?;
@@ -75,8 +88,7 @@ impl Invocation {
                         probe_args.extend_from_slice(&args[start..i]);
                         continue;
                     }
-                    let (name, path) = arg.split_once('=').ok_or("implicit_extern")?;
-                    extern_names.push(name.rsplit(':').next().unwrap().to_owned());
+                    let (_, path) = arg.split_once('=').ok_or("implicit_extern")?;
                     let path = PathBuf::from(path);
                     if !matches!(
                         path.extension().and_then(OsStr::to_str),
@@ -86,6 +98,9 @@ impl Invocation {
                     }
                     externs.push(path);
                 }
+                // dependency= serves transitive crates. Direct imports must
+                // come from --extern or the fingerprinted sysroot. A plain
+                // -L, crate=, or native= would allow undeclared inputs.
                 "-L" => {
                     if !value()?.starts_with("dependency=") {
                         return Err("native_search_path");
@@ -111,6 +126,10 @@ impl Invocation {
                         | "target-feature"
                         | "relocation-model"
                         | "symbol-mangling-version"
+                        | "linker"
+                        | "link-arg"
+                        | "link-args"
+                        | "linker-features"
                         | "force-frame-pointers"
                         | "force-unwind-tables" => (),
                         _ => return Err("codegen_option"),
@@ -124,11 +143,19 @@ impl Invocation {
                 }
                 "--cfg" | "--check-cfg" | "--edition" | "--cap-lints" | "--allow" | "--warn"
                 | "--deny" | "--forbid" | "--force-warn" | "-A" | "-W" | "-D" | "-F"
-                | "--error-format" | "--color" | "--diagnostic-width" => {
+                | "--color" | "--diagnostic-width" => {
                     value()?;
                 }
+                "--error-format" => {
+                    if value()? != "json" {
+                        return Err("diagnostic_option");
+                    }
+                    json_errors = true;
+                }
                 "--json" => {
-                    if !value()?.split(',').all(|v| {
+                    let opts = value()?;
+                    artifacts |= opts.split(',').any(|v| v == "artifacts");
+                    if !opts.split(',').all(|v| {
                         matches!(
                             v,
                             "artifacts"
@@ -156,6 +183,9 @@ impl Invocation {
             return Err("custom_output");
         }
         let dir = out_dir.ok_or("custom_output")?;
+        if !artifacts || !json_errors {
+            return Err("diagnostic_option");
+        }
         let kinds: Vec<_> = emit.ok_or("custom_output")?.split(',').collect();
         if !kinds.contains(&"dep-info")
             || !kinds
@@ -184,9 +214,9 @@ impl Invocation {
         }
         Ok(Self {
             name: name.into(),
+            codegen: kinds.contains(&"link"),
             source: source.ok_or("missing_source")?,
             externs,
-            extern_names,
             outputs,
             probe_args,
         })
