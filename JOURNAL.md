@@ -1,5 +1,9 @@
 # Work journal
 
+## 2026-11-21 — profiling the 0.2 release
+
+- Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.
+
 ## 2026-11-21
 
 - Started from an empty repository. Found a locally customized kache installation and checked its scheduler notes and regression scenarios.

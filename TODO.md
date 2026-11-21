@@ -14,3 +14,9 @@
 - [x] Accelerate eligible native executable builds with verified linker inputs.
 - [x] Reduce save-to-diagnostic latency and idle work in watch mode.
 - [x] Qualify correctness, run repeated comparisons, and install the measured release.
+
+## Verification and storage hot paths
+
+- [ ] Shorten content verification on the last link while respecting Cargo's job limit.
+- [ ] Reduce repeated store work on small artifacts and closely spaced saves.
+- [ ] Compare against the installed 0.2 release and peers, and qualify the installed update.
