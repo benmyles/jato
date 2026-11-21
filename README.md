@@ -4,7 +4,7 @@ Jato speeds up repeat Rust builds and gives you compiler feedback on save. It re
 
 Jato 0.10 can also accelerate Cargo when you need the same project in several ordinary target directories. It can verify links made by the upstream Linux x86-64 mold 3.0.0 release, including build scripts and procedural-macro libraries. [Measurements and reproduction commands](bench/README.md)
 
-On stable ripgrep, Jato 0.9 restored a clean development build in a median 146 ms, versus 319 ms for kache and 1.62 s for sccache. Olo's pinned nightly project still favors kache for a full rebuild after deleting Cargo's intermediates. The measurements distinguish empty stores, full restores and new delivery directories with fresh Cargo state. [Benchmarks](bench/README.md)
+On stable ripgrep, Jato restored a clean development build in a median 200 ms. kache took 569 ms through its compiler wrapper and 909 ms through its Cargo shim. sccache took 4.10 s. Olo’s pinned nightly project still favors kache for a full rebuild after deleting Cargo’s intermediates. [Cold, restored and fresh benchmarks](bench/README.md)
 
 ## Get started
 

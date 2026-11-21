@@ -29,6 +29,20 @@ A retained Cargo build directory lets Cargo preserve its own fingerprints, build
 
 Cargo hardlinked copies of `nm-fake` across the two same-filesystem targets. On opposite sides of a Btrfs subvolume boundary, the public targets had distinct inodes. Overwriting A in place preserved B and the next delivery to C. C took 0.78 s. The Olo trial reused an existing physical intermediate directory and put public output on a new subvolume. The CLI regression exercises newly managed intermediates on their own subvolume. [Delivery timings and byte checks](cargo-delivery-0.10.json) · [Cargo build cache](https://doc.rust-lang.org/cargo/reference/build-cache.html)
 
+## Stable ripgrep
+
+Three rotating trials built ripgrep 14.1.1 using Rust 1.100, identical development profile settings, four jobs and a compiler selected through PATH. Each executable ran after each build. The comparison included both the kache wrapper and its Cargo shim. Normal Cargo compiler-info caching was enabled.
+
+| Median elapsed | Jato 0.10 | Jato 0.9 | kache wrapper | kache Cargo shim | sccache | Bare Cargo |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold | 11.84 s | 13.55 s | 9.59 s | 14.51 s | 8.94 s | 11.44 s |
+| Full restore | 200 ms | 258 ms | 569 ms | 909 ms | 4.10 s | 11.60 s |
+| Already fresh | 29 ms | 34 ms | 32 ms | 43 ms | 37 ms | 33 ms |
+
+The Jato store occupied 108.4 MiB in logical files and 2.57 MiB of exclusive Btrfs extents while the target existed. The kache wrapper used 109.3 MiB logical and 0.66 MiB exclusive. sccache used 23.6 MiB logical. Median peak individual-process RSS during restore was 85 MiB with Jato and 34 MiB with kache. Jato had zero idle daemon RAM. The kache and sccache daemons each retained about 19 MiB RSS. These disk and memory metrics describe different resources and phases. [Trial results and filesystem accounting](named-ripgrep-0.10.json)
+
+One separate ripgrep trial kept each contender's Cargo intermediates. After removing the delivery target, rebuilding took 29 ms with Jato, 31 ms with the kache wrapper, 40 ms with its Cargo shim, 28 ms with sccache and 30 ms with bare Cargo. The Jato trial's Cargo intermediate files totaled 143.2 MiB logical, separately from its compiler cache. [Retained-directory controls](retained-ripgrep-0.10.json)
+
 ## Concurrent Cargo jobs
 
 Two concurrent builds selected separate packages and delivery targets in one workspace using `jato --keep-build`. Each build script slept for 800 ms. With default locking their script intervals had zero overlap in both trials. Olo's pinned Cargo with `-Zfine-grain-locking` overlapped them by 765 and 769 ms. Both delivered programs ran with their expected output. This exercises Cargo's scheduling behavior on a controlled fixture. [Timing and overlap samples](cargo-scheduling-0.10.json) · [Benchmark](cargo_scheduling.py)
@@ -40,6 +54,8 @@ We also timed five alternating Olo unit-graph constructions with nightly's exper
 Jato authenticates the user-installed mold executable while hashing it for the native-input fingerprint. On 27 observed build-script links, one fewer 42,246,008-byte read per link avoids 1.06 GiB of logical reads. The same-size modified-linker regression still rejects publication. For a linked macro library, an external input was changed after cleaning the target. The library hit and its consumer generated the new value.
 
 A separate serial Cargo test retained a 15.5 MiB dependency in the target and evicted the producer's Jato entry. The dependency was too old to have a publication in flight. On that consumer the 0.9 wrapper read 16,255,732 dependency bytes. The 0.10 wrapper read zero, and rustc produced metadata with the expected value. Source edits, failing consumers and reversions are separate cases in the harness. A 0.9 store also restored all 39 ripgrep units under 0.10. Its executable matched SHA-256 and passed 299 upstream tests. [Uncertified dependency trace](uncertified-extern-0.10.json) · [Cache migration and upstream tests](upstream-0.10.json)
+
+For four unchanged consumers of an edited producer with an 8 MiB embedded asset, three iterations measured median successful checks of 317 ms for Jato, 485 ms for kache and 855 ms for sccache. Reverting the edit took 75, 227 and 210 ms respectively. A downstream type check verified each successful revision. A rejected revision produced the expected compiler error. [Dependency edit samples and wrapper byte traces](dependency-edits-0.10.json)
 
 ## Save-to-compiler feedback
 

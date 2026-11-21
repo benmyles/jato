@@ -11,6 +11,7 @@
 - Rebuilt both Olo packages with the release binary. Full restore produced 188 hits, 62 misses and 26 opaque macro consumers, taking 188.92 s. The kache wrapper took 2.97 s and its Cargo shim took 5.55 s into an emptied target with a primed store. Retaining Cargo state gave Jato 0.67–0.83 s delivery with independently writable Btrfs copies.
 - Counted bytes read by a real consumer wrapper after evicting its producer. Version 0.9 read 16,255,732 bytes of old metadata. Version 0.10 read zero and rustc produced the expected downstream type. A migrated ripgrep build restored 39 units, reproduced the executable and passed 299 upstream tests.
 - Checked Cargo's nightly scheduling on two simultaneous builds with 800 ms build scripts. Default locking serialized the scripts. Fine-grained locking overlapped them by 765 and 769 ms. A separate experimental resolver run produced the same Olo unit graph while changing lockfile semantics, so the normal CLI keeps Cargo’s selected resolver.
+- In three rotating stable ripgrep runs, full clean-target restores took a median 200 ms with Jato, 569 ms with the kache wrapper, 909 ms with its Cargo shim and 4.10 s with sccache. With fresh Cargo intermediates all five entry points, including bare Cargo, delivered the executable in 28–40 ms.
 
 ## 2026-11-21 — Olo nightly Cargo builds
 
