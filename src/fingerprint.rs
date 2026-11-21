@@ -664,13 +664,34 @@ pub fn native_externs<'a>(
 }
 
 pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) -> Result<Externs> {
-    certify_externs(
-        &extern_inputs(inv, since)?,
-        inv.codegen,
-        since,
-        store,
-        defer,
-    )
+    let inputs = extern_inputs(inv, since)?;
+    // After an expensive compile an opaque dependency can rule out this
+    // entire capture. Check sizes before reading a large dependency set.
+    // Fresh pipelined metadata can still be recorded pending its producer.
+    if defer
+        && inputs
+            .iter()
+            .fold(0u64, |bytes, input| bytes.saturating_add(input.size()))
+            >= 1 << 20
+    {
+        for input in &inputs {
+            ensure!(
+                can_defer(input, since) || store.has_artifact_size(input.size(), inv.codegen)?,
+                "unverified extern {}",
+                input.path().display()
+            );
+        }
+    }
+    certify_externs(&inputs, inv.codegen, since, store, defer)
+}
+
+fn can_defer(input: &crate::content::Input<'_>, since: SystemTime) -> bool {
+    input.path().extension() == Some(OsStr::new("rmeta"))
+        && since
+            .duration_since(input.modified)
+            .unwrap_or_default()
+            .as_secs()
+            <= 120
 }
 
 pub fn certify_externs(
@@ -691,14 +712,7 @@ pub fn certify_externs(
     {
         let path = input.path();
         if !store.knows_artifact(&digest, codegen)? {
-            if !defer
-                || path.extension() != Some(OsStr::new("rmeta"))
-                || since
-                    .duration_since(fs::metadata(path)?.modified()?)
-                    .unwrap_or_default()
-                    .as_secs()
-                    > 120
-            {
+            if !defer || !can_defer(input, since) {
                 bail!("unverified extern {}", path.display());
             }
             needs.push(digest);

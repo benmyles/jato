@@ -40,6 +40,8 @@ fn literal_instruction(word: &str) -> bool {
             | "sbb"
             | "mul"
             | "div"
+            | "sqrtsd"
+            | "sqrtss"
             | "lfence"
             | "sfence"
             | "mfence"

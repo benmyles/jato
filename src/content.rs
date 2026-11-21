@@ -17,7 +17,9 @@ use std::time::SystemTime;
 static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
 
 pub fn open(path: &Path) -> std::io::Result<File> {
-    open_with_flags(path, 0)
+    // Callers expect a regular file. A replacement FIFO between stat and open
+    // must not block the compiler.
+    open_with_flags(path, libc::O_NONBLOCK)
 }
 
 pub(crate) fn open_with_flags(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
@@ -57,6 +59,7 @@ pub fn inherit_jobs() {
 pub struct Input<'a> {
     path: &'a Path,
     identity: [u64; 7],
+    pub(crate) modified: SystemTime,
     handle: Option<File>,
 }
 
@@ -83,6 +86,7 @@ impl<'a> Input<'a> {
         Ok(Self {
             path,
             identity: stamp(meta),
+            modified: meta.modified()?,
             handle: None,
         })
     }
@@ -298,11 +302,8 @@ mod tests {
         ] {
             let data = &bytes[..size as usize];
             fs::write(&path, data)?;
-            let input = Input {
-                path: &path,
-                identity: stamp(&fs::metadata(&path)?),
-                handle: None,
-            };
+            let since = SystemTime::now() + std::time::Duration::from_secs(1);
+            let input = Input::new(&path, &fs::metadata(&path)?, since)?;
             for workers in 1..=4 {
                 let parts = ranges(size, workers)
                     .map(|r| input.read(r))

@@ -4,7 +4,6 @@ use std::ffi::OsStr;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 // Upstream mold 3.0.0, x86_64 Linux. The release archive's SHA-256 is
 // 6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189.
@@ -21,14 +20,8 @@ pub(super) fn candidate(path: &Path) -> bool {
         .is_ok_and(|m| m.is_file() && m.len() == BYTES)
 }
 
-pub(super) fn verified(path: &Path) -> Result<bool> {
-    if !candidate(path) {
-        return Ok(false);
-    }
-    let file = crate::content::open_with_flags(path, libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
-    let input = crate::content::Input::with_file(path, file, SystemTime::now())?;
-    Ok(crate::content::digests(&[input], 2 << 20)?[0]
-        == *blake3::Hash::from_hex(BLAKE3)?.as_bytes())
+pub(super) fn authentic(digest: &crate::store::Digest) -> bool {
+    blake3::Hash::from_bytes(*digest).to_hex().as_str() == BLAKE3
 }
 
 pub(super) struct Output {
@@ -173,7 +166,24 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("mold");
         fs::copy(upstream, &path)?;
-        ensure!(verified(&path)?);
+        let manifest = super::super::Manifest {
+            verified_mold: true,
+            release_images: [path.clone()].into(),
+            read: vec![path.clone()],
+            lookup: vec![],
+            missing: vec![],
+            listed: vec![],
+            shared_listing: None,
+        };
+        let digest = || {
+            manifest.digest(
+                Path::new("/unused"),
+                std::time::SystemTime::now(),
+                &Default::default(),
+                &[],
+            )
+        };
+        digest()?;
         let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
         let mut byte = [0];
         file.read_exact_at(&mut byte, BYTES / 2)?;
@@ -181,7 +191,7 @@ mod tests {
         file.write_all_at(&byte, BYTES / 2)?;
         drop(file);
         assert!(candidate(&path));
-        assert!(!verified(&path)?);
+        assert!(digest().is_err());
         Ok(())
     }
 }

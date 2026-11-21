@@ -94,6 +94,11 @@ pub fn active_incremental(dir: &Path, krate: &str) -> Option<bool> {
 pub struct Manifest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     verified_mold: bool,
+    // On the publishing invocation these execve paths must be authenticated
+    // by the same whole-file reads that supply the native fingerprint. A
+    // later lookup already has that authenticated fingerprint to match.
+    #[serde(skip)]
+    release_images: BTreeSet<PathBuf>,
     missing: Vec<(PathBuf, bool)>,
     lookup: Vec<PathBuf>,
     read: Vec<PathBuf>,
@@ -199,8 +204,8 @@ impl Capture {
                 .map(|p| p.join("ld.mold"))
                 .find(|p| p.is_file())
             && let mold = fs::canonicalize(mold)?
-            && !mold::candidate(&mold)
             && trusted_tool(&mold, root)?.is_none()
+            && !mold::candidate(&mold)
         {
             bail!("user-installed mold: delegated native link");
         }
@@ -218,8 +223,9 @@ impl Capture {
                 .find(|p| p.is_file())
                 .context("no native linker driver")?
         };
+        let image = fs::canonicalize(&candidate)?;
         ensure!(
-            trusted_tool(&fs::canonicalize(&candidate)?, root)?.is_some(),
+            trusted_tool(&image, root)?.is_some() || mold::candidate(&image),
             "{} is a custom linker or launcher. --system-linker selects /usr/bin/cc",
             candidate.display()
         );
@@ -736,6 +742,7 @@ impl Observations {
         let mut compiled = false;
         let mut linked = false;
         let mut verified_mold = false;
+        let mut release_images = BTreeSet::new();
         for path in &self.images {
             let image = fs::canonicalize(path)?;
             if image == compiler {
@@ -745,8 +752,14 @@ impl Observations {
                     inv.executable,
                     "external tool during native library compilation"
                 );
-                let is_linker = trusted_tool(&image, root)?
-                    .with_context(|| format!("unverified native tool {}", image.display()))?;
+                let is_linker = match trusted_tool(&image, root)? {
+                    Some(linker) => linker,
+                    None if mold::candidate(&image) => {
+                        release_images.insert(path.clone());
+                        true
+                    }
+                    None => bail!("unverified native tool {}", image.display()),
+                };
                 verified_mold |= is_linker
                     && matches!(
                         image.file_name().and_then(OsStr::to_str),
@@ -812,6 +825,7 @@ impl Observations {
             .collect();
         let mut plan = Manifest {
             verified_mold: verified_mold || self.reentered,
+            release_images,
             missing: Vec::new(),
             lookup: Vec::new(),
             read: Vec::new(),
@@ -944,7 +958,7 @@ fn trusted_tool(image: &Path, root: &Path) -> Result<Option<bool>> {
     if !image.starts_with(root)
         && !(system_file(image) && system_owner(image, &fs::metadata(image)?))
     {
-        return Ok(mold::verified(image)?.then_some(true));
+        return Ok(None);
     }
     let file = image.file_name().and_then(OsStr::to_str).unwrap_or("");
     let mut name = file;
@@ -1008,6 +1022,7 @@ impl Manifest {
         let mut hashes = BTreeMap::new();
         let mut content = Vec::new();
         let mut occurrences = Vec::new();
+        let mut release_digests = Vec::new();
         let mut symlinks = BTreeSet::new();
         for (p, not_directory) in &self.missing {
             let expected = if *not_directory {
@@ -1118,11 +1133,14 @@ impl Manifest {
                         !recent(&m, since),
                         "native input changed during compilation"
                     );
-                    if real.starts_with(root) || system_file(&real) && system_owner(&real, &m) {
+                    let release = class == b'r' && self.release_images.contains(p);
+                    if !release
+                        && (real.starts_with(root) || system_file(&real) && system_owner(&real, &m))
+                    {
                         for n in stamp(&m) {
                             h.update(&n.to_le_bytes());
                         }
-                    } else if !covered.contains(&real) {
+                    } else if release || !covered.contains(&real) {
                         let index = match hashes.entry(stamp(&m)) {
                             std::collections::btree_map::Entry::Occupied(v) => *v.get(),
                             std::collections::btree_map::Entry::Vacant(v) => {
@@ -1133,6 +1151,9 @@ impl Manifest {
                         };
                         field(&mut h, b"content");
                         occurrences.push(index);
+                        if release {
+                            release_digests.push(index);
+                        }
                     }
                 } else {
                     bail!("non-regular native input {}", p.display());
@@ -1140,6 +1161,13 @@ impl Manifest {
             }
         }
         let digests = crate::content::digests(&content, 2 << 20)?;
+        ensure!(
+            release_digests.len() == self.release_images.len()
+                && release_digests
+                    .into_iter()
+                    .all(|i| mold::authentic(&digests[i])),
+            "unverified mold executable"
+        );
         for index in occurrences {
             field(&mut h, &digests[index]);
         }
