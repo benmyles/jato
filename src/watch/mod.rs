@@ -79,6 +79,7 @@ impl Options {
 struct Changes {
     full: bool,
     paths: BTreeSet<PathBuf>,
+    new_dirs: BTreeSet<PathBuf>,
 }
 
 impl Changes {
@@ -86,11 +87,15 @@ impl Changes {
         Self {
             full: true,
             paths: BTreeSet::new(),
+            new_dirs: BTreeSet::new(),
         }
     }
-    fn add(&mut self, path: PathBuf) {
+    fn add(&mut self, path: PathBuf, created_dir: bool) {
         if self.full {
             return;
+        }
+        if created_dir && !self.paths.contains(&path) {
+            self.new_dirs.insert(path.clone());
         }
         self.paths.insert(path);
         if self.paths.len() >= 128 {
@@ -102,7 +107,8 @@ impl Changes {
             *self = Self::all();
         } else {
             for p in other.paths {
-                self.add(p);
+                let created = other.new_dirs.contains(&p);
+                self.add(p, created);
             }
         }
     }
@@ -118,10 +124,10 @@ struct Inbox {
 }
 
 impl Inbox {
-    fn record(&self, paths: Vec<PathBuf>) {
+    fn record(&self, paths: Vec<PathBuf>, created_dir: bool) {
         let mut changes = self.changes.lock().unwrap();
         for p in paths {
-            changes.add(p);
+            changes.add(p, created_dir);
         }
         let _ = self.wake.try_send(());
     }
@@ -215,6 +221,20 @@ pub fn run(args: &[OsString]) -> Result<i32> {
             deadline = Some(Instant::now() + options.delay);
         }
         if deadline.is_some_and(|d| d <= Instant::now()) {
+            tree.drop_transient_output_dirs(&mut batch);
+            if batch.empty() {
+                batch = Changes::default();
+                deadline = None;
+                continue;
+            }
+            if env::var_os("JATO_LOG").as_deref() == Some(std::ffi::OsStr::new("debug")) {
+                if batch.full {
+                    eprintln!("jato watch: filesystem requested a rescan");
+                }
+                for path in &batch.paths {
+                    eprintln!("jato watch: changed {}", path.display());
+                }
+            }
             if let Some(mut old) = job.take() {
                 old.stop();
                 batch.merge(wave.clone());

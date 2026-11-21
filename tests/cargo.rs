@@ -422,6 +422,7 @@ fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
     let mut child = p
         .command()
         .env("WATCH_STARTS", &log)
+        .env("JATO_LOG", "debug")
         .current_dir(p.temp.path())
         .args([
             "watch",
@@ -436,7 +437,9 @@ fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
         .arg("--target-dir")
         .arg(p.root.join("custom output"))
         .args(["--", "two words"])
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(p.temp.path().join("watch.log")).unwrap(),
+        ))
         .spawn()
         .unwrap();
     struct StopOnDrop(u32);
@@ -463,7 +466,12 @@ fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
     };
     wait_for_runs(1);
     std::thread::sleep(Duration::from_millis(180));
-    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().lines().count(),
+        1,
+        "{}",
+        fs::read_to_string(p.temp.path().join("watch.log")).unwrap()
+    );
     write(&source, &format!("{main}\n// save"));
     let runs = wait_for_runs(2);
     unsafe {
@@ -507,4 +515,63 @@ fn nested_workspace_wrapper_runs_with_original_compiler_arguments() {
             .lines()
             .any(|p| Path::new(p).file_name() == Some(OsStr::new("rustc")))
     );
+}
+
+#[test]
+fn compiler_environment_and_features_invalidate_independently() {
+    let p = Project::new();
+    for (path, features) in [
+        (
+            p.root.join("Cargo.toml"),
+            "[features]\nfast=['leaf/fast']\n",
+        ),
+        (p.root.join("leaf/Cargo.toml"), "[features]\nfast=[]\n"),
+    ] {
+        let manifest = fs::read_to_string(&path).unwrap();
+        write(path, &format!("{manifest}\n{features}"));
+    }
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        r#"pub fn value() -> String {
+        format!("{}|{:?}", cfg!(feature="fast"), option_env!("LEAF_ENV"))
+    }"#,
+    );
+    for (fast, value) in [
+        (false, None),
+        (false, Some("")),
+        (false, Some("a\nb\\c")),
+        (true, Some("a\nb\\c")),
+        (false, None),
+    ] {
+        let mut cmd = p.command();
+        cmd.args(["run", "-q"]);
+        if fast {
+            cmd.args(["--features", "fast"]);
+        }
+        if let Some(v) = value {
+            cmd.env("LEAF_ENV", v);
+        }
+        assert_eq!(
+            success(&mut cmd).stdout,
+            format!("{fast}|{value:?}\n").as_bytes()
+        );
+    }
+    assert!(p.hits() > 0);
+}
+
+#[test]
+fn damaged_shared_chunks_trigger_a_real_recompile_and_heal() {
+    let p = Project::new();
+    p.run(&["run", "-q"]);
+    let db = rusqlite::Connection::open(p.temp.path().join("cache/artifacts-v1.sqlite3")).unwrap();
+    db.execute("UPDATE chunks SET data=zeroblob(length(data))", [])
+        .unwrap();
+    drop(db);
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert!(p.stats()["counters"]["corrupt"].as_u64().unwrap_or(0) > 0);
+    let hits = p.hits();
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert!(p.hits() > hits);
 }

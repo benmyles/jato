@@ -22,7 +22,10 @@ impl Tree {
         let watcher =
             notify::recommended_watcher(move |event: notify::Result<Event>| match event {
                 Ok(e) if matches!(e.kind, EventKind::Access(_)) => (),
-                Ok(e) if !e.need_rescan() && !e.paths.is_empty() => inbox.record(e.paths),
+                Ok(e) if !e.need_rescan() && !e.paths.is_empty() => inbox.record(
+                    e.paths,
+                    matches!(e.kind, EventKind::Create(notify::event::CreateKind::Folder)),
+                ),
                 _ => inbox.rescan(),
             })?;
         let mut tree = Self {
@@ -117,6 +120,26 @@ impl Tree {
     pub fn filter(&self, mut changes: Changes) -> Changes {
         changes.paths.retain(|p| !self.ignored(p, p.is_dir()));
         changes
+    }
+
+    pub fn drop_transient_output_dirs(&self, changes: &mut Changes) {
+        // Cargo initializes an output directory by making a temporary sibling
+        // named <basename><six random characters>, then renaming it. Ignore
+        // only a newly created directory that has already disappeared.
+        changes.paths.retain(|p| {
+            if !changes.new_dirs.contains(p) || self.directories.contains(p) || p.exists() {
+                return true;
+            }
+            let name = p.file_name().unwrap_or_default().as_encoded_bytes();
+            !self.excluded.iter().any(|out| {
+                out.parent() == p.parent()
+                    && out.file_name().is_some_and(|base| {
+                        name.strip_prefix(base.as_encoded_bytes()).is_some_and(|s| {
+                            s.len() == 6 && s.iter().all(u8::is_ascii_alphanumeric)
+                        })
+                    })
+            })
+        });
     }
 
     pub fn topology_changed(&self, paths: &BTreeSet<PathBuf>) -> bool {

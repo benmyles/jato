@@ -16,3 +16,5 @@
 - Added artifact-notification checks, byte-for-byte restore tests, staged-file recovery after interrupted jobs, and coverage for nested wrappers, custom watch commands, and process-group cancellation.
 - Built and ran the suite with Rust 1.89.0 in an isolated toolchain installation. Verified the wrapper against both newer and older Cargo output layouts.
 - Added repeatable save-to-diagnostic and fix-to-workspace measurements, plus Linux CI for stable Rust and the minimum supported toolchain. Verified the installed binary with this machine's existing Cargo shim and test runner.
+- A repeated watch test exposed a second run caused by Cargo's temporary sibling directory during target initialization. Filtered that short-lived directory and passed the cancellation test twelve times consecutively.
+- Added end-to-end checks for damaged-cache recovery and independent invalidation by features, absent or empty environment variables, and escaped environment values. All sixteen tests pass on Rust 1.89.0 and 1.100.0.
