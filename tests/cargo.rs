@@ -1216,3 +1216,126 @@ fn concurrent_worktrees_keep_generated_files_private_in_a_global_target() {
         2
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_foreground_command_can_handle_terminal_interrupts() {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    if !worktree_available() {
+        return;
+    }
+    let p = Project::new();
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let mut terminal = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let mut cmd = p.command();
+    cmd.args([
+        "worktree",
+        "exec",
+        "/bin/sh",
+        "-ec",
+        "trap 'exit 42' INT; echo ready; while :; do sleep .1; done",
+    ])
+    .stdin(slave.try_clone().unwrap())
+    .stdout(slave.try_clone().unwrap())
+    .stderr(slave);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(cmd);
+    let mut fd = libc::pollfd {
+        fd: terminal.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert!(unsafe { libc::poll(&mut fd, 1, 8000) } > 0);
+    let mut line = String::new();
+    BufReader::new(&terminal).read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ready");
+    terminal.write_all(&[3]).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(42));
+            break;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("foreground interrupt timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn target_only_views_reuse_a_common_dependency_and_keep_host_source_paths() {
+    if !worktree_available() {
+        return;
+    }
+    let a = Project::new();
+    let b = Project::new();
+    let shared = a.temp.path().join("shared-leaf");
+    fs::rename(a.root.join("leaf"), &shared).unwrap();
+    let cache = a.temp.path().join("cache");
+    let target = a.temp.path().join("global");
+    for (p, name) in [(&a, "first"), (&b, "second")] {
+        write(
+            p.root.join("Cargo.toml"),
+            &format!(
+                "[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nleaf={{path={shared:?}}}\n"
+            ),
+        );
+        write(
+            p.root.join("src/main.rs"),
+            r#"fn main(){println!("{} {}",leaf::value(),env!("CARGO_MANIFEST_DIR"));}"#,
+        );
+        let result = success(
+            p.command()
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_BUILD_BUILD_DIR", &target)
+                .env("CARGO_HOME", a.temp.path().join("cargo"))
+                .env("JATO_CACHE_DIR", &cache)
+                .env("JATO_LOG", "debug")
+                .args(["worktree", "run", "--release"]),
+        );
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            format!("one:none {}", p.root.display())
+        );
+        if name == "second" {
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("jato [leaf] hit"),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+    assert_eq!(
+        fs::read_dir(target.join(".jato-worktree")).unwrap().count(),
+        2
+    );
+}

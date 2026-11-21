@@ -15,6 +15,9 @@
 - Avoided validating the native link closure twice when a checkout’s module directories change. Across seven alternating ripgrep pairs, the median fell from 319 ms to 289 ms. All 299 upstream integration tests passed against the restored executable.
 - Profiling 192 shared 256 KiB chunks exposed SQLite rewriting payload pages just to increment a reference count. Switched reclamation to the existing indexed single-file and ordered-frame references. Tested both deletion orders and a live schema upgrade without rewriting payloads.
 
+- Tested Ctrl-C through a real foreground terminal. Kept the mount supervisor alive until the command finishes handling its signal and restored the caller’s signal mask in the payload. Also confirmed target-only views share a dependency while preserving both applications’ physical source paths.
+- Migrated populated schema versions 1, 2, 3, 6, 8, 9 and 10, then reclaimed all charged bytes. An installed-binary test restored six real 0.3 compiler entries. Checked the standard Cargo shim and ran all 299 ripgrep integration tests against a confirmed cross-checkout release hit.
+
 ## 2026-11-21 — profiling the 0.2 release
 
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.

@@ -511,6 +511,7 @@ pub fn enter(args: &[OsString]) -> Result<i32> {
     {
         return Err(std::io::Error::last_os_error()).context("creating worktree process group");
     }
+    host::restore_payload_signals()?;
     if args.first().is_some_and(|a| a == "exec") {
         let mut cmd = Command::new(args.get(1).context("missing worktree program")?);
         cmd.args(&args[2..]);

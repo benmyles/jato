@@ -24,6 +24,26 @@ use std::time::Duration;
 const ENDPOINT: &str = "JATO_WORKTREE_HOST";
 const TIMEOUT: Duration = Duration::from_millis(250);
 const PATH_LIMIT: usize = 4096;
+const FORWARDED: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+const UNBLOCK: &str = "JATO_WORKTREE_UNBLOCK";
+
+pub(super) fn restore_payload_signals() -> Result<()> {
+    let bits = std::env::var(UNBLOCK)?.parse::<u8>()?;
+    unsafe {
+        let mut mask = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        for (i, sig) in FORWARDED.iter().enumerate() {
+            if bits & (1 << i) != 0 {
+                libc::sigaddset(&mut mask, *sig);
+            }
+        }
+        let e = libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+        if e != 0 {
+            return Err(io::Error::from_raw_os_error(e).into());
+        }
+    }
+    Ok(())
+}
 
 fn peer(stream: &UnixStream) -> io::Result<libc::ucred> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -183,7 +203,7 @@ impl Signals {
             let mut mask = std::mem::zeroed();
             let mut previous = std::mem::zeroed();
             libc::sigemptyset(&mut mask);
-            for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            for s in FORWARDED {
                 libc::sigaddset(&mut mask, s);
             }
             let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
@@ -198,7 +218,7 @@ impl Signals {
             Ok(Self { fd, previous })
         }
     }
-    fn forward(&self, group: bool, child: i32, inner: Option<&(i32, Option<OwnedFd>)>) {
+    fn forward(&self, group: bool, inner: Option<&(i32, Option<OwnedFd>)>) -> Option<i32> {
         unsafe {
             let mut info: libc::signalfd_siginfo = std::mem::zeroed();
             while libc::read(
@@ -208,30 +228,30 @@ impl Signals {
             ) == std::mem::size_of_val(&info) as isize
             {
                 let sig = info.ssi_signo as i32;
+                let Some((pid, fd)) = inner else {
+                    return Some(sig);
+                };
                 if group || info.ssi_code != libc::SI_KERNEL {
                     // Leave the bubblewrap monitor alive to return the
                     // payload's actual status after it handles the signal.
-                    if let Some((pid, fd)) = inner {
-                        if group && libc::kill(-*pid, sig) == 0 {
-                            continue;
-                        }
-                        if let Some(fd) = fd {
-                            libc::syscall(
-                                libc::SYS_pidfd_send_signal,
-                                fd.as_raw_fd(),
-                                sig,
-                                std::ptr::null::<libc::siginfo_t>(),
-                                0,
-                            );
-                        } else {
-                            libc::kill(*pid, sig);
-                        }
+                    if group && libc::kill(-*pid, sig) == 0 {
+                        continue;
+                    }
+                    if let Some(fd) = fd {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            fd.as_raw_fd(),
+                            sig,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
                     } else {
-                        libc::kill(child, sig);
+                        libc::kill(*pid, sig);
                     }
                 }
             }
         }
+        None
     }
 }
 impl Drop for Signals {
@@ -271,13 +291,17 @@ pub fn run(mut cmd: Command, payload: &[OsString]) -> Result<i32> {
         cmd.process_group(0);
     }
     cmd.env("JATO_WORKTREE_PROCESS_GROUP", if group { "1" } else { "0" });
-    let previous = signals.previous;
+    // A foreground TTY broadcasts Ctrl-C to both the program and the mount
+    // supervisor. Keep the supervisor alive while the program handles it.
+    let mut bits = 0u8;
+    for (i, sig) in FORWARDED.iter().enumerate() {
+        if unsafe { libc::sigismember(&signals.previous, *sig) } == 0 {
+            bits |= 1 << i;
+        }
+    }
+    cmd.env(UNBLOCK, bits.to_string());
     unsafe {
         cmd.pre_exec(move || {
-            let e = libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
-            if e != 0 {
-                return Err(io::Error::from_raw_os_error(e));
-            }
             if libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -348,8 +372,13 @@ pub fn run(mut cmd: Command, payload: &[OsString]) -> Result<i32> {
                     Err(_) => reader = None,
                 }
             }
-            if fds[0].revents != 0 {
-                signals.forward(group, pid, inner.as_ref());
+            if fds[0].revents != 0
+                && let Some(sig) = signals.forward(group, inner.as_ref())
+            {
+                // The command has not reported its PID during mount setup.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(128 + sig);
             }
             if fds[1].revents != 0
                 && let Ok((s, _)) = server.accept()
