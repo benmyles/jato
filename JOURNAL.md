@@ -21,6 +21,10 @@
 - Across eight 16 MiB asset revisions, Jato skipped 218.75 MiB of recompression and used 22.1% fewer filesystem output blocks than 0.3. The previous and current releases restored the same original archive. A 272 MiB packed spill/restore test peaked at 7,776 KiB RSS.
 - Across eleven edits, the installed ordinary watcher reported the first compiler error in 53.5 ms and workspace success after a fix in 54.9 ms. The projected watcher took 53.6 ms and 56.5 ms.
 
+- Measured the installed release against upstream kache 2.2.0 and sccache 0.19.0 with explicit base directories. On a warm store and a separate checkout, ripgrep took 273 ms, 380 ms and 15.50 s respectively. The regex application took 109 ms, 180 ms and 4.98 s. Cold builds favored the peers.
+
+- Passed all 43 standard tests on Rust 1.89 and 1.100 with native hits, sealed files and worktree support required. Ran the larger packed I/O test separately. Verified Cargo’s locked offline source package, its benchmarks, fixtures and all four project documents.
+
 ## 2026-11-21 — profiling the 0.2 release
 
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.

@@ -2,7 +2,7 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-On a Linux workstation, a clean-target ripgrep release rebuild took **198 ms with warm Jato**, down from **25.71 s with plain Cargo**. In a separate head-to-head with upstream kache 2.2.0, Jato took **173 ms** and kache took **305 ms**. Eight revisions of a library with embedded data used **51% less packed storage than Jato 0.2**. The report includes first builds, edit latency, memory and individual samples. [Measurements and reproduction](bench/README.md)
+On a Linux workstation, a warm release build of **ripgrep 14.1.1 in a separate checkout and an empty target directory** took **273 ms with Jato worktree**, 380 ms with kache 2.2.0, and 15.50 s with sccache 0.19.0 configured for those paths. These are medians of three builds. The first builds took 27.11 s, 22.06 s and 14.84 s respectively. In an eight-revision embedded-asset workload, Jato wrote 22% fewer filesystem output blocks than Jato 0.3. [Measurements and reproduction](bench/README.md)
 
 ## Get started
 
@@ -32,7 +32,7 @@ jato --system-linker build --release
 
 ## Reuse builds across worktrees
 
-On Linux, install the distribution’s `bubblewrap` package and use the same private `JATO_CACHE_DIR` across builds. For registry dependencies shared by different projects, run `jato worktree build --release`. Source paths keep their usual meaning. For multiple copies or Git worktrees of the same workspace, run these commands from each checkout:
+On Linux, install the distribution’s `bubblewrap` package and use the same private `JATO_CACHE_DIR` across builds. For registry dependencies shared by different projects, run `jato worktree build --release`. Source paths keep their usual meaning. For multiple copies or Git worktrees of the same workspace, run the following commands from each checkout.
 
 ```sh
 jato worktree --root . build --release
@@ -41,9 +41,9 @@ jato worktree --root . paths
 jato worktree --root . cargo clean
 ```
 
-Each invocation starts Cargo in a private mount namespace. Cargo sees the same target and build paths across runs. With `--root`, it also sees the source at a stable path. Choose a root containing the workspace and any inputs reached via relative paths. Jato checks ancestor configuration before moving the source. The cache directory must be outside the projected source. The host must permit bubblewrap to create its mount namespace. [Bubblewrap](https://github.com/containers/bubblewrap) · [Cargo configuration discovery](https://doc.rust-lang.org/cargo/reference/config.html)
+Each invocation starts Cargo in a private mount namespace with the invoking user’s normal filesystem access. Cargo sees the same target and build paths across runs. With `--root`, it also sees the source at a stable path. Choose a root containing the workspace and any inputs reached via relative paths. Jato checks ancestor configuration before moving the source. The cache directory must be outside the projected source. The host must permit bubblewrap to create its mount namespace. [Bubblewrap](https://github.com/containers/bubblewrap) · [Cargo configuration discovery](https://doc.rust-lang.org/cargo/reference/config.html)
 
-Writable outputs live in a checkout-specific `.jato-worktree` subdirectory under Cargo’s configured target and build directories. This keeps Cargo’s freshness and incremental state independent, including when multiple checkouts share a global `CARGO_TARGET_DIR`. `paths` prints the physical directories as JSON and accepts the same `--target-dir`, `--manifest-path`, and `--config` options as the build. `jato worktree … cargo clean` clears that view’s build outputs. Ordinary `cargo clean` can clear the entire configured target directory.
+Writable outputs live in a checkout-specific `.jato-worktree` subdirectory under Cargo’s configured target and build directories. This keeps Cargo’s freshness and incremental state independent, including when multiple checkouts share a global `CARGO_TARGET_DIR`. Using both ordinary and projected builds retains both sets of Cargo outputs until cleaned. `paths` prints the physical directories as JSON and accepts the same `--target-dir`, `--manifest-path`, and `--config` options as the build. `jato worktree … cargo clean` clears that view’s build outputs. Ordinary `cargo clean` can clear the entire configured target directory.
 
 Compiler diagnostics, Cargo JSON, debug information and path-valued macros such as `env!("CARGO_MANIFEST_DIR")` and `env!("OUT_DIR")` can contain view paths. Use `jato worktree --root . run` or `jato worktree --root . exec PROGRAM [ARGS...]` when a program or debugger needs to open those paths. Programs that need the host checkout path embedded in a shipped binary can use ordinary `jato build`. Separate caches, toolchains, features and differing inputs still affect reuse.
 
@@ -59,7 +59,7 @@ Compiler diagnostics, Cargo JSON, debug information and path-valued macros such 
 
 The watcher uses native filesystem events and Cargo metadata. It subscribes to workspace directories, member directories, and direct local path dependencies. Use `--watch` for other inputs such as an external generator's templates. It honors directory ignore rules and excludes Cargo outputs and Jato's cache. New saves supersede an active job, including its compiler and test processes. Ctrl-C stops the watcher and its active job. Set `JATO_LOG=debug` to see which paths scheduled a check.
 
-On Linux a write-close event can complete a pending edit. A rename into place can also complete a save. On a two-package workspace the median time from saving to the first rustc error was **48 ms**, and fixing the error brought the full workspace back to green in **49 ms**. These measurements cover 22 saves per version. [Watch measurements](bench/README.md#save-to-compiler-feedback)
+On Linux a write-close event or a rename into place can complete a save. In an 11-edit, two-package workspace run, the installed watcher reported the first rustc error in a median **53.5 ms**. A fix brought the whole workspace back to green in **54.9 ms**. [Watch measurements](bench/README.md#save-to-compiler-feedback)
 
 ## Use with existing tools
 

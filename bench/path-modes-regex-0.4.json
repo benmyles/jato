@@ -1,0 +1,385 @@
+{
+  "project": "locked regex application",
+  "mode": "release",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "jobs": 4,
+  "runs": 3,
+  "versions": {
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "jato": "jato 0.4.0",
+    "worktree": "jato 0.4.0",
+    "kache": "kache 2.2.0",
+    "sccache_basedirs": "sccache 0.19.0"
+  },
+  "samples": {
+    "cargo": {
+      "cold": [
+        {
+          "seconds": 7.876222,
+          "peak_process_kib": 329384
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.051271,
+          "peak_process_kib": 35144
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 10.236843,
+          "peak_process_kib": 331492
+        },
+        {
+          "seconds": 7.587756,
+          "peak_process_kib": 332428
+        },
+        {
+          "seconds": 7.949804,
+          "peak_process_kib": 331164
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 10.398853,
+          "peak_process_kib": 325784
+        },
+        {
+          "seconds": 11.602378,
+          "peak_process_kib": 331632
+        },
+        {
+          "seconds": 7.278745,
+          "peak_process_kib": 328748
+        }
+      ],
+      "new_checkout": [
+        {
+          "seconds": 9.011997,
+          "peak_process_kib": 327468
+        },
+        {
+          "seconds": 10.237671,
+          "peak_process_kib": 325952
+        },
+        {
+          "seconds": 6.667546,
+          "peak_process_kib": 330392
+        }
+      ]
+    },
+    "jato": {
+      "cold": [
+        {
+          "seconds": 9.951616,
+          "peak_process_kib": 326388,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.025588,
+          "peak_process_kib": 20472,
+          "hits": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.07758,
+          "peak_process_kib": 20640,
+          "hits": 6
+        },
+        {
+          "seconds": 0.074193,
+          "peak_process_kib": 20600,
+          "hits": 6
+        },
+        {
+          "seconds": 0.075183,
+          "peak_process_kib": 20588,
+          "hits": 6
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 7.254487,
+          "peak_process_kib": 321464,
+          "hits": 0
+        },
+        {
+          "seconds": 7.322743,
+          "peak_process_kib": 330224,
+          "hits": 0
+        },
+        {
+          "seconds": 7.631583,
+          "peak_process_kib": 329544,
+          "hits": 0
+        }
+      ],
+      "new_checkout": [
+        {
+          "seconds": 8.418476,
+          "peak_process_kib": 331020,
+          "hits": 0
+        },
+        {
+          "seconds": 9.672495,
+          "peak_process_kib": 327892,
+          "hits": 0
+        },
+        {
+          "seconds": 14.224303,
+          "peak_process_kib": 321712,
+          "hits": 0
+        }
+      ]
+    },
+    "worktree": {
+      "cold": [
+        {
+          "seconds": 9.047975,
+          "peak_process_kib": 331472,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.034772,
+          "peak_process_kib": 20792,
+          "hits": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.091864,
+          "peak_process_kib": 20600,
+          "hits": 6
+        },
+        {
+          "seconds": 0.111925,
+          "peak_process_kib": 57884,
+          "hits": 6
+        },
+        {
+          "seconds": 0.099823,
+          "peak_process_kib": 57764,
+          "hits": 6
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.085462,
+          "peak_process_kib": 20784,
+          "hits": 6
+        },
+        {
+          "seconds": 0.086843,
+          "peak_process_kib": 20760,
+          "hits": 6
+        },
+        {
+          "seconds": 0.088907,
+          "peak_process_kib": 20356,
+          "hits": 6
+        }
+      ],
+      "new_checkout": [
+        {
+          "seconds": 0.097951,
+          "peak_process_kib": 57684,
+          "hits": 6
+        },
+        {
+          "seconds": 0.105025,
+          "peak_process_kib": 58020,
+          "hits": 6
+        },
+        {
+          "seconds": 0.099696,
+          "peak_process_kib": 57824,
+          "hits": 6
+        }
+      ]
+    },
+    "kache": {
+      "cold": [
+        {
+          "seconds": 8.105971,
+          "peak_process_kib": 327328,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.085648,
+          "peak_process_kib": 35072,
+          "hits": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.149873,
+          "peak_process_kib": 34952,
+          "hits": 6
+        },
+        {
+          "seconds": 0.15985,
+          "peak_process_kib": 34780,
+          "hits": 6
+        },
+        {
+          "seconds": 0.151879,
+          "peak_process_kib": 34868,
+          "hits": 6
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.149085,
+          "peak_process_kib": 34936,
+          "hits": 6
+        },
+        {
+          "seconds": 0.144649,
+          "peak_process_kib": 34868,
+          "hits": 6
+        },
+        {
+          "seconds": 0.15197,
+          "peak_process_kib": 35136,
+          "hits": 6
+        }
+      ],
+      "new_checkout": [
+        {
+          "seconds": 0.200329,
+          "peak_process_kib": 35060,
+          "hits": 6
+        },
+        {
+          "seconds": 0.200683,
+          "peak_process_kib": 35088,
+          "hits": 6
+        },
+        {
+          "seconds": 0.249005,
+          "peak_process_kib": 35124,
+          "hits": 6
+        }
+      ]
+    },
+    "sccache_basedirs": {
+      "cold": [
+        {
+          "seconds": 6.355018,
+          "peak_process_kib": 129992,
+          "hits": 0
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.047564,
+          "peak_process_kib": 34868,
+          "hits": 0
+        }
+      ],
+      "same_target": [
+        {
+          "seconds": 0.71626,
+          "peak_process_kib": 127856,
+          "hits": 5
+        },
+        {
+          "seconds": 0.708287,
+          "peak_process_kib": 127800,
+          "hits": 5
+        },
+        {
+          "seconds": 0.718699,
+          "peak_process_kib": 128000,
+          "hits": 5
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 5.553126,
+          "peak_process_kib": 129912,
+          "hits": 0
+        },
+        {
+          "seconds": 5.548188,
+          "peak_process_kib": 131008,
+          "hits": 0
+        },
+        {
+          "seconds": 5.66398,
+          "peak_process_kib": 129608,
+          "hits": 0
+        }
+      ],
+      "new_checkout": [
+        {
+          "seconds": 5.303994,
+          "peak_process_kib": 130056,
+          "hits": 0
+        },
+        {
+          "seconds": 5.215378,
+          "peak_process_kib": 130056,
+          "hits": 0
+        },
+        {
+          "seconds": 4.959214,
+          "peak_process_kib": 129208,
+          "hits": 0
+        }
+      ]
+    }
+  },
+  "median_seconds": {
+    "cargo": {
+      "cold": 7.876222,
+      "fresh": 0.051271,
+      "same_target": 7.949804,
+      "new_target": 10.398853,
+      "new_checkout": 9.011997
+    },
+    "jato": {
+      "cold": 9.951616,
+      "fresh": 0.025588,
+      "same_target": 0.075183,
+      "new_target": 7.322743,
+      "new_checkout": 9.672495
+    },
+    "worktree": {
+      "cold": 9.047975,
+      "fresh": 0.034772,
+      "same_target": 0.099823,
+      "new_target": 0.086843,
+      "new_checkout": 0.099696
+    },
+    "kache": {
+      "cold": 8.105971,
+      "fresh": 0.085648,
+      "same_target": 0.151879,
+      "new_target": 0.149085,
+      "new_checkout": 0.200683
+    },
+    "sccache_basedirs": {
+      "cold": 6.355018,
+      "fresh": 0.047564,
+      "same_target": 0.71626,
+      "new_target": 5.553126,
+      "new_checkout": 5.215378
+    }
+  },
+  "store_bytes": {
+    "cargo": 0,
+    "jato": 36540995,
+    "worktree": 36459075,
+    "kache": 35575348,
+    "sccache_basedirs": 73375205
+  }
+}
