@@ -14,6 +14,9 @@
 - Verified the November 18 upstream kache 2.2.0 archive against its published SHA-256. Added independent contender selection and support for its changed statistics format alongside the locally installed 2.1.1.
 - The final interleaved ripgrep release medians were 198 ms for Jato 0.3, 289 ms for 0.2, 251 ms for installed kache 2.1.1, and 5.52 s for sccache. Packed store size fell from 48.8 MiB to 37.3 MiB. Migrated schema versions 1, 2, 3, and 8 and verified byte accounting and pruning.
 - Eight library revisions representing 280.0 MiB of compiler output occupied 90.9 MiB of packed payload, down from 187.3 MiB. Both versions restored the same first archive by SHA-256. Over 22 saves, median save-to-error latency improved from 65.3 ms to 48.3 ms.
+- Compared directly with the upstream kache 2.2.0 executable over three additional ripgrep trials. Jato's warm check and release medians were 148 ms and 173 ms. Kache's were 353 ms and 305 ms.
+- Warm zlib-backed release builds took 149 ms with Jato 0.3, 896 ms with 0.2, and 205 ms with upstream kache. The 12 MiB embedded-data release took 38 ms, 467 ms, and 131 ms respectively. Each executable's output was checked.
+- The locked regex application restored in 69 ms for release and 64 ms for check. A new edit took 51 ms and undo took 28 ms. Verified `jato --system-linker build --release -j1` through the machine's ordinary Cargo launcher.
 
 ## 2026-11-21
 

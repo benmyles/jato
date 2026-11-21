@@ -2,7 +2,7 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-On a Linux workstation, a clean-target ripgrep release rebuild took **198 ms with warm Jato**, down from **25.71 s with plain Cargo**. Eight revisions of a library with embedded data used **51% less packed storage than Jato 0.2**. The benchmarks cover first builds, warm rebuilds, source edits, native libraries and save-to-diagnostic latency. [Measurements and reproduction](bench/README.md)
+On a Linux workstation, a clean-target ripgrep release rebuild took **198 ms with warm Jato**, down from **25.71 s with plain Cargo**. In a separate head-to-head with upstream kache 2.2.0, Jato took **173 ms** and kache took **305 ms**. Eight revisions of a library with embedded data used **51% less packed storage than Jato 0.2**. The report includes first builds, edit latency, memory and individual samples. [Measurements and reproduction](bench/README.md)
 
 ## Get started
 

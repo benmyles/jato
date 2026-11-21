@@ -17,6 +17,18 @@ All three warm release trials favored Jato 0.3 over both Jato 0.2 and the instal
 
 A separate 21-pair experiment compared only the two Jato versions with prefilled stores. The warm check medians were 161 ms for 0.3 and 156 ms for 0.2. The median difference **within each adjacent pair** was 0.17 ms, with 0.3 first in ten pairs and 0.2 first in eleven. [All matched check samples](paired-0.3.json)
 
+### Upstream kache 2.2.0
+
+| ripgrep, separate three-trial comparison | Jato 0.3 | kache 2.2.0 |
+| --- | ---: | ---: |
+| First check | 3.17 s | 3.23 s |
+| Clean-target check, warm store | **148 ms** | 353 ms |
+| First release build | 18.96 s | 19.53 s |
+| Clean-target release rebuild, warm store | **173 ms** | 305 ms |
+| Unchanged release build | 37 ms | 88 ms |
+
+The two tools ran against one another with separate private local stores. Jato's warm release times ranged from 164 to 182 ms and kache's from 304 to 327 ms. The private kache 2.2 server used 18.6 MiB RSS after the release builds. [Upstream kache and Jato samples](ripgrep-kache-2.2-0.3.json)
+
 ### Packed storage
 
 | ripgrep release | Store file lengths | Unique compressed chunks | Warm restore |
@@ -34,6 +46,30 @@ Aligning packed chunks with archive members and embedded metadata reduced the st
 | Jato 0.3 unique payload | **13.7 MiB** | **51.1 MiB** | **90.9 MiB** |
 
 Both stores represented 280.0 MiB of compiler outputs after eight revisions. Jato 0.3 used **51% less compressed payload**, and its SQLite files occupied 93.0 MiB compared with 190.2 MiB for 0.2. Both restored the first library byte-for-byte. This workload moves archive members between revisions and retains the same embedded table. [Revision sizes and restored archive digests](history-0.3.json)
+
+## Small builds and edits
+
+| Regex application | Cargo | Jato 0.2 | Jato 0.3 | kache 2.1.1 | kache 2.2.0 | sccache |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| First check | 1.76 s | 1.87 s | 1.79 s | 2.07 s | 2.24 s | 2.25 s |
+| Clean-target check, warm store | 1.78 s | 67 ms | **64 ms** | 130 ms | 155 ms | 407 ms |
+| Check after a new edit | 63 ms | 51 ms | **51 ms** | 129 ms | 130 ms | 84 ms |
+| Check after undo | 63 ms | 27 ms | 28 ms | 93 ms | 72 ms | 76 ms |
+| First release build | 6.62 s | 8.18 s | 6.89 s | 7.27 s | 6.85 s | 4.85 s |
+| Clean-target release rebuild, warm store | 6.55 s | 98 ms | **69 ms** | 127 ms | 150 ms | 637 ms |
+
+Packed Jato restored this release in 120 ms from 8.1 MiB of store files. The automatic mode used 34.4 MiB of file lengths, with reflink sharing on the measured volume. [Regex times, RSS and extents](regex-0.3.json)
+
+## Native libraries and embedded data
+
+| Warm clean-target workload | Cargo | Jato 0.2 | Jato 0.3 | kache 2.1.1 | kache 2.2.0 | sccache |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| System zlib, check | 1.25 s | 379 ms | **159 ms** | 182 ms | 198 ms | 481 ms |
+| System zlib, release | 1.96 s | 896 ms | **149 ms** | 181 ms | 205 ms | 806 ms |
+| 12 MiB embedded asset, check | 118 ms | 40 ms | **35 ms** | 99 ms | 119 ms | 129 ms |
+| 12 MiB embedded asset, release | 465 ms | 467 ms | **38 ms** | 124 ms | 131 ms | 209 ms |
+
+The zlib program compressed and decompressed its message after each release build. On this host, libz-sys passed native library declarations through Cargo. The embedded program read a runtime-selected byte of the generated data. Their first Jato release builds took 2.56 s and 616 ms, compared with 1.73 s and 470 ms for plain Cargo. [Zlib samples](zlib-0.3.json) · [Embedded data samples](embedded-0.3.json)
 
 ## Save to compiler feedback
 
