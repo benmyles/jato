@@ -1,0 +1,22 @@
+name: Rust
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, "1.89.0"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install toolchain
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal
+      - name: Check formatting and lints
+        if: matrix.rust == 'stable'
+        run: |
+          rustup component add rustfmt clippy --toolchain stable
+          cargo +stable fmt --check
+          cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo +${{ matrix.rust }} test --locked

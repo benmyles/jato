@@ -422,6 +422,7 @@ fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
     let mut child = p
         .command()
         .env("WATCH_STARTS", &log)
+        .current_dir(p.temp.path())
         .args([
             "watch",
             "--debounce",
@@ -429,9 +430,12 @@ fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
             "--",
             "run",
             "-q",
-            "--",
-            "two words",
+            "--manifest-path",
         ])
+        .arg(p.root.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(p.root.join("custom output"))
+        .args(["--", "two words"])
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
@@ -458,6 +462,8 @@ fn watcher_restarts_a_running_program_and_preserves_custom_arguments() {
         }
     };
     wait_for_runs(1);
+    std::thread::sleep(Duration::from_millis(180));
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
     write(&source, &format!("{main}\n// save"));
     let runs = wait_for_runs(2);
     unsafe {

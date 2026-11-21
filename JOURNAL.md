@@ -14,4 +14,5 @@
 - Reproduced an overly conservative native-link classification on aho-corasick and corrected it. Verified a clean restore with the older Cargo 1.85 target layout.
 - Verified rustc's direct and transitive search-path behavior, then removed an unnecessary restriction on inactive extern declarations. Metadata-only evidence now stays separate from codegen evidence.
 - Added artifact-notification checks, byte-for-byte restore tests, staged-file recovery after interrupted jobs, and coverage for nested wrappers, custom watch commands, and process-group cancellation.
-- Built and ran the suite with Rust 1.89.0 in an isolated toolchain installation. Verified the installed compiler wrapper against both newer and older Cargo output layouts.
+- Built and ran the suite with Rust 1.89.0 in an isolated toolchain installation. Verified the wrapper against both newer and older Cargo output layouts.
+- Added repeatable save-to-diagnostic and fix-to-workspace measurements, plus Linux CI for stable Rust and the minimum supported toolchain. Verified the installed binary with this machine's existing Cargo shim and test runner.
