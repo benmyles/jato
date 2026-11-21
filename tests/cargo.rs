@@ -926,3 +926,229 @@ fn cargo_probe_cache_replays_exact_bytes_and_leaves_source_queries_alone() {
     p.run(&["gc", "0"]);
     assert_eq!(p.stats()["probe_entries"], 0);
 }
+
+#[cfg(target_os = "linux")]
+fn worktree_available() -> bool {
+    let available = Command::new("bwrap")
+        .args(["--dev-bind", "/", "/", "--", "true"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if std::env::var_os("JATO_TEST_WORKTREE").is_some() {
+        assert!(available, "qualification requires working bubblewrap");
+    }
+    available
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_checkouts_restore_and_resolve_changed_modules() {
+    if !worktree_available() {
+        return;
+    }
+    let a = Project::new();
+    let b = Project::new();
+    let cache = a.temp.path().join("cache");
+    let main = r#"fn main() { println!("{} {} {:?}", env!("CARGO_MANIFEST_DIR"), leaf::value(), std::env::args().skip(1).collect::<Vec<_>>()); }"#;
+    for p in [&a, &b] {
+        write(p.root.join("src/main.rs"), main);
+    }
+    let command = |p: &Project| {
+        let mut c = p.command();
+        c.env("CARGO_HOME", a.temp.path().join("cargo"))
+            .env("JATO_LOG", "debug")
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["worktree", "--root", "."]);
+        if cfg!(all(target_arch = "x86_64", target_env = "gnu")) {
+            c.arg("--system-linker");
+        }
+        c
+    };
+    let run = |p: &Project| {
+        success(command(p).args(["run", "--release", "--", "--target-dir", "arg with spaces"]))
+    };
+    let physical = a.run(&["run", "--release"]);
+    assert!(String::from_utf8_lossy(&physical.stdout).contains(a.root.to_str().unwrap()));
+    let first = run(&a);
+    let restored = run(&b);
+    assert_eq!(first.stdout, restored.stdout);
+    let out = String::from_utf8(restored.stdout).unwrap();
+    assert!(out.contains(cache.join("view-v1/workspace").to_str().unwrap()));
+    assert!(out.contains(r#"one:none ["--target-dir", "arg with spaces"]"#));
+    let log = String::from_utf8_lossy(&restored.stderr);
+    assert!(log.contains("jato [leaf] hit"), "{log}");
+    if std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+        assert!(log.contains("jato [app] hit"), "{log}");
+    }
+    let target = |p| {
+        let paths: Value =
+            serde_json::from_slice(&success(command(p).arg("paths")).stdout).unwrap();
+        PathBuf::from(paths["target_directory"].as_str().unwrap())
+    };
+    let bin_a = target(&a).join("release/app");
+    let bin_b = target(&b).join("release/app");
+    assert!(bin_a.is_file() && bin_b.is_file());
+    assert_eq!(a.run(&["run", "--release"]).stdout, physical.stdout);
+    assert_eq!(fs::read_dir(cache.join("view-v1")).unwrap().count(), 0);
+    write(b.root.join("leaf/src/text file"), "two");
+    assert!(
+        String::from_utf8(run(&b).stdout)
+            .unwrap()
+            .contains("two:none")
+    );
+    assert_eq!(
+        success(Command::new(&bin_a).args(["--target-dir", "arg with spaces"])).stdout,
+        first.stdout
+    );
+    success(command(&b).args(["cargo", "--color", "never", "clean"]));
+    assert!(!bin_b.exists());
+    write(b.root.join("leaf/src/text file"), "one");
+    write(b.root.join("leaf/src/value/mod.rs"), "pub fn value() {}");
+    let fail = command(&b).args(["build", "--release"]).output().unwrap();
+    assert!(!fail.status.success());
+    assert!(String::from_utf8_lossy(&fail.stderr).contains("E0761"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_commands_have_private_mounts_and_forward_exit_status() {
+    if !worktree_available() {
+        return;
+    }
+    let a = Project::new();
+    let b = Project::new();
+    let mut children = Vec::new();
+    for (p, label) in [(&a, "left"), (&b, "right")] {
+        let mut cmd = p.command();
+        cmd.env("JATO_CACHE_DIR",a.temp.path().join("cache"))
+            .args(["worktree","--root",".","exec","/bin/sh","-ec",
+                r#"echo "$1" > "$CARGO_TARGET_DIR/marker"; touch "$2"; while test ! -f "$3"; do sleep .01; done; test "$(cat "$CARGO_TARGET_DIR/marker")" = "$1"; exit 17"#,
+                "sh",label])
+            .arg(p.temp.path().join("ready"))
+            .arg(if label=="left" {b.temp.path()}else{a.temp.path()}.join("ready"));
+        children.push(cmd.spawn().unwrap());
+    }
+    for child in &mut children {
+        assert_eq!(child.wait().unwrap().code(), Some(17));
+    }
+    for (p, label) in [(&a, "left"), (&b, "right")] {
+        assert_eq!(
+            fs::read_to_string({
+                let paths: Value = serde_json::from_slice(
+                    &success(
+                        p.command()
+                            .env("JATO_CACHE_DIR", a.temp.path().join("cache"))
+                            .args(["worktree", "--root", ".", "paths"]),
+                    )
+                    .stdout,
+                )
+                .unwrap();
+                Path::new(paths["target_directory"].as_str().unwrap()).join("marker")
+            })
+            .unwrap()
+            .trim(),
+            label
+        );
+    }
+    let ready = a.temp.path().join("started");
+    let mut child = a
+        .command()
+        .args([
+            "worktree",
+            "exec",
+            "/bin/sh",
+            "-ec",
+            r#"trap 'exit 42' TERM; touch "$1"; while :; do sleep .05; done"#,
+            "sh",
+        ])
+        .arg(&ready)
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !ready.exists() {
+        assert!(child.try_wait().unwrap().is_none() && std::time::Instant::now() < until);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "worktree did not forward SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(42));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_cargo_obeys_config_and_target_overrides() {
+    if !worktree_available() {
+        return;
+    }
+    let p = Project::new();
+    let output = p.temp.path().join("physical target");
+    let build = p.temp.path().join("physical intermediate");
+    let config = p.root.join("custom.toml");
+    write(
+        &config,
+        &format!(
+            "[build]\ntarget-dir={:?}\nbuild-dir={:?}\n",
+            p.temp.path().join("unused"),
+            build
+        ),
+    );
+    let mut cmd = p.command();
+    let out = success(
+        cmd.env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .current_dir(p.root.join("leaf"))
+            .arg("worktree")
+            .arg("--root")
+            .arg(&p.root)
+            .args(["run", "--release", "--config"])
+            .arg(&config)
+            .arg("--target-dir")
+            .arg(&output)
+            .arg("--manifest-path")
+            .arg(p.root.join("Cargo.toml")),
+    );
+    assert_eq!(out.stdout, b"one:none\n");
+    let paths: Value = serde_json::from_slice(
+        &success(
+            p.command()
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .args(["worktree", "--root", ".", "paths", "--config"])
+                .arg(&config)
+                .arg("--target-dir")
+                .arg(&output),
+        )
+        .stdout,
+    )
+    .unwrap();
+    let final_dir = Path::new(paths["target_directory"].as_str().unwrap());
+    assert!(final_dir.starts_with(&output) && final_dir.join("release/app").is_file());
+    assert!(!p.temp.path().join("unused/release/app").exists());
+    let meta =
+        success(
+            p.command()
+                .args(["cargo", "metadata", "--no-deps", "--format-version", "1"]),
+        );
+    if serde_json::from_slice::<Value>(&meta.stdout)
+        .unwrap()
+        .get("build_directory")
+        .is_some()
+    {
+        let build_dir = Path::new(paths["build_directory"].as_str().unwrap());
+        assert!(
+            build_dir.starts_with(build)
+                && (build_dir.join("release/deps").is_dir()
+                    || build_dir.join("release/build").is_dir())
+        );
+    }
+}

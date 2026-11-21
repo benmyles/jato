@@ -135,6 +135,14 @@ impl Workspace {
             excluded.push(cache);
         }
         excluded.extend(meta.build_directory);
+        if std::env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")) {
+            excluded.extend(
+                ["JATO_WORKTREE_TARGET_ALIAS", "JATO_WORKTREE_BUILD_ALIAS"]
+                    .into_iter()
+                    .filter_map(std::env::var_os)
+                    .map(PathBuf::from),
+            );
+        }
         Ok(Self {
             roots,
             excluded,

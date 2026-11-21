@@ -23,6 +23,6 @@
 
 ## Worktree reuse and packed writes
 
-- [ ] Reuse builds across independent worktrees and target locations with verified, stable compiler inputs.
+- [x] Reuse builds across independent worktrees and target locations with verified, stable compiler inputs.
 - [ ] Reduce repeated compression and bound per-entry indexing memory in packed storage.
 - [ ] Exercise concurrent and changed checkouts, compare warm and relocated builds with peers, and qualify the installed release.

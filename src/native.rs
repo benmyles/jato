@@ -830,7 +830,7 @@ impl Observations {
                 }) {
                     ensure!(
                         real.starts_with(root)
-                            || system_file(&real) && fs::metadata(&real)?.uid() == 0,
+                            || system_file(&real) && system_owner(&real, &fs::metadata(&real)?),
                         "unverified native plugin"
                     );
                 }
@@ -852,7 +852,9 @@ impl Observations {
 // Some distributions prefix the GNU target triple or suffix an LLVM version.
 // Recognize the canonical ELF executable, never just the name of a symlink.
 fn trusted_tool(image: &Path, root: &Path) -> Result<Option<bool>> {
-    if !image.starts_with(root) && !(system_file(image) && fs::metadata(image)?.uid() == 0) {
+    if !image.starts_with(root)
+        && !(system_file(image) && system_owner(image, &fs::metadata(image)?))
+    {
         return Ok(None);
     }
     let file = image.file_name().and_then(OsStr::to_str).unwrap_or("");
@@ -880,7 +882,15 @@ fn trusted_tool(image: &Path, root: &Path) -> Result<Option<bool>> {
     Ok((magic == *b"\x7fELF").then_some(ld))
 }
 
-fn system_file(p: &Path) -> bool {
+#[cfg(target_os = "linux")]
+use crate::worktree::system_owner;
+
+#[cfg(not(target_os = "linux"))]
+fn system_owner(_: &Path, m: &fs::Metadata) -> bool {
+    m.uid() == 0
+}
+
+pub(crate) fn system_file(p: &Path) -> bool {
     [
         "/usr/lib",
         "/usr/lib64",
@@ -1016,7 +1026,7 @@ impl Manifest {
                         !recent(&m, since),
                         "native input changed during compilation"
                     );
-                    if real.starts_with(root) || system_file(&real) && m.uid() == 0 {
+                    if real.starts_with(root) || system_file(&real) && system_owner(&real, &m) {
                         for n in stamp(&m) {
                             h.update(&n.to_le_bytes());
                         }

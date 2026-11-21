@@ -95,10 +95,12 @@ fn discover(
         }
         // Familiar bytes with a changed module search directory need fresh
         // name resolution. Ordinary edits go directly to the actual compiler.
-        if plan.native.is_some() {
+        if plan.native.is_some()
+            && env::var_os("JATO_WORKTREE_ACTIVE").as_deref() != Some(OsStr::new("1"))
+        {
             continue;
         }
-        return rediscover(store, compiler, inv, recipe, start, externs);
+        return rediscover(store, compiler, inv, recipe, start, externs, plan);
     }
     trace(
         &inv.name,
@@ -114,6 +116,7 @@ fn rediscover(
     recipe: &fingerprint::Recipe,
     start: SystemTime,
     externs: &Digest,
+    recorded: fingerprint::Plan,
 ) -> Result<Option<Hit>> {
     let _ = store.count("discovery_probe", 1);
     let probe = crate::staging::file(&store.dir)?;
@@ -126,7 +129,15 @@ fn rediscover(
         .stderr(Stdio::null())
         .status()?;
     ensure!(status.success(), "input discovery failed");
-    let plan = fingerprint::dependencies(probe.path())?;
+    let mut plan = fingerprint::dependencies(probe.path())?;
+    if recorded.native.is_some() {
+        // A copied source tree has new directory inodes. Ask this rustc to
+        // resolve modules again before revalidating the observed link inputs.
+        if !plan.same_rust_inputs(&recorded) {
+            return Ok(None);
+        }
+        plan.native = recorded.native;
+    }
     let inputs = plan.inputs(recipe, inv, start, false)?;
     let topology = inputs.topology(start)?;
     let key = inputs.key(&plan, recipe, inv, start, externs)?;

@@ -10,6 +10,8 @@ mod sealed;
 mod staging;
 mod store;
 mod watch;
+#[cfg(target_os = "linux")]
+mod worktree;
 
 use anyhow::{Context, Result, bail};
 use std::env;
@@ -25,6 +27,7 @@ Usage
   jato check|build|test|run|clippy [CARGO_ARGUMENTS...]
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
   jato watch [OPTIONS]             Check on save, with changed packages first
+  jato worktree [--root DIR] ACTION  Reuse builds across independent target directories
   jato stats [--json]              Show cache contents and compiler counters
   jato gc [SIZE]                   Evict least-recently-used entries to SIZE
   jato --system-linker build [...]   Select /usr/bin/cc for x86_64 GNU host links
@@ -60,18 +63,7 @@ fn cargo_command(args: &[OsString], system_linker: bool) -> Result<Command> {
     let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.args(args).env("RUSTC_WRAPPER", env::current_exe()?);
     if system_linker {
-        anyhow::ensure!(
-            cfg!(all(
-                target_arch = "x86_64",
-                target_os = "linux",
-                target_env = "gnu"
-            )) && Path::new("/usr/bin/cc").is_file(),
-            "--system-linker needs the x86_64 Linux GNU system C driver"
-        );
-        cmd.env(
-            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-            "/usr/bin/cc",
-        );
+        set_system_linker(&mut cmd)?;
     }
     if env::var_os("JATO_CACHE_DIR").is_some() {
         cmd.env("JATO_CACHE_DIR", cache_dir()?);
@@ -79,10 +71,34 @@ fn cargo_command(args: &[OsString], system_linker: bool) -> Result<Command> {
     Ok(cmd)
 }
 
+fn set_system_linker(cmd: &mut Command) -> Result<()> {
+    anyhow::ensure!(
+        cfg!(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_env = "gnu"
+        )) && Path::new("/usr/bin/cc").is_file(),
+        "--system-linker needs the x86_64 Linux GNU system C driver"
+    );
+    cmd.env(
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+        "/usr/bin/cc",
+    );
+    Ok(())
+}
+
 fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if args.first().is_some_and(|a| a == "__worktree-launch") {
+        return worktree::enter(&args[1..]);
+    }
+    dispatch(&args)
+}
+
+fn dispatch(args: &[OsString]) -> Result<i32> {
     let system_linker = args.first().is_some_and(|a| a == "--system-linker");
-    let args = if system_linker { &args[1..] } else { &args[..] };
+    let args = if system_linker { &args[1..] } else { args };
     let first = args.first().map(OsString::as_os_str);
     let verb = first.and_then(OsStr::to_str);
     match verb {
@@ -94,6 +110,10 @@ fn run() -> Result<i32> {
             return compiler::passthrough(cargo_command(args, system_linker)?);
         }
         Some("watch") => return watch::run(&args[1..], system_linker),
+        #[cfg(target_os = "linux")]
+        Some("worktree") => return worktree::run(&args[1..], system_linker),
+        #[cfg(not(target_os = "linux"))]
+        Some("worktree") => bail!("worktree views require Linux and bubblewrap"),
         Some("cargo") => return compiler::passthrough(cargo_command(&args[1..], system_linker)?),
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;

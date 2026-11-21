@@ -114,6 +114,9 @@ pub fn recipe(compiler: &OsStr, args: &[OsString], native: bool) -> Result<Recip
     }
     let toolchain = *identity.finalize().as_bytes();
     let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v9");
+    if env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")) {
+        field(&mut hash, b"jato worktree paths v1");
+    }
     field(&mut hash, &toolchain);
     field(&mut hash, compiler.as_bytes());
     field(&mut hash, cwd.as_os_str().as_bytes());
@@ -298,6 +301,10 @@ pub struct Inputs {
 }
 
 impl Plan {
+    pub fn same_rust_inputs(&self, other: &Self) -> bool {
+        self.files == other.files && self.env == other.env
+    }
+
     pub fn inputs(
         &self,
         recipe: &Recipe,
