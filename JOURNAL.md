@@ -15,6 +15,7 @@
 - Timed seven atomic edits and undos per tool with Cargo’s dev profile. Ripgrep undos took a median 161 ms with 0.6, 591 ms with 0.5, 270 ms with kache 2.2 and 604 ms with sccache 0.19. Every measured executable printed its expected revision.
 - Linked and ran a downstream consumer against every shifted-asset revision from all four caches. Packed Jato retained 23.0 MiB of store files, kache 384.2 MiB and sccache 384.1 MiB. All four restored their own original archive exactly. sccache completed the eight first builds fastest.
 - Measured five ripgrep worktree revisits, seven ordinary clean-target pairs, three simultaneous cold regex pairs and eleven watcher edits. A newly populated automatic-mode store also restored all 39 ripgrep units in another checkout and its executable passed the 299 upstream tests. The normal machine Cargo launcher restored and ran the six-unit regex application.
+- Verified the locked Cargo source package offline, including the fixtures, benchmark harnesses, raw measurements and project documents. Checked the archive’s Git revision and the installed executable’s SHA-256 against the benchmarked binary.
 
 ## 2026-11-21 — concurrent builds and repeated validation
 

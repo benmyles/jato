@@ -39,4 +39,4 @@
 - [x] Restore verified native results on live incremental hits and keep new edits on rustc’s normal incremental path.
 - [x] Reuse packed data across insertions and deletions while preserving bounded capture and exact restoration.
 - [x] Reject impossible large-input variants before whole-file hashing and test changes inside and outside the sampled regions.
-- [ ] Profile remaining verification costs, qualify the installed build, and compare edit and rebuild workloads with peers.
+- [x] Reduce repeated worktree ownership checks, qualify the installed build and source package, and compare live edits, revision histories and clean builds with upstream peers.
