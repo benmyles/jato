@@ -7,6 +7,11 @@
 - [x] Exercise clean rebuilds, edited inputs, concurrent builds, cache failures, and watch behavior on real Cargo invocations.
 - [x] Measure performance, resource use, and installability. Document the operating envelope and release checks.
 
+## Coding agent skill
+
+- [x] Write a portable Jato skill and exercise its Cargo commands in a Rust workspace.
+- [ ] Install the skill globally for Claude Code, Codex and agy and verify client discovery.
+
 ## Optimization pass
 
 - [x] Establish isolated head-to-head baselines with kache and sccache.

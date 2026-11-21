@@ -1,5 +1,9 @@
 # Work journal
 
+## 2026-11-21 — coding agent skill
+
+- Wrote a shared Cargo workflow for Claude Code, Codex and agy. Checked its skill manifest and ran the examples in a two-crate workspace, including a filtered test, Clippy, toolchain forwarding, fast profiles, worktree execution and both watch modes after an edit.
+
 ## 2026-11-21 — dependency changes and large packed frames
 
 - A real two-crate Cargo check changed a producer constant and kept the consumer source fixed. The 0.7 consumer wrapper read a 130,015,982-byte rmeta twice, for 260,031,964 bytes before and after rustc. A previous cold packed capture wrote more than 70 MiB to SQLite for a 32 MiB embedded asset.
