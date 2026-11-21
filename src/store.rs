@@ -1867,17 +1867,25 @@ mod tests {
             .conn
             .execute("DELETE FROM entries WHERE key=?1", [[0; 32]])?;
         store.collect_objects(false)?;
-        for (i, bytes) in [(1, &shifted), (2, &edited)] {
-            fs::write(&path, b"live target")?;
-            assert!(store.restore(&[i; 32], paths)?.is_some());
-            assert_eq!(fs::read(&path)?, *bytes);
+        let object = crate::sealed::path(&store.dir, blake3::hash(&base).as_bytes());
+        for copied in [false, true] {
+            if copied {
+                // An ordinary backup can preserve the base bytes while
+                // dropping the kernel's fs-verity attribute.
+                fs::remove_file(&object)?;
+                fs::write(&object, &base)?;
+            }
+            for (i, bytes) in [(1, &shifted), (2, &edited)] {
+                fs::write(&path, b"live target")?;
+                assert!(store.restore(&[i; 32], paths)?.is_some());
+                assert_eq!(fs::read(&path)?, *bytes);
+            }
         }
         store.conn.execute("UPDATE patches SET data=zeroblob(length(data)) WHERE entry=(SELECT id FROM entries WHERE key=?1)",[[1;32]])?;
         fs::write(&path, b"working copy")?;
         assert!(store.restore(&[1; 32], paths).is_err());
         assert_eq!(fs::read(&path)?, b"working copy");
         assert_eq!(store.stats()?.patched_files, 1);
-        let object = crate::sealed::path(&store.dir, blake3::hash(&base).as_bytes());
         fs::remove_file(object)?;
         assert!(store.restore(&[2; 32], paths).is_err());
         assert_eq!(fs::read(&path)?, b"working copy");

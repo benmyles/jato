@@ -1,0 +1,554 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "asset_mib": 8,
+  "consumers": 4,
+  "runs": 7,
+  "jobs": 4,
+  "tools": {
+    "cargo": {
+      "version": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 0.326785,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.331256,
+            "hits": 0
+          },
+          {
+            "seconds": 0.326308,
+            "hits": 0
+          },
+          {
+            "seconds": 0.29118,
+            "hits": 0
+          },
+          {
+            "seconds": 0.334179,
+            "hits": 0
+          },
+          {
+            "seconds": 0.275041,
+            "hits": 0
+          },
+          {
+            "seconds": 0.377423,
+            "hits": 0
+          },
+          {
+            "seconds": 0.30099,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.367269,
+            "hits": 0
+          },
+          {
+            "seconds": 0.252807,
+            "hits": 0
+          },
+          {
+            "seconds": 0.293689,
+            "hits": 0
+          },
+          {
+            "seconds": 0.378202,
+            "hits": 0
+          },
+          {
+            "seconds": 0.325235,
+            "hits": 0
+          },
+          {
+            "seconds": 0.27324,
+            "hits": 0
+          },
+          {
+            "seconds": 0.275216,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.258689,
+            "hits": 0
+          },
+          {
+            "seconds": 0.409379,
+            "hits": 0
+          },
+          {
+            "seconds": 0.270463,
+            "hits": 0
+          },
+          {
+            "seconds": 0.300497,
+            "hits": 0
+          },
+          {
+            "seconds": 0.32215,
+            "hits": 0
+          },
+          {
+            "seconds": 0.289403,
+            "hits": 0
+          },
+          {
+            "seconds": 0.285145,
+            "hits": 0
+          }
+        ]
+      },
+      "producer_metadata_bytes": 32510508,
+      "median_seconds": {
+        "cold": 0.326785,
+        "edit": 0.326308,
+        "error": 0.293689,
+        "undo": 0.289403
+      }
+    },
+    "jato": {
+      "version": "jato 0.8.0",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 0.404966,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.367908,
+            "hits": 0
+          },
+          {
+            "seconds": 0.346773,
+            "hits": 0
+          },
+          {
+            "seconds": 0.430351,
+            "hits": 0
+          },
+          {
+            "seconds": 0.375748,
+            "hits": 0
+          },
+          {
+            "seconds": 0.421787,
+            "hits": 0
+          },
+          {
+            "seconds": 0.376708,
+            "hits": 0
+          },
+          {
+            "seconds": 0.384626,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.29926,
+            "hits": 0
+          },
+          {
+            "seconds": 0.327293,
+            "hits": 0
+          },
+          {
+            "seconds": 0.335569,
+            "hits": 0
+          },
+          {
+            "seconds": 0.971239,
+            "hits": 0
+          },
+          {
+            "seconds": 0.280168,
+            "hits": 0
+          },
+          {
+            "seconds": 0.300918,
+            "hits": 0
+          },
+          {
+            "seconds": 0.30703,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.081973,
+            "hits": 5
+          },
+          {
+            "seconds": 0.076924,
+            "hits": 5
+          },
+          {
+            "seconds": 0.084446,
+            "hits": 5
+          },
+          {
+            "seconds": 0.328248,
+            "hits": 5
+          },
+          {
+            "seconds": 0.069047,
+            "hits": 5
+          },
+          {
+            "seconds": 0.096392,
+            "hits": 5
+          },
+          {
+            "seconds": 0.08836,
+            "hits": 5
+          }
+        ]
+      },
+      "producer_metadata_bytes": 32510508,
+      "successful_consumer_rmeta_bytes_read": 32516654,
+      "failed_consumer_rmeta_bytes_read": 3072,
+      "median_seconds": {
+        "cold": 0.404966,
+        "edit": 0.376708,
+        "error": 0.30703,
+        "undo": 0.084446
+      }
+    },
+    "kache": {
+      "version": "kache 2.2.0",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 0.533184,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.525214,
+            "hits": 0
+          },
+          {
+            "seconds": 0.506158,
+            "hits": 0
+          },
+          {
+            "seconds": 0.663105,
+            "hits": 0
+          },
+          {
+            "seconds": 0.565926,
+            "hits": 0
+          },
+          {
+            "seconds": 0.511727,
+            "hits": 0
+          },
+          {
+            "seconds": 0.577601,
+            "hits": 0
+          },
+          {
+            "seconds": 0.52229,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.396098,
+            "hits": 0
+          },
+          {
+            "seconds": 0.458826,
+            "hits": 0
+          },
+          {
+            "seconds": 0.493984,
+            "hits": 0
+          },
+          {
+            "seconds": 0.753988,
+            "hits": 0
+          },
+          {
+            "seconds": 0.46783,
+            "hits": 0
+          },
+          {
+            "seconds": 0.603955,
+            "hits": 0
+          },
+          {
+            "seconds": 0.539197,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.239551,
+            "hits": 5
+          },
+          {
+            "seconds": 0.278451,
+            "hits": 5
+          },
+          {
+            "seconds": 0.253682,
+            "hits": 5
+          },
+          {
+            "seconds": 0.247928,
+            "hits": 5
+          },
+          {
+            "seconds": 0.275028,
+            "hits": 5
+          },
+          {
+            "seconds": 0.334294,
+            "hits": 5
+          },
+          {
+            "seconds": 0.294398,
+            "hits": 5
+          }
+        ]
+      },
+      "producer_metadata_bytes": 32510430,
+      "median_seconds": {
+        "cold": 0.533184,
+        "edit": 0.525214,
+        "error": 0.493984,
+        "undo": 0.275028
+      }
+    },
+    "sccache": {
+      "version": "sccache 0.19.0",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 1.016499,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.653193,
+            "hits": 0
+          },
+          {
+            "seconds": 1.0878,
+            "hits": 0
+          },
+          {
+            "seconds": 0.8047,
+            "hits": 0
+          },
+          {
+            "seconds": 0.871,
+            "hits": 0
+          },
+          {
+            "seconds": 0.765397,
+            "hits": 0
+          },
+          {
+            "seconds": 1.97769,
+            "hits": 0
+          },
+          {
+            "seconds": 0.733387,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.735782,
+            "hits": 0
+          },
+          {
+            "seconds": 0.849734,
+            "hits": 0
+          },
+          {
+            "seconds": 0.831755,
+            "hits": 0
+          },
+          {
+            "seconds": 0.704986,
+            "hits": 0
+          },
+          {
+            "seconds": 1.118866,
+            "hits": 0
+          },
+          {
+            "seconds": 0.588983,
+            "hits": 0
+          },
+          {
+            "seconds": 0.718824,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.283761,
+            "hits": 5
+          },
+          {
+            "seconds": 0.328854,
+            "hits": 5
+          },
+          {
+            "seconds": 0.383187,
+            "hits": 5
+          },
+          {
+            "seconds": 0.354148,
+            "hits": 5
+          },
+          {
+            "seconds": 0.318071,
+            "hits": 5
+          },
+          {
+            "seconds": 0.31817,
+            "hits": 5
+          },
+          {
+            "seconds": 0.363567,
+            "hits": 5
+          }
+        ]
+      },
+      "producer_metadata_bytes": 32510508,
+      "median_seconds": {
+        "cold": 1.016499,
+        "edit": 0.8047,
+        "error": 0.735782,
+        "undo": 0.328854
+      }
+    },
+    "previous_jato": {
+      "version": "jato 0.7.0",
+      "samples": {
+        "cold": [
+          {
+            "seconds": 0.457313,
+            "hits": 0
+          }
+        ],
+        "edit": [
+          {
+            "seconds": 0.413192,
+            "hits": 0
+          },
+          {
+            "seconds": 0.426981,
+            "hits": 0
+          },
+          {
+            "seconds": 0.476307,
+            "hits": 0
+          },
+          {
+            "seconds": 0.456798,
+            "hits": 0
+          },
+          {
+            "seconds": 0.451408,
+            "hits": 0
+          },
+          {
+            "seconds": 0.470619,
+            "hits": 0
+          },
+          {
+            "seconds": 0.419216,
+            "hits": 0
+          }
+        ],
+        "error": [
+          {
+            "seconds": 0.386068,
+            "hits": 0
+          },
+          {
+            "seconds": 0.415891,
+            "hits": 0
+          },
+          {
+            "seconds": 0.427046,
+            "hits": 0
+          },
+          {
+            "seconds": 0.48396,
+            "hits": 0
+          },
+          {
+            "seconds": 0.432703,
+            "hits": 0
+          },
+          {
+            "seconds": 0.547865,
+            "hits": 0
+          },
+          {
+            "seconds": 0.393287,
+            "hits": 0
+          }
+        ],
+        "undo": [
+          {
+            "seconds": 0.08032,
+            "hits": 5
+          },
+          {
+            "seconds": 0.069914,
+            "hits": 5
+          },
+          {
+            "seconds": 0.097002,
+            "hits": 5
+          },
+          {
+            "seconds": 0.082217,
+            "hits": 5
+          },
+          {
+            "seconds": 0.087548,
+            "hits": 5
+          },
+          {
+            "seconds": 0.08646,
+            "hits": 5
+          },
+          {
+            "seconds": 0.079166,
+            "hits": 5
+          }
+        ]
+      },
+      "producer_metadata_bytes": 32510508,
+      "successful_consumer_rmeta_bytes_read": 65021020,
+      "failed_consumer_rmeta_bytes_read": 32510510,
+      "median_seconds": {
+        "cold": 0.457313,
+        "edit": 0.451408,
+        "error": 0.427046,
+        "undo": 0.082217
+      }
+    }
+  }
+}
