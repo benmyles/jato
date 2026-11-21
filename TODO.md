@@ -25,6 +25,7 @@
 - [ ] Close the fully emptied-target Olo performance gap while preserving correct behavior for changing procedural-macro inputs and native dependencies.
 - [ ] Qualify any proposed macro-consumer reuse against changed unreported files, environment, native-library initialization and re-exports. Measure actual coverage across the Olo dependency graph.
 - [ ] Measure whether sharing validated linker and extern digests within one Cargo invocation pays for a helper process. Include concurrent writes, shared mappings, renames, helper failure, memory use and the already-fresh build.
+- [x] Reuse a kernel-verified linker digest when the selected upstream mold file already has fs-verity. Measure linker reads and preserve the mutable-file path.
 
 ## Coding agent skill
 

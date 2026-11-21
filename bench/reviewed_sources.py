@@ -15,6 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--scratch", default=os.environ.get("TMPDIR", "/var/tmp"))
+    parser.add_argument("--fetch", action="store_true", help="prefetch the locked registry crates in the configured Cargo home")
     opts = parser.parse_args()
     jato = Path(shutil.which(opts.jato) or opts.jato).resolve(strict=True)
     rustc = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()) / "bin/rustc"
@@ -32,7 +33,7 @@ def main():
         (project / "Cargo.toml").write_text(
             '[package]\nname="review_consumer"\nversion="0.0.0"\nedition="2021"\n'
             '[dependencies]\nlibc={version="=0.2.191",features=["extra_traits"]}\ncmov="=0.5.4"\n'
-            'num-bigint="=0.4.8"\nnum-traits={version="=0.2.19",features=["libm","i128"]}\n'
+            'num-bigint="=0.4.8"\nlibm="=0.2.16"\nnum-traits={version="=0.2.19",features=["libm","i128"]}\n'
             'num-integer={version="=0.1.47",features=["i128","std"]}\n'
             '[profile.dev]\nopt-level=3\ndebug-assertions=true\nincremental=false\n')
         home = root / "cargo"
@@ -65,7 +66,10 @@ def main():
             if target.is_dir():
                 shutil.rmtree(target)
             return run([cargo, "build", "--locked", "--offline"], **extra).stderr
-        run([cargo, "generate-lockfile", "--offline"])
+        if opts.fetch:
+            run([cargo, "fetch"], CARGO_NET_OFFLINE="false")
+        else:
+            run([cargo, "generate-lockfile", "--offline"])
         libc = extract("libc")
         traits = extract("num-traits")
         with (project/"Cargo.toml").open("a") as f:

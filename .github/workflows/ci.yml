@@ -41,3 +41,5 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-11-14 --profile minimal
           JATO_TEST_NIGHTLY="$(rustup which --toolchain nightly-2026-11-14 rustc)" cargo +stable test --locked nightly_split_metadata
+          cargo +stable build --locked
+          rustup run nightly-2026-11-14 python3 bench/reviewed_sources.py --fetch --jato "$PWD/target/debug/jato" --scratch "$RUNNER_TEMP"

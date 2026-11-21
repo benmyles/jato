@@ -1,0 +1,36 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "linker": "upstream mold 3.0.0 on a private fs-verity inode",
+  "jobs": 1,
+  "program_sha256": "8c43a3349e7969a3c1992183ba7d78b059d1a7250ee9d07f4d80ffd1a4918c57",
+  "results": {
+    "previous": {
+      "times": [
+        0.171201,
+        0.091121,
+        0.107609,
+        0.122343,
+        0.089026
+      ],
+      "traced_bytes": [
+        42246008,
+        42246008
+      ],
+      "median": 0.107609
+    },
+    "current": {
+      "times": [
+        0.103723,
+        0.086574,
+        0.108137,
+        0.064415,
+        0.088226
+      ],
+      "traced_bytes": [
+        0,
+        0
+      ],
+      "median": 0.088226
+    }
+  }
+}
