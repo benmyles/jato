@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Install the Jato skill for this user's Claude Code, Codex and Antigravity CLI."""
+
+import argparse
+import os
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+
+
+def needs_copy(target, content, force):
+    if target.parent.is_symlink() or target.is_symlink():
+        raise ValueError(f"skill directory or file is a symlink: {target}")
+    if target.exists() and not target.is_file():
+        raise ValueError(f"expected a regular skill file: {target}")
+    try:
+        with target.open("rb") as current:
+            if current.read(len(content) + 1) == content:
+                return False
+    except FileNotFoundError:
+        return True
+    if not force:
+        raise ValueError(f"{target} differs. Review it and use --force to replace it.")
+    return True
+
+
+def publish(target, content, force):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".jato-install-", dir=target.parent) as staging:
+        staged = Path(staging) / "new"
+        staged.write_bytes(content)
+        if force:
+            os.replace(staged, target)
+        else:
+            # Publish a complete file without overwriting a concurrent installation.
+            try:
+                os.link(staged, target)
+            except FileExistsError:
+                if needs_copy(target, content, force=False):
+                    raise
+                return False
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--force", action="store_true",
+                        help="replace existing SKILL.md files whose contents differ")
+    args = parser.parse_args()
+    home = Path(os.environ["HOME"]) if "HOME" in os.environ else Path.home()
+    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+    if not home.is_absolute() or not claude.is_absolute():
+        parser.error("HOME and CLAUDE_CONFIG_DIR must be absolute paths")
+    roots = {
+        "Claude Code": claude / "skills",
+        "Codex": home / ".agents/skills",
+        "agy": home / ".gemini/antigravity-cli/skills",
+    }
+    source = Path(__file__).resolve().parents[1] / "skills/jato/SKILL.md"
+    content = source.read_bytes()
+
+    # Check every destination before installing into the first one.
+    plan = []
+    for client, root in roots.items():
+        target = root / "jato/SKILL.md"
+        plan.append((client, target, needs_copy(target, content, args.force)))
+
+    for client, target, needed in plan:
+        changed = needed and publish(target, content, args.force)
+        print(f"{client} {'installed' if changed else 'current'} at {target}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        sys.exit(f"install-skill: {error}")

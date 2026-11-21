@@ -18,7 +18,7 @@ Keep the project's toolchain, features, target, profile, package selections, loc
 | `cargo clippy --all-targets -- -D warnings` | `jato clippy --all-targets -- -D warnings` |
 | `cargo +stable build --release` | `jato cargo +stable build --release` |
 
-For a script or tool that starts Cargo itself, set `RUSTC_WRAPPER="$(command -v jato)"` on that process. Jato occupies Cargo's compiler-wrapper slot. Check any existing wrapper before switching. Ordinary Jato commands need no project configuration edits.
+For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(command -v jato)"`. Ordinary Jato commands need no configuration edits. If the task calls for persistent project integration, merge `rustc-wrapper = "jato"` into `[build]` in `.cargo/config.toml`. Check the role of any existing wrapper before replacing it. Every developer and CI runner using that config needs `jato` on `PATH`.
 
 ## Choose an edit loop
 

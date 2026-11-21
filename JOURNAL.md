@@ -3,6 +3,8 @@
 ## 2026-11-21 — coding agent skill
 
 - Wrote a shared Cargo workflow for Claude Code, Codex and agy. Checked its skill manifest and ran the examples in a two-crate workspace, including a filtered test, Clippy, toolchain forwarding, fast profiles, worktree execution and both watch modes after an edit.
+- Added one per-user installer. Four tests cover independent copies, repeat installs, customized files, linked directories and an alternate Claude configuration root. Plain Cargo also stored both workspace units with the documented project wrapper.
+- Claude Code 2.1.330 and Codex 0.170.0 listed the skill from an unrelated project. Antigravity CLI 1.5.13 read its full manifest during offline discovery and required sign-in to start a session. Installed all three user copies and verified a second run preserved them.
 
 ## 2026-11-21 — dependency changes and large packed frames
 

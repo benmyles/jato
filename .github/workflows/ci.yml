@@ -10,6 +10,9 @@ jobs:
         rust: [stable, "1.89.0"]
     steps:
       - uses: actions/checkout@v6
+      - name: Test global skill installation
+        if: matrix.rust == 'stable'
+        run: python3 tests/install_skill.py
       - name: Install toolchain
         run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - name: Check formatting and lints

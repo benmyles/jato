@@ -10,7 +10,7 @@
 ## Coding agent skill
 
 - [x] Write a portable Jato skill and exercise its Cargo commands in a Rust workspace.
-- [ ] Install the skill globally for Claude Code, Codex and agy and verify client discovery.
+- [x] Install the skill globally for Claude Code, Codex and agy and verify client discovery.
 
 ## Optimization pass
 

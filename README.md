@@ -25,6 +25,24 @@ jato stats
 
 The first compilation populates the cache. Cargo continues to skip fresh units and maintains its incremental data in the usual target directory. A restored unit can save an entire compiler invocation. An edit that produces new inputs still needs compilation.
 
+### Use Jato with coding agents
+
+From the Jato checkout, install the [Jato skill](skills/jato/SKILL.md) for every project in your account. One command installs it for all three clients and requires only Python 3.
+
+```sh
+./scripts/install-skill
+```
+
+Open the agent in your Rust project and ask it to use Jato, or invoke the skill explicitly in a new session.
+
+| Client | Example prompt | Default skill directory |
+| --- | --- | --- |
+| Claude Code | `/jato run the workspace tests` | `~/.claude/skills/jato/` |
+| Codex | `$jato run the workspace tests` | `~/.agents/skills/jato/` |
+| Antigravity CLI (`agy`) | `/jato run the workspace tests` | `~/.gemini/antigravity-cli/skills/jato/` |
+
+The installer honors `CLAUDE_CONFIG_DIR`. Each copy works after moving the checkout. A repeat installation preserves matching files. To update copies that differ, review them and rerun `./scripts/install-skill --force`. In a running agy session, `/skills reload` refreshes the commands. [Claude Code skills](https://code.claude.com/docs/en/skills) · [Codex skills](https://developers.openai.com/codex/skills) · [Antigravity skills](https://antigravity.google/docs/skills)
+
 ### Fast development builds
 
 Use `jato dev` to build, `jato dev run` to start the application, or `jato dev test` to run its tests. `jato dev watch` uses the same profile for focused and workspace checks. For separate checkouts, use `jato dev worktree --root . run`.
@@ -155,4 +173,4 @@ Procedural-macro expansion can inspect arbitrary external state. A crate using s
 
 ## Development
 
-Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. The integration suite builds disposable Cargo projects and exercises compiler invalidation, exact artifact restoration, process cancellation, and concurrent cache access. Project conventions, the release checklist, and the work journal live alongside the code. [AGENTS.md](AGENTS.md) · [TODO.md](TODO.md) · [JOURNAL.md](JOURNAL.md)
+Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. The integration suite builds disposable Cargo projects and exercises compiler invalidation, exact artifact restoration, process cancellation, and concurrent cache access. Run `python3 tests/install_skill.py` to check the global skill installer in temporary user homes. Project conventions, the release checklist, and the work journal live alongside the code. [AGENTS.md](AGENTS.md) · [TODO.md](TODO.md) · [JOURNAL.md](JOURNAL.md)
