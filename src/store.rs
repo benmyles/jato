@@ -2,7 +2,7 @@ use crate::staging::Output;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -13,6 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
+const SCHEMA_VERSION: u32 = 9;
+const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
 
@@ -119,6 +121,61 @@ struct Prepared {
     sealed: Option<crate::sealed::Object>,
 }
 
+#[derive(Default)]
+struct Decoder {
+    zstd: Option<zstd::bulk::Decompressor<'static>>,
+    buffer: Vec<u8>,
+}
+
+impl Decoder {
+    fn decode<'a>(&'a mut self, packed: &'a [u8], raw: usize, hash: Digest) -> Result<&'a [u8]> {
+        ensure!(raw <= CHUNK && packed.len() <= raw, Damaged::Chunk(hash));
+        if raw == packed.len() {
+            return Ok(packed);
+        }
+        let zstd = match &mut self.zstd {
+            Some(zstd) => zstd,
+            None => self.zstd.insert(zstd::bulk::Decompressor::new()?),
+        };
+        self.buffer.clear();
+        self.buffer.reserve(raw);
+        zstd.decompress_to_buffer(packed, &mut self.buffer)
+            .map_err(|_| Damaged::Chunk(hash))?;
+        ensure!(self.buffer.len() == raw, Damaged::Chunk(hash));
+        Ok(&self.buffer)
+    }
+}
+
+fn encode_plan(raw: &[u8]) -> Result<(Digest, Vec<u8>)> {
+    ensure!(raw.len() <= MAX_PLAN, "input manifest exceeds size limit");
+    let hash = *blake3::hash(raw).as_bytes();
+    // JSON always starts with a printable byte. A zero tags a compressed
+    // manifest with its bounded, exact decompressed length.
+    if raw.len() >= 1024 {
+        let packed = zstd::bulk::compress(raw, 1)?;
+        if packed.len() + 5 < raw.len() {
+            let mut data = Vec::with_capacity(packed.len() + 5);
+            data.push(0);
+            data.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            data.extend_from_slice(&packed);
+            return Ok((hash, data));
+        }
+    }
+    Ok((hash, raw.to_vec()))
+}
+
+fn decode_plan(stored: &[u8]) -> Result<Vec<u8>> {
+    if stored.first() != Some(&0) {
+        return Ok(stored.to_vec());
+    }
+    let header = stored.get(1..5).context("short input manifest")?;
+    let len = u32::from_le_bytes(header.try_into()?) as usize;
+    ensure!(len <= MAX_PLAN, "oversized input manifest");
+    let raw = zstd::bulk::decompress(&stored[5..], len)?;
+    ensure!(raw.len() == len, "short decoded input manifest");
+    Ok(raw)
+}
+
 impl Store {
     pub fn open() -> Result<Self> {
         let mut store = Self::at(cache_dir()?, cache_limit()?)?;
@@ -147,8 +204,11 @@ impl Store {
             "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA mmap_size=33554432; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576;",
         )?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        ensure!(version <= 8, "unrecognized Jato cache format {version}");
-        if version < 8 {
+        ensure!(
+            version <= SCHEMA_VERSION,
+            "unrecognized Jato cache format {version}"
+        );
+        if version < SCHEMA_VERSION {
             let init = OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -156,14 +216,28 @@ impl Store {
                 .open(dir.join("schema.lock"))?;
             init.lock()?;
             let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            ensure!(
+                version <= SCHEMA_VERSION,
+                "unrecognized Jato cache format {version}"
+            );
             if version == 0 {
                 conn.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL;")?;
             }
-            if version < 8 {
+            if version < SCHEMA_VERSION {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if version == 2 {
                     tx.execute_batch(
                         "ALTER TABLE plans ADD COLUMN codegen INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                if version > 0 {
+                    tx.execute_batch(
+                        "ALTER TABLE files ADD COLUMN single INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                if version >= 2 {
+                    tx.execute_batch(
+                        "ALTER TABLE plans ADD COLUMN manifest INTEGER REFERENCES manifests",
                     )?;
                 }
                 tx.execute_batch(SCHEMA)?;
@@ -250,19 +324,76 @@ impl Store {
         )? {
             tx.execute("DELETE FROM probes WHERE key=(SELECT key FROM probes ORDER BY seen LIMIT 1)", [])?;
         }
-        evict(&tx, self.limit)?;
+        let evicted = evict(&tx, self.limit)?;
         tx.commit()?;
+        if evicted != 0 {
+            self.collect_objects(false)?;
+        }
         Ok(())
     }
 
-    pub fn plans(&self, recipe: &Digest) -> Result<Vec<Vec<u8>>> {
-        let mut q = self.conn.prepare_cached("SELECT inputs FROM entries JOIN plans ON entry=id WHERE recipe=?1 AND NOT EXISTS(SELECT 1 FROM needs WHERE needs.entry=id) AND length(inputs)<=262144 ORDER BY access DESC LIMIT 4")?;
+    pub fn plans(&mut self, recipe: &Digest) -> Result<Vec<Vec<u8>>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut q = tx.prepare_cached(
+            "SELECT p.manifest,m.hash,
+                    CASE WHEN p.manifest IS NULL AND length(p.inputs)<=?2 THEN p.inputs
+                         WHEN length(m.data)<=?2 THEN m.data END
+             FROM entries e JOIN plans p ON p.entry=e.id LEFT JOIN manifests m ON p.manifest=m.id
+             WHERE e.recipe=?1 AND NOT EXISTS(SELECT 1 FROM needs WHERE needs.entry=e.id)
+             ORDER BY e.access DESC LIMIT 48",
+        )?;
         let mut plans = Vec::new();
-        for row in q.query_map([recipe], |r| r.get::<_, Vec<u8>>(0))? {
-            let bytes = row?;
+        let mut ids = BTreeSet::new();
+        let mut damaged = Vec::new();
+        let mut rows = q.query(params![recipe, MAX_PLAN])?;
+        while let Some(row) = rows.next()? {
+            let bytes = if let Some(id) = row.get::<_, Option<i64>>(0)? {
+                if !ids.insert(id) {
+                    continue;
+                }
+                let raw = row
+                    .get_ref(2)?
+                    .as_blob()
+                    .ok()
+                    .and_then(|stored| decode_plan(stored).ok());
+                let checksum = row.get_ref(1)?.as_blob().ok();
+                match raw {
+                    Some(bytes) if Some(blake3::hash(&bytes).as_bytes().as_slice()) == checksum => {
+                        bytes
+                    }
+                    _ => {
+                        damaged.push(id);
+                        continue;
+                    }
+                }
+            } else {
+                let Some(raw) = row.get::<_, Option<Vec<u8>>>(2)? else {
+                    continue;
+                };
+                raw
+            };
             if !plans.contains(&bytes) {
                 plans.push(bytes);
+                if plans.len() == 4 {
+                    break;
+                }
             }
+        }
+        drop(rows);
+        drop(q);
+        // Keeping the read snapshot through invalidation prevents removal of
+        // a newer manifest installed concurrently under a recycled row id.
+        let reap = !damaged.is_empty();
+        for id in damaged {
+            tx.execute(
+                "DELETE FROM entries WHERE id IN (SELECT entry FROM plans WHERE manifest=?1)",
+                [id],
+            )?;
+            tx.execute("INSERT INTO counters VALUES('corrupt',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[])?;
+        }
+        tx.commit()?;
+        if reap {
+            self.collect_objects(false)?;
         }
         Ok(plans)
     }
@@ -318,12 +449,14 @@ impl Store {
         // Compress in parallel with other compilers, outside SQLite's single writer.
         // Anonymous staging files are reclaimed by the OS even on process death.
         let mut spool = tempfile::spooled_tempfile_in(CHUNK, &self.dir);
-        let mut compressed = Vec::with_capacity(zstd::zstd_safe::compress_bound(CHUNK));
-        let mut buffer = vec![0; CHUNK];
-        let mut compressor = zstd::bulk::Compressor::new(1)?;
+        let mut compressed = Vec::new();
+        let mut buffer = Vec::new();
+        let mut compressor = None;
+        let manifest = plan.as_ref().map(|p| encode_plan(p.inputs)).transpose()?;
         let plan_cost = plan
             .as_ref()
-            .map_or(0, |p| 176 + p.inputs.len() + 96 * p.needs.len());
+            .zip(manifest.as_ref())
+            .map_or(0, |(p, (_, bytes))| 272 + bytes.len() + 96 * p.needs.len());
         let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
         if charge > self.limit || stderr.len() > DIAGNOSTIC_LIMIT {
             return Ok(false);
@@ -370,6 +503,10 @@ impl Store {
                 self.allow_sealed = Some(false);
             }
             let mut hasher = blake3::Hasher::new();
+            let window = length.min(CHUNK as u64) as usize;
+            if buffer.len() < window {
+                buffer.resize(window, 0);
+            }
             loop {
                 let mut n = 0;
                 while n < buffer.len() {
@@ -383,13 +520,24 @@ impl Store {
                     break;
                 }
                 let raw = &buffer[..n];
-                compressor.compress_to_buffer(raw, &mut compressed)?;
-                let packed = if compressed.len() < n {
-                    compressed.as_slice()
+                let packed = if n >= 64 {
+                    let encoder = match &mut compressor {
+                        Some(encoder) => encoder,
+                        None => compressor.insert(zstd::bulk::Compressor::new(1)?),
+                    };
+                    compressed.clear();
+                    compressed.reserve(zstd::zstd_safe::compress_bound(n));
+                    encoder.compress_to_buffer(raw, &mut compressed)?;
+                    if compressed.len() < n {
+                        compressed.as_slice()
+                    } else {
+                        raw
+                    }
                 } else {
                     raw
                 };
-                charge += (packed.len() + 192) as u64;
+                let overhead = if length <= CHUNK as u64 { 96 } else { 192 };
+                charge += (packed.len() + overhead) as u64;
                 if charge > self.limit {
                     return Ok(false);
                 }
@@ -428,9 +576,10 @@ impl Store {
         }
         let entry = tx.last_insert_rowid();
         for (slot, file) in files.iter().enumerate() {
+            let single = file.frames.len() == 1;
             tx.execute(
-                "INSERT INTO files VALUES(?1,?2,?3,?4,?5)",
-                params![entry, slot, &file.hash, file.size, file.mode],
+                "INSERT INTO files(entry,slot,digest,size,mode,single) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![entry, slot, &file.hash, file.size, file.mode, single],
             )?;
             if let Some(object) = &file.sealed {
                 crate::sealed::publish(object, &crate::sealed::path(&self.dir, &file.hash))?;
@@ -446,14 +595,22 @@ impl Store {
                 spool.read_exact(packed)?;
                 tx.prepare_cached("INSERT INTO chunks VALUES(?1,?2,?3,1) ON CONFLICT(hash) DO UPDATE SET refs=refs+1")?
                     .execute(params![&frame.hash, frame.raw, &*packed])?;
-                tx.prepare_cached("INSERT INTO parts VALUES(?1,?2,?3,?4)")?
-                    .execute(params![entry, slot, ordinal, &frame.hash])?;
+                if !single {
+                    tx.prepare_cached("INSERT INTO parts VALUES(?1,?2,?3,?4)")?
+                        .execute(params![entry, slot, ordinal, &frame.hash])?;
+                }
             }
         }
-        if let Some(plan) = plan {
+        if let (Some(plan), Some((hash, bytes))) = (plan, manifest) {
+            let manifest: i64 = tx.query_row(
+                "INSERT INTO manifests(hash,data,refs) VALUES(?1,?2,1) ON CONFLICT(hash)
+                 DO UPDATE SET refs=refs+1 RETURNING id",
+                params![hash, bytes],
+                |r| r.get(0),
+            )?;
             tx.execute(
-                "INSERT INTO plans VALUES(?1,?2,?3,?4)",
-                params![entry, plan.inputs, plan.topology, plan.codegen],
+                "INSERT INTO plans(entry,inputs,topology,codegen,manifest) VALUES(?1,x'',?2,?3,?4)",
+                params![entry, plan.topology, plan.codegen, manifest],
             )?;
             tx.execute(
                 "INSERT INTO source_variants VALUES(?1,?2)",
@@ -510,35 +667,41 @@ impl Store {
         };
         let staged = (|| -> Result<Vec<Output>> {
             ensure!(blake3::hash(&stderr).as_bytes() == &hash, Damaged::Entry);
-            let count: usize =
-                tx.query_row("SELECT COUNT(*) FROM files WHERE entry=?1", [id], |r| {
-                    r.get(0)
-                })?;
-            ensure!(count == outputs.len(), Damaged::Entry);
+            let mut files = tx.prepare_cached(
+                "SELECT f.slot,f.digest,f.size,f.mode,f.single,o.verity,c.raw,
+                        CASE WHEN length(c.data)<=?2 THEN c.data END
+                 FROM files f LEFT JOIN clones x ON x.entry=f.entry AND x.slot=f.slot AND x.hash=f.digest
+                 LEFT JOIN objects o ON o.hash=x.hash
+                 LEFT JOIN chunks c ON f.single=1 AND c.hash=f.digest
+                 WHERE f.entry=?1 ORDER BY f.slot"
+            )?;
+            let mut records = files.query(params![id, CHUNK])?;
             let mut staged = crate::staging::for_outputs(outputs)?;
-            let mut decompressor = zstd::bulk::Decompressor::new()?;
-            let mut decoded = Vec::with_capacity(CHUNK);
+            let mut decoder = Decoder::default();
             for (slot, staged_file) in staged.iter_mut().enumerate() {
                 let tmp = staged_file.writer();
-                let (digest, size, mode) = tx.query_row(
-                    "SELECT digest,size,mode FROM files WHERE entry=?1 AND slot=?2",
-                    params![id, slot],
-                    |r| {
-                        Ok((
-                            r.get::<_, Digest>(0)?,
-                            r.get::<_, u64>(1)?,
-                            r.get::<_, u32>(2)?,
-                        ))
-                    },
-                )?;
-                let verity = tx
-                    .query_row(
-                        "SELECT o.verity FROM clones c JOIN objects o ON o.hash=c.hash
-                     WHERE c.entry=?1 AND c.slot=?2 AND o.hash=?3",
-                        params![id, slot, digest],
-                        |r| r.get::<_, Digest>(0),
-                    )
-                    .optional()?;
+                let row = records.next()?.ok_or(Damaged::Entry)?;
+                ensure!(row.get::<_, usize>(0)? == slot, Damaged::Entry);
+                let digest: Digest = row.get(1)?;
+                let size: u64 = row.get(2)?;
+                let mode: u32 = row.get(3)?;
+                tmp.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+                if row.get::<_, bool>(4)? {
+                    let raw = row.get::<_, usize>(6).map_err(|_| Damaged::Chunk(digest))?;
+                    let packed = row
+                        .get_ref(7)?
+                        .as_blob()
+                        .map_err(|_| Damaged::Chunk(digest))?;
+                    let bytes = decoder.decode(packed, raw, digest)?;
+                    ensure!(
+                        blake3::hash(bytes).as_bytes() == &digest,
+                        Damaged::Chunk(digest)
+                    );
+                    ensure!(size == raw as u64, Damaged::Entry);
+                    tmp.write_all(bytes)?;
+                    continue;
+                }
+                let verity = row.get::<_, Option<Digest>>(5)?;
                 if let Some(verity) = verity {
                     let path = crate::sealed::path(&self.dir, &digest);
                     let mut source = File::open(path).map_err(|e| {
@@ -549,7 +712,6 @@ impl Store {
                         }
                     })?;
                     crate::sealed::restore(&mut source, tmp, &verity, &digest, size)?;
-                    tmp.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
                     continue;
                 }
                 let mut hasher = blake3::Hasher::new();
@@ -563,16 +725,7 @@ impl Store {
                         .get_ref(2)?
                         .as_blob()
                         .map_err(|_| Damaged::Chunk(hash))?;
-                    ensure!(raw <= CHUNK && packed.len() <= raw, Damaged::Chunk(hash));
-                    let bytes = if packed.len() == raw {
-                        packed
-                    } else {
-                        decompressor
-                            .decompress_to_buffer(packed, &mut decoded)
-                            .map_err(|_| Damaged::Chunk(hash))?;
-                        &decoded
-                    };
-                    ensure!(bytes.len() == raw, Damaged::Chunk(hash));
+                    let bytes = decoder.decode(packed, raw, hash)?;
                     tmp.write_all(bytes)?;
                     hasher.update(bytes);
                     written += raw as u64;
@@ -586,17 +739,17 @@ impl Store {
                     while let Some(row) = rows.next()? {
                         let (chunk, raw) = (row.get::<_, Digest>(0)?, row.get::<_, usize>(1)?);
                         ensure!(raw <= CHUNK, Damaged::Chunk(chunk));
-                        decoded.resize(raw, 0);
-                        tmp.read_exact(&mut decoded)?;
+                        decoder.buffer.resize(raw, 0);
+                        tmp.read_exact(&mut decoder.buffer)?;
                         ensure!(
-                            blake3::hash(&decoded).as_bytes() == &chunk,
+                            blake3::hash(&decoder.buffer).as_bytes() == &chunk,
                             Damaged::Chunk(chunk)
                         );
                     }
                     return Err(Damaged::Entry.into());
                 }
-                tmp.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
             }
+            ensure!(records.next()?.is_none(), Damaged::Entry);
             Ok(staged)
         })();
         tx.commit()?;
@@ -606,7 +759,7 @@ impl Store {
                 if let Some(damage) = e.downcast_ref::<Damaged>() {
                     match damage {
                         Damaged::Chunk(hash) => self.conn.execute(
-                            "DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1)", [hash],
+                            "DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1 UNION SELECT entry FROM files WHERE single=1 AND digest=?1)", [hash],
                         )?,
                         Damaged::Object(hash) => self.conn.execute(
                             "DELETE FROM entries WHERE id IN (SELECT entry FROM clones WHERE hash=?1)", [hash],
@@ -758,6 +911,54 @@ fn evict(tx: &Transaction<'_>, limit: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variants_share_checked_manifests_and_single_chunk_payloads() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::at(root.path().join("cache"), 1024 * 1024)?;
+        let outputs = [root.path().join("metadata")];
+        fs::write(&outputs[0], b"shared output")?;
+        let inputs = b"repeated/source/path.rs ".repeat(1000);
+        let evidence = || Evidence {
+            inputs: &inputs,
+            sources: &[6; 32],
+            needs: &[],
+            topology: &[2; 32],
+            codegen: false,
+        };
+        for i in 1..=12 {
+            assert!(store.save(&[8; 32], &[i; 32], &outputs, b"", 1, Some(evidence()))?);
+        }
+        let (refs, bytes): (usize, usize) =
+            store
+                .conn
+                .query_row("SELECT refs,length(data) FROM manifests", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        assert_eq!(refs, 12);
+        assert!(bytes < inputs.len() / 10);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM parts", [], |r| r.get::<_, u64>(0))?,
+            0
+        );
+        assert_eq!(
+            store.plans(&[8; 32])?.as_slice(),
+            std::slice::from_ref(&inputs)
+        );
+        store
+            .conn
+            .execute("UPDATE manifests SET data=zeroblob(length(data))", [])?;
+        assert!(store.plans(&[8; 32])?.is_empty());
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        assert!(store.save(&[8; 32], &[1; 32], &outputs, b"", 1, Some(evidence()))?);
+        assert_eq!(store.plans(&[8; 32])?, [inputs]);
+        assert_eq!(store.restore(&[1; 32], &outputs)?, Some(vec![]));
+        store.prune(0)?;
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        Ok(())
+    }
 
     #[test]
     fn chunks_are_shared_lru_is_bounded_and_corruption_does_not_escape() -> Result<()> {

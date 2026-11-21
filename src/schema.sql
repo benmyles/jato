@@ -9,7 +9,7 @@ CREATE INDEX IF NOT EXISTS recipes ON entries(recipe,access DESC);
 CREATE INDEX IF NOT EXISTS lru ON entries(access);
 CREATE TABLE IF NOT EXISTS files(
     entry INTEGER REFERENCES entries ON DELETE CASCADE, slot INTEGER, digest BLOB NOT NULL,
-    size INTEGER NOT NULL, mode INTEGER NOT NULL, PRIMARY KEY(entry,slot)
+    size INTEGER NOT NULL, mode INTEGER NOT NULL, single INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(entry,slot)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS artifacts ON files(digest);
 CREATE TABLE IF NOT EXISTS chunks(
@@ -32,6 +32,10 @@ END;
 CREATE TRIGGER IF NOT EXISTS drop_file AFTER DELETE ON files BEGIN
     UPDATE usage SET bytes=bytes-128;
 END;
+CREATE TRIGGER IF NOT EXISTS drop_single AFTER DELETE ON files WHEN OLD.single=1 BEGIN
+    UPDATE chunks SET refs=refs-1 WHERE hash=OLD.digest;
+    DELETE FROM chunks WHERE hash=OLD.digest AND refs=0;
+END;
 CREATE TRIGGER IF NOT EXISTS add_chunk AFTER INSERT ON chunks BEGIN
     UPDATE usage SET bytes=bytes+96+length(NEW.data);
 END;
@@ -46,9 +50,22 @@ CREATE TRIGGER IF NOT EXISTS drop_part AFTER DELETE ON parts BEGIN
     UPDATE chunks SET refs=refs-1 WHERE hash=OLD.chunk;
     DELETE FROM chunks WHERE hash=OLD.chunk AND refs=0;
 END;
-CREATE TABLE IF NOT EXISTS plans(
-    entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, inputs BLOB NOT NULL, topology BLOB NOT NULL, codegen INTEGER NOT NULL DEFAULT 0
+CREATE TABLE IF NOT EXISTS manifests(
+    id INTEGER PRIMARY KEY, hash BLOB NOT NULL UNIQUE, data BLOB NOT NULL, refs INTEGER NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS add_manifest AFTER INSERT ON manifests BEGIN
+    UPDATE usage SET bytes=bytes+96+length(NEW.data);
+END;
+CREATE TRIGGER IF NOT EXISTS drop_manifest AFTER DELETE ON manifests BEGIN
+    UPDATE usage SET bytes=bytes-96-length(OLD.data);
+END;
+CREATE TABLE IF NOT EXISTS plans(
+    entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE, inputs BLOB NOT NULL, topology BLOB NOT NULL, codegen INTEGER NOT NULL DEFAULT 0, manifest INTEGER REFERENCES manifests
+);
+CREATE TRIGGER IF NOT EXISTS release_manifest AFTER DELETE ON plans WHEN OLD.manifest IS NOT NULL BEGIN
+    UPDATE manifests SET refs=refs-1 WHERE id=OLD.manifest;
+    DELETE FROM manifests WHERE id=OLD.manifest AND refs=0;
+END;
 CREATE TRIGGER IF NOT EXISTS add_plan AFTER INSERT ON plans BEGIN
     UPDATE usage SET bytes=bytes+80+length(NEW.inputs);
 END;
@@ -91,4 +108,4 @@ CREATE INDEX IF NOT EXISTS source_keys ON source_variants(digest);
 CREATE TRIGGER IF NOT EXISTS add_variant AFTER INSERT ON source_variants BEGIN UPDATE usage SET bytes=bytes+96; END;
 CREATE TRIGGER IF NOT EXISTS drop_variant AFTER DELETE ON source_variants BEGIN UPDATE usage SET bytes=bytes-96; END;
 CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY,last_run INTEGER NOT NULL) WITHOUT ROWID;
-PRAGMA user_version=8;
+PRAGMA user_version=9;
