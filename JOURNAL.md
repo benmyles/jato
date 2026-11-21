@@ -20,3 +20,4 @@
 - Added end-to-end checks for damaged-cache recovery and independent invalidation by features, absent or empty environment variables, and escaped environment values. All sixteen tests pass on Rust 1.89.0 and 1.100.0.
 - Measured the installed release over three runs per build scenario. Ripgrep clean checks went from 6.28 s to 0.65 s and release rebuilds from 61.61 s to 25.62 s. Its 116.1 MiB of artifacts occupied 36.0 MiB of SQLite files.
 - Measured five edits end to end. Median save-to-diagnostic latency was 186 ms with a 100 ms debounce. Recorded raw samples, fresh and cold builds, edit overhead, RSS, and reproduction commands in bench/.
+- Verified the distributable Cargo package and made the locked benchmark fixture available inside its source archive.

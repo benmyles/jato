@@ -34,7 +34,9 @@ def main():
             if not (project / "Cargo.lock").is_file():
                 parser.error("--project needs an existing Cargo.lock")
         else:
-            shutil.copytree(Path(__file__).parent / "regex-app", project, ignore=shutil.ignore_patterns("target"))
+            shutil.copytree(Path(__file__).parent / "regex-app", project, ignore=shutil.ignore_patterns("target", "jato-bench-*"))
+            # Cargo omits nested packages when creating a .crate archive.
+            (project / "Cargo.toml.in").rename(project / "Cargo.toml")
         env = dict(os.environ, CARGO_BUILD_JOBS=str(options.jobs), RUSTC_WRAPPER="",
                    RUSTC_WORKSPACE_WRAPPER="", CARGO_TARGET_DIR=str(target),
                    CARGO_BUILD_BUILD_DIR=str(target), JATO_CACHE_DIR=str(cache),
