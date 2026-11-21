@@ -107,7 +107,7 @@ Jato's Cargo commands select Jato as `RUSTC_WRAPPER` for the child process. Carg
 | `jato stats --json` | Show this cache's logical artifact bytes, sealed and compressed payload, SQLite file sizes, compiler hits, probe hits, pending entries and bypasses. |
 | `jato gc 256MiB` | Immediately evict least-recently-used entries to this size. `jato gc` uses the configured budget. `jato gc 0` removes all managed entries. |
 | `JATO_LOG=debug jato check` | Print per-crate decisions, including unavailable inputs and unsupported compiler options, when Cargo invokes rustc. |
-| `JATO_LOG=timings jato build --release` | Show per-hit validation and restore times in microseconds. |
+| `JATO_LOG=timings jato build --release` | Show per-hit validation and restore times, and the compile, validation and storage costs of a recorded miss, in microseconds. |
 | `JATO_LINK_CACHE=0 jato build` | Use the original toolchain for final links and units requiring native input observation. |
 | `JATO_DISABLE=1 jato build` | Delegate every invocation directly to the compiler for this run. |
 
@@ -117,9 +117,11 @@ SQLite publishes each complete artifact set in a transaction. Hits verify the re
 
 The compiler counters cover invocations that reach the wrapper after Cargo's freshness check. A `coalesced_hit` is a verified hit after observing another compiler on the same scheduling hint. A `live_incremental_hit` restores an eligible native output during an existing incremental session. Both count toward `hit`. `reused_compiler_ms` sums earlier compiler durations, which can overlap during parallel builds. `probe_hit` counts replayed compiler version and target queries separately.
 
-Packed writes hash frames before compression and can reuse previously compressed frames across revisions. `packed_reused_bytes` in `jato stats --json` counts raw bytes whose compression was skipped by successful publications. Ordered frame descriptors share the bounded staging spool with new payloads. Distinct digest sets beyond 1,024 entries spill to a private temporary SQLite index. [SQLite temporary databases](https://www.sqlite.org/inmemorydb.html#temporary_databases)
+Packed writes hash frames before compression and can reuse previously compressed frames across revisions. `packed_reused_bytes` in `jato stats --json` counts raw bytes whose compression was skipped by successful publications. Ordered frame descriptors share the bounded staging spool with compressed payloads. For a new incompressible frame of at least 16 KiB, the descriptor points back to the compiler output. Publication rereads and hashes those exact bytes before inserting them into SQLite. Distinct digest sets beyond 1,024 entries spill to a private temporary SQLite index. [SQLite temporary databases](https://www.sqlite.org/inmemorydb.html#temporary_databases)
 
-Jato 0.6 upgrades earlier local caches in place. Old fixed-size chunks and new content-defined chunks can coexist. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
+When a new compiler output matches an existing sealed object, Jato can use that object for the new entry. It verifies the entire output digest and the kernel measurement of the candidate. The `sealed_reused_bytes` counter records bytes matched this way.
+
+Jato 0.7 reads existing 0.6 entries and upgrades older local caches in place. Old fixed-size chunks and new content-defined chunks can coexist. Reusing a chunk leaves its compressed payload untouched. Worktree builds populate their own compiler recipes. New variants share checked input manifests, and `jato gc` reclaims their storage after the last reference is evicted.
 
 ## What can be reused
 
@@ -131,7 +133,7 @@ On x86-64 GNU Linux, Jato can also reuse binaries, test executables and compiled
 
 This also covers Rust libraries using a native-only search path or an ordinary `-l` static or dynamic library declaration. When rustc bundles a static archive into an rlib, Jato validates the archive it actually opened and the search paths it tried. Cargo continues to run build scripts, including any C compilation they request.
 
-Cargo's default release and dev profiles can reuse eligible native outputs. Jato records an incremental native build when it observes rustc creating fresh state for that crate. Reverting an edit can restore that executable even while the incremental session is live. Jato leaves the session in place for rustc to compile the next new edit. Cargo controls the incremental setting.
+Cargo's default release and dev profiles can reuse eligible native outputs. Jato records an incremental native build when it observes rustc creating fresh state for that crate. Reverting an edit can restore that executable even while the incremental session is live. Jato leaves the session in place for rustc to compile the next new edit. For small source directories it also records the names and types of directory entries and the identities of untracked entries. An editor can replace a tracked file by rename and still restore its old executable after full content verification. A different layout, symlinks or a directory set beyond the bounded scan can require fresh rustc module resolution. Cargo controls the incremental setting.
 
 Cargo versions with a shared `target/*/deps` directory can have concurrent jobs changing a directory as the linker searches it. Jato requires the observed search to validate and lets rustc finish such a link when the directory has changed.
 

@@ -187,12 +187,22 @@ fn fast_development_profile_keeps_project_settings_and_argument_boundaries() {
         "fn main(){println!(\"{} {:?}\",cfg!(debug_assertions), std::env::args().skip(1).collect::<Vec<_>>());}",
     );
     let build = p.run(&["dev", "--message-format=json"]);
-    let app = String::from_utf8(build.stdout)
+    let artifacts: Vec<_> = String::from_utf8(build.stdout)
         .unwrap()
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .find(|v| v["reason"] == "compiler-artifact" && v["target"]["name"] == "app")
+        .filter(|v| v["reason"] == "compiler-artifact")
+        .collect();
+    let app = artifacts
+        .iter()
+        .find(|v| v["target"]["name"] == "app")
         .unwrap();
+    let leaf = artifacts
+        .iter()
+        .find(|v| v["target"]["name"] == "leaf")
+        .unwrap();
+    assert_eq!(app["profile"]["debuginfo"], "line-tables-only");
+    assert_eq!(leaf["profile"]["debuginfo"], 0);
     assert_eq!(app["profile"]["opt_level"], "1");
     assert_eq!(app["profile"]["debug_assertions"], true);
     assert!(p.root.join("target/jato-dev/app").is_file());

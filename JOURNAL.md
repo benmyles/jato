@@ -7,6 +7,8 @@
 - Recorded a bounded directory layout for eligible incremental native units. The atomic-save undo and subsequent clean restore both hit, and adding a competing module still produced rustc error E0761. The undo used no discovery probe.
 - Reduced a new 256 KiB incompressible frame to a 40-byte staging descriptor. Publication rechecks the entire frame. Sealed capture can reuse a fully matched existing object even near the storage budget. Exercised changes outside the sample and eviction of the last reference before publication.
 - Compared four Cargo profile configurations in three rotating cold ripgrep builds each. Selected 16 codegen units, workspace line tables and dependency debug level zero for the explicit `jato dev` command. It inherits the project’s dev settings, and Cargo keeps a separate target profile. Verified explicit release selection, argument boundaries, test execution and watch feedback.
+- Traced the installed release on a cold 32 MiB packed asset. Anonymous staging writes fell from 34,072,742 bytes to zero. Seven byte-identical executable captures reused 238,069,160 bytes of authenticated objects. Downstream executables checked all embedded bytes, and both tools restored their originals.
+- Passed 55 tests on Rust 1.89 and 1.100 with native, sealed and worktree reuse required, plus the separate 272 MiB spill test. A migrated 0.6 release and a newly populated jato-dev cache each restored 39 ripgrep units in another checkout and passed all 299 upstream integration tests. Historical storage schemas reclaimed all charged bytes after GC.
 
 ## 2026-11-21 — live incremental replay and shifted artifacts
 

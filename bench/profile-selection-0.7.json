@@ -1,0 +1,86 @@
+{
+  "versions": {
+    "jato": "jato 0.6.0",
+    "toolchain": "rustc 1.100.0"
+  },
+  "project": "ripgrep 14.1.1",
+  "jobs": 4,
+  "runs": 3,
+  "columns": [
+    "cold_seconds",
+    "artifact_bytes"
+  ],
+  "overrides": {
+    "default": {},
+    "normal16": {
+      "codegen-units": 16
+    },
+    "lines16": {
+      "codegen-units": 16,
+      "debug": "line-tables-only"
+    },
+    "lines16deps0": {
+      "codegen-units": 16,
+      "debug": "line-tables-only",
+      "package.*.debug": "none"
+    }
+  },
+  "samples": {
+    "default": [
+      [
+        16.1473,
+        214444477
+      ],
+      [
+        12.7663,
+        214444477
+      ],
+      [
+        11.9746,
+        214444477
+      ]
+    ],
+    "lines16": [
+      [
+        6.2255,
+        152751371
+      ],
+      [
+        9.0403,
+        152751371
+      ],
+      [
+        8.2619,
+        152751371
+      ]
+    ],
+    "lines16deps0": [
+      [
+        7.4869,
+        114224941
+      ],
+      [
+        6.0996,
+        114224941
+      ],
+      [
+        11.8449,
+        114224941
+      ]
+    ],
+    "normal16": [
+      [
+        9.973,
+        220074691
+      ],
+      [
+        8.1042,
+        220074691
+      ],
+      [
+        14.0662,
+        220074691
+      ]
+    ]
+  }
+}

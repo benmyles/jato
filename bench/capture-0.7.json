@@ -1,0 +1,96 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "runs": 7,
+  "asset_bytes": 33554432,
+  "samples": {
+    "jato": {
+      "version": "jato 0.7.0",
+      "cold_packed": {
+        "anonymous_staging_bytes_written": 0,
+        "sqlite_bytes_written": 70716968,
+        "compressed_payload_bytes": 34049094
+      },
+      "builds": [
+        {
+          "seconds": 2.183211,
+          "native_store_us": 55323
+        },
+        {
+          "seconds": 0.33795,
+          "native_store_us": 10706
+        },
+        {
+          "seconds": 0.353215,
+          "native_store_us": 10959
+        },
+        {
+          "seconds": 0.288838,
+          "native_store_us": 11013
+        },
+        {
+          "seconds": 0.404059,
+          "native_store_us": 11301
+        },
+        {
+          "seconds": 0.371262,
+          "native_store_us": 12667
+        },
+        {
+          "seconds": 0.329798,
+          "native_store_us": 12076
+        },
+        {
+          "seconds": 0.415004,
+          "native_store_us": 12234
+        }
+      ],
+      "executable_sha256": "740a7de753a5d4644686afdb6697cfce4656a7964b626134636d6b183d719d51",
+      "executable_bytes": 34009880,
+      "sealed_reused_bytes": 238069160,
+      "sealed_objects": 3,
+      "median_edit_seconds": 0.353215,
+      "restore_hits": 2
+    },
+    "previous_jato": {
+      "version": "jato 0.6.0",
+      "cold_packed": {
+        "anonymous_staging_bytes_written": 34072742,
+        "sqlite_bytes_written": 70753736,
+        "compressed_payload_bytes": 34049102
+      },
+      "builds": [
+        {
+          "seconds": 1.349465
+        },
+        {
+          "seconds": 0.346226
+        },
+        {
+          "seconds": 0.304233
+        },
+        {
+          "seconds": 0.312654
+        },
+        {
+          "seconds": 0.55315
+        },
+        {
+          "seconds": 0.402829
+        },
+        {
+          "seconds": 0.407181
+        },
+        {
+          "seconds": 0.458985
+        }
+      ],
+      "executable_sha256": "740a7de753a5d4644686afdb6697cfce4656a7964b626134636d6b183d719d51",
+      "executable_bytes": 34009880,
+      "sealed_reused_bytes": 0,
+      "sealed_objects": 3,
+      "median_edit_seconds": 0.402829,
+      "restore_hits": 2
+    }
+  }
+}

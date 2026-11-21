@@ -1,0 +1,194 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "variants": 8,
+  "edit_asset": false,
+  "insert_asset": false,
+  "samples": {
+    "previous_jato": {
+      "version": "jato 0.6.0",
+      "revisions": [
+        {
+          "seconds": 0.823858,
+          "filesystem_output_blocks": 177712,
+          "entries": 1,
+          "artifact_bytes": 36700594,
+          "compressed_bytes": 10564986,
+          "charged_bytes": 10600025,
+          "database_bytes": 12017664,
+          "packed_reused_bytes": 0
+        },
+        {
+          "seconds": 0.350647,
+          "filesystem_output_blocks": 115360,
+          "entries": 2,
+          "artifact_bytes": 73401335,
+          "compressed_bytes": 11326613,
+          "charged_bytes": 11385857,
+          "database_bytes": 12017664,
+          "packed_reused_bytes": 15792300
+        },
+        {
+          "seconds": 0.355132,
+          "filesystem_output_blocks": 119528,
+          "entries": 3,
+          "artifact_bytes": 110102231,
+          "compressed_bytes": 12088266,
+          "charged_bytes": 12171715,
+          "database_bytes": 13594624,
+          "packed_reused_bytes": 31584600
+        },
+        {
+          "seconds": 0.472688,
+          "filesystem_output_blocks": 115416,
+          "entries": 4,
+          "artifact_bytes": 146803273,
+          "compressed_bytes": 12849984,
+          "charged_bytes": 12957638,
+          "database_bytes": 13594624,
+          "packed_reused_bytes": 47376900
+        },
+        {
+          "seconds": 0.426746,
+          "filesystem_output_blocks": 119792,
+          "entries": 5,
+          "artifact_bytes": 183504472,
+          "compressed_bytes": 13611735,
+          "charged_bytes": 13743594,
+          "database_bytes": 15196160,
+          "packed_reused_bytes": 63169200
+        },
+        {
+          "seconds": 0.342301,
+          "filesystem_output_blocks": 115640,
+          "entries": 6,
+          "artifact_bytes": 220205816,
+          "compressed_bytes": 14373540,
+          "charged_bytes": 14529604,
+          "database_bytes": 15196160,
+          "packed_reused_bytes": 78961500
+        },
+        {
+          "seconds": 0.35582,
+          "filesystem_output_blocks": 119840,
+          "entries": 7,
+          "artifact_bytes": 256907311,
+          "compressed_bytes": 15135365,
+          "charged_bytes": 15315634,
+          "database_bytes": 16781312,
+          "packed_reused_bytes": 94753800
+        },
+        {
+          "seconds": 0.411384,
+          "filesystem_output_blocks": 115776,
+          "entries": 8,
+          "artifact_bytes": 293608959,
+          "compressed_bytes": 15897229,
+          "charged_bytes": 16101703,
+          "database_bytes": 16781312,
+          "packed_reused_bytes": 110546100
+        }
+      ],
+      "restore_seconds": 0.124724,
+      "restore_hits": 1,
+      "verified_revisions": 8,
+      "archive_sha256": "9a92f6134dd997b9eb124e9611a86b63d7b138a5ae8fbb61106ad450723d2aa0",
+      "store_bytes": 16783368,
+      "btrfs_total": 16785408,
+      "btrfs_exclusive": 16785408,
+      "btrfs_set_shared": 0
+    },
+    "jato": {
+      "version": "jato 0.7.0",
+      "revisions": [
+        {
+          "seconds": 0.527813,
+          "filesystem_output_blocks": 169040,
+          "entries": 1,
+          "artifact_bytes": 36700594,
+          "compressed_bytes": 10564986,
+          "charged_bytes": 10600025,
+          "database_bytes": 12017664,
+          "packed_reused_bytes": 0
+        },
+        {
+          "seconds": 0.340485,
+          "filesystem_output_blocks": 113848,
+          "entries": 2,
+          "artifact_bytes": 73401335,
+          "compressed_bytes": 11326613,
+          "charged_bytes": 11385857,
+          "database_bytes": 12017664,
+          "packed_reused_bytes": 15792300
+        },
+        {
+          "seconds": 0.481949,
+          "filesystem_output_blocks": 117952,
+          "entries": 3,
+          "artifact_bytes": 110102231,
+          "compressed_bytes": 12088266,
+          "charged_bytes": 12171715,
+          "database_bytes": 13594624,
+          "packed_reused_bytes": 31584600
+        },
+        {
+          "seconds": 0.368901,
+          "filesystem_output_blocks": 113904,
+          "entries": 4,
+          "artifact_bytes": 146803273,
+          "compressed_bytes": 12849984,
+          "charged_bytes": 12957638,
+          "database_bytes": 13594624,
+          "packed_reused_bytes": 47376900
+        },
+        {
+          "seconds": 0.618302,
+          "filesystem_output_blocks": 118024,
+          "entries": 5,
+          "artifact_bytes": 183504472,
+          "compressed_bytes": 13611735,
+          "charged_bytes": 13743594,
+          "database_bytes": 15196160,
+          "packed_reused_bytes": 63169200
+        },
+        {
+          "seconds": 0.354928,
+          "filesystem_output_blocks": 114192,
+          "entries": 6,
+          "artifact_bytes": 220205816,
+          "compressed_bytes": 14373540,
+          "charged_bytes": 14529604,
+          "database_bytes": 15196160,
+          "packed_reused_bytes": 78961500
+        },
+        {
+          "seconds": 0.405979,
+          "filesystem_output_blocks": 118200,
+          "entries": 7,
+          "artifact_bytes": 256907311,
+          "compressed_bytes": 15135365,
+          "charged_bytes": 15315634,
+          "database_bytes": 16781312,
+          "packed_reused_bytes": 94753800
+        },
+        {
+          "seconds": 0.352279,
+          "filesystem_output_blocks": 114096,
+          "entries": 8,
+          "artifact_bytes": 293608959,
+          "compressed_bytes": 15897229,
+          "charged_bytes": 16101703,
+          "database_bytes": 16781312,
+          "packed_reused_bytes": 110546100
+        }
+      ],
+      "restore_seconds": 0.08825,
+      "restore_hits": 1,
+      "verified_revisions": 8,
+      "archive_sha256": "9a92f6134dd997b9eb124e9611a86b63d7b138a5ae8fbb61106ad450723d2aa0",
+      "store_bytes": 16783368,
+      "btrfs_total": 16785408,
+      "btrfs_exclusive": 16785408,
+      "btrfs_set_shared": 0
+    }
+  }
+}
