@@ -3,6 +3,7 @@ mod compiler;
 mod fingerprint;
 mod invocation;
 mod native;
+mod probe;
 mod sealed;
 mod staging;
 mod store;
@@ -24,6 +25,7 @@ Usage
   jato watch [OPTIONS]             Check on save, with changed packages first
   jato stats [--json]              Show cache contents and compiler counters
   jato gc [SIZE]                   Evict least-recently-used entries to SIZE
+  jato --system-linker build [...]   Select /usr/bin/cc for x86_64 GNU host links
   jato --version
 
 Examples
@@ -36,6 +38,9 @@ Environment
   JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
   JATO_MAX_SIZE     Persistent cache budget, default 1GiB
   JATO_LOG=debug    Explain each cache decision on stderr
+  JATO_LOG=timings  Include the time spent validating and restoring a hit
+  JATO_STORAGE=packed  Use compressed chunks for all new artifacts
+  JATO_LINK_CACHE=0  Delegate native linking directly to rustc
   JATO_DISABLE=1    Run the compiler directly
 ";
 
@@ -49,9 +54,23 @@ fn main() {
     }
 }
 
-fn cargo_command(args: &[OsString]) -> Result<Command> {
+fn cargo_command(args: &[OsString], system_linker: bool) -> Result<Command> {
     let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.args(args).env("RUSTC_WRAPPER", env::current_exe()?);
+    if system_linker {
+        anyhow::ensure!(
+            cfg!(all(
+                target_arch = "x86_64",
+                target_os = "linux",
+                target_env = "gnu"
+            )) && Path::new("/usr/bin/cc").is_file(),
+            "--system-linker needs the x86_64 Linux GNU system C driver"
+        );
+        cmd.env(
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "/usr/bin/cc",
+        );
+    }
     if env::var_os("JATO_CACHE_DIR").is_some() {
         cmd.env("JATO_CACHE_DIR", cache_dir()?);
     }
@@ -60,6 +79,8 @@ fn cargo_command(args: &[OsString]) -> Result<Command> {
 
 fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    let system_linker = args.first().is_some_and(|a| a == "--system-linker");
+    let args = if system_linker { &args[1..] } else { &args[..] };
     let first = args.first().map(OsString::as_os_str);
     let verb = first.and_then(OsStr::to_str);
     match verb {
@@ -68,10 +89,10 @@ fn run() -> Result<i32> {
             print!("{HELP}")
         }
         Some("check" | "build" | "test" | "run" | "clippy") => {
-            return compiler::passthrough(cargo_command(&args)?);
+            return compiler::passthrough(cargo_command(args, system_linker)?);
         }
-        Some("watch") => return watch::run(&args[1..]),
-        Some("cargo") => return compiler::passthrough(cargo_command(&args[1..])?),
+        Some("watch") => return watch::run(&args[1..], system_linker),
+        Some("cargo") => return compiler::passthrough(cargo_command(&args[1..], system_linker)?),
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
             if args.len() == 2 {
@@ -82,7 +103,7 @@ fn run() -> Result<i32> {
                 println!("Cache     {}", stats.directory.display());
                 println!("Lookups   {hits} hits, {misses} compiler runs after lookup");
                 println!(
-                    "On disk   {:.2} MiB including SQLite files",
+                    "Database  {:.2} MiB across SQLite files",
                     stats.database_bytes as f64 / 1048576.0
                 );
                 println!(
@@ -94,8 +115,8 @@ fn run() -> Result<i32> {
                     stats.charged_bytes, stats.limit_bytes
                 );
                 println!(
-                    "Payload   {} compressed bytes for {} artifact bytes",
-                    stats.compressed_bytes, stats.artifact_bytes
+                    "Payload   {} packed bytes + {} sealed bytes for {} artifact bytes",
+                    stats.compressed_bytes, stats.sealed_bytes, stats.artifact_bytes
                 );
                 for (name, value) in stats.counters {
                     if name != "hit" && name != "miss" {

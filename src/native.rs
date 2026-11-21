@@ -4,6 +4,7 @@
 //! checks both successful reads and unsuccessful search candidates.
 use crate::fingerprint::{field, hash_file, recent, stamp};
 use crate::invocation::Invocation;
+use crate::store::Digest;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +19,10 @@ use std::os::unix::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
@@ -28,35 +33,136 @@ const MAX_LINE: usize = 1024 * 1024;
 struct Access {
     present: bool,
     missing: bool,
+    not_directory: bool,
     read: bool,
     list: bool,
     wrote: bool,
     created_dir: bool,
     exclusive: bool,
+    opened_as: Option<PathBuf>,
 }
 
 #[derive(Default)]
 pub struct Observations {
     paths: BTreeMap<PathBuf, Access>,
     images: BTreeSet<PathBuf>,
+    shared_listing: Option<(PathBuf, Digest)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Manifest {
-    missing: Vec<PathBuf>,
+    missing: Vec<(PathBuf, bool)>,
     lookup: Vec<PathBuf>,
     read: Vec<PathBuf>,
     listed: Vec<PathBuf>,
+    shared_listing: Option<(PathBuf, Digest)>,
 }
 
-pub struct Capture(JoinHandle<(bool, Result<Observations>)>);
+// Older Cargo puts dependencies and the unit's own outputs in the same
+// directory. Its mtime necessarily changes. Keep the actual names, order and
+// types read by rustc in a streaming digest, excluding its declared outputs.
+struct SharedDirectory {
+    path: PathBuf,
+    outputs: Vec<PathBuf>,
+    pending: Option<((u32, u32), blake3::Hasher, usize)>,
+    completed: Option<Digest>,
+}
+
+impl SharedDirectory {
+    fn record(&mut self, pid: u32, args: &str, result: &str) -> Result<()> {
+        let (fd, batch) = args.split_once(", ").context("missing directory batch")?;
+        let number = fd
+            .split_once('<')
+            .context("unknown directory fd")?
+            .0
+            .parse()?;
+        let (owner, hash, count) = self
+            .pending
+            .get_or_insert_with(|| ((pid, number), blake3::Hasher::new(), 0));
+        ensure!(
+            *owner == (pid, number),
+            "overlapping shared directory reads"
+        );
+        let batch = batch
+            .strip_prefix('[')
+            .and_then(|s| s.rsplit_once("], ").map(|v| v.0))
+            .context("undecoded shared directory entries")?;
+        if result == "0" {
+            ensure!(batch.is_empty(), "nonempty directory EOF");
+            let digest = *hash.finalize().as_bytes();
+            ensure!(
+                self.completed.is_none_or(|d| d == digest),
+                "shared directory contents changed"
+            );
+            self.completed = Some(digest);
+            self.pending = None;
+        } else {
+            ensure!(!batch.is_empty(), "missing directory entries");
+            for entry in batch.split("}, ") {
+                *count += 1;
+                ensure!(*count <= 16384, "native search directory too large");
+                let (_, typed) = entry
+                    .split_once(", d_type=")
+                    .context("missing directory type")?;
+                let (kind, name) = typed
+                    .split_once(", d_name=")
+                    .context("missing directory name")?;
+                let (name, tail) = quoted(name)?;
+                ensure!(tail.is_empty() || tail == "}", "unknown directory record");
+                if name.as_os_str() != "." && name.as_os_str() != ".." {
+                    hash_dirent(hash, &self.outputs, name.as_os_str(), kind);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn hash_dirent(hash: &mut blake3::Hasher, outputs: &[PathBuf], name: &OsStr, kind: &str) {
+    if outputs
+        .iter()
+        .all(|output| output.file_name() != Some(name))
+    {
+        field(hash, name.as_bytes());
+        field(hash, kind.as_bytes());
+    }
+}
+
+pub struct Capture {
+    activity: Arc<AtomicBool>,
+    reader: JoinHandle<Result<Observations>>,
+}
 
 impl Capture {
-    pub fn command(compiler: &OsStr, args: &[OsString]) -> Result<(Command, Self)> {
+    pub fn command(
+        compiler: &OsStr,
+        args: &[OsString],
+        inv: &Invocation,
+        root: &Path,
+    ) -> Result<(Command, Self)> {
         let exe = Path::new("/usr/bin/strace");
         ensure!(
             cfg!(all(target_os = "linux", target_arch = "x86_64")) && exe.is_file(),
             "native input tracing unavailable"
+        );
+        let linker = inv.linker.as_deref().unwrap_or_else(|| Path::new("cc"));
+        let candidate = if linker.components().count() > 1 {
+            linker.to_owned()
+        } else {
+            let bin = root.join("lib/rustlib/x86_64-unknown-linux-gnu/bin");
+            [bin.clone(), bin.join("self-contained")]
+                .into_iter()
+                .chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                ))
+                .map(|d| d.join(linker))
+                .find(|p| p.is_file())
+                .context("no native linker driver")?
+        };
+        ensure!(
+            trusted_tool(&fs::canonicalize(&candidate)?, root)?.is_some(),
+            "{} is a custom linker or launcher. --system-linker selects /usr/bin/cc",
+            candidate.display()
         );
         let debugged = fs::read_to_string("/proc/self/status")?.lines().any(|l| {
             l.strip_prefix("TracerPid:")
@@ -66,6 +172,20 @@ impl Capture {
         let (reader, writer) = io::pipe()?;
         let fd = writer.as_raw_fd();
         let mut cmd = Command::new(exe);
+        let dir = fs::canonicalize(
+            inv.outputs[0]
+                .parent()
+                .context("missing output directory")?,
+        )?;
+        let shared = dir.ends_with("deps").then(|| SharedDirectory {
+            path: dir,
+            outputs: inv.outputs.clone(),
+            pending: None,
+            completed: None,
+        });
+        if shared.is_some() {
+            cmd.args(["-e", "abbrev=!getdents64"]);
+        }
         cmd.args([
             "-f",
             "-qq",
@@ -75,7 +195,7 @@ impl Capture {
             "-xx",
             "-y",
             "-e",
-            "trace=%file,getdents64",
+            "trace=%file,getdents64,connect,sendto,sendmsg,recvfrom,recvmsg,memfd_create,io_uring_setup",
             "-o",
         ])
         .arg(format!("/proc/self/fd/{fd}"))
@@ -93,29 +213,47 @@ impl Capture {
             });
         }
         let cwd = std::env::current_dir()?;
+        let activity = Arc::new(AtomicBool::new(false));
+        let tracer = activity.clone();
         let worker = std::thread::Builder::new()
             .name("jato-link-inputs".into())
             .stack_size(256 * 1024)
             .spawn(move || {
                 let mut reader = BufReader::new(reader);
-                let mut started = false;
-                let result = parse(&mut reader, &cwd, &mut started);
+                let result = parse(&mut reader, &cwd, &tracer, shared);
                 // A new strace dialect or an oversized manifest only prevents
                 // caching. Drain the stream so the original compiler can finish.
                 let _ = io::copy(&mut reader, &mut io::sink());
-                (started, result)
+                result
             })?;
-        Ok((cmd, Self(worker)))
+        Ok((
+            cmd,
+            Self {
+                activity,
+                reader: worker,
+            },
+        ))
+    }
+
+    pub fn started(&self) -> bool {
+        self.activity.load(Ordering::Acquire)
     }
 
     pub fn finish(self) -> (bool, Result<Observations>) {
-        self.0
+        let parsed = self
+            .reader
             .join()
-            .unwrap_or_else(|_| (true, Err(anyhow::anyhow!("native input reader stopped"))))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("native input reader stopped")));
+        (self.activity.load(Ordering::Acquire), parsed)
     }
 }
 
-fn parse(reader: &mut impl BufRead, cwd: &Path, started: &mut bool) -> Result<Observations> {
+fn parse(
+    reader: &mut impl BufRead,
+    cwd: &Path,
+    started: &AtomicBool,
+    mut shared: Option<SharedDirectory>,
+) -> Result<Observations> {
     let mut seen = Observations::default();
     let mut partial = BTreeMap::new();
     let mut pending_bytes = 0;
@@ -130,7 +268,7 @@ fn parse(reader: &mut impl BufRead, cwd: &Path, started: &mut bool) -> Result<Ob
         {
             break;
         }
-        *started = true; // The tracer ran a tracee. Never retry its compiler on parser errors.
+        started.store(true, Ordering::Release); // The tracer ran a tracee. Never retry its compiler on parser errors.
         ensure!(line.len() <= MAX_LINE, "oversized trace record");
         let (pid, call) = line
             .trim_end()
@@ -175,13 +313,38 @@ fn parse(reader: &mut impl BufRead, cwd: &Path, started: &mut bool) -> Result<Ob
             .trim_start()
             .strip_prefix("= ")
             .context("missing syscall result")?;
-        seen.observe(name, args, result, cwd)?;
+        if name == "getdents64" {
+            ensure!(
+                !result.starts_with('-'),
+                "unsuccessful native directory read"
+            );
+            let path = fd_path(
+                args.split_once(',')
+                    .context("unrecognized directory read")?
+                    .0,
+            )?;
+            if let Some(s) = &mut shared
+                && s.path == path
+            {
+                s.record(pid, args, result)?;
+            }
+            seen.paths.entry(path).or_default().list = true;
+        } else {
+            seen.observe(name, args, result, cwd)?;
+        }
         ensure!(
             seen.paths.len() <= MAX_PATHS,
             "native input manifest too large"
         );
     }
-    ensure!(partial.is_empty() && *started, "incomplete compiler trace");
+    ensure!(
+        partial.is_empty() && started.load(Ordering::Acquire),
+        "incomplete compiler trace"
+    );
+    if let Some(s) = shared {
+        ensure!(s.pending.is_none(), "incomplete shared directory listing");
+        seen.shared_listing = s.completed.map(|d| (s.path, d));
+    }
     Ok(seen)
 }
 
@@ -252,6 +415,13 @@ impl Observations {
         if name == "getcwd" {
             return Ok(());
         }
+        ensure!(
+            result
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'-'),
+            "unrecognized syscall outcome"
+        );
         let ok = !result.starts_with("-1 ");
         let absent = result.starts_with("-1 ENOENT ") || result.starts_with("-1 ENOTDIR ");
         let already = result.starts_with("-1 EEXIST ");
@@ -260,20 +430,11 @@ impl Observations {
             ok || absent || already || nonlink,
             "unmodeled native lookup: {name} {result}"
         );
-        if name == "getdents64" {
-            let path = fd_path(
-                args.split_once(',')
-                    .context("unrecognized directory read")?
-                    .0,
-            )?;
-            self.paths.entry(path).or_default().list = true;
-            return Ok(());
-        }
         let at = match name {
             "openat" | "newfstatat" | "statx" | "readlinkat" | "faccessat" | "faccessat2"
-            | "unlinkat" | "mkdirat" => true,
+            | "unlinkat" | "mkdirat" | "fchmodat" | "fchmodat2" => true,
             "open" | "stat" | "lstat" | "access" | "readlink" | "execve" | "unlink" | "rmdir"
-            | "mkdir" | "rename" => false,
+            | "mkdir" | "rename" | "chmod" => false,
             _ => bail!("unmodeled filesystem operation {name}"),
         };
         if matches!(name, "newfstatat" | "statx")
@@ -311,7 +472,15 @@ impl Observations {
         }
         let a = self.paths.entry(path.clone()).or_default();
         a.present |= ok || already || nonlink;
-        a.missing |= absent;
+        if absent {
+            let not_directory = result.starts_with("-1 ENOTDIR ");
+            ensure!(
+                !a.missing || a.not_directory == not_directory,
+                "native lookup error changed"
+            );
+            a.not_directory = not_directory;
+            a.missing = true;
+        }
         if !ok {
             return Ok(());
         }
@@ -330,13 +499,20 @@ impl Observations {
                     a.exclusive |= flags.contains("O_EXCL");
                 } else {
                     a.read = true;
+                    let resolved = fd_path(result)?;
+                    ensure!(
+                        resolved.is_absolute()
+                            && a.opened_as.as_ref().is_none_or(|old| *old == resolved),
+                        "input resolution changed during native compilation"
+                    );
+                    a.opened_as = Some(resolved);
                 }
             }
             "mkdirat" | "mkdir" => {
                 a.wrote = true;
                 a.created_dir = true;
             }
-            "unlink" | "unlinkat" | "rmdir" => a.wrote = true,
+            "unlink" | "unlinkat" | "rmdir" | "chmod" | "fchmodat" | "fchmodat2" => a.wrote = true,
             "rename" => {
                 a.wrote = true;
                 let (dest, _) = quoted(rest.trim_start_matches(", "))?;
@@ -384,26 +560,10 @@ impl Observations {
         let mut linked = false;
         for path in &self.images {
             let image = fs::canonicalize(path)?;
-            let name = image.file_name().and_then(OsStr::to_str).unwrap_or("");
-            let driver = name == "gcc"
-                || name == "cc"
-                || name == "clang"
-                || name.starts_with("clang-")
-                || name.contains("-gcc")
-                || name.starts_with("gcc-");
-            let ld = matches!(
-                name,
-                "rust-lld" | "ld" | "ld.bfd" | "ld.gold" | "ld.lld" | "lld" | "mold"
-            );
-            ensure!(
-                image == compiler
-                    || (ld || driver || name == "collect2")
-                        && (image.starts_with(root)
-                            || system_file(&image) && fs::metadata(&image)?.uid() == 0),
-                "unverified native tool {}",
-                image.display()
-            );
-            linked |= ld;
+            if image != compiler {
+                linked |= trusted_tool(&image, root)?
+                    .with_context(|| format!("unverified native tool {}", image.display()))?;
+            }
         }
         ensure!(linked, "no supported ELF linker observed");
         let folders: Vec<_> = self
@@ -411,7 +571,7 @@ impl Observations {
             .iter()
             .filter(|(p, a)| {
                 a.created_dir
-                    && p.parent() == Some(&out)
+                    && (p.parent() == Some(&out) || p.parent() == Some(temp.as_path()))
                     && p.file_name().is_some_and(|n| {
                         n.as_bytes().starts_with(b"rustc") || n.as_bytes().starts_with(b"rmeta")
                     })
@@ -424,6 +584,7 @@ impl Observations {
             lookup: Vec::new(),
             read: Vec::new(),
             listed: Vec::new(),
+            shared_listing: self.shared_listing,
         };
         for (p, a) in self.paths {
             if outputs.contains(&p) || folders.iter().any(|f| p.starts_with(f)) {
@@ -486,10 +647,25 @@ impl Observations {
                 "name changed during native compilation: {}",
                 p.display()
             );
+            if let Some(real) = a.opened_as {
+                ensure!(
+                    fs::canonicalize(&p)? == real,
+                    "native input was redirected during compilation"
+                );
+                if real.file_name().is_some_and(|n| {
+                    n.as_bytes().ends_with(b".so") || n.as_bytes().windows(4).any(|w| w == b".so.")
+                }) {
+                    ensure!(
+                        real.starts_with(root)
+                            || system_file(&real) && fs::metadata(&real)?.uid() == 0,
+                        "unverified native plugin"
+                    );
+                }
+            }
             if a.list {
                 plan.listed.push(p);
             } else if a.missing && !a.present {
-                plan.missing.push(p);
+                plan.missing.push((p, a.not_directory));
             } else if a.read || self.images.contains(&p) {
                 plan.read.push(p);
             } else {
@@ -498,6 +674,37 @@ impl Observations {
         }
         Ok(plan)
     }
+}
+
+// Some distributions prefix the GNU target triple or suffix an LLVM version.
+// Recognize the canonical ELF executable, never just the name of a symlink.
+fn trusted_tool(image: &Path, root: &Path) -> Result<Option<bool>> {
+    if !image.starts_with(root) && !(system_file(image) && fs::metadata(image)?.uid() == 0) {
+        return Ok(None);
+    }
+    let file = image.file_name().and_then(OsStr::to_str).unwrap_or("");
+    let mut name = file;
+    if let Some((base, version)) = name.rsplit_once('-')
+        && !version.is_empty()
+        && version.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+    {
+        name = base;
+    }
+    if name.starts_with("x86_64-")
+        && let Some((_, last)) = name.rsplit_once('-')
+    {
+        name = last;
+    }
+    let ld = matches!(
+        name,
+        "ld" | "ld.bfd" | "ld.gold" | "ld.lld" | "lld" | "rust-lld" | "mold"
+    );
+    if !ld && !matches!(name, "gcc" | "cc" | "clang" | "collect2") {
+        return Ok(None);
+    }
+    let mut magic = [0; 4];
+    fs::File::open(image)?.read_exact(&mut magic)?;
+    Ok((magic == *b"\x7fELF").then_some(ld))
 }
 
 fn system_file(p: &Path) -> bool {
@@ -519,14 +726,24 @@ impl Manifest {
         root: &Path,
         since: SystemTime,
         covered: &BTreeSet<PathBuf>,
+        outputs: &[PathBuf],
     ) -> Result<[u8; 32]> {
         let mut h = blake3::Hasher::new_derive_key("jato linux ELF input manifest v1");
-        for p in &self.missing {
+        let mut parents: BTreeMap<&Path, PathBuf> = BTreeMap::new();
+        let mut hashes = BTreeMap::new();
+        let mut symlinks = BTreeSet::new();
+        for (p, not_directory) in &self.missing {
+            let expected = if *not_directory {
+                io::ErrorKind::NotADirectory
+            } else {
+                io::ErrorKind::NotFound
+            };
             ensure!(
-                matches!(fs::metadata(p),Err(e) if matches!(e.kind(),io::ErrorKind::NotFound|io::ErrorKind::NotADirectory)),
-                "native search candidate appeared"
+                matches!(fs::symlink_metadata(p),Err(e) if e.kind()==expected),
+                "native search candidate changed"
             );
             field(&mut h, b"absent");
+            h.update(&[u8::from(*not_directory)]);
             field(&mut h, p.as_os_str().as_bytes());
         }
         for (class, paths) in [
@@ -535,26 +752,89 @@ impl Manifest {
             (b'd', &self.listed),
         ] {
             for p in paths {
-                let real =
-                    fs::canonicalize(p).with_context(|| format!("native input {}", p.display()))?;
-                let m = fs::metadata(&real)?;
+                let entry = fs::symlink_metadata(p)
+                    .with_context(|| format!("native input {}", p.display()))?;
+                let (real, m) = if entry.is_symlink() {
+                    ensure!(
+                        !recent(&entry, since),
+                        "native symlink changed during compilation"
+                    );
+                    field(&mut h, fs::read_link(p)?.as_os_str().as_bytes());
+                    (fs::canonicalize(p)?, fs::metadata(p)?)
+                } else if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                    let dir = match parents.entry(parent) {
+                        std::collections::btree_map::Entry::Occupied(v) => v.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(v) => {
+                            v.insert(fs::canonicalize(parent)?)
+                        }
+                    };
+                    (dir.join(name), entry)
+                } else {
+                    (fs::canonicalize(p)?, entry)
+                };
+                if p != &real {
+                    for ancestor in p.ancestors().skip(1) {
+                        if !symlinks.insert(ancestor) {
+                            break;
+                        }
+                        let m = fs::symlink_metadata(ancestor)?;
+                        ensure!(
+                            !m.is_symlink() || !recent(&m, since),
+                            "native path redirected during compilation"
+                        );
+                    }
+                }
                 h.update(&[class]);
                 field(&mut h, p.as_os_str().as_bytes());
                 field(&mut h, real.as_os_str().as_bytes());
                 h.update(&m.mode().to_le_bytes());
                 if m.is_dir() {
                     if class == b'd' {
-                        ensure!(!recent(&m, since), "directory changed during compilation");
-                        let mut names = fs::read_dir(&real)?
-                            .take(16385)
-                            .map(|e| e.map(|e| e.file_name()))
-                            .collect::<io::Result<Vec<_>>>()?;
-                        ensure!(names.len() <= 16384, "native search directory too large");
-                        names.retain(|n| n != ".jato-staging-v1");
-                        names.sort();
-                        for n in names {
-                            field(&mut h, n.as_bytes());
+                        let shared = self.shared_listing.as_ref().filter(|(dir, _)| *dir == real);
+                        ensure!(
+                            shared.is_some() || !recent(&m, since),
+                            "native directory changed: {}",
+                            real.display()
+                        );
+                        let mut listing = blake3::Hasher::new();
+                        for (index, entry) in fs::read_dir(&real)?.enumerate() {
+                            ensure!(index < 16384, "native search directory too large");
+                            let e = entry?;
+                            let ty = e.file_type()?;
+                            let kind = if ty.is_file() {
+                                "DT_REG"
+                            } else if ty.is_dir() {
+                                "DT_DIR"
+                            } else if ty.is_symlink() {
+                                "DT_LNK"
+                            } else if ty.is_fifo() {
+                                "DT_FIFO"
+                            } else if ty.is_socket() {
+                                "DT_SOCK"
+                            } else if ty.is_char_device() {
+                                "DT_CHR"
+                            } else if ty.is_block_device() {
+                                "DT_BLK"
+                            } else {
+                                bail!("unknown directory entry type");
+                            };
+                            hash_dirent(
+                                &mut listing,
+                                if shared.is_some() { outputs } else { &[] },
+                                &e.file_name(),
+                                kind,
+                            );
                         }
+                        ensure!(
+                            stamp(&m) == stamp(&fs::metadata(&real)?),
+                            "native directory changed during enumeration"
+                        );
+                        let digest = *listing.finalize().as_bytes();
+                        ensure!(
+                            shared.is_none_or(|(_, expected)| *expected == digest),
+                            "shared output directory differs from compiler observation"
+                        );
+                        field(&mut h, &digest);
                     }
                 } else if m.is_file() {
                     ensure!(
@@ -566,7 +846,13 @@ impl Manifest {
                             h.update(&n.to_le_bytes());
                         }
                     } else if !covered.contains(&real) {
-                        field(&mut h, &hash_file(&real, since, None)?);
+                        let digest = match hashes.entry(stamp(&m)) {
+                            std::collections::btree_map::Entry::Occupied(v) => *v.get(),
+                            std::collections::btree_map::Entry::Vacant(v) => {
+                                *v.insert(hash_file(p, since, None)?)
+                            }
+                        };
+                        field(&mut h, &digest);
                     }
                 } else {
                     bail!("non-regular native input {}", p.display());
@@ -599,5 +885,21 @@ pub fn environment(hash: &mut blake3::Hasher) {
         }
         field(hash, k.as_bytes());
         field(hash, v.as_bytes());
+    }
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines().filter(|l| {
+            [
+                "Uid:",
+                "Gid:",
+                "Groups:",
+                "CapEff:",
+                "NoNewPrivs:",
+                "Seccomp:",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p))
+        }) {
+            field(hash, line.as_bytes());
+        }
     }
 }

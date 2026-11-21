@@ -10,7 +10,7 @@
 ## Optimization pass
 
 - [x] Establish isolated head-to-head baselines with kache and sccache.
-- [ ] Reduce compiler validation and artifact restore overhead.
-- [ ] Accelerate eligible native executable builds with verified linker inputs.
-- [ ] Reduce save-to-diagnostic latency and idle work in watch mode.
+- [x] Reduce compiler validation and artifact restore overhead.
+- [x] Accelerate eligible native executable builds with verified linker inputs.
+- [x] Reduce save-to-diagnostic latency and idle work in watch mode.
 - [ ] Qualify correctness, run repeated comparisons, and install the measured release.

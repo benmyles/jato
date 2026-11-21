@@ -1,3 +1,4 @@
+use crate::staging::Output;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -8,7 +9,6 @@ use std::io::{Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tempfile::NamedTempFile;
 
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -68,6 +68,7 @@ impl std::error::Error for Damaged {}
 
 pub struct Evidence<'a> {
     pub inputs: &'a [u8],
+    pub sources: &'a Digest,
     pub needs: &'a [Digest],
     pub topology: &'a Digest,
     pub codegen: bool,
@@ -91,6 +92,8 @@ pub struct Stats {
     pub compressed_bytes: u64,
     pub sealed_objects: u64,
     pub sealed_bytes: u64,
+    pub pending_entries: u64,
+    pub probe_entries: u64,
     pub artifact_bytes: u64,
     pub counters: BTreeMap<String, u64>,
 }
@@ -133,13 +136,19 @@ impl Store {
             .mode(0o700)
             .create(&dir)?;
         let mut conn = Connection::open(dir.join("artifacts-v1.sqlite3"))?;
+        // Each wrapper is short-lived. Keep the WAL between invocations;
+        // checkpoint by size and during GC, rather than fsyncing on every exit.
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         conn.busy_timeout(Duration::from_secs(3))?;
         conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA mmap_size=33554432; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=4194304;",
+            "PRAGMA foreign_keys=ON; PRAGMA cache_size=-1024; PRAGMA mmap_size=33554432; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576;",
         )?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        ensure!(version <= 6, "unrecognized Jato cache format {version}");
-        if version < 6 {
+        ensure!(version <= 8, "unrecognized Jato cache format {version}");
+        if version < 8 {
             let init = OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -150,7 +159,7 @@ impl Store {
             if version == 0 {
                 conn.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL;")?;
             }
-            if version < 6 {
+            if version < 8 {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if version == 2 {
                     tx.execute_batch(
@@ -182,11 +191,68 @@ impl Store {
             return Ok(stable);
         }
         let stable = crate::admission::stable_compiler(compiler)?;
+        self.record_compiler(identity, stable)?;
+        Ok(stable)
+    }
+
+    pub fn record_compiler(&self, identity: &Digest, stable: bool) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO compilers VALUES(?1,?2,?3)",
             params![identity, stable, now()],
         )?;
-        Ok(stable)
+        Ok(())
+    }
+
+    pub fn probe(&self, key: &Digest) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT stdout,stderr,checksum FROM probes
+             WHERE key=?1 AND length(stdout)+length(stderr)<=65536",
+                [key],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, Digest>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stdout, stderr, checksum)) = result else {
+            return Ok(None);
+        };
+        if probe_checksum(&stdout, &stderr) != checksum {
+            self.conn
+                .execute("DELETE FROM probes WHERE key=?1", [key])?;
+            return Ok(None);
+        }
+        Ok(Some((stdout, stderr)))
+    }
+
+    pub fn save_probe(&mut self, key: &Digest, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+        let budget = (self.limit / 32).min(256 * 1024);
+        if stdout.len() + stderr.len() > 65536
+            || (stdout.len() + stderr.len() + 160) as u64 > budget
+        {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO probes VALUES(?1,?2,?3,?4,?5)",
+            params![key, stdout, stderr, probe_checksum(stdout, stderr), now()],
+        )?;
+        while tx.query_row(
+            "SELECT COUNT(*)>64 OR COALESCE(SUM(length(stdout)+length(stderr)+160),0)>?1 FROM probes",
+            [budget], |r| r.get::<_, bool>(0),
+        )? {
+            tx.execute("DELETE FROM probes WHERE key=(SELECT key FROM probes ORDER BY seen LIMIT 1)", [])?;
+        }
+        evict(&tx, self.limit)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn plans(&self, recipe: &Digest) -> Result<Vec<Vec<u8>>> {
@@ -199,6 +265,13 @@ impl Store {
             }
         }
         Ok(plans)
+    }
+
+    pub fn has_sources(&self, digest: &Digest) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM source_variants WHERE digest=?1)")?
+            .query_row([digest], |r| r.get(0))?)
     }
 
     pub fn topology(&self, key: &Digest) -> Result<Option<Digest>> {
@@ -250,11 +323,15 @@ impl Store {
         let mut compressor = zstd::bulk::Compressor::new(1)?;
         let plan_cost = plan
             .as_ref()
-            .map_or(0, |p| 80 + p.inputs.len() + 96 * p.needs.len());
+            .map_or(0, |p| 176 + p.inputs.len() + 96 * p.needs.len());
         let mut charge = (320 + stderr.len() + 128 * outputs.len() + plan_cost) as u64;
         if charge > self.limit || stderr.len() > DIAGNOSTIC_LIMIT {
             return Ok(false);
         }
+        let used = self
+            .conn
+            .query_row("SELECT bytes FROM usage", [], |r| r.get::<_, u64>(0))?;
+        let headroom = self.limit.saturating_sub(used);
         let mut files = Vec::new();
         for path in outputs {
             let mut source =
@@ -270,12 +347,17 @@ impl Store {
             };
             let length = metadata.len();
             if length >= CHUNK as u64
-                && charge.saturating_add(length).saturating_add(256) <= self.limit
+                && charge.saturating_add(length).saturating_add(256) <= headroom
                 && *self
                     .allow_sealed
                     .get_or_insert_with(|| crate::sealed::supported(&self.dir))
             {
                 if let Ok(object) = crate::sealed::prepare(&source, &self.dir) {
+                    ensure!(
+                        crate::fingerprint::stamp(&metadata)
+                            == crate::fingerprint::stamp(&fs::metadata(path)?),
+                        "compiler output changed during capture"
+                    );
                     file.hash = object.hash;
                     file.size = length;
                     charge += length + 256;
@@ -323,7 +405,9 @@ impl Store {
                 });
             }
             ensure!(
-                file.size == metadata.len(),
+                file.size == metadata.len()
+                    && crate::fingerprint::stamp(&metadata)
+                        == crate::fingerprint::stamp(&fs::metadata(path)?),
                 "compiler output changed while recording"
             );
             file.hash = if file.frames.len() == 1 {
@@ -371,6 +455,10 @@ impl Store {
                 "INSERT INTO plans VALUES(?1,?2,?3,?4)",
                 params![entry, plan.inputs, plan.topology, plan.codegen],
             )?;
+            tx.execute(
+                "INSERT INTO source_variants VALUES(?1,?2)",
+                params![entry, plan.sources],
+            )?;
             for digest in plan.needs {
                 tx.execute(
                     "INSERT OR IGNORE INTO needs VALUES(?1,?2,?3)",
@@ -393,6 +481,13 @@ impl Store {
                 }
             }
         }
+        let time = now();
+        let sweep = files.iter().any(|f| f.sealed.is_some())
+            && tx.execute(
+                "INSERT INTO maintenance VALUES('sealed',?1) ON CONFLICT(name)
+             DO UPDATE SET last_run=excluded.last_run WHERE last_run < ?2",
+                params![time, time - 3_600_000_000],
+            )? == 1;
         let evicted = evict(&tx, self.limit)?;
         let kept = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE id=?1)",
@@ -400,8 +495,8 @@ impl Store {
             |r| r.get(0),
         )?;
         tx.commit()?;
-        if evicted > 0 {
-            self.collect_objects(false)?;
+        if evicted > 0 || sweep {
+            self.collect_objects(sweep)?;
         }
         Ok(kept)
     }
@@ -413,7 +508,7 @@ impl Store {
         let Some((id, stderr, hash, ms)) = entry else {
             return Ok(None);
         };
-        let staged = (|| -> Result<Vec<NamedTempFile>> {
+        let staged = (|| -> Result<Vec<Output>> {
             ensure!(blake3::hash(&stderr).as_bytes() == &hash, Damaged::Entry);
             let count: usize =
                 tx.query_row("SELECT COUNT(*) FROM files WHERE entry=?1", [id], |r| {
@@ -423,7 +518,8 @@ impl Store {
             let mut staged = crate::staging::for_outputs(outputs)?;
             let mut decompressor = zstd::bulk::Decompressor::new()?;
             let mut decoded = Vec::with_capacity(CHUNK);
-            for (slot, tmp) in staged.iter_mut().enumerate() {
+            for (slot, staged_file) in staged.iter_mut().enumerate() {
+                let tmp = staged_file.writer();
                 let (digest, size, mode) = tx.query_row(
                     "SELECT digest,size,mode FROM files WHERE entry=?1 AND slot=?2",
                     params![id, slot],
@@ -435,7 +531,14 @@ impl Store {
                         ))
                     },
                 )?;
-                let verity=tx.query_row("SELECT o.verity FROM clones c JOIN objects o ON o.hash=c.hash WHERE c.entry=?1 AND c.slot=?2 AND o.hash=?3",params![id,slot,digest],|r|r.get::<_,Digest>(0)).optional()?;
+                let verity = tx
+                    .query_row(
+                        "SELECT o.verity FROM clones c JOIN objects o ON o.hash=c.hash
+                     WHERE c.entry=?1 AND c.slot=?2 AND o.hash=?3",
+                        params![id, slot, digest],
+                        |r| r.get::<_, Digest>(0),
+                    )
+                    .optional()?;
                 if let Some(verity) = verity {
                     let path = crate::sealed::path(&self.dir, &digest);
                     let mut source = File::open(path).map_err(|e| {
@@ -445,9 +548,8 @@ impl Store {
                             e.into()
                         }
                     })?;
-                    crate::sealed::restore(&mut source, tmp.as_file_mut(), &verity, &digest, size)?;
-                    tmp.as_file()
-                        .set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+                    crate::sealed::restore(&mut source, tmp, &verity, &digest, size)?;
+                    tmp.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
                     continue;
                 }
                 let mut hasher = blake3::Hasher::new();
@@ -493,8 +595,7 @@ impl Store {
                     }
                     return Err(Damaged::Entry.into());
                 }
-                tmp.as_file()
-                    .set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+                tmp.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
             }
             Ok(staged)
         })();
@@ -504,9 +605,13 @@ impl Store {
             Err(e) => {
                 if let Some(damage) = e.downcast_ref::<Damaged>() {
                     match damage {
-                        Damaged::Chunk(hash)=>self.conn.execute("DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1)",[hash])?,
-                        Damaged::Object(hash)=>self.conn.execute("DELETE FROM entries WHERE id IN (SELECT entry FROM clones WHERE hash=?1)",[hash])?,
-                        Damaged::Entry=>self.conn.execute("DELETE FROM entries WHERE key=?1",[key])?,
+                        Damaged::Chunk(hash) => self.conn.execute(
+                            "DELETE FROM entries WHERE id IN (SELECT entry FROM parts WHERE chunk=?1)", [hash],
+                        )?,
+                        Damaged::Object(hash) => self.conn.execute(
+                            "DELETE FROM entries WHERE id IN (SELECT entry FROM clones WHERE hash=?1)", [hash],
+                        )?,
+                        Damaged::Entry => self.conn.execute("DELETE FROM entries WHERE key=?1", [key])?,
                     };
                     self.collect_objects(false)?;
                     let _ = self.count("corrupt", 1);
@@ -515,7 +620,7 @@ impl Store {
             }
         };
         for (tmp, path) in staged.into_iter().zip(outputs) {
-            tmp.persist(path)?;
+            tmp.publish(path)?;
         }
         // A failed statistics update cannot invalidate already verified outputs.
         let _ = (|| -> Result<()> {
@@ -541,6 +646,7 @@ impl Store {
         let removed = evict(&tx, limit)?;
         tx.commit()?;
         self.collect_objects(true)?;
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(removed)
     }
 
@@ -548,20 +654,26 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut q = tx.prepare("SELECT hash FROM retired")?;
-        let retired = q
-            .query_map([], |r| r.get::<_, Digest>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(q);
-        for digest in retired {
-            let p = crate::sealed::path(&self.dir, &digest);
-            match fs::remove_file(p) {
-                Ok(()) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.into()),
+        let mut select = tx.prepare("SELECT hash FROM retired LIMIT 128")?;
+        let mut forget = tx.prepare("DELETE FROM retired WHERE hash=?1")?;
+        loop {
+            let retired = select
+                .query_map([], |r| r.get::<_, Digest>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if retired.is_empty() {
+                break;
             }
-            tx.execute("DELETE FROM retired WHERE hash=?1", [digest])?;
+            for digest in retired {
+                let p = crate::sealed::path(&self.dir, &digest);
+                match fs::remove_file(p) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(e.into()),
+                }
+                forget.execute([digest])?;
+            }
         }
+        drop((select, forget));
         if sweep {
             crate::sealed::sweep(&self.dir, &tx)?;
         }
@@ -589,6 +701,8 @@ impl Store {
             database_bytes,
             entries: scalar("SELECT COUNT(*) FROM entries")?,
             chunks: scalar("SELECT COUNT(*) FROM chunks")?,
+            pending_entries: scalar("SELECT COUNT(DISTINCT entry) FROM needs")?,
+            probe_entries: scalar("SELECT COUNT(*) FROM probes")?,
             sealed_objects: scalar("SELECT COUNT(*) FROM objects")?,
             sealed_bytes: scalar("SELECT COALESCE(SUM(bytes),0) FROM objects")?,
             compressed_bytes: scalar("SELECT COALESCE(SUM(length(data)),0) FROM chunks")?,
@@ -600,9 +714,34 @@ impl Store {
     }
 }
 
+fn probe_checksum(stdout: &[u8], stderr: &[u8]) -> Digest {
+    *blake3::Hasher::new()
+        .update(&(stdout.len() as u64).to_le_bytes())
+        .update(stdout)
+        .update(stderr)
+        .finalize()
+        .as_bytes()
+}
+
 fn evict(tx: &Transaction<'_>, limit: u64) -> Result<u64> {
     let mut removed = 0;
     while tx.query_row("SELECT bytes FROM usage", [], |r| r.get::<_, u64>(0))? > limit {
+        if tx.execute(
+            "DELETE FROM probes WHERE key=(SELECT key FROM probes ORDER BY seen LIMIT 1)",
+            [],
+        )? != 0
+        {
+            continue;
+        }
+        if tx.execute(
+            "DELETE FROM entries WHERE id=(SELECT n.entry FROM needs n JOIN entries e
+             ON e.id=n.entry ORDER BY e.access LIMIT 1)",
+            [],
+        )? != 0
+        {
+            removed += 1;
+            continue;
+        }
         let n = tx.execute(
             "DELETE FROM entries WHERE id=(SELECT id FROM entries ORDER BY access,id LIMIT 1)",
             [],
@@ -659,6 +798,7 @@ mod tests {
         fs::write(&output, b"metadata")?;
         let proof = Evidence {
             inputs: b"{}",
+            sources: &[7; 32],
             needs: &[],
             topology: &[0; 32],
             codegen: false,
@@ -691,6 +831,7 @@ mod tests {
                 fs::write(&file, bytes)?;
                 let proof = Evidence {
                     inputs: b"{}",
+                    sources: &[7; 32],
                     topology: &[1; 32],
                     needs,
                     codegen,

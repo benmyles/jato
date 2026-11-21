@@ -661,7 +661,104 @@ fn native_executable_tracks_archive_contents_and_negative_search_paths() {
     assert!(build().status.success());
     assert_eq!(success(&mut Command::new(&output)).stdout, b"3\n");
     fs::remove_file(early.join("libjato_test_value.a")).unwrap();
+    p.clean();
+    let reverted = build();
+    assert!(
+        reverted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reverted.stderr)
+    );
+    assert_eq!(success(&mut Command::new(&output)).stdout, b"1\n");
+    if std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+        assert!(
+            String::from_utf8_lossy(&reverted.stderr).contains("jato [app] hit"),
+            "{}",
+            String::from_utf8_lossy(&reverted.stderr)
+        );
+    }
     fs::remove_file(late.join("libjato_test_value.a")).unwrap();
     p.clean();
     assert!(!build().status.success());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[test]
+fn compiled_proc_macro_is_reusable_but_its_expansion_runs_again() {
+    let p = Project::new();
+    write(
+        p.root.join("m/Cargo.toml"),
+        "[package]\nname='read_macro'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+    );
+    write(
+        p.root.join("m/src/lib.rs"),
+        r#"#[proc_macro]
+        pub fn read(_:proc_macro::TokenStream)->proc_macro::TokenStream {
+            let s=std::fs::read_to_string(std::env::var_os("JATO_TEST_MACRO_INPUT").unwrap()).unwrap();
+            format!("{:?}",s).parse().unwrap()
+        }"#,
+    );
+    write(
+        p.root.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nread_macro={path='m'}\n",
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main(){println!("{}",read_macro::read!());}"#,
+    );
+    let side = p.temp.path().join("untracked");
+    for value in ["one", "two"] {
+        write(&side, value);
+        p.clean();
+        let out = success(
+            p.command()
+                .env_remove("JATO_LINK_CACHE")
+                .env("JATO_TEST_MACRO_INPUT", &side)
+                .env("JATO_LOG", "debug")
+                .args(["--system-linker", "run", "--release"]),
+        );
+        assert_eq!(out.stdout, format!("{value}\n").as_bytes());
+        if value == "two" && std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("jato [read_macro] hit"),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn cargo_probe_cache_replays_exact_bytes_and_leaves_source_queries_alone() {
+    use std::process::Stdio;
+    let p = Project::new();
+    let native = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    let rustc = Path::new(String::from_utf8(native.stdout).unwrap().trim()).join("bin/rustc");
+    let expected = success(Command::new(&rustc).arg("-vV"));
+    for _ in 0..2 {
+        let out = success(p.command().arg(&rustc).arg("-vV"));
+        assert_eq!(out.stdout, expected.stdout);
+        assert_eq!(out.stderr, expected.stderr);
+    }
+    assert_eq!(p.stats()["counters"]["probe_hit"], 1);
+    for name in ["first", "second"] {
+        let mut cmd = p.command();
+        let mut child = cmd
+            .arg(&rustc)
+            .args(["-", "--print=crate-name"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        writeln!(child.stdin.take().unwrap(), "#![crate_name=\"{name}\"]").unwrap();
+        assert_eq!(
+            child.wait_with_output().unwrap().stdout,
+            format!("{name}\n").as_bytes()
+        );
+    }
+    p.run(&["gc", "0"]);
+    assert_eq!(p.stats()["probe_entries"], 0);
 }

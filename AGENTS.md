@@ -7,3 +7,5 @@
 - Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, and cargo test --locked before release. Keep README.md, TODO.md, and the concise work journal current. Commit working milestones.
 - Change the cache-key epoch when interpretation of compiler inputs or artifact provenance changes. Metadata-only evidence must never authorize code generation.
 - Use bench/run.py for clean and restored builds and bench/feedback.py for save-to-diagnostic latency. Record workload, profile, repetitions, and machine details with any performance claim.
+- Use bench/compare.py for comparisons with other compiler caches. Isolate their daemons, configuration, stores and target directories, and verify the built program. Include cold builds, fresh builds and edits alongside warm restores.
+- For native cache changes, run the suite with JATO_TEST_NATIVE_HITS=1 on x86-64 GNU Linux with strace. Validate both shared and per-unit Cargo output layouts. For sealed storage changes, also set JATO_TEST_SEALED=1 on compressed Btrfs with fs-verity. A restored target must remain independently writable.

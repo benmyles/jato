@@ -21,10 +21,8 @@ pub fn path(dir: &Path, digest: &Digest) -> PathBuf {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::ffi::CString;
     use std::io;
     use std::os::fd::AsRawFd;
-    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
 
     // Fixed Linux uapi structures from linux/fsverity.h, ABI version 1.
     #[repr(C)]
@@ -112,12 +110,7 @@ mod linux {
     pub fn prepare(src: &File, dir: &Path) -> Result<Object> {
         // Anonymous until the database writer publishes it. An interrupted
         // compression/build therefore leaves no multi-megabyte staging file.
-        let writer = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_TMPFILE)
-            .open(dir)?;
+        let writer = crate::staging::anonymous(dir)?;
         clone_file(src, &writer)?;
         let mut file = File::open(format!("/proc/self/fd/{}", writer.as_raw_fd()))?;
         drop(writer); // fs-verity requires no writable handles
@@ -159,20 +152,7 @@ mod linux {
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
         }
-        let fd = CString::new(format!("/proc/self/fd/{}", object.file.as_raw_fd()))?;
-        let dest = CString::new(path.as_os_str().as_bytes())?;
-        let result = unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                fd.as_ptr(),
-                libc::AT_FDCWD,
-                dest.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
-            )
-        };
-        if result < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+        crate::staging::link_file(&object.file, path)?;
         Ok(())
     }
 

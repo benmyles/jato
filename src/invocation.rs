@@ -5,6 +5,7 @@ pub struct Invocation {
     pub name: String,
     pub codegen: bool,
     pub executable: bool,
+    pub linker: Option<PathBuf>,
     pub deferred_links: bool,
     pub source: PathBuf,
     pub externs: Vec<PathBuf>,
@@ -40,6 +41,8 @@ impl Invocation {
         let mut suffix = "";
         let mut crate_type = None;
         let mut test = false;
+        let mut prefer_dynamic = false;
+        let mut linker = None;
         let mut deferred_links = cfg!(all(
             target_arch = "x86_64",
             target_os = "linux",
@@ -119,7 +122,13 @@ impl Invocation {
                     }
                 }
                 "-C" => {
-                    let (setting, v) = value()?.split_once('=').ok_or("codegen_option")?;
+                    let option = value()?;
+                    if option == "prefer-dynamic" {
+                        prefer_dynamic = true;
+                        probe_args.extend_from_slice(&args[start..i]);
+                        continue;
+                    }
+                    let (setting, v) = option.split_once('=').ok_or("codegen_option")?;
                     match setting {
                         "incremental" => {
                             probe = false;
@@ -134,6 +143,7 @@ impl Invocation {
                         "extra-filename" => suffix = v,
                         "split-debuginfo" if v == "off" => (),
                         "target-cpu" if v != "native" => (),
+                        "linker" => linker = Some(PathBuf::from(v)),
                         "target-feature" => {
                             deferred_links &= !v.contains("+crt-static");
                         }
@@ -149,7 +159,6 @@ impl Invocation {
                         | "lto"
                         | "relocation-model"
                         | "symbol-mangling-version"
-                        | "linker"
                         | "linker-features"
                         | "force-frame-pointers"
                         | "force-unwind-tables" => (),
@@ -218,7 +227,11 @@ impl Invocation {
             return Err("custom_output");
         }
         let library = matches!(crate_type, Some("lib" | "rlib"));
-        if !library && !(test || crate_type == Some("bin")) {
+        let proc_macro = crate_type == Some("proc-macro");
+        if prefer_dynamic && !proc_macro {
+            return Err("codegen_option");
+        }
+        if !library && !(test || proc_macro || crate_type == Some("bin")) {
             return Err("crate_type");
         }
         let executable = kinds.contains(&"link") && (!library || test);
@@ -237,7 +250,9 @@ impl Invocation {
             outputs.push(dir.join(format!("lib{stem}.rmeta")));
         }
         if kinds.contains(&"link") {
-            outputs.push(if executable {
+            outputs.push(if proc_macro && !test {
+                dir.join(format!("lib{stem}.so"))
+            } else if executable {
                 dir.join(&stem)
             } else {
                 dir.join(format!("lib{stem}.rlib"))
@@ -247,6 +262,7 @@ impl Invocation {
             name: name.into(),
             codegen: kinds.contains(&"link"),
             executable,
+            linker,
             deferred_links,
             source: source.ok_or("missing_source")?,
             externs,

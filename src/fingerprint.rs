@@ -103,7 +103,7 @@ pub fn recipe(compiler: &OsStr, args: &[OsString], native: bool) -> Result<Recip
         }
     }
     let toolchain = *identity.finalize().as_bytes();
-    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v6");
+    let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v9");
     field(&mut hash, &toolchain);
     field(&mut hash, compiler.as_bytes());
     field(&mut hash, cwd.as_os_str().as_bytes());
@@ -281,20 +281,20 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
     })
 }
 
-pub struct Snapshot {
-    pub key: Digest,
-    pub topology: Digest,
+pub struct Inputs {
+    pub sources: Digest,
+    namespace: BTreeSet<PathBuf>,
+    covered: BTreeSet<PathBuf>,
 }
 
 impl Plan {
-    pub fn snapshot(
+    pub fn inputs(
         &self,
         recipe: &Recipe,
         inv: &Invocation,
         since: SystemTime,
-        externs: &Digest,
         admit_codegen: bool,
-    ) -> Result<Snapshot> {
+    ) -> Result<Inputs> {
         let root = fs::canonicalize(&inv.source)?;
         let mut has_root = false;
         let mut hash = blake3::Hasher::new_derive_key("jato verified Rust inputs v2");
@@ -331,7 +331,7 @@ impl Plan {
             // appears. Track the containing directories and the alternate name,
             // even when the alternate directory or file does not yet exist.
             let original = cwd.join(file);
-            for resolved in [&original, &path] {
+            for resolved in std::iter::once(&path).chain((original != path).then_some(&original)) {
                 let parent = resolved.parent().context("source without a parent")?;
                 namespace.insert(parent.to_owned());
                 if resolved.file_name() == Some(OsStr::new("mod.rs")) {
@@ -364,17 +364,43 @@ impl Plan {
                 None => field(&mut hash, b"unset"),
             }
         }
+        Ok(Inputs {
+            sources: *hash.finalize().as_bytes(),
+            namespace,
+            covered,
+        })
+    }
+}
+
+impl Inputs {
+    pub fn key(
+        mut self,
+        plan: &Plan,
+        recipe: &Recipe,
+        inv: &Invocation,
+        since: SystemTime,
+        externs: &Digest,
+    ) -> Result<Digest> {
+        let mut hash = blake3::Hasher::new_derive_key("jato verified compilation v3");
+        field(&mut hash, &self.sources);
         field(&mut hash, externs);
-        if let Some(native) = &self.native {
+        if let Some(native) = &plan.native {
             for p in &inv.externs {
-                covered.insert(fs::canonicalize(p)?);
+                self.covered.insert(fs::canonicalize(p)?);
             }
-            field(&mut hash, &native.digest(&recipe.root, since, &covered)?);
+            field(
+                &mut hash,
+                &native.digest(&recipe.root, since, &self.covered, &inv.outputs)?,
+            );
         }
+        Ok(*hash.finalize().as_bytes())
+    }
+
+    pub fn topology(&self, since: SystemTime) -> Result<Digest> {
         let mut topology = blake3::Hasher::new();
-        for p in namespace {
+        for p in &self.namespace {
             field(&mut topology, p.as_os_str().as_bytes());
-            match fs::metadata(&p) {
+            match fs::metadata(p) {
                 Ok(m) => {
                     ensure!(
                         !recent(&m, since),
@@ -395,10 +421,7 @@ impl Plan {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(Snapshot {
-            key: *hash.finalize().as_bytes(),
-            topology: *topology.finalize().as_bytes(),
-        })
+        Ok(*topology.finalize().as_bytes())
     }
 }
 
@@ -413,7 +436,14 @@ pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) 
     for path in &inv.externs {
         let digest = hash_file(path, since, None)?;
         if !store.knows_artifact(&digest, inv.codegen)? {
-            if !defer || path.extension() != Some(OsStr::new("rmeta")) {
+            if !defer
+                || path.extension() != Some(OsStr::new("rmeta"))
+                || since
+                    .duration_since(fs::metadata(path)?.modified()?)
+                    .unwrap_or_default()
+                    .as_secs()
+                    > 120
+            {
                 bail!("unverified extern {}", path.display());
             }
             needs.push(digest);

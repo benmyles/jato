@@ -31,6 +31,7 @@ A custom Cargo command runs verbatim on every change. Ctrl-C stops the job.
 ";
 
 struct Options {
+    system_linker: bool,
     focus_only: bool,
     delay: Option<Duration>,
     extra: Vec<PathBuf>,
@@ -38,8 +39,9 @@ struct Options {
 }
 
 impl Options {
-    fn parse(args: &[OsString]) -> Result<Self> {
+    fn parse(args: &[OsString], system_linker: bool) -> Result<Self> {
         let mut opts = Self {
+            system_linker,
             focus_only: false,
             delay: None,
             extra: Vec::new(),
@@ -150,7 +152,7 @@ struct Job {
 }
 
 impl Job {
-    fn spawn(args: &[OsString]) -> Result<Self> {
+    fn spawn(args: &[OsString], system_linker: bool) -> Result<Self> {
         eprintln!(
             "jato watch > cargo {}",
             args.iter()
@@ -158,7 +160,7 @@ impl Job {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        let child = cargo_command(args)?
+        let child = cargo_command(args, system_linker)?
             .process_group(0)
             .spawn()
             .context("starting Cargo job")?;
@@ -256,12 +258,12 @@ fn wait(
     Ok(())
 }
 
-pub fn run(args: &[OsString]) -> Result<i32> {
+pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
     if args == ["--help"] || args == ["-h"] {
         print!("{HELP}");
         return Ok(0);
     }
-    let options = Options::parse(args)?;
+    let options = Options::parse(args, system_linker)?;
     let (wake, receiver) = UnixDatagram::pair()?;
     wake.set_nonblocking(true)?;
     receiver.set_nonblocking(true)?;
@@ -360,7 +362,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
             && deadline.is_none()
             && let Some(args) = queue.pop_front()
         {
-            job = Some(Job::spawn(&args)?);
+            job = Some(Job::spawn(&args, system_linker)?);
         }
         wait(&receiver, job.as_ref(), deadline)?;
     }

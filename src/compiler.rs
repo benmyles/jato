@@ -37,6 +37,7 @@ fn discover(
     inv: &Invocation,
     recipe: &fingerprint::Recipe,
 ) -> Result<Option<Vec<u8>>> {
+    let before = Instant::now();
     let plans = store.plans(&recipe.key)?;
     if plans.is_empty() {
         trace(
@@ -46,27 +47,58 @@ fn discover(
         return Ok(None);
     }
     let start = SystemTime::now();
-    let externs = fingerprint::externs(inv, start, store, false)?.key;
+    let mut externs = None;
     for encoded in plans {
         let plan: fingerprint::Plan = serde_json::from_slice(&encoded)?;
         if inv.executable && plan.native.is_none() {
             continue;
         }
-        let Ok(snapshot) = plan.snapshot(recipe, inv, start, &externs, false) else {
+        let Ok(inputs) = plan.inputs(recipe, inv, start, false) else {
             continue;
         };
-        let Some(topology) = store.topology(&snapshot.key)? else {
+        // An edit with new source bytes cannot hit, even if all dependency
+        // artifacts match. Send it to rustc before reading those artifacts.
+        if !store.has_sources(&inputs.sources)? {
+            continue;
+        }
+        let sources_checked = Instant::now();
+        let externs = match &externs {
+            Some(key) => key,
+            None => externs.insert(fingerprint::externs(inv, start, store, false)?.key),
+        };
+        let externs_checked = Instant::now();
+        let current = inputs.topology(start)?;
+        let key = match inputs.key(&plan, recipe, inv, start, externs) {
+            Ok(key) => key,
+            Err(error) => {
+                trace(&inv.name, error);
+                continue;
+            }
+        };
+        let Some(topology) = store.topology(&key)? else {
             continue;
         };
-        if topology == snapshot.topology {
-            return store.restore(&snapshot.key, &inv.outputs);
+        if topology == current {
+            let restore = Instant::now();
+            let result = store.restore(&key, &inv.outputs)?;
+            if env::var_os("JATO_LOG").as_deref() == Some(OsStr::new("timings")) {
+                eprintln!(
+                    "jato [{}] sources {} us, externs {} us, namespace and link {} us, restore {} us",
+                    inv.name,
+                    (sources_checked - before).as_micros(),
+                    (externs_checked - sources_checked).as_micros(),
+                    (restore - externs_checked).as_micros(),
+                    restore.elapsed().as_micros()
+                );
+            }
+            return Ok(result);
         }
         // Familiar bytes with a changed module search directory need fresh
         // name resolution. Ordinary edits go directly to the actual compiler.
         if plan.native.is_some() {
             continue;
         }
-        return rediscover(store, compiler, inv, recipe, start, &externs);
+        return rediscover(store, compiler, inv, recipe, start, externs);
     }
     trace(
         &inv.name,
@@ -95,42 +127,73 @@ fn rediscover(
         .status()?;
     ensure!(status.success(), "input discovery failed");
     let plan = fingerprint::dependencies(probe.path())?;
-    let snapshot = plan.snapshot(recipe, inv, start, externs, false)?;
-    let restored = store.restore(&snapshot.key, &inv.outputs)?;
+    let inputs = plan.inputs(recipe, inv, start, false)?;
+    let topology = inputs.topology(start)?;
+    let key = inputs.key(&plan, recipe, inv, start, externs)?;
+    let restored = store.restore(&key, &inv.outputs)?;
     if restored.is_some() {
-        let _ = store.refresh_topology(&snapshot.key, &snapshot.topology);
+        let _ = store.refresh_topology(&key, &topology);
     }
     Ok(restored)
 }
 
-fn compile(mut cmd: Command) -> Result<(ExitStatus, Option<Vec<u8>>)> {
+struct Compiled {
+    status: ExitStatus,
+    diagnostics: Option<Vec<u8>>,
+    early: Vec<u8>,
+}
+
+fn compile(mut cmd: Command, capture: Option<&crate::native::Capture>) -> Result<Compiled> {
     let mut child = cmd
         .stderr(Stdio::piped())
         .spawn()
         .context("starting rustc")?;
     drop(cmd);
     let mut pipe = child.stderr.take().unwrap();
-    let mut stderr = io::stderr().lock();
     let mut log = Some(Vec::new());
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = match pipe.read(&mut buf) {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            other => other?,
-        };
-        if n == 0 {
-            break;
-        }
-        stderr.write_all(&buf[..n])?;
-        if let Some(bytes) = &mut log {
-            if bytes.len() + n <= DIAGNOSTIC_LIMIT {
-                bytes.extend_from_slice(&buf[..n]);
+    let mut early = Vec::new();
+    let mut buf = [0; 16 * 1024];
+    let mut stderr = io::stderr().lock();
+    let streamed = (|| -> io::Result<()> {
+        loop {
+            let n = match pipe.read(&mut buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            // Keep attach errors out of Cargo diagnostics when a restricted
+            // kernel requires a retry without the observer.
+            if early.len() + n <= 64 * 1024 && capture.is_some_and(|c| !c.started()) {
+                early.extend_from_slice(&buf[..n]);
             } else {
-                log = None;
+                if !early.is_empty() {
+                    stderr.write_all(&early)?;
+                    early.clear();
+                }
+                stderr.write_all(&buf[..n])?;
+            }
+            if let Some(bytes) = &mut log {
+                if bytes.len() + n <= DIAGNOSTIC_LIMIT {
+                    bytes.extend_from_slice(&buf[..n]);
+                } else {
+                    log = None;
+                }
             }
         }
+    })();
+    drop(pipe);
+    if let Err(e) = streamed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e.into());
     }
-    Ok((child.wait()?, log))
+    Ok(Compiled {
+        status: child.wait()?,
+        diagnostics: log,
+        early,
+    })
 }
 
 pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
@@ -138,6 +201,22 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         return passthrough(original(compiler, args));
     }
     let crate_name = env::var("CARGO_CRATE_NAME").unwrap_or_default();
+    if [
+        "RUSTC_BOOTSTRAP",
+        "RUSTC_LOG",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "RUST_TARGET_PATH",
+    ]
+    .iter()
+    .any(|k| env::var_os(k).is_some_and(|s| !s.is_empty() && (*k != "RUSTC_BOOTSTRAP" || s != "0")))
+    {
+        trace(&crate_name, "custom compiler environment");
+        return passthrough(original(compiler, args));
+    }
+    if let Some(code) = crate::probe::run(compiler, args)? {
+        return Ok(code);
+    }
     let invocation = match Invocation::parse(compiler, args) {
         Ok(v) => v,
         Err(reason) => {
@@ -151,19 +230,6 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
         }
     };
     let inv = &invocation;
-    if [
-        "RUSTC_BOOTSTRAP",
-        "RUSTC_LOG",
-        "LD_PRELOAD",
-        "LD_AUDIT",
-        "RUST_TARGET_PATH",
-    ]
-    .iter()
-    .any(|k| env::var_os(k).is_some_and(|s| !s.is_empty() && (*k != "RUSTC_BOOTSTRAP" || s != "0")))
-    {
-        trace(&inv.name, "custom compiler environment");
-        return passthrough(original(compiler, args));
-    }
     let setup =
         Store::open().and_then(|s| Ok((s, fingerprint::recipe(compiler, args, inv.executable)?)));
     let (mut store, recipe) = match setup {
@@ -191,7 +257,7 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             trace(&inv.name, e);
             return passthrough(original(compiler, args));
         }
-        match crate::native::Capture::command(compiler, args) {
+        match crate::native::Capture::command(compiler, args, inv, &recipe.root) {
             Ok((cmd, capture)) => {
                 native = Some(capture);
                 cmd
@@ -204,21 +270,24 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     } else {
         original(compiler, args)
     };
-    let result = compile(cmd);
+    let result = compile(cmd, native.as_ref());
     let observed = if let Some(capture) = native {
         let (started, observed) = capture.finish();
-        if !started
-            && result
-                .as_ref()
-                .map_or(true, |(status, _)| !status.success())
-        {
+        if !started && result.as_ref().map_or(true, |out| !out.status.success()) {
             return passthrough(original(compiler, args));
         }
         Some(observed)
     } else {
         None
     };
-    let (status, diagnostics) = result?;
+    let Compiled {
+        status,
+        diagnostics,
+        early,
+    } = result?;
+    if !early.is_empty() {
+        io::stderr().write_all(&early)?;
+    }
     let elapsed = timer.elapsed().as_millis() as u64;
     if status.success() {
         let result = (|| -> Result<()> {
@@ -237,7 +306,10 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 store.stable_compiler(compiler, &recipe.toolchain)?,
                 "prerelease or custom compiler"
             );
-            let snapshot = plan.snapshot(&recipe, inv, since, &externs.key, inv.codegen)?;
+            let inputs = plan.inputs(&recipe, inv, since, inv.codegen)?;
+            let sources = inputs.sources;
+            let topology = inputs.topology(since)?;
+            let key = inputs.key(&plan, &recipe, inv, since, &externs.key)?;
             let encoded = serde_json::to_vec(&plan)?;
             ensure!(
                 encoded.len() <= 256 * 1024,
@@ -245,14 +317,15 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             );
             if !store.save(
                 &recipe.key,
-                &snapshot.key,
+                &key,
                 &inv.outputs,
                 &log,
                 elapsed,
                 Some(Evidence {
                     inputs: &encoded,
                     needs: &externs.needs,
-                    topology: &snapshot.topology,
+                    topology: &topology,
+                    sources: &sources,
                     codegen: inv.codegen,
                 }),
             )? {

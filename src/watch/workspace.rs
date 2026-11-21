@@ -46,8 +46,11 @@ pub fn configuration(path: &Path) -> bool {
 
 /// Carry location-changing options over to Cargo metadata. The program's
 /// own arguments following a second `--` are opaque to the watcher.
-fn metadata_command(job: &[OsString]) -> Result<(std::process::Command, Vec<PathBuf>)> {
-    let mut cmd = cargo_command(&[])?;
+fn metadata_command(
+    job: &[OsString],
+    system_linker: bool,
+) -> Result<(std::process::Command, Vec<PathBuf>)> {
+    let mut cmd = cargo_command(&[], system_linker)?;
     if let Some(toolchain) = job
         .first()
         .filter(|s| s.as_encoded_bytes().starts_with(b"+"))
@@ -85,7 +88,7 @@ fn metadata_command(job: &[OsString]) -> Result<(std::process::Command, Vec<Path
 
 impl Workspace {
     pub fn load(options: &super::Options) -> Result<Self> {
-        let (mut cmd, mut excluded) = metadata_command(&options.job)?;
+        let (mut cmd, mut excluded) = metadata_command(&options.job, options.system_linker)?;
         let out = cmd.output()?;
         ensure!(
             out.status.success(),

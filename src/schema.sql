@@ -83,4 +83,12 @@ CREATE TRIGGER IF NOT EXISTS drop_clone AFTER DELETE ON clones BEGIN
     UPDATE objects SET refs=refs-1 WHERE hash=OLD.hash;
     DELETE FROM objects WHERE hash=OLD.hash AND refs=0;
 END;
-PRAGMA user_version=6;
+CREATE TABLE IF NOT EXISTS probes(key BLOB PRIMARY KEY,stdout BLOB NOT NULL,stderr BLOB NOT NULL,checksum BLOB NOT NULL,seen INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS add_probe AFTER INSERT ON probes BEGIN UPDATE usage SET bytes=bytes+160+length(NEW.stdout)+length(NEW.stderr); END;
+CREATE TRIGGER IF NOT EXISTS drop_probe AFTER DELETE ON probes BEGIN UPDATE usage SET bytes=bytes-160-length(OLD.stdout)-length(OLD.stderr); END;
+CREATE TABLE IF NOT EXISTS source_variants(entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE,digest BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS source_keys ON source_variants(digest);
+CREATE TRIGGER IF NOT EXISTS add_variant AFTER INSERT ON source_variants BEGIN UPDATE usage SET bytes=bytes+96; END;
+CREATE TRIGGER IF NOT EXISTS drop_variant AFTER DELETE ON source_variants BEGIN UPDATE usage SET bytes=bytes-96; END;
+CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY,last_run INTEGER NOT NULL) WITHOUT ROWID;
+PRAGMA user_version=8;
