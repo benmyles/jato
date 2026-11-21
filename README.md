@@ -2,7 +2,7 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-Jato can reuse linked executables, libraries containing native archives, and crates with large embedded data. The head-to-head comparison covers ripgrep, ordinary edits, a system-zlib application and a 12 MiB asset, with first builds, warm rebuilds, storage and memory measured separately. [Benchmark report](bench/README.md)
+On a Linux workstation, a clean-target ripgrep release rebuild took **198 ms with warm Jato**, down from **25.71 s with plain Cargo**. Eight revisions of a library with embedded data used **51% less packed storage than Jato 0.2**. The benchmarks cover first builds, warm rebuilds, source edits, native libraries and save-to-diagnostic latency. [Measurements and reproduction](bench/README.md)
 
 ## Get started
 
@@ -42,7 +42,7 @@ jato --system-linker build --release
 
 The watcher uses native filesystem events and Cargo metadata. It subscribes to workspace directories, member directories, and direct local path dependencies. Use `--watch` for other inputs such as an external generator's templates. It honors directory ignore rules and excludes Cargo outputs and Jato's cache. New saves supersede an active job, including its compiler and test processes. Ctrl-C stops the watcher and its active job. Set `JATO_LOG=debug` to see which paths scheduled a check.
 
-On Linux a write-close event can complete a pending edit. A rename into place can also complete a save. The watcher times feedback through the first rustc error and through the successful workspace check after a fix. [Watch measurements](bench/README.md#save-to-compiler-feedback)
+On Linux a write-close event can complete a pending edit. A rename into place can also complete a save. On a two-package workspace the median time from saving to the first rustc error was **48 ms**, and fixing the error brought the full workspace back to green in **49 ms**. These measurements cover 22 saves per version. [Watch measurements](bench/README.md#save-to-compiler-feedback)
 
 ## Use with existing tools
 

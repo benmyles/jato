@@ -2,6 +2,48 @@
 
 The comparison uses the installed Jato 0.3.0, Jato 0.2.0, the machine's kache 2.1.1, upstream kache 2.2.0, upstream sccache 0.19.0 and plain Cargo. All timed builds use the same Rust 1.100.0 toolchain, four Cargo jobs and default profile settings on an Intel Core Ultra 7 356H running Fedora 45. The local Btrfs volume uses Zstandard level 1 compression. The workstation was shared with other workloads. Full per-run timings and counters accompany the medians. [0.2 report](0.2.md) · [0.1 report](0.1.md)
 
+## ripgrep 14.1.1
+
+| Workload | Cargo | Jato 0.2 | Jato 0.3 | Installed kache 2.1.1 | sccache 0.19 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| First check | 3.37 s | 3.44 s | 6.52 s | 3.81 s | 4.14 s |
+| Clean-target check, warm store | 3.69 s | 157 ms | 168 ms | 311 ms | 1.19 s |
+| Unchanged check, existing target | 62 ms | 38 ms | 40 ms | 76 ms | 63 ms |
+| First release build | 30.02 s | 36.06 s | 27.56 s | 28.40 s | 16.23 s |
+| Clean-target release rebuild, warm store | 25.71 s | 289 ms | **198 ms** | 251 ms | 5.52 s |
+| Unchanged release build, existing target | 60 ms | 48 ms | 41 ms | 90 ms | 73 ms |
+
+All three warm release trials favored Jato 0.3 over both Jato 0.2 and the installed kache. Cold checks were slower in this run. The numbers are wall-clock medians from three trials. [Interleaved build times and memory samples](ripgrep-0.3.json)
+
+A separate 21-pair experiment compared only the two Jato versions with prefilled stores. The warm check medians were 161 ms for 0.3 and 156 ms for 0.2. The median difference **within each adjacent pair** was 0.17 ms, with 0.3 first in ten pairs and 0.2 first in eleven. [All matched check samples](paired-0.3.json)
+
+### Packed storage
+
+| ripgrep release | Store file lengths | Unique compressed chunks | Warm restore |
+| --- | ---: | ---: | ---: |
+| Jato 0.2 packed | 48.8 MiB | 46.0 MiB | 325 ms |
+| Jato 0.3 packed | **37.3 MiB** | **34.8 MiB** | **294 ms** |
+
+Aligning packed chunks with archive members and embedded metadata reduced the store's apparent size by 24%. The automatic Btrfs mode used 160.4 MiB of file lengths, including shared extents, and had the faster 198 ms restore. Its largest process used 85.2 MiB on that restore. The Jato cache used zero idle server memory. The private kache 2.1.1 and sccache servers used 26.4 MiB and 18.8 MiB respectively. [Storage and RSS samples](ripgrep-0.3.json)
+
+### Retaining source revisions
+
+| Packed library history | One revision | Four revisions | Eight revisions |
+| --- | ---: | ---: | ---: |
+| Jato 0.2 unique payload | 23.4 MiB | 93.7 MiB | 187.3 MiB |
+| Jato 0.3 unique payload | **13.7 MiB** | **51.1 MiB** | **90.9 MiB** |
+
+Both stores represented 280.0 MiB of compiler outputs after eight revisions. Jato 0.3 used **51% less compressed payload**, and its SQLite files occupied 93.0 MiB compared with 190.2 MiB for 0.2. Both restored the first library byte-for-byte. This workload moves archive members between revisions and retains the same embedded table. [Revision sizes and restored archive digests](history-0.3.json)
+
+## Save to compiler feedback
+
+| Watch defaults | Save to first rustc error | Fix to workspace success | Idle watcher RSS |
+| --- | ---: | ---: | ---: |
+| Jato 0.2 | 65.3 ms | 66.6 ms | 4.3 MiB |
+| Jato 0.3 | **48.3 ms** | **48.8 ms** | 4.3 MiB |
+
+Each version ran two eleven-edit sessions on the same two-member workload. Session order was 0.2, 0.3, 0.3, 0.2. With 0.3, the first diagnostic arrived in 45.6–63.9 ms across the 22 saves. [Raw watch sessions](feedback-0.3.json)
+
 ## Reproduce
 
 Install Jato from this repository. Save a separate 0.2.0 binary to repeat the version comparison. The harness resolves the stock toolchain, uses private stores and peer daemon sockets, and exercises the normal Cargo compiler-wrapper interface. It uses the same absolute target path for each contender. Each tool, profile and trial starts with an empty store. The first build fills it, the warm build starts from a second empty target, and the fresh build retains that target. Tool order rotates and profile order alternates between trials.

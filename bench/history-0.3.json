@@ -1,0 +1,148 @@
+{
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "variants": 8,
+  "samples": {
+    "previous_jato": {
+      "version": "jato 0.2.0",
+      "revisions": [
+        {
+          "entries": 1,
+          "artifact_bytes": 36700594,
+          "compressed_bytes": 24554114,
+          "charged_bytes": 24584305,
+          "database_bytes": 25964544,
+          "seconds": 0.5416
+        },
+        {
+          "entries": 2,
+          "artifact_bytes": 73401335,
+          "compressed_bytes": 49108116,
+          "charged_bytes": 49167137,
+          "database_bytes": 50741248,
+          "seconds": 0.500796
+        },
+        {
+          "entries": 3,
+          "artifact_bytes": 110102231,
+          "compressed_bytes": 73662144,
+          "charged_bytes": 73749995,
+          "database_bytes": 75509760,
+          "seconds": 0.53174
+        },
+        {
+          "entries": 4,
+          "artifact_bytes": 146803273,
+          "compressed_bytes": 98216086,
+          "charged_bytes": 98332767,
+          "database_bytes": 100286464,
+          "seconds": 0.509846
+        },
+        {
+          "entries": 5,
+          "artifact_bytes": 183504472,
+          "compressed_bytes": 122770048,
+          "charged_bytes": 122915559,
+          "database_bytes": 125071360,
+          "seconds": 0.485238
+        },
+        {
+          "entries": 6,
+          "artifact_bytes": 220205816,
+          "compressed_bytes": 147323971,
+          "charged_bytes": 147498312,
+          "database_bytes": 149880832,
+          "seconds": 0.502884
+        },
+        {
+          "entries": 7,
+          "artifact_bytes": 256907311,
+          "compressed_bytes": 171877906,
+          "charged_bytes": 172081077,
+          "database_bytes": 174645248,
+          "seconds": 0.563318
+        },
+        {
+          "entries": 8,
+          "artifact_bytes": 293608959,
+          "compressed_bytes": 196431716,
+          "charged_bytes": 196663717,
+          "database_bytes": 199430144,
+          "seconds": 0.542597
+        }
+      ],
+      "restore_seconds": 0.122009,
+      "archive_sha256": "7a48b182dc41fd5dc2d6ec2b2563c7f669b3d5db7c2ca844cfe3ef8bfdb12826"
+    },
+    "jato": {
+      "version": "jato 0.3.0",
+      "revisions": [
+        {
+          "entries": 1,
+          "artifact_bytes": 36700594,
+          "compressed_bytes": 14374476,
+          "charged_bytes": 14399099,
+          "database_bytes": 15708160,
+          "seconds": 0.505706
+        },
+        {
+          "entries": 2,
+          "artifact_bytes": 73401335,
+          "compressed_bytes": 28748842,
+          "charged_bytes": 28796582,
+          "database_bytes": 30199808,
+          "seconds": 0.475247
+        },
+        {
+          "entries": 3,
+          "artifact_bytes": 110102231,
+          "compressed_bytes": 43123224,
+          "charged_bytes": 43194081,
+          "database_bytes": 44699648,
+          "seconds": 0.483817
+        },
+        {
+          "entries": 4,
+          "artifact_bytes": 146803273,
+          "compressed_bytes": 53565427,
+          "charged_bytes": 53657961,
+          "database_bytes": 55263232,
+          "seconds": 0.505854
+        },
+        {
+          "entries": 5,
+          "artifact_bytes": 183504472,
+          "compressed_bytes": 64007632,
+          "charged_bytes": 64121843,
+          "database_bytes": 65826816,
+          "seconds": 0.485482
+        },
+        {
+          "entries": 6,
+          "artifact_bytes": 220205816,
+          "compressed_bytes": 74449856,
+          "charged_bytes": 74585744,
+          "database_bytes": 76382208,
+          "seconds": 0.593773
+        },
+        {
+          "entries": 7,
+          "artifact_bytes": 256907311,
+          "compressed_bytes": 84892080,
+          "charged_bytes": 85049645,
+          "database_bytes": 86937600,
+          "seconds": 0.504163
+        },
+        {
+          "entries": 8,
+          "artifact_bytes": 293608959,
+          "compressed_bytes": 95334264,
+          "charged_bytes": 95513506,
+          "database_bytes": 97505280,
+          "seconds": 0.492659
+        }
+      ],
+      "restore_seconds": 0.112535,
+      "archive_sha256": "7a48b182dc41fd5dc2d6ec2b2563c7f669b3d5db7c2ca844cfe3ef8bfdb12826"
+    }
+  }
+}

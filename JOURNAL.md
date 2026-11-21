@@ -12,6 +12,8 @@
 - Investigated a slower ripgrep check in the first interleaved comparison. Alternating warm targets narrowed the gap. Checked small dependency sets through retained file descriptors, reserved spare threads for larger metadata batches, and limited read-ahead to actual pending inputs. Added a regression for replacing a path while its previous inode is open.
 - Across 21 matched ripgrep checks on the installed release, 0.3 won 10 pairs and 0.2 won 11. The median within-pair difference was 0.17 ms. Verified all 32 project tests on both supported Rust toolchains.
 - Verified the November 18 upstream kache 2.2.0 archive against its published SHA-256. Added independent contender selection and support for its changed statistics format alongside the locally installed 2.1.1.
+- The final interleaved ripgrep release medians were 198 ms for Jato 0.3, 289 ms for 0.2, 251 ms for installed kache 2.1.1, and 5.52 s for sccache. Packed store size fell from 48.8 MiB to 37.3 MiB. Migrated schema versions 1, 2, 3, and 8 and verified byte accounting and pruning.
+- Eight library revisions representing 280.0 MiB of compiler output occupied 90.9 MiB of packed payload, down from 187.3 MiB. Both versions restored the same first archive by SHA-256. Over 22 saves, median save-to-error latency improved from 65.3 ms to 48.3 ms.
 
 ## 2026-11-21
 
