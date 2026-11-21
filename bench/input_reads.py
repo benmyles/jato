@@ -66,14 +66,16 @@ def main():
             run(command, env, project)
             stats = json.loads(run([exe, "stats", "--json"], env, project))
             assert stats["entries"] == 1, stats
-            results[name] = dict(
-                version=run([exe, "--version"], env, project).decode().strip(),
-                seconds=[],
-            )
+            results[name] = {
+                "version": run([exe, "--version"], env, project).decode().strip(),
+                "seconds": [],
+            }
 
         def failure(args, env):
             start = time.perf_counter()
-            output = subprocess.run(args, env=env, cwd=project, capture_output=True)
+            output = subprocess.run(
+                args, env=env, cwd=project, capture_output=True, check=False
+            )
             elapsed = time.perf_counter() - start
             assert (
                 output.returncode == 101 and b"jato benchmark error" in output.stderr
@@ -131,14 +133,14 @@ def main():
             )
         print(
             json.dumps(
-                dict(
-                    rustc=run([rustc, "-V"], base, project).decode().strip(),
-                    kernel=platform.release(),
-                    jobs=1,
-                    asset_bytes=asset.stat().st_size,
-                    runs=opts.runs,
-                    samples=results,
-                ),
+                {
+                    "rustc": run([rustc, "-V"], base, project).decode().strip(),
+                    "kernel": platform.release(),
+                    "jobs": 1,
+                    "asset_bytes": asset.stat().st_size,
+                    "runs": opts.runs,
+                    "samples": results,
+                },
                 indent=2,
             )
         )

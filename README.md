@@ -2,7 +2,7 @@
 
 Jato speeds up repeat Rust builds and gives you compiler feedback on save. It remembers individual Cargo compiler results across cleans and branch switches. In a workspace, it checks the package you edited first, then checks the whole workspace.
 
-Jato 0.6 restores an earlier executable when you undo an edit in a live incremental build. In seven ripgrep dev-profile trials, an undo took **161 ms** with Jato, **270 ms** with kache, and **604 ms** with sccache. Eight revisions inserting bytes into a 16 MiB embedded asset occupied **21.4 MiB** of packed payload, down from **256.0 MiB** with Jato 0.5. The benchmark report includes cold builds, new edits, cache I/O and the commands to reproduce each result. [Measurements and reproduction](bench/README.md)
+Jato 0.6 restores an earlier executable when you undo an edit in a live incremental build. In seven ripgrep dev-profile trials, an undo took **161 ms** with Jato, **270 ms** with kache, and **604 ms** with sccache. After eight revisions inserting bytes into a 16 MiB embedded asset, Jato’s packed store occupied **23.0 MiB** of files. kache and sccache each retained about **384 MiB**. The benchmark report includes cold builds, new edits, cache I/O and the commands to reproduce each result. [Measurements and reproduction](bench/README.md)
 
 ## Get started
 

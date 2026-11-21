@@ -5,7 +5,6 @@ import argparse
 import contextlib
 import json
 import os
-from pathlib import Path
 import platform
 import re
 import shutil
@@ -14,9 +13,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 from compare import binary, run
-from worktrees import cargo_environment, private_environment, counters
+from worktrees import cargo_environment, counters, private_environment
 
 
 def main():
@@ -92,8 +92,9 @@ def main():
 
         def edit(revision):
             branch = (
-                '\n    if std::env::var_os("JATO_BENCH_PROBE").is_some() { println!("revision-%d"); std::process::exit(0); }\n'
-                % revision
+                '\n    if std::env::var_os("JATO_BENCH_PROBE").is_some() { '
+                f'println!("revision-{revision}"); '
+                "std::process::exit(0); }\n"
             )
             temporary = source.with_suffix(".bench-save")
             temporary.write_text(
@@ -175,18 +176,18 @@ def main():
         }
         print(
             json.dumps(
-                dict(
-                    versions=versions,
-                    project=opts.project.name
+                {
+                    "versions": versions,
+                    "project": opts.project.name
                     if opts.project
                     else "locked regex application",
-                    rustc=run([rustc, "-V"], base, project).decode().strip(),
-                    kernel=platform.release(),
-                    runs=opts.runs,
-                    jobs=opts.jobs,
-                    samples=samples,
-                    median_seconds=medians,
-                ),
+                    "rustc": run([rustc, "-V"], base, project).decode().strip(),
+                    "kernel": platform.release(),
+                    "runs": opts.runs,
+                    "jobs": opts.jobs,
+                    "samples": samples,
+                    "median_seconds": medians,
+                },
                 indent=2,
             )
         )
