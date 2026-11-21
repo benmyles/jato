@@ -1,18 +1,69 @@
+mod compiler;
+mod fingerprint;
+mod invocation;
 mod store;
 
 use anyhow::{Result, bail};
-use store::{Store, cache_limit, parse_size};
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+use std::process::Command;
+use store::{Store, cache_dir, cache_limit, parse_size};
+
+const HELP: &str = "\
+Jato — a local Rust build cache and workspace edit runner
+
+Usage
+  jato check|build|test|run|clippy [CARGO_ARGUMENTS...]
+  jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
+  jato stats [--json]              Show cache contents and compiler counters
+  jato gc [SIZE]                   Evict least-recently-used entries to SIZE
+  jato --version
+
+Examples
+  jato check --all-targets
+  jato test -p parser -- --nocapture
+  jato cargo +stable build --release
+  jato gc 256MiB
+
+Environment
+  JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
+  JATO_MAX_SIZE     Persistent cache budget, default 1GiB
+  JATO_LOG=debug    Explain each cache decision on stderr
+";
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("jato: {e:#}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("jato: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+fn cargo_command(args: &[OsString]) -> Result<Command> {
+    let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cmd.args(args).env("RUSTC_WRAPPER", env::current_exe()?);
+    if env::var_os("JATO_CACHE_DIR").is_some() {
+        cmd.env("JATO_CACHE_DIR", cache_dir()?);
+    }
+    Ok(cmd)
+}
+
+fn run() -> Result<i32> {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    let first = args.first().map(OsString::as_os_str);
+    let verb = first.and_then(OsStr::to_str);
+    match verb {
+        Some("--version" | "-V") => println!("jato {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h" | "help") | None if first.is_none() || verb.is_some() => {
+            print!("{HELP}")
+        }
+        Some("check" | "build" | "test" | "run" | "clippy") => {
+            return compiler::passthrough(cargo_command(&args)?);
+        }
+        Some("cargo") => return compiler::passthrough(cargo_command(&args[1..])?),
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
             if args.len() == 2 {
@@ -39,12 +90,23 @@ fn run() -> Result<()> {
         Some("gc") if args.len() <= 2 => {
             let limit = args
                 .get(1)
-                .map(|s| parse_size(s))
+                .and_then(|a| a.to_str())
+                .map(parse_size)
                 .transpose()?
                 .unwrap_or(cache_limit()?);
             println!("Evicted {} entries", Store::open()?.prune(limit)?);
         }
-        _ => bail!("usage: jato stats [--json] | gc [SIZE]"),
+        _ if first.is_some_and(|s| {
+            Path::new(s).components().count() > 1
+                || s == "rustc"
+                || env::var_os("RUSTC_WRAPPER").is_some_and(|w| !w.is_empty())
+                    && args.len() > 1
+                    && args[1].to_string_lossy().contains("rustc")
+        }) =>
+        {
+            return compiler::wrap(first.unwrap(), &args[1..]);
+        }
+        _ => bail!("unknown command or arguments. Run jato --help"),
     }
-    Ok(())
+    Ok(0)
 }
