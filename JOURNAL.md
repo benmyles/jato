@@ -18,6 +18,9 @@
 - Tested Ctrl-C through a real foreground terminal. Kept the mount supervisor alive until the command finishes handling its signal and restored the caller’s signal mask in the payload. Also confirmed target-only views share a dependency while preserving both applications’ physical source paths.
 - Migrated populated schema versions 1, 2, 3, 6, 8, 9 and 10, then reclaimed all charged bytes. An installed-binary test restored six real 0.3 compiler entries. Checked the standard Cargo shim and ran all 299 ripgrep integration tests against a confirmed cross-checkout release hit.
 
+- Across eight 16 MiB asset revisions, Jato skipped 218.75 MiB of recompression and used 22.1% fewer filesystem output blocks than 0.3. The previous and current releases restored the same original archive. A 272 MiB packed spill/restore test peaked at 7,776 KiB RSS.
+- Across eleven edits, the installed ordinary watcher reported the first compiler error in 53.5 ms and workspace success after a fix in 54.9 ms. The projected watcher took 53.6 ms and 56.5 ms.
+
 ## 2026-11-21 — profiling the 0.2 release
 
 - Profiled a clean-target ripgrep release restore. Its final wrapper spent 15.7 ms on direct externs, 65.4 ms on namespace and native inputs, and 1.0 ms restoring outputs. The recorded native reads included 104 MiB of Cargo target files.

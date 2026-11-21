@@ -1,0 +1,35 @@
+{
+  "runs": 11,
+  "debounce_ms": null,
+  "save_to_diagnostic_ms": [
+    49.1,
+    52.6,
+    51.8,
+    53.6,
+    52.7,
+    53.3,
+    54.6,
+    57.9,
+    54.4,
+    65.8,
+    65.0
+  ],
+  "fix_to_workspace_green_ms": [
+    52.0,
+    52.1,
+    53.4,
+    52.6,
+    57.8,
+    56.5,
+    53.4,
+    56.6,
+    82.3,
+    81.5,
+    83.9
+  ],
+  "median_diagnostic_ms": 53.6,
+  "median_workspace_green_ms": 56.5,
+  "idle_watch_rss_kib": 4312,
+  "worktree": true,
+  "idle_tree_pss_kib": 2894
+}

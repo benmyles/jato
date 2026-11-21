@@ -1,0 +1,177 @@
+{
+  "versions": {
+    "jato": "jato 0.4.0",
+    "jato_packed": "jato 0.4.0",
+    "previous_jato": "jato 0.3.0",
+    "previous_packed": "jato 0.3.0"
+  },
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "project": "locked embedded application",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "jobs": 4,
+  "runs": 1,
+  "samples": {
+    "jato": {
+      "release": [
+        {
+          "cold": 1.31622,
+          "cold_peak_process_rss_kib": 246508,
+          "warm": 0.04795,
+          "warm_peak_process_rss_kib": 19424,
+          "fresh": 0.02325,
+          "fresh_peak_process_rss_kib": 19004,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 50788314,
+          "packed_bytes": 309,
+          "probe_hits": 7,
+          "hits": 2,
+          "store_bytes": 51187770,
+          "btrfs_total": 51191808,
+          "btrfs_exclusive": 397312,
+          "btrfs_set_shared": 50794496
+        }
+      ]
+    },
+    "jato_packed": {
+      "release": [
+        {
+          "cold": 1.19037,
+          "cold_peak_process_rss_kib": 246208,
+          "warm": 0.13132,
+          "warm_peak_process_rss_kib": 40532,
+          "fresh": 0.02238,
+          "fresh_peak_process_rss_kib": 18968,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 37966566,
+          "probe_hits": 7,
+          "hits": 2,
+          "store_bytes": 39337984,
+          "btrfs_total": 39337984,
+          "btrfs_exclusive": 39337984,
+          "btrfs_set_shared": 0
+        }
+      ]
+    },
+    "previous_jato": {
+      "release": [
+        {
+          "cold": 0.73219,
+          "cold_peak_process_rss_kib": 246332,
+          "warm": 0.04784,
+          "warm_peak_process_rss_kib": 18912,
+          "fresh": 0.02373,
+          "fresh_peak_process_rss_kib": 18844,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 50788314,
+          "packed_bytes": 309,
+          "probe_hits": 7,
+          "hits": 2,
+          "store_bytes": 51187770,
+          "btrfs_total": 51191808,
+          "btrfs_exclusive": 397312,
+          "btrfs_set_shared": 50794496
+        }
+      ]
+    },
+    "previous_packed": {
+      "release": [
+        {
+          "cold": 1.63626,
+          "cold_peak_process_rss_kib": 246524,
+          "warm": 0.11549,
+          "warm_peak_process_rss_kib": 40012,
+          "fresh": 0.02097,
+          "fresh_peak_process_rss_kib": 19128,
+          "idle_server_rss_kib": 0,
+          "sealed_bytes": 0,
+          "packed_bytes": 37966566,
+          "probe_hits": 7,
+          "hits": 2,
+          "store_bytes": 39337984,
+          "btrfs_total": 39337984,
+          "btrfs_exclusive": 39337984,
+          "btrfs_set_shared": 0
+        }
+      ]
+    }
+  },
+  "median": {
+    "jato": {
+      "release": {
+        "cold": 1.31622,
+        "cold_peak_process_rss_kib": 246508,
+        "warm": 0.04795,
+        "warm_peak_process_rss_kib": 19424,
+        "fresh": 0.02325,
+        "fresh_peak_process_rss_kib": 19004,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 50788314,
+        "packed_bytes": 309,
+        "probe_hits": 7,
+        "hits": 2,
+        "store_bytes": 51187770,
+        "btrfs_total": 51191808,
+        "btrfs_exclusive": 397312,
+        "btrfs_set_shared": 50794496
+      }
+    },
+    "jato_packed": {
+      "release": {
+        "cold": 1.19037,
+        "cold_peak_process_rss_kib": 246208,
+        "warm": 0.13132,
+        "warm_peak_process_rss_kib": 40532,
+        "fresh": 0.02238,
+        "fresh_peak_process_rss_kib": 18968,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 0,
+        "packed_bytes": 37966566,
+        "probe_hits": 7,
+        "hits": 2,
+        "store_bytes": 39337984,
+        "btrfs_total": 39337984,
+        "btrfs_exclusive": 39337984,
+        "btrfs_set_shared": 0
+      }
+    },
+    "previous_jato": {
+      "release": {
+        "cold": 0.73219,
+        "cold_peak_process_rss_kib": 246332,
+        "warm": 0.04784,
+        "warm_peak_process_rss_kib": 18912,
+        "fresh": 0.02373,
+        "fresh_peak_process_rss_kib": 18844,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 50788314,
+        "packed_bytes": 309,
+        "probe_hits": 7,
+        "hits": 2,
+        "store_bytes": 51187770,
+        "btrfs_total": 51191808,
+        "btrfs_exclusive": 397312,
+        "btrfs_set_shared": 50794496
+      }
+    },
+    "previous_packed": {
+      "release": {
+        "cold": 1.63626,
+        "cold_peak_process_rss_kib": 246524,
+        "warm": 0.11549,
+        "warm_peak_process_rss_kib": 40012,
+        "fresh": 0.02097,
+        "fresh_peak_process_rss_kib": 19128,
+        "idle_server_rss_kib": 0,
+        "sealed_bytes": 0,
+        "packed_bytes": 37966566,
+        "probe_hits": 7,
+        "hits": 2,
+        "store_bytes": 39337984,
+        "btrfs_total": 39337984,
+        "btrfs_exclusive": 39337984,
+        "btrfs_set_shared": 0
+      }
+    }
+  }
+}
