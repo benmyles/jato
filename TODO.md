@@ -53,4 +53,4 @@
 - [x] Reduce redundant whole-dependency reads when a producer changes under an otherwise unchanged consumer.
 - [x] Reduce large packed payload writes and preserve bounded restoration, shared-frame eviction and corruption recovery.
 - [x] Share a verified sealed base across nearby compiler-output revisions and verify the full result when restoring each edit.
-- [ ] Measure cold, restored and edited real Cargo builds, test upgrades and qualify the installed package.
+- [x] Measure cold, restored and edited real Cargo builds, test upgrades and qualify the installed package.
