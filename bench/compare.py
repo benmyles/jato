@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare local Rust compiler wrappers using identical Cargo arguments and target paths."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,11 +83,14 @@ def extent_usage(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", type=Path, help="an existing locked Cargo project")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--project", type=Path, help="an existing locked Cargo project")
+    source.add_argument("--fixture", choices=["regex", "zlib", "embedded"], default="regex")
     parser.add_argument("--verify-bin", help="compare this release program's --version output")
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato")
     parser.add_argument("--include-packed", action="store_true", help="also measure Jato with portable packed storage")
+    parser.add_argument("--previous-packed", action="store_true", help="also measure --previous-jato in packed mode")
     parser.add_argument("--workloads", nargs="+", choices=["release","check"], default=["check","release"])
     parser.add_argument("--kache", default="kache")
     parser.add_argument("--sccache", default="sccache")
@@ -103,6 +107,10 @@ def main():
         tools["jato_packed"] = tools["jato"]
     if options.previous_jato:
         tools["previous_jato"] = binary(options.previous_jato)
+    if options.previous_packed:
+        if not options.previous_jato:
+            parser.error("--previous-packed needs --previous-jato")
+        tools["previous_packed"] = tools["previous_jato"]
     rustc = binary(str(Path(subprocess.check_output(["rustc", "--print", "sysroot"],
                                                     text=True).strip()) / "bin/rustc"))
     cargo = rustc.with_name("cargo")
@@ -115,8 +123,18 @@ def main():
             project = options.project.resolve(strict=True)
         else:
             project = root / "fixture"
-            shutil.copytree(Path(__file__).parent / "regex-app", project)
+            shutil.copytree(Path(__file__).parent / (options.fixture + "-app"), project)
             (project / "Cargo.toml.in").rename(project / "Cargo.toml")
+            known_output, edit_from, edit_to = {
+                "regex": (b"3\n", "one two three", "one two"),
+                "zlib": (b"verified native library round trip\n", "native library", "native archive"),
+                "embedded": (None, "unwrap_or(0)", "unwrap_or(1)"),
+            }[options.fixture]
+            if options.fixture == "embedded":
+                payload = hashlib.shake_256(b"jato embedded fixture v1").digest(12 * 1024 * 1024 + 17)
+                (project / "asset.bin").write_bytes(payload)
+                known_output = f"{len(payload)} {payload[0]}\n".encode()
+                del payload
         if not (project / "Cargo.lock").is_file():
             parser.error("the benchmark needs a locked Cargo project")
         cargo_home = root / "cargo"
@@ -156,7 +174,7 @@ def main():
                                    KACHE_MAX_SIZE="1GiB", SCCACHE_DIR=str(cache), SCCACHE_CACHE_SIZE="1G",
                                    SCCACHE_SERVER_UDS=str(private / "s.sock"), SCCACHE_CONF=str(config),
                                    SCCACHE_ALLOW_INCREMENTAL="1")
-                        if name == "jato_packed":
+                        if name in {"jato_packed", "previous_packed"}:
                             cfg["JATO_STORAGE"] = "packed"
                         assert len(os.fsencode(cfg["SCCACHE_SERVER_UDS"])) < 104, "use a shorter --scratch path"
                         command = [cargo, *(["check"] if mode == "check" else ["build", "--release"]),
@@ -179,7 +197,7 @@ def main():
                                     shutil.rmtree(target)
                                 measure(phase)
                                 if mode == "release" and (options.verify_bin or not options.project):
-                                    args = [target / "release" / (options.verify_bin or "jato-regex-bench")]
+                                    args = [target / "release" / (options.verify_bin or f"jato-{options.fixture}-bench")]
                                     if options.verify_bin:
                                         args.append("--version")
                                     output = run(args, cfg, project)
@@ -187,11 +205,12 @@ def main():
                                         expected = output
                                     assert expected == output, "restored executable output changed"
                                     if not options.project:
-                                        assert output == b"3\n", "incorrect regex result"
+                                        assert output == known_output, "incorrect fixture result"
                             if mode == "check" and not options.project:
                                 source = project / "src/main.rs"
                                 original = source.read_text()
-                                source.write_text(original.replace("one two three", "one two"))
+                                assert edit_from in original, "fixture edit no longer applies"
+                                source.write_text(original.replace(edit_from, edit_to, 1))
                                 measure("edit")
                                 source.write_text(original)
                                 measure("undo")
@@ -204,7 +223,7 @@ def main():
                                     sample["idle_server_rss_kib"] = server_rss(socket_path)
                                 else:
                                     sample["idle_server_rss_kib"] = 0
-                                if name in {"jato","jato_packed"}:
+                                if name in {"jato","jato_packed","previous_jato","previous_packed"}:
                                     sample["sealed_bytes"] = stats.get("sealed_bytes", 0)
                                     sample["packed_bytes"] = stats["compressed_bytes"]
                                     sample["probe_hits"] = stats["counters"].get("probe_hit", 0)
@@ -224,7 +243,7 @@ def main():
         medians = {k: {m: {key: statistics.median(s[key] for s in samples)
                            for key in samples[0] if all(s.get(key) is not None for s in samples)} for m, samples in modes.items()}
                    for k, modes in results.items()}
-        print(json.dumps(dict(versions=versions, kernel=platform.release(), project=project.name if options.project else "locked regex application",
+        print(json.dumps(dict(versions=versions, kernel=platform.release(), project=project.name if options.project else f"locked {options.fixture} application",
                               rustc=run([rustc, "-V"], env, project).decode().strip(),
                               jobs=options.jobs, runs=options.runs, samples=results, median=medians), indent=2))
 
