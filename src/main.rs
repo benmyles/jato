@@ -2,6 +2,7 @@ mod compiler;
 mod fingerprint;
 mod invocation;
 mod store;
+mod watch;
 
 use anyhow::{Result, bail};
 use std::env;
@@ -16,6 +17,7 @@ Jato — a local Rust build cache and workspace edit runner
 Usage
   jato check|build|test|run|clippy [CARGO_ARGUMENTS...]
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
+  jato watch [OPTIONS]             Check on save, with changed packages first
   jato stats [--json]              Show cache contents and compiler counters
   jato gc [SIZE]                   Evict least-recently-used entries to SIZE
   jato --version
@@ -63,6 +65,7 @@ fn run() -> Result<i32> {
         Some("check" | "build" | "test" | "run" | "clippy") => {
             return compiler::passthrough(cargo_command(&args)?);
         }
+        Some("watch") => return watch::run(&args[1..]),
         Some("cargo") => return compiler::passthrough(cargo_command(&args[1..])?),
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
