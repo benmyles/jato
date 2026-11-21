@@ -44,7 +44,7 @@ Environment
   JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
   JATO_MAX_SIZE     Persistent cache budget, default 1GiB
   JATO_LOG=debug    Explain each cache decision on stderr
-  JATO_LOG=timings  Include the time spent validating and restoring a hit
+  JATO_LOG=timings  Time compiler runs, input validation, storage and restores
   JATO_STORAGE=packed  Use compressed chunks for all new artifacts
   JATO_COALESCE=0   Compile concurrent misses independently
   JATO_LINK_CACHE=0  Delegate native linking directly to rustc

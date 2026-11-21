@@ -390,7 +390,8 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
     if !early.is_empty() {
         io::stderr().write_all(&early)?;
     }
-    let elapsed = timer.elapsed().as_millis() as u64;
+    let compiled = Instant::now();
+    let elapsed = (compiled - timer).as_millis() as u64;
     if status.success() {
         let result = (|| -> Result<()> {
             let log = diagnostics.context("diagnostics exceed recording limit")?;
@@ -424,6 +425,7 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 encoded.len() <= 256 * 1024,
                 "input manifest exceeds recording limit"
             );
+            let validated = Instant::now();
             if !store.save(
                 &recipe.key,
                 &key,
@@ -440,6 +442,15 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 }),
             )? {
                 bail!("entry exceeds cache budget");
+            }
+            if env::var_os("JATO_LOG").as_deref() == Some(OsStr::new("timings")) {
+                eprintln!(
+                    "jato [{}] compile {} us, validate {} us, store {} us",
+                    inv.name,
+                    (compiled - timer).as_micros(),
+                    (validated - compiled).as_micros(),
+                    validated.elapsed().as_micros()
+                );
             }
             Ok(())
         })();

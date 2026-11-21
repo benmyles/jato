@@ -40,3 +40,9 @@
 - [x] Reuse packed data across insertions and deletions while preserving bounded capture and exact restoration.
 - [x] Reject impossible large-input variants before whole-file hashing and test changes inside and outside the sampled regions.
 - [x] Reduce repeated worktree ownership checks, qualify the installed build and source package, and compare live edits, revision histories and clean builds with upstream peers.
+
+## Cold capture and editor saves
+
+- [ ] Reduce temporary writes during cold capture without changing restored bytes.
+- [ ] Avoid repeated module discovery when a verified live executable survives an editor rename.
+- [ ] Measure cold builds and edit cycles against 0.6 and upstream caches, and qualify the installed release.

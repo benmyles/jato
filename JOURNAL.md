@@ -1,5 +1,10 @@
 # Work journal
 
+## 2026-11-21 — cold capture and editor saves
+
+- Added per-unit compile, validation and publication timings. On an isolated fresh incremental regex link, six runs put the bare compiler at 198 ms and its native observer at 479 ms. Switching from hexadecimal to printable trace strings took 541 ms.
+- A warm undo in the 0.6 live benchmark launched one additional rustc dependency probe on each atomic save. Packed capture also spooled new incompressible frames before writing the same bytes to SQLite.
+
 ## 2026-11-21 — live incremental replay and shifted artifacts
 
 - A dev-profile edit and undo both bypassed the installed 0.5 cache because rustc’s incremental session was active. The original executable had already been recorded from a clean session.
