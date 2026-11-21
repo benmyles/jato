@@ -69,6 +69,7 @@ def main():
                 if revision == 0:
                     initial = hashlib.sha256(archive.read_bytes()).hexdigest()
                 stats = json.loads(run([binary, "stats", "--json"], project, cfg))
+                assert stats["entries"] == revision + 1, "a source revision was not stored"
                 sample.append({k: stats[k] for k in ("entries", "artifact_bytes", "compressed_bytes", "charged_bytes", "database_bytes")})
                 sample[-1]["seconds"] = round(seconds, 6)
             shutil.rmtree(target)

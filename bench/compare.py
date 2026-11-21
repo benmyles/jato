@@ -81,6 +81,38 @@ def extent_usage(root):
     return dict(btrfs_total=total, btrfs_exclusive=exclusive, btrfs_set_shared=shared)
 
 
+def paired_restores(options, tools, env, project, root, target):
+    samples = {}
+    medians = {}
+    for mode in options.workloads:
+        command = [env["CARGO"], *(["check"] if mode == "check" else ["build", "--release"]), "--locked", "-q"]
+        timings = {name: [] for name in tools}
+        expected = None
+        names = list(tools)
+        # One untimed build per store, followed by alternating clean targets.
+        for iteration in range(options.paired_restores + 1):
+            for name in names[iteration % len(names):] + names[:iteration % len(names)]:
+                cfg = dict(env, RUSTC_WRAPPER=str(tools[name]), JATO_CACHE_DIR=str(root / f"{name}-{mode}"))
+                if name.endswith("_packed"):
+                    cfg["JATO_STORAGE"] = "packed"
+                if target.exists():
+                    shutil.rmtree(target)
+                start = time.perf_counter()
+                run(command, cfg, project)
+                elapsed = time.perf_counter() - start
+                if iteration:
+                    timings[name].append(round(elapsed, 6))
+                if mode == "release" and (options.verify_bin or not options.project):
+                    output = run([target / "release" / (options.verify_bin or f"jato-{options.fixture}-bench"),
+                                  *(["--version"] if options.verify_bin else [])], cfg, project)
+                    if expected is None:
+                        expected = output
+                    assert expected == output, "restored program changed"
+        samples[mode] = timings
+        medians[mode] = {name: statistics.median(rows) for name, rows in timings.items()}
+    return dict(samples=samples, median=medians)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
@@ -91,6 +123,8 @@ def main():
     parser.add_argument("--previous-jato")
     parser.add_argument("--include-packed", action="store_true", help="also measure Jato with portable packed storage")
     parser.add_argument("--previous-packed", action="store_true", help="also measure --previous-jato in packed mode")
+    parser.add_argument("--paired-restores", type=int, metavar="N",
+                        help="prime the two Jato versions and alternate N warm clean targets per version")
     parser.add_argument("--workloads", nargs="+", choices=["release","check"], default=["check","release"])
     parser.add_argument("--kache", default="kache")
     parser.add_argument("--sccache", default="sccache")
@@ -101,8 +135,13 @@ def main():
     options = parser.parse_args()
     if min(options.jobs, options.runs) < 1:
         parser.error("--jobs and --runs must be positive")
-    tools = {"cargo": None, "jato": binary(options.jato), "kache": binary(options.kache),
-             "sccache": binary(options.sccache)}
+    if options.paired_restores is not None:
+        if options.paired_restores < 1 or not options.previous_jato:
+            parser.error("--paired-restores needs a positive count and --previous-jato")
+        tools = {"jato": binary(options.jato)}
+    else:
+        tools = {"cargo": None, "jato": binary(options.jato), "kache": binary(options.kache),
+                 "sccache": binary(options.sccache)}
     if options.include_packed:
         tools["jato_packed"] = tools["jato"]
     if options.previous_jato:
@@ -156,6 +195,12 @@ def main():
         if options.offline:
             env["CARGO_NET_OFFLINE"] = "true"
         run([cargo, "fetch", "--locked"], env, project)
+        if options.paired_restores:
+            result = paired_restores(options, tools, env, project, root, target)
+            print(json.dumps(dict(versions=versions, project=project.name if options.project else options.fixture,
+                                  rustc=run([rustc, "-V"], env, project).decode().strip(), jobs=options.jobs,
+                                  pairs=options.paired_restores, **result), indent=2))
+            return
         results = {name: {} for name in tools}
         expected = None
         order = list(tools)
