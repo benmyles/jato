@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import statistics
 import subprocess
@@ -28,7 +29,7 @@ def tree_bytes(root):
     for directory, _, files in os.walk(root):
         for name in files:
             try:
-                info = (Path(directory) / name).stat()
+                info = (Path(directory) / name).lstat()
             except FileNotFoundError:
                 continue
             identity = info.st_dev, info.st_ino
@@ -38,12 +39,47 @@ def tree_bytes(root):
     return total
 
 
+def server_rss(sock):
+    """Identify only the server listening on this benchmark's private socket."""
+    try:
+        rows = Path("/proc/net/unix").read_text().splitlines()
+        inodes = {row.split()[6] for row in rows if row.split()[-1] == str(sock)}
+        wanted = {f"socket:[{inode}]" for inode in inodes}
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                if proc.joinpath("comm").read_text().strip() not in {"sccache", "kache-engine", "kache"}:
+                    continue
+                if any(os.readlink(fd) in wanted for fd in proc.joinpath("fd").iterdir()):
+                    rss = next(s for s in proc.joinpath("status").read_text().splitlines() if s.startswith("VmRSS:"))
+                    return int(rss.split()[1])
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+    except (OSError, StopIteration):
+        pass
+    return None
+
+
+def extent_usage(root):
+    if not root.is_dir() or not shutil.which("btrfs"):
+        return {}
+    result = subprocess.run(["btrfs", "filesystem", "du", "-s", "--raw", root], capture_output=True, text=True)
+    if result.returncode:
+        return {}
+    try:
+        total, exclusive, shared = map(int, result.stdout.splitlines()[-1].split()[:3])
+    except (ValueError, IndexError):
+        return {}
+    return dict(btrfs_total=total, btrfs_exclusive=exclusive, btrfs_set_shared=shared)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, help="an existing locked Cargo project")
     parser.add_argument("--verify-bin", help="compare this release program's --version output")
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--previous-jato")
+    parser.add_argument("--include-packed", action="store_true", help="also measure Jato with portable packed storage")
+    parser.add_argument("--workloads", nargs="+", choices=["release","check"], default=["check","release"])
     parser.add_argument("--kache", default="kache")
     parser.add_argument("--sccache", default="sccache")
     parser.add_argument("--runs", type=int, default=3)
@@ -55,6 +91,8 @@ def main():
         parser.error("--jobs and --runs must be positive")
     tools = {"cargo": None, "jato": binary(options.jato), "kache": binary(options.kache),
              "sccache": binary(options.sccache)}
+    if options.include_packed:
+        tools["jato_packed"] = tools["jato"]
     if options.previous_jato:
         tools["previous_jato"] = binary(options.previous_jato)
     rustc = binary(str(Path(subprocess.check_output(["rustc", "--print", "sysroot"],
@@ -96,7 +134,7 @@ def main():
         expected = None
         order = list(tools)
         for trial in range(options.runs):
-            for mode in (["check", "release"] if trial % 2 == 0 else ["release", "check"]):
+            for mode in (options.workloads if trial % 2 == 0 else reversed(options.workloads)):
                 for name in order[trial % len(order):] + order[:trial % len(order)]:
                     exe = tools[name]
                     sample = {}
@@ -110,13 +148,19 @@ def main():
                                    KACHE_MAX_SIZE="1GiB", SCCACHE_DIR=str(cache), SCCACHE_CACHE_SIZE="1G",
                                    SCCACHE_SERVER_UDS=str(private / "s.sock"), SCCACHE_CONF=str(config),
                                    SCCACHE_ALLOW_INCREMENTAL="1")
+                        if name == "jato_packed":
+                            cfg["JATO_STORAGE"] = "packed"
                         assert len(os.fsencode(cfg["SCCACHE_SERVER_UDS"])) < 104, "use a shorter --scratch path"
                         command = [cargo, *(["check"] if mode == "check" else ["build", "--release"]),
                                    "--locked", "-q"]
                         def measure(phase):
+                            rss = private / "rss"
+                            timed = ["/usr/bin/time", "-f", "%M", "-o", rss, *command] if Path("/usr/bin/time").is_file() else command
                             start = time.perf_counter()
-                            run(command, cfg, project)
+                            run(timed, cfg, project)
                             sample[phase] = round(time.perf_counter() - start, 5)
+                            if rss.is_file():
+                                sample[phase + "_peak_process_rss_kib"] = int(rss.read_text())
                         server = {"sccache": (["--start-server"], ["--stop-server"]),
                                   "kache": (["daemon", "start"], ["daemon", "stop"])}.get(name)
                         if server:
@@ -134,6 +178,8 @@ def main():
                                     if expected is None:
                                         expected = output
                                     assert expected == output, "restored executable output changed"
+                                    if not options.project:
+                                        assert output == b"3\n", "incorrect regex result"
                             if mode == "check" and not options.project:
                                 source = project / "src/main.rs"
                                 original = source.read_text()
@@ -145,6 +191,15 @@ def main():
                                 stats_args = {"sccache": ["--show-stats", "--stats-format", "json"],
                                               "kache": ["--json", "stats"]}.get(name, ["stats", "--json"])
                                 stats = json.loads(run([exe, *stats_args], cfg, project))
+                                if server:
+                                    socket_path = cfg["KACHE_SOCKET_PATH" if name == "kache" else "SCCACHE_SERVER_UDS"]
+                                    sample["idle_server_rss_kib"] = server_rss(socket_path)
+                                else:
+                                    sample["idle_server_rss_kib"] = 0
+                                if name in {"jato","jato_packed"}:
+                                    sample["sealed_bytes"] = stats.get("sealed_bytes", 0)
+                                    sample["packed_bytes"] = stats["compressed_bytes"]
+                                    sample["probe_hits"] = stats["counters"].get("probe_hit", 0)
                                 if name == "kache":
                                     sample["hits"] = stats["lifetime"]["hits"]
                                 elif name == "sccache":
@@ -155,12 +210,14 @@ def main():
                             if server:
                                 run([exe, *server[1]], cfg, project)
                         sample["store_bytes"] = tree_bytes(cache)
+                        sample.update(extent_usage(cache))
                     results[name].setdefault(mode, []).append(sample)
                     print(trial + 1, mode, name, sample, file=sys.stderr, flush=True)
         medians = {k: {m: {key: statistics.median(s[key] for s in samples)
-                           for key in samples[0]} for m, samples in modes.items()}
+                           for key in samples[0] if all(s.get(key) is not None for s in samples)} for m, samples in modes.items()}
                    for k, modes in results.items()}
-        print(json.dumps(dict(versions=versions, rustc=run([rustc, "-V"], env, project).decode().strip(),
+        print(json.dumps(dict(versions=versions, kernel=platform.release(), project=project.name if options.project else "locked regex application",
+                              rustc=run([rustc, "-V"], env, project).decode().strip(),
                               jobs=options.jobs, runs=options.runs, samples=results, median=medians), indent=2))
 
 
