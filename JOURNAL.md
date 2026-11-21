@@ -7,6 +7,8 @@
 - Added observed native archive inputs for Rust libraries with native-only search paths and ordinary static or dynamic link flags. Verified byte changes, search priority, removal and bundled link attributes using a real C archive.
 - Shared checked, compressed input manifests across source variants. Stored single-chunk artifacts directly by digest and joined artifact descriptors in one SQLite read. Tested shared-record corruption, eviction and recovery.
 - Added bounded parallel BLAKE3 subtrees for large single inputs and streaming admission for large embedded assets. Validated empty, partial and power-of-two boundaries against standard BLAKE3 and changed an embedded byte through a real Cargo release build.
+- Found exact sidecar metadata embedded at unaligned offsets in real rlibs. Packed storage now follows archive member and metadata boundaries and compresses repeated frames once per entry. Verified exact restores after shifting members and changing archive headers.
+- Allowed an idle watcher to act on a completed Rust-file save. Close-only events require a pending edit, and a busy watcher or explicit debounce keeps batching. Published verified compiler diagnostics before waiting to record hit statistics.
 
 ## 2026-11-21
 

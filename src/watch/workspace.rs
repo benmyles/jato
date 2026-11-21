@@ -126,6 +126,7 @@ impl Workspace {
                 "artifacts-v1.sqlite3-wal",
                 "artifacts-v1.sqlite3-shm",
                 "schema.lock",
+                "objects-v1",
                 ".jato-staging-v1",
             ] {
                 excluded.push(cache.join(name));

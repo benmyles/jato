@@ -84,6 +84,7 @@ struct Changes {
     full: bool,
     paths: BTreeSet<PathBuf>,
     new_dirs: BTreeSet<PathBuf>,
+    completed: Option<PathBuf>,
 }
 
 impl Changes {
@@ -92,6 +93,7 @@ impl Changes {
             full: true,
             paths: BTreeSet::new(),
             new_dirs: BTreeSet::new(),
+            completed: None,
         }
     }
     fn add(&mut self, path: PathBuf, created_dir: bool) {
@@ -100,6 +102,9 @@ impl Changes {
         }
         if created_dir && !self.paths.contains(&path) {
             self.new_dirs.insert(path.clone());
+        }
+        if self.completed.as_ref() == Some(&path) {
+            self.completed = None;
         }
         self.paths.insert(path);
         if self.paths.len() >= 128 {
@@ -114,10 +119,23 @@ impl Changes {
                 let created = other.new_dirs.contains(&p);
                 self.add(p, created);
             }
+            if other.completed.is_some() {
+                self.completed = other.completed;
+            }
         }
     }
     fn empty(&self) -> bool {
         !self.full && self.paths.is_empty()
+    }
+
+    fn debounce(&self, idle: bool) -> Duration {
+        if self.full || self.paths.len() > 4 || self.paths.iter().any(|p| configuration(p)) {
+            Duration::from_millis(100)
+        } else if idle && self.paths.len() == 1 && self.completed.as_ref() == self.paths.first() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(16)
+        }
     }
 }
 
@@ -128,11 +146,14 @@ struct Inbox {
 }
 
 impl Inbox {
-    fn record(&self, paths: Vec<PathBuf>, created_dir: bool) {
+    fn record(&self, paths: Vec<PathBuf>, created_dir: bool, completed: Option<PathBuf>) {
         let mut changes = self.changes.lock().unwrap();
-        let wake = changes.empty();
+        let wake = changes.empty() && changes.completed.is_none();
         for p in paths {
             changes.add(p, created_dir);
+        }
+        if let Some(path) = completed {
+            changes.completed = Some(path);
         }
         if wake {
             let _ = self.wake.send(&[1]);
@@ -293,16 +314,17 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
             return Ok(130);
         }
         let incoming = tree.filter(std::mem::take(&mut *inbox.changes.lock().unwrap()));
-        if !incoming.empty() {
+        if !incoming.empty()
+            || options.delay.is_none()
+                && incoming
+                    .completed
+                    .as_ref()
+                    .is_some_and(|p| batch.paths.contains(p))
+        {
             batch.merge(incoming);
-            let delay = options.delay.unwrap_or_else(|| {
-                // Editor saves usually touch one member. Give checkout and
-                // configuration bursts more time to settle before restarting.
-                let bulk = batch.full
-                    || batch.paths.len() > 4
-                    || batch.paths.iter().any(|p| configuration(p));
-                Duration::from_millis(if bulk { 100 } else { 16 })
-            });
+            let delay = options
+                .delay
+                .unwrap_or_else(|| batch.debounce(job.is_none() && queue.is_empty()));
             deadline = Some(Instant::now() + delay);
         }
         if deadline.is_some_and(|d| d <= Instant::now()) {
@@ -365,5 +387,27 @@ pub fn run(args: &[OsString], system_linker: bool) -> Result<i32> {
             job = Some(Job::spawn(&args, system_linker)?);
         }
         wait(&receiver, job.as_ref(), deadline)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_completed_single_save_can_start_an_idle_job() {
+        let source = PathBuf::from("src/lib.rs");
+        let mut batch = Changes {
+            completed: Some(source.clone()),
+            ..Changes::default()
+        };
+        assert!(batch.empty()); // A close without a write never schedules a build.
+        batch.add(source.clone(), false);
+        assert_eq!(batch.debounce(true), Duration::from_millis(16));
+        batch.completed = Some(source);
+        assert_eq!(batch.debounce(true), Duration::ZERO);
+        assert_eq!(batch.debounce(false), Duration::from_millis(16));
+        batch.add(PathBuf::from("Cargo.toml"), false);
+        assert_eq!(batch.debounce(true), Duration::from_millis(100));
     }
 }

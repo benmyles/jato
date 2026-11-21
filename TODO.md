@@ -17,6 +17,6 @@
 
 ## Verification and storage hot paths
 
-- [ ] Shorten content verification on the last link while respecting Cargo's job limit.
-- [ ] Reduce repeated store work on small artifacts and closely spaced saves.
+- [x] Shorten content verification on the last link while respecting Cargo's job limit.
+- [x] Reduce repeated store work on small artifacts and closely spaced saves.
 - [ ] Compare against the installed 0.2 release and peers, and qualify the installed update.
