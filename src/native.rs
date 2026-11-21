@@ -1037,7 +1037,7 @@ impl Manifest {
                 }
             }
         }
-        let digests = crate::content::digests(&content)?;
+        let digests = crate::content::digests(&content, 2 << 20)?;
         for index in occurrences {
             field(&mut h, &digests[index]);
         }

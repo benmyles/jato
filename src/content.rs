@@ -4,8 +4,9 @@ use crate::store::Digest;
 use anyhow::{Context, Result, ensure};
 use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root};
 use std::fs::{self, File, Metadata};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::ops::Range;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::{
     OnceLock,
@@ -14,6 +15,28 @@ use std::sync::{
 use std::time::SystemTime;
 
 static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
+
+pub fn open(path: &Path) -> std::io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+        {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::Unsupported
+                ) => {}
+            result => return result,
+        }
+    }
+    File::open(path)
+}
 
 pub fn inherit_jobs() {
     JOBSERVER.get_or_init(|| {
@@ -26,6 +49,20 @@ pub fn inherit_jobs() {
 pub struct Input<'a> {
     path: &'a Path,
     identity: [u64; 7],
+    handle: Option<File>,
+}
+
+struct Positioned<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+impl Read for Positioned<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read_at(buffer, self.offset)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
 }
 
 impl<'a> Input<'a> {
@@ -38,23 +75,40 @@ impl<'a> Input<'a> {
         Ok(Self {
             path,
             identity: stamp(meta),
+            handle: None,
         })
     }
 
+    pub fn with_file(path: &'a Path, file: File, since: SystemTime) -> Result<Self> {
+        let mut input = Self::new(path, &file.metadata()?, since)?;
+        input.handle = Some(file);
+        Ok(input)
+    }
+
     fn read(&self, range: Range<u64>) -> Result<Digest> {
-        let mut file =
-            File::open(self.path).with_context(|| format!("opening {}", self.path.display()))?;
-        ensure!(
-            stamp(&file.metadata()?) == self.identity,
-            "input replaced before hashing"
-        );
+        let opened;
+        let file = match &self.handle {
+            Some(f) => f,
+            None => {
+                opened =
+                    open(self.path).with_context(|| format!("opening {}", self.path.display()))?;
+                ensure!(
+                    stamp(&opened.metadata()?) == self.identity,
+                    "input replaced before hashing"
+                );
+                &opened
+            }
+        };
         let whole = range.start == 0 && range.end == self.identity[2];
         let mut h = blake3::Hasher::new();
         if !whole {
             h.set_input_offset(range.start);
-            file.seek(SeekFrom::Start(range.start))?;
         }
-        let mut reader = file.take(range.end - range.start);
+        let mut reader = Positioned {
+            file,
+            offset: range.start,
+        }
+        .take(range.end - range.start);
         h.update_reader(&mut reader)?;
         ensure!(
             reader.limit() == 0 && stamp(&fs::metadata(self.path)?) == self.identity,
@@ -97,12 +151,40 @@ fn root(parts: &[Digest]) -> Digest {
     *merge_subtrees_root(&subtree(left), &subtree(right), Mode::Hash).as_bytes()
 }
 
-pub fn digests(inputs: &[Input<'_>]) -> Result<Vec<Digest>> {
-    let serial = || inputs.iter().map(|i| i.read(0..i.identity[2])).collect();
+pub fn digests(inputs: &[Input<'_>], bytes_per_worker: u64) -> Result<Vec<Digest>> {
+    let serial = || {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // Overlap a small amount of I/O for actual dependencies on the
+            // serial path. This also works with cargo -j1 on fresh reflinks.
+            let mut remaining = 2 << 20;
+            for input in inputs.iter().skip(1) {
+                if let Some(file) = &input.handle
+                    && input.identity[2] >= 256 << 10
+                {
+                    let count = input.identity[2].min(512 << 10).min(remaining);
+                    unsafe {
+                        libc::posix_fadvise(
+                            file.as_raw_fd(),
+                            0,
+                            count as libc::off_t,
+                            libc::POSIX_FADV_WILLNEED,
+                        );
+                    }
+                    remaining -= count;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        inputs.iter().map(|i| i.read(0..i.identity[2])).collect()
+    };
     let bytes = inputs
         .iter()
         .fold(0u64, |n, f| n.saturating_add(f.identity[2]));
-    let workers = bytes.div_ceil(MIN_STRIPE).min(4) as usize;
+    let workers = bytes.div_ceil(bytes_per_worker).min(4) as usize;
     let Some(server) = JOBSERVER
         .get()
         .and_then(Option::as_ref)
@@ -161,6 +243,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_retained_descriptor_cannot_vouch_for_a_replaced_path() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let file = d.path().join("dependency");
+        let replacement = d.path().join("replacement");
+        fs::write(&file, b"first")?;
+        let input = Input::with_file(
+            &file,
+            open(&file)?,
+            SystemTime::now() + std::time::Duration::from_secs(1),
+        )?;
+        fs::write(&replacement, b"other")?;
+        fs::rename(replacement, &file)?;
+        assert!(input.read(0..5).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn streamed_stripes_match_standard_blake3_for_every_tree_shape() -> Result<()> {
         let d = tempfile::tempdir()?;
         let path = d.path().join("input");
@@ -186,6 +285,7 @@ mod tests {
             let input = Input {
                 path: &path,
                 identity: stamp(&fs::metadata(&path)?),
+                handle: None,
             };
             for workers in 1..=4 {
                 let parts = ranges(size, workers)

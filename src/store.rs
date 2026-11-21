@@ -446,11 +446,9 @@ impl Store {
     }
 
     pub fn knows_artifact(&self, digest: &Digest, codegen: bool) -> Result<bool> {
-        Ok(self.conn.query_row(
+        Ok(self.conn.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM files JOIN plans ON plans.entry=files.entry WHERE digest=?1 AND (?2=0 OR codegen=1) AND NOT EXISTS(SELECT 1 FROM needs WHERE needs.entry=files.entry))",
-            params![digest,codegen],
-            |r| r.get(0),
-        )?)
+        )?.query_row(params![digest,codegen], |r| r.get(0))?)
     }
 
     pub fn count(&self, event: &str, value: u64) -> Result<()> {
@@ -749,7 +747,7 @@ impl Store {
                 let verity = row.get::<_, Option<Digest>>(5)?;
                 if let Some(verity) = verity {
                     let path = crate::sealed::path(&self.dir, &digest);
-                    let mut source = File::open(path).map_err(|e| {
+                    let mut source = crate::content::open(&path).map_err(|e| {
                         if e.kind() == std::io::ErrorKind::NotFound {
                             anyhow::Error::new(Damaged::Object(digest))
                         } else {

@@ -39,10 +39,23 @@ fn stamp_path(hash: &mut blake3::Hasher, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ordered(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = fs::read_dir(dir)?
-        .map(|e| e.map(|v| v.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
+fn ordered(dir: &Path, include: Option<fn(&fs::FileType) -> bool>) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(include) = include {
+            let ty = entry.file_type()?;
+            let keep = if ty.is_symlink() {
+                fs::metadata(entry.path()).is_ok_and(|m| include(&m.file_type()))
+            } else {
+                include(&ty)
+            };
+            if !keep {
+                continue;
+            }
+        }
+        paths.push(entry.path());
+    }
     paths.sort();
     Ok(paths)
 }
@@ -79,25 +92,22 @@ pub fn recipe(compiler: &OsStr, args: &[OsString], native: bool) -> Result<Recip
             .find(|p| p.is_file())
             .context("compiler missing from PATH")?
     };
-    let actual = fs::canonicalize(&executable)?;
-    let bundled = fs::canonicalize(root.join("bin/rustc"))?;
-    if actual != bundled {
+    let bundled = root.join("bin/rustc");
+    if executable != bundled && fs::canonicalize(&executable)? != fs::canonicalize(&bundled)? {
         let proxy = executable.with_file_name("rustup");
         let same_inode = fs::metadata(proxy).is_ok_and(|m| {
-            fs::metadata(&actual).is_ok_and(|a| a.dev() == m.dev() && a.ino() == m.ino())
+            fs::metadata(&executable).is_ok_and(|a| a.dev() == m.dev() && a.ino() == m.ino())
         });
         ensure!(same_inode, "custom rustc driver");
     }
     stamp_path(&mut identity, &root.join("bin/rustc"))?;
-    for p in ordered(&root.join("lib"))? {
-        if p.is_file() {
-            stamp_path(&mut identity, &p)?;
-        }
+    for p in ordered(&root.join("lib"), Some(fs::FileType::is_file))? {
+        stamp_path(&mut identity, &p)?;
     }
-    for target in ordered(&root.join("lib/rustlib"))? {
+    for target in ordered(&root.join("lib/rustlib"), Some(fs::FileType::is_dir))? {
         let dir = target.join("lib");
         if dir.is_dir() {
-            for p in ordered(&dir)? {
+            for p in ordered(&dir, None)? {
                 stamp_path(&mut identity, &p)?;
             }
         }
@@ -181,8 +191,8 @@ fn hash_open(
             blake3::hash(buffer)
         }
     } else if before.len() >= 4 << 20 {
-        let input = crate::content::Input::new(path, &before, since)?;
-        return Ok(crate::content::digests(&[input])?[0]);
+        let input = crate::content::Input::with_file(path, f, since)?;
+        return Ok(crate::content::digests(&[input], 2 << 20)?[0]);
     } else {
         let mut h = blake3::Hasher::new();
         h.update_reader(&mut f)?;
@@ -305,7 +315,8 @@ impl Plan {
         let mut scan = admit_codegen.then(Vec::new);
         let cwd = std::env::current_dir()?;
         for file in &self.files {
-            let opened = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+            let opened = crate::content::open(file)
+                .with_context(|| format!("opening {}", file.display()))?;
             #[cfg(target_os = "linux")]
             let path = fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd()))
                 .or_else(|_| fs::canonicalize(file))?;
@@ -447,9 +458,22 @@ pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) 
     let inputs = inv
         .externs
         .iter()
-        .map(|path| crate::content::Input::new(path, &fs::metadata(path)?, since))
+        .map(|path| {
+            if inv.externs.len() <= 16 {
+                crate::content::Input::with_file(path, crate::content::open(path)?, since)
+            } else {
+                crate::content::Input::new(path, &fs::metadata(path)?, since)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
-    for (path, digest) in inv.externs.iter().zip(crate::content::digests(&inputs)?) {
+    // Small metadata reads are often on a busy, wide check graph. Give newly
+    // ready Cargo units priority there; reserve finer stripes for codegen.
+    let bytes_per_worker = if inv.codegen { 2 << 20 } else { 8 << 20 };
+    for (path, digest) in inv
+        .externs
+        .iter()
+        .zip(crate::content::digests(&inputs, bytes_per_worker)?)
+    {
         if !store.knows_artifact(&digest, inv.codegen)? {
             if !defer
                 || path.extension() != Some(OsStr::new("rmeta"))

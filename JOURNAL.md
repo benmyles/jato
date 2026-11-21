@@ -9,6 +9,7 @@
 - Added bounded parallel BLAKE3 subtrees for large single inputs and streaming admission for large embedded assets. Validated empty, partial and power-of-two boundaries against standard BLAKE3 and changed an embedded byte through a real Cargo release build.
 - Found exact sidecar metadata embedded at unaligned offsets in real rlibs. Packed storage now follows archive member and metadata boundaries and compresses repeated frames once per entry. Verified exact restores after shifting members and changing archive headers.
 - Allowed an idle watcher to act on a completed Rust-file save. Close-only events require a pending edit, and a busy watcher or explicit debounce keeps batching. Published verified compiler diagnostics before waiting to record hit statistics.
+- Investigated a slower ripgrep check in the first interleaved comparison. Alternating warm targets narrowed the gap. Checked small dependency sets through retained file descriptors, reserved spare threads for larger metadata batches, and limited read-ahead to actual pending inputs. Added a regression for replacing a path while its previous inode is open.
 
 ## 2026-11-21
 
