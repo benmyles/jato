@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHUNK: usize = 256 * 1024;
 const DEFAULT_LIMIT: u64 = 1024 * 1024 * 1024;
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 const MAX_PLAN: usize = 256 * 1024;
 pub const DIAGNOSTIC_LIMIT: usize = 512 * 1024;
 pub type Digest = [u8; 32];
@@ -432,28 +432,46 @@ impl Store {
             .conn
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM source_variants s JOIN plans p ON p.entry=s.entry
-             WHERE s.digest=?1 AND p.topology=?2)",
+             WHERE s.digest=?1 AND (p.topology=?2 OR EXISTS(
+                 SELECT 1 FROM worktree_topologies w WHERE w.entry=p.entry AND ?2 IN(w.latest,w.previous,w.oldest))))",
             )?
             .query_row(params![sources, topology], |r| r.get(0))?)
     }
 
-    pub fn topology(&self, key: &Digest) -> Result<Option<Digest>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT topology FROM entries JOIN plans ON entry=id WHERE key=?1",
-                [key],
-                |r| r.get(0),
-            )
-            .optional()?)
+    pub fn matches_topology(&self, key: &Digest, topology: &Digest) -> Result<Option<bool>> {
+        Ok(self.conn.prepare_cached(
+            "SELECT CASE WHEN p.topology=?2 THEN 1 ELSE EXISTS(
+                SELECT 1 FROM worktree_topologies w WHERE w.entry=p.entry AND ?2 IN(w.latest,w.previous,w.oldest)
+             ) END FROM entries e JOIN plans p ON p.entry=e.id WHERE e.key=?1"
+        )?.query_row(params![key, topology], |r| r.get(0)).optional()?)
     }
 
-    pub fn refresh_topology(&self, key: &Digest, topology: &Digest) -> Result<()> {
-        self.conn.execute(
-            "UPDATE plans SET topology=?1 WHERE entry=(SELECT id FROM entries WHERE key=?2)",
-            params![topology, key],
-        )?;
+    pub fn refresh_topology(&self, key: &Digest, topology: &Digest, projected: bool) -> Result<()> {
+        if projected {
+            // Keep the original witness plus the last three independently
+            // resolved alternatives. An optional hint cannot evict artifacts.
+            self.conn.execute(
+                "INSERT INTO worktree_topologies(entry,latest)
+                 SELECT e.id,?2 FROM entries e JOIN plans p ON p.entry=e.id WHERE e.key=?1 AND p.topology<>?2 AND
+                 ((SELECT bytes FROM usage)+192<=?3 OR EXISTS(SELECT 1 FROM worktree_topologies w WHERE w.entry=e.id))
+                 ON CONFLICT(entry) DO UPDATE SET oldest=previous,previous=latest,latest=excluded.latest
+                 WHERE latest<>excluded.latest AND previous IS NOT excluded.latest AND oldest IS NOT excluded.latest",
+                params![key,topology,self.limit]
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE plans SET topology=?1 WHERE entry=(SELECT id FROM entries WHERE key=?2)",
+                params![topology, key],
+            )?;
+        }
         Ok(())
+    }
+
+    pub fn has_artifact_size(&self, size: u64, codegen: bool) -> Result<bool> {
+        Ok(self.conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM files f JOIN plans p ON p.entry=f.entry
+             WHERE f.size=?1 AND p.codegen>=?2 AND NOT EXISTS(SELECT 1 FROM needs n WHERE n.entry=f.entry))"
+        )?.query_row(params![size,codegen], |r|r.get(0))?)
     }
 
     pub fn knows_artifact(&self, digest: &Digest, codegen: bool) -> Result<bool> {
@@ -797,7 +815,7 @@ impl Store {
         }))
     }
 
-    pub fn record_hit(&mut self, hit: &Hit) -> Result<()> {
+    pub fn record_hit(&mut self, hit: &Hit, coalesced: bool) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -806,6 +824,9 @@ impl Store {
             params![now(), hit.key],
         )?;
         tx.execute("INSERT INTO counters VALUES ('hit',1),('reused_compiler_ms',?1) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", [hit.compiler_ms])?;
+        if coalesced {
+            tx.execute("INSERT INTO counters VALUES('coalesced_hit',1) ON CONFLICT(name) DO UPDATE SET value=value+1",[])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -936,9 +957,95 @@ mod tests {
             let Some(hit) = self.materialize(key, paths)? else {
                 return Ok(None);
             };
-            self.record_hit(&hit)?;
+            self.record_hit(&hit, false)?;
             Ok(Some(hit.diagnostics))
         }
+    }
+
+    #[test]
+    fn extra_topologies_are_bounded_charged_and_evicted_with_the_entry() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let files = [dir.path().join("file")];
+        fs::write(&files[0], b"output")?;
+        let mut store = Store::at(dir.path().join("cache"), 1 << 20)?;
+        let key = [8; 32];
+        let sources = [9; 32];
+        let ev = Evidence {
+            inputs: b"manifest",
+            sources: &sources,
+            needs: &[],
+            topology: &[0; 32],
+            codegen: true,
+        };
+        assert!(store.save(&[7; 32], &key, &files, b"", 1, Some(ev))?);
+        let base = store.stats()?.charged_bytes;
+        store.limit = base;
+        store.refresh_topology(&key, &[1; 32], true)?;
+        assert_eq!(store.matches_topology(&key, &[1; 32])?, Some(false));
+        store.limit += 192;
+        for n in 1..=7 {
+            store.refresh_topology(&key, &[n; 32], true)?;
+            assert!(store.has_source_topology(&sources, &[n; 32])?);
+            assert_eq!(store.stats()?.charged_bytes, base + 192);
+        }
+        for n in 0..=7 {
+            assert_eq!(
+                store.matches_topology(&key, &[n; 32])?,
+                Some(n == 0 || n >= 5)
+            );
+        }
+        store.prune(0)?;
+        assert_eq!(store.stats()?.charged_bytes, 0);
+        assert_eq!(store.matches_topology(&key, &[7; 32])?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn native_preflight_size_cannot_authorize_bytes_or_replaced_paths() -> Result<()> {
+        use crate::{fingerprint, invocation::Invocation};
+        let dir = tempfile::tempdir()?;
+        let extern_file = dir.path().join("libexample.rlib");
+        fs::write(&extern_file, b"valid")?;
+        let mut store = Store::at(dir.path().join("cache"), 1 << 20)?;
+        let ev = Evidence {
+            inputs: b"manifest",
+            sources: &[2; 32],
+            needs: &[],
+            topology: &[4; 32],
+            codegen: true,
+        };
+        assert!(store.save(
+            &[5; 32],
+            &[1; 32],
+            std::slice::from_ref(&extern_file),
+            b"",
+            1,
+            Some(ev)
+        )?);
+        let inv = Invocation {
+            name: "unit".into(),
+            codegen: true,
+            executable: true,
+            observe_native: true,
+            linker: None,
+            incremental: None,
+            deferred_links: false,
+            source: dir.path().join("main.rs"),
+            externs: vec![extern_file.clone()],
+            outputs: vec![],
+            probe_args: vec![],
+        };
+        let since = SystemTime::now();
+        let pre = fingerprint::native_externs(&inv, since, &store)?;
+        assert!(fingerprint::certify_externs(&pre, true, since, &store, false).is_ok());
+        fs::write(dir.path().join("other"), b"valid")?;
+        fs::rename(dir.path().join("other"), &extern_file)?;
+        assert!(fingerprint::certify_externs(&pre, true, since, &store, false).is_err());
+        fs::write(&extern_file, b"wrong")?;
+        let since = SystemTime::now();
+        let pre = fingerprint::native_externs(&inv, since, &store)?;
+        assert!(fingerprint::certify_externs(&pre, true, since, &store, false).is_err());
+        Ok(())
     }
 
     #[test]

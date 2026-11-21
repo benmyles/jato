@@ -91,10 +91,10 @@ fn discover(
                 continue;
             }
         };
-        let Some(topology) = store.topology(&key)? else {
+        let Some(topology) = store.matches_topology(&key, &current)? else {
             continue;
         };
-        if topology == current {
+        if topology {
             let restore = Instant::now();
             let result = store.materialize(&key, &inv.outputs)?;
             if env::var_os("JATO_LOG").as_deref() == Some(OsStr::new("timings")) {
@@ -165,7 +165,8 @@ fn rediscover(
     let key = inputs.key(&plan, recipe, inv, start, externs)?;
     let restored = store.materialize(&key, &inv.outputs)?;
     if restored.is_some() {
-        let _ = store.refresh_topology(&key, &topology);
+        let projected = env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1"));
+        let _ = store.refresh_topology(&key, &topology, projected);
     }
     Ok(restored)
 }
@@ -273,30 +274,45 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             return passthrough(original(compiler, args));
         }
     };
-    match discover(&mut store, compiler, inv, &recipe) {
-        Ok(Some(hit)) => {
-            // Cargo can schedule dependent units as soon as their verified
-            // metadata notification arrives, even with a busy WAL writer.
-            io::stderr().write_all(&hit.diagnostics)?;
-            let _ = store.record_hit(&hit);
-            trace(&inv.name, "hit");
-            return Ok(0);
+    // Take the ticket before lookup to close the publication race. Warm
+    // readers restore concurrently and never need to wait for the owner.
+    let ticket = crate::flight::Ticket::enter(&store.dir, &recipe.key, &inv.source);
+    let mut waited = false;
+    loop {
+        match discover(&mut store, compiler, inv, &recipe) {
+            Ok(Some(hit)) => {
+                io::stderr().write_all(&hit.diagnostics)?;
+                let _ = store.record_hit(&hit, waited);
+                trace(&inv.name, "hit");
+                return Ok(0);
+            }
+            Ok(None) => (),
+            Err(e) => {
+                trace(&inv.name, format_args!("compile after lookup: {e:#}"));
+                break;
+            }
         }
-        Ok(None) => (),
-        Err(e) => trace(&inv.name, format_args!("compile after lookup: {e:#}")),
+        if waited || !ticket.as_ref().is_some_and(crate::flight::Ticket::wait) {
+            break;
+        }
+        waited = true;
     }
     let _ = store.count("miss", 1);
     let since = SystemTime::now();
     let timer = Instant::now();
     let mut native = None;
+    let mut native_inputs = None;
     let cmd = if inv.observe_native {
         if let Err(e) = crate::native::Capture::available(inv, &recipe.root) {
             trace(&inv.name, e);
             return passthrough(original(compiler, args));
         }
-        if let Err(e) = fingerprint::externs(inv, since, &store, false) {
-            trace(&inv.name, e);
-            return passthrough(original(compiler, args));
+        match fingerprint::native_externs(inv, since, &store) {
+            Ok(inputs) => native_inputs = Some(inputs),
+            Err(e) => {
+                trace(&inv.name, e);
+                return passthrough(original(compiler, args));
+            }
         }
         match crate::native::Capture::command(compiler, args, inv) {
             Ok((cmd, capture)) => {
@@ -337,7 +353,12 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
                 inv.confirms_outputs(&log),
                 "compiler reported an unexpected artifact set"
             );
-            let externs = fingerprint::externs(inv, since, &store, !inv.observe_native)?;
+            let externs = match &native_inputs {
+                Some(inputs) => {
+                    fingerprint::certify_externs(inputs, inv.codegen, since, &store, false)?
+                }
+                None => fingerprint::externs(inv, since, &store, true)?,
+            };
             let mut plan = fingerprint::dependencies(&inv.outputs[0])?;
             if let Some(observed) = observed {
                 plan.native =

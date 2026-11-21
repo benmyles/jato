@@ -3,6 +3,7 @@ mod archive;
 mod compiler;
 mod content;
 mod fingerprint;
+mod flight;
 mod invocation;
 mod native;
 mod probe;
@@ -45,6 +46,7 @@ Environment
   JATO_LOG=debug    Explain each cache decision on stderr
   JATO_LOG=timings  Include the time spent validating and restoring a hit
   JATO_STORAGE=packed  Use compressed chunks for all new artifacts
+  JATO_COALESCE=0   Compile concurrent misses independently
   JATO_LINK_CACHE=0  Delegate native linking directly to rustc
   JATO_DISABLE=1    Run the compiler directly
 ";

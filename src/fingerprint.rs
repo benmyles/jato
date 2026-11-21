@@ -459,11 +459,8 @@ pub struct Externs {
     pub needs: Vec<Digest>,
 }
 
-pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) -> Result<Externs> {
-    let mut hash = blake3::Hasher::new_derive_key("jato extern closure v1");
-    let mut needs = Vec::new();
-    let inputs = inv
-        .externs
+fn extern_inputs(inv: &Invocation, since: SystemTime) -> Result<Vec<crate::content::Input<'_>>> {
+    inv.externs
         .iter()
         .map(|path| {
             if inv.externs.len() <= 16 {
@@ -472,16 +469,55 @@ pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) 
                 crate::content::Input::new(path, &fs::metadata(path)?, since)
             }
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+// Preflight is a negative admission filter. A size match can start an
+// observation, but only a full certified content digest can publish it.
+pub fn native_externs<'a>(
+    inv: &'a Invocation,
+    since: SystemTime,
+    store: &Store,
+) -> Result<Vec<crate::content::Input<'a>>> {
+    let inputs = extern_inputs(inv, since)?;
+    for input in &inputs {
+        ensure!(
+            store.has_artifact_size(input.size(), inv.codegen)?,
+            "unverified extern {}",
+            input.path().display()
+        );
+    }
+    Ok(inputs)
+}
+
+pub fn externs(inv: &Invocation, since: SystemTime, store: &Store, defer: bool) -> Result<Externs> {
+    certify_externs(
+        &extern_inputs(inv, since)?,
+        inv.codegen,
+        since,
+        store,
+        defer,
+    )
+}
+
+pub fn certify_externs(
+    inputs: &[crate::content::Input<'_>],
+    codegen: bool,
+    since: SystemTime,
+    store: &Store,
+    defer: bool,
+) -> Result<Externs> {
+    let mut hash = blake3::Hasher::new_derive_key("jato extern closure v1");
+    let mut needs = Vec::new();
     // Small metadata reads are often on a busy, wide check graph. Give newly
     // ready Cargo units priority there; reserve finer stripes for codegen.
-    let bytes_per_worker = if inv.codegen { 2 << 20 } else { 8 << 20 };
-    for (path, digest) in inv
-        .externs
+    let bytes_per_worker = if codegen { 2 << 20 } else { 8 << 20 };
+    for (input, digest) in inputs
         .iter()
-        .zip(crate::content::digests(&inputs, bytes_per_worker)?)
+        .zip(crate::content::digests(inputs, bytes_per_worker)?)
     {
-        if !store.knows_artifact(&digest, inv.codegen)? {
+        let path = input.path();
+        if !store.knows_artifact(&digest, codegen)? {
             if !defer
                 || path.extension() != Some(OsStr::new("rmeta"))
                 || since

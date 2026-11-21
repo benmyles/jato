@@ -994,6 +994,19 @@ fn projected_checkouts_restore_and_resolve_changed_modules() {
     if std::env::var_os("JATO_TEST_NATIVE_HITS").is_some() {
         assert!(log.contains("jato [app] hit"), "{log}");
     }
+    let probes = a.stats()["counters"]["discovery_probe"]
+        .as_u64()
+        .unwrap_or(0);
+    for p in [&a, &b] {
+        success(command(p).args(["cargo", "clean"]));
+        assert_eq!(run(p).stdout, first.stdout);
+    }
+    assert_eq!(
+        a.stats()["counters"]["discovery_probe"]
+            .as_u64()
+            .unwrap_or(0),
+        probes
+    );
     let target = |p| {
         let paths: Value =
             serde_json::from_slice(&success(command(p).arg("paths")).stdout).unwrap();
@@ -1338,4 +1351,85 @@ fn target_only_views_reuse_a_common_dependency_and_keep_host_source_paths() {
         fs::read_dir(target.join(".jato-worktree")).unwrap().count(),
         2
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn concurrent_library_misses_share_only_verified_outputs() {
+    use std::process::Stdio;
+    if !worktree_available() {
+        return;
+    }
+    let a = Project::new();
+    let b = Project::new();
+    let cache = a.temp.path().join("cache");
+    for p in [&a, &b] {
+        write(
+            p.root.join("Cargo.toml"),
+            "[package]\nname='joined'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write(
+            p.root.join("src/main.rs"),
+            "fn main(){println!(\"{}\",joined::value());}",
+        );
+        write(
+            p.root.join("src/lib.rs"),
+            "mod module; pub use module::value;",
+        );
+        write(
+            p.root.join("src/module.rs"),
+            "pub fn value()->&'static str{include_str!(\"asset\")}",
+        );
+        write(p.root.join("src/asset"), "same");
+    }
+    let command = |p: &Project| {
+        let mut c = p.command();
+        c.env("JATO_CACHE_DIR", &cache)
+            .env("CARGO_HOME", a.temp.path().join("cargo"))
+            .env_remove("JATO_COALESCE")
+            .args(["worktree", "--root", "."]);
+        c
+    };
+    let pair = || {
+        let children = [&a, &b].map(|p| {
+            command(p)
+                .args(["build", "--release", "--lib"])
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        });
+        children.map(|c| c.wait_with_output().unwrap())
+    };
+    for r in pair() {
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    }
+    let v = a.stats();
+    assert_eq!(v["counters"]["miss"], 1);
+    assert_eq!(v["counters"]["hit"], 1);
+    for (p, text) in [(&a, "first"), (&b, "other")] {
+        success(command(p).args(["cargo", "clean"]));
+        write(p.root.join("src/asset"), text);
+    }
+    for r in pair() {
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    }
+    for (p, text) in [(&a, "first\n"), (&b, "other\n")] {
+        assert_eq!(
+            success(command(p).args(["run", "--release", "-q"])).stdout,
+            text.as_bytes()
+        );
+    }
+    for p in [&a, &b] {
+        success(command(p).args(["cargo", "clean"]));
+    }
+    write(
+        a.root.join("src/module.rs"),
+        "compile_error!(\"only this checkout fails\");",
+    );
+    let [fail, ok] = pair();
+    assert!(
+        !fail.status.success()
+            && String::from_utf8_lossy(&fail.stderr).contains("only this checkout fails")
+    );
+    assert!(ok.status.success());
 }

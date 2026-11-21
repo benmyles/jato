@@ -17,12 +17,16 @@ use std::time::SystemTime;
 static JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
 
 pub fn open(path: &Path) -> std::io::Result<File> {
+    open_with_flags(path, 0)
+}
+
+pub(crate) fn open_with_flags(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
         match fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOATIME)
+            .custom_flags(libc::O_NOATIME | flags)
             .open(path)
         {
             Err(e)
@@ -35,7 +39,11 @@ pub fn open(path: &Path) -> std::io::Result<File> {
             result => return result,
         }
     }
-    File::open(path)
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
 }
 
 pub fn inherit_jobs() {
@@ -83,6 +91,14 @@ impl<'a> Input<'a> {
         let mut input = Self::new(path, &file.metadata()?, since)?;
         input.handle = Some(file);
         Ok(input)
+    }
+
+    pub fn size(&self) -> u64 {
+        self.identity[2]
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path
     }
 
     fn read(&self, range: Range<u64>) -> Result<Digest> {

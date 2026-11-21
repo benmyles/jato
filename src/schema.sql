@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS files(
     size INTEGER NOT NULL, mode INTEGER NOT NULL, single INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(entry,slot)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS artifacts ON files(digest);
+CREATE INDEX IF NOT EXISTS artifact_sizes ON files(size);
 -- Keep the legacy refs column for existing databases. The files and parts
 -- indexes identify live users without dirtying a compressed payload.
 CREATE TABLE IF NOT EXISTS chunks(
@@ -112,5 +113,16 @@ CREATE TABLE IF NOT EXISTS source_variants(entry INTEGER PRIMARY KEY REFERENCES 
 CREATE INDEX IF NOT EXISTS source_keys ON source_variants(digest);
 CREATE TRIGGER IF NOT EXISTS add_variant AFTER INSERT ON source_variants BEGIN UPDATE usage SET bytes=bytes+96; END;
 CREATE TRIGGER IF NOT EXISTS drop_variant AFTER DELETE ON source_variants BEGIN UPDATE usage SET bytes=bytes-96; END;
+-- Only entries resolved in multiple directory layouts need this row.
+CREATE TABLE IF NOT EXISTS worktree_topologies(
+    entry INTEGER PRIMARY KEY REFERENCES entries ON DELETE CASCADE,
+    latest BLOB NOT NULL, previous BLOB, oldest BLOB
+);
+CREATE TRIGGER IF NOT EXISTS add_worktree_topology AFTER INSERT ON worktree_topologies BEGIN
+    UPDATE usage SET bytes=bytes+192;
+END;
+CREATE TRIGGER IF NOT EXISTS drop_worktree_topology AFTER DELETE ON worktree_topologies BEGIN
+    UPDATE usage SET bytes=bytes-192;
+END;
 CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY,last_run INTEGER NOT NULL) WITHOUT ROWID;
-PRAGMA user_version=11;
+PRAGMA user_version=12;
