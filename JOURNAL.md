@@ -5,3 +5,4 @@
 - Started from an empty repository. Found a locally customized kache installation and checked its scheduler notes and regression scenarios.
 - Chose a local, daemon-free cache with content-addressed chunks and a separate edit watcher. Cargo keeps its normal target directory, scheduling, and incremental state.
 - Selected cold, restored, unchanged, and edited builds as distinct measurement cases.
+- Built and tested transactional storage, 256 KiB compressed chunks, duplicate elimination, staged restores, corruption recovery, and LRU pruning. Two storage regression tests pass.

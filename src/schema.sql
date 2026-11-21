@@ -1,0 +1,49 @@
+CREATE TABLE IF NOT EXISTS usage(bytes INTEGER NOT NULL);
+INSERT INTO usage SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM usage);
+CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS entries(
+    id INTEGER PRIMARY KEY, key BLOB UNIQUE NOT NULL, recipe BLOB NOT NULL,
+    access INTEGER NOT NULL, stderr BLOB NOT NULL, stderr_hash BLOB NOT NULL, compile_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS recipes ON entries(recipe);
+CREATE INDEX IF NOT EXISTS lru ON entries(access);
+CREATE TABLE IF NOT EXISTS files(
+    entry INTEGER REFERENCES entries ON DELETE CASCADE, slot INTEGER, digest BLOB NOT NULL,
+    size INTEGER NOT NULL, mode INTEGER NOT NULL, PRIMARY KEY(entry,slot)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS artifacts ON files(digest);
+CREATE TABLE IF NOT EXISTS chunks(
+    hash BLOB PRIMARY KEY, raw INTEGER NOT NULL, data BLOB NOT NULL, refs INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS parts(
+    entry INTEGER REFERENCES entries ON DELETE CASCADE, slot INTEGER, ordinal INTEGER, chunk BLOB NOT NULL,
+    PRIMARY KEY(entry,slot,ordinal)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS chunk_users ON parts(chunk);
+CREATE TRIGGER IF NOT EXISTS add_entry AFTER INSERT ON entries BEGIN
+    UPDATE usage SET bytes=bytes+320+length(NEW.stderr);
+END;
+CREATE TRIGGER IF NOT EXISTS drop_entry AFTER DELETE ON entries BEGIN
+    UPDATE usage SET bytes=bytes-320-length(OLD.stderr);
+END;
+CREATE TRIGGER IF NOT EXISTS add_file AFTER INSERT ON files BEGIN
+    UPDATE usage SET bytes=bytes+128;
+END;
+CREATE TRIGGER IF NOT EXISTS drop_file AFTER DELETE ON files BEGIN
+    UPDATE usage SET bytes=bytes-128;
+END;
+CREATE TRIGGER IF NOT EXISTS add_chunk AFTER INSERT ON chunks BEGIN
+    UPDATE usage SET bytes=bytes+96+length(NEW.data);
+END;
+CREATE TRIGGER IF NOT EXISTS drop_chunk AFTER DELETE ON chunks BEGIN
+    UPDATE usage SET bytes=bytes-96-length(OLD.data);
+END;
+CREATE TRIGGER IF NOT EXISTS add_part AFTER INSERT ON parts BEGIN
+    UPDATE usage SET bytes=bytes+96;
+END;
+CREATE TRIGGER IF NOT EXISTS drop_part AFTER DELETE ON parts BEGIN
+    UPDATE usage SET bytes=bytes-96;
+    UPDATE chunks SET refs=refs-1 WHERE hash=OLD.chunk;
+    DELETE FROM chunks WHERE hash=OLD.chunk AND refs=0;
+END;
+PRAGMA user_version=1;
