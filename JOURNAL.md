@@ -10,6 +10,8 @@
 - Found exact sidecar metadata embedded at unaligned offsets in real rlibs. Packed storage now follows archive member and metadata boundaries and compresses repeated frames once per entry. Verified exact restores after shifting members and changing archive headers.
 - Allowed an idle watcher to act on a completed Rust-file save. Close-only events require a pending edit, and a busy watcher or explicit debounce keeps batching. Published verified compiler diagnostics before waiting to record hit statistics.
 - Investigated a slower ripgrep check in the first interleaved comparison. Alternating warm targets narrowed the gap. Checked small dependency sets through retained file descriptors, reserved spare threads for larger metadata batches, and limited read-ahead to actual pending inputs. Added a regression for replacing a path while its previous inode is open.
+- Across 21 matched ripgrep checks on the installed release, 0.3 won 10 pairs and 0.2 won 11. The median within-pair difference was 0.17 ms. Verified all 32 project tests on both supported Rust toolchains.
+- Verified the November 18 upstream kache 2.2.0 archive against its published SHA-256. Added independent contender selection and support for its changed statistics format alongside the locally installed 2.1.1.
 
 ## 2026-11-21
 

@@ -127,7 +127,10 @@ def main():
                         help="prime the two Jato versions and alternate N warm clean targets per version")
     parser.add_argument("--workloads", nargs="+", choices=["release","check"], default=["check","release"])
     parser.add_argument("--kache", default="kache")
+    parser.add_argument("--local-kache", help="also compare a second installed kache with its own daemon")
     parser.add_argument("--sccache", default="sccache")
+    parser.add_argument("--tools", nargs="+", choices=["cargo","jato","kache","sccache"],
+                        default=["cargo","jato","kache","sccache"], help="base contenders to measure")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--offline", action="store_true")
@@ -140,10 +143,11 @@ def main():
             parser.error("--paired-restores needs a positive count and --previous-jato")
         tools = {"jato": binary(options.jato)}
     else:
-        tools = {"cargo": None, "jato": binary(options.jato), "kache": binary(options.kache),
-                 "sccache": binary(options.sccache)}
+        tools = {name: None if name=="cargo" else binary(getattr(options,name)) for name in options.tools}
+        if options.local_kache:
+            tools["kache_local"] = binary(options.local_kache)
     if options.include_packed:
-        tools["jato_packed"] = tools["jato"]
+        tools["jato_packed"] = binary(options.jato)
     if options.previous_jato:
         tools["previous_jato"] = binary(options.previous_jato)
     if options.previous_packed:
@@ -208,6 +212,7 @@ def main():
             for mode in (options.workloads if trial % 2 == 0 else reversed(options.workloads)):
                 for name in order[trial % len(order):] + order[:trial % len(order)]:
                     exe = tools[name]
+                    kind = "kache" if name=="kache_local" else name
                     sample = {}
                     with tempfile.TemporaryDirectory(dir=root, prefix="s-") as private:
                         private = Path(private)
@@ -233,7 +238,7 @@ def main():
                             if rss.is_file():
                                 sample[phase + "_peak_process_rss_kib"] = int(rss.read_text())
                         server = {"sccache": (["--start-server"], ["--stop-server"]),
-                                  "kache": (["daemon", "start"], ["daemon", "stop"])}.get(name)
+                                  "kache": (["daemon", "start"], ["daemon", "stop"])}.get(kind)
                         if server:
                             run([exe, *server[0]], cfg, project)
                         try:
@@ -261,10 +266,10 @@ def main():
                                 measure("undo")
                             if exe:
                                 stats_args = {"sccache": ["--show-stats", "--stats-format", "json"],
-                                              "kache": ["--json", "stats"]}.get(name, ["stats", "--json"])
+                                              "kache": ["--json", "stats"]}.get(kind, ["stats", "--json"])
                                 stats = json.loads(run([exe, *stats_args], cfg, project))
                                 if server:
-                                    socket_path = cfg["KACHE_SOCKET_PATH" if name == "kache" else "SCCACHE_SERVER_UDS"]
+                                    socket_path = cfg["KACHE_SOCKET_PATH" if kind == "kache" else "SCCACHE_SERVER_UDS"]
                                     sample["idle_server_rss_kib"] = server_rss(socket_path)
                                 else:
                                     sample["idle_server_rss_kib"] = 0
@@ -272,8 +277,10 @@ def main():
                                     sample["sealed_bytes"] = stats.get("sealed_bytes", 0)
                                     sample["packed_bytes"] = stats["compressed_bytes"]
                                     sample["probe_hits"] = stats["counters"].get("probe_hit", 0)
-                                if name == "kache":
-                                    sample["hits"] = stats["lifetime"]["hits"]
+                                if kind == "kache":
+                                    # 2.2 exposes local hits directly. Each
+                                    # trial uses a private, local-only store.
+                                    sample["hits"] = stats["local_hits"] if "local_hits" in stats else stats["lifetime"]["hits"]
                                 elif name == "sccache":
                                     sample["hits"] = sum(stats["stats"]["cache_hits"]["counts"].values())
                                 else:
