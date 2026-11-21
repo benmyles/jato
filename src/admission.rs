@@ -11,8 +11,10 @@ use std::process::Command;
 
 mod assembly;
 mod nightly;
+mod review;
 mod text;
 pub use nightly::{check_root, verify_conditions};
+pub(crate) use review::{Candidate, Origin, Review};
 pub(crate) use text::data_only;
 
 #[derive(Clone, Copy)]
@@ -77,13 +79,14 @@ pub fn verify_bytes(
     path: &Path,
     deferred_links: bool,
     observed: bool,
+    reviewed_assembly: bool,
 ) -> Result<bool> {
     if [b"asm".as_slice(), b"link"]
         .iter()
         .any(|p| memmem::find(bytes, p).is_some())
         && let Ok(src) = std::str::from_utf8(bytes)
     {
-        return inspect_source(src, deferred_links, observed)
+        return inspect_source(src, deferred_links, observed, reviewed_assembly)
             .map_err(|reason| anyhow::anyhow!("{reason} in {}", path.display()));
     }
     Ok(false)
@@ -138,6 +141,7 @@ fn inspect_source(
     source: &str,
     deferred_links: bool,
     observed: bool,
+    reviewed_assembly: bool,
 ) -> std::result::Result<bool, &'static str> {
     let mut extended = false;
     let mut input = source;
@@ -169,9 +173,10 @@ fn inspect_source(
                     && (prev == "mod" && matches!(first, Some(";" | "{")) || prefix);
                 if !module {
                     let bare_import = prev == ":" && matches!(first, Some(";" | "," | "}"));
-                    if word == "asm"
-                        && !sensitive.last().is_some_and(|&(group, _)| group)
-                        && (bare_import || assembly::closed_template(input))
+                    if reviewed_assembly
+                        || word == "asm"
+                            && !sensitive.last().is_some_and(|&(group, _)| group)
+                            && (bare_import || assembly::closed_template(input))
                     {
                         extended = true;
                     } else {
@@ -213,7 +218,7 @@ fn inspect_source(
 
 #[cfg(test)]
 fn opaque_input(source: &str, deferred_links: bool, observed: bool) -> Option<&'static str> {
-    inspect_source(source, deferred_links, observed).err()
+    inspect_source(source, deferred_links, observed, false).err()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -295,6 +300,12 @@ fn literal_link(input: &str) -> Option<LinkKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_reviewed_assembly_site_still_checks_native_link_attributes() {
+        let src = r#"cfg_if! { if #[cfg(unix)] { pub use asm::socket::*; } }
+                     #[link(name = "archive", kind = "static")] extern "C" {}"#;
+        assert_eq!(inspect_source(src, false, false, true), Err("native link attribute"));
+    }
     #[test]
     fn ordinary_asm_modules_do_not_hide_macros_or_aliases() {
         assert!(opaque_input("pub(crate) mod asm; use asm::types::*;", false, false).is_none());

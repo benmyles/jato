@@ -578,6 +578,46 @@ impl Store {
         )?.query_row(params![digest,codegen], |r| r.get(0))?)
     }
 
+    pub fn has_reviewed_origin(
+        &self,
+        digest: &Digest,
+        candidate: &crate::admission::Candidate,
+        budget: &mut usize,
+    ) -> Result<bool> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            source_origin_v1: Option<crate::admission::Origin>,
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.hash,m.data FROM files f JOIN plans p ON p.entry=f.entry
+             JOIN manifests m ON m.id=p.manifest WHERE f.digest=?1 AND p.codegen=1
+             AND NOT EXISTS(SELECT 1 FROM needs n WHERE n.entry=p.entry)
+             AND length(m.data)<=?2 LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![digest, MAX_PLAN, *budget])?;
+        while *budget > 0
+            && let Some(row) = rows.next()?
+        {
+            *budget -= 1;
+            let stored = row.get_ref(1)?.as_blob()?;
+            let Ok(raw) = decode_plan(stored) else {
+                continue;
+            };
+            if blake3::hash(&raw).as_bytes().as_slice() != row.get_ref(0)?.as_blob()? {
+                continue;
+            }
+            if let Ok(Manifest {
+                source_origin_v1: Some(origin),
+            }) = serde_json::from_slice(&raw)
+                && candidate.matches(&origin)
+                && candidate.verify_dependencies(self, &origin.dependencies, budget)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn count(&self, event: &str, value: u64) -> Result<()> {
         self.conn.execute("INSERT INTO counters VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", params![event, value])?;
         Ok(())
@@ -1385,6 +1425,7 @@ mod tests {
             Some(ev)
         )?);
         let inv = Invocation {
+            review_settings: None,
             source_arg: 0,
             mold: false,
             name: "unit".into(),

@@ -1,5 +1,10 @@
 # Work journal
 
+## 2026-11-21 — macro-generated assembly and producer provenance
+
+- Reproduced Olo's 188 hits on 0.10. Four frequently compiled libraries use private macro-generated register instructions or Rust modules named `asm`. Compared their full active source sets with the crate archives authenticated by Olo’s lockfile.
+- Bound a narrow assembly exception to the complete source set, compiler options and extern bindings. Libraries with macro providers also require complete, checksummed producer provenance down to the reviewed leaves. A clean Cargo build of libc, cmov, num-bigint and rustix restored all four.
+
 ## 2026-11-21 — Olo's linked units and Cargo intermediates
 
 - Authenticated the upstream x86-64 mold 3.0.0 binary against Olo’s installation. Traced its fresh executable and proc-macro output paths. Both restored after deleting the target. After changing an untracked input to the restored macro, its consumer produced the new value.

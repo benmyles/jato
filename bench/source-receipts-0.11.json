@@ -1,0 +1,170 @@
+[
+  {
+    "package": "bitflags-2.13.2",
+    "archive_sha256": "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06",
+    "files": 8,
+    "settings": [
+      "--cfg=feature=\"serde\"",
+      "--cfg=feature=\"serde_core\"",
+      "--cfg=feature=\"std\"",
+      "--edition=2021",
+      "--extern[0]=serde_core",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "7fb3b93764c13ff5d164679c2c4077af863d592ec73d2c6097d391f445948576"
+  },
+  {
+    "package": "cmov-0.5.4",
+    "archive_sha256": "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a",
+    "files": 7,
+    "settings": [
+      "--edition=2024",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "153475abf838d6486f430eea68e52b498ade1dccb3be96d3a30d14379c543c5c"
+  },
+  {
+    "package": "libc-0.2.191",
+    "archive_sha256": "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a",
+    "files": 65,
+    "settings": [
+      "--cfg=feature=\"default\"",
+      "--cfg=feature=\"extra_traits\"",
+      "--cfg=feature=\"std\"",
+      "--cfg=linux_time_bits64",
+      "--edition=2021",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "57386c26cc2b97755b9691772089770e7d41fce3ba9f23572b5848f2716d1fd4"
+  },
+  {
+    "package": "libm-0.2.16",
+    "archive_sha256": "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981",
+    "files": 142,
+    "settings": [
+      "--cfg=arch_enabled",
+      "--cfg=feature=\"arch\"",
+      "--cfg=feature=\"default\"",
+      "--cfg=optimizations_enabled",
+      "--edition=2021",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "3226eefb7d2a575fc27db9acc08c7cd82e396cc8669feecec181d8608c57e3f5"
+  },
+  {
+    "package": "linux-raw-sys-0.12.1",
+    "archive_sha256": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
+    "files": 12,
+    "settings": [
+      "--cfg=feature=\"auxvec\"",
+      "--cfg=feature=\"elf\"",
+      "--cfg=feature=\"errno\"",
+      "--cfg=feature=\"general\"",
+      "--cfg=feature=\"if_ether\"",
+      "--cfg=feature=\"ioctl\"",
+      "--cfg=feature=\"net\"",
+      "--cfg=feature=\"netlink\"",
+      "--cfg=feature=\"no_std\"",
+      "--cfg=feature=\"prctl\"",
+      "--cfg=feature=\"system\"",
+      "--cfg=feature=\"xdp\"",
+      "--edition=2021",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "e1b57122810cdc7a407296bce5738864c939fbc911eefb653637b42fa783d9a9"
+  },
+  {
+    "package": "num-bigint-0.4.8",
+    "archive_sha256": "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367",
+    "files": 28,
+    "settings": [
+      "--cfg=feature=\"default\"",
+      "--cfg=feature=\"std\"",
+      "--edition=2021",
+      "--extern[0]=num_integer",
+      "--extern[1]=num_traits",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "94ac60737081ebf25f3ce1b9258b28b4a990ed40163c3b77200262cecea02fb1"
+  },
+  {
+    "package": "num-integer-0.1.47",
+    "archive_sha256": "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b",
+    "files": 3,
+    "settings": [
+      "--cfg=feature=\"default\"",
+      "--cfg=feature=\"i128\"",
+      "--cfg=feature=\"std\"",
+      "--edition=2018",
+      "--extern[0]=num_traits",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "6998e69cf01bf264d4fb774a069a58d6a79b7731a2b3d3d5063d5a78cda26df8"
+  },
+  {
+    "package": "num-traits-0.2.19",
+    "archive_sha256": "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841",
+    "files": 19,
+    "settings": [
+      "--cfg=feature=\"default\"",
+      "--cfg=feature=\"i128\"",
+      "--cfg=feature=\"libm\"",
+      "--cfg=feature=\"std\"",
+      "--cfg=has_total_cmp",
+      "--edition=2021",
+      "--extern[0]=libm",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "7eef0b90fae1b6e462e81d40a290039eebfb57de7f417600cc6d7f2dc077dbfe"
+  },
+  {
+    "package": "rustix-1.1.5",
+    "archive_sha256": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+    "files": 180,
+    "settings": [
+      "--cfg=feature=\"alloc\"",
+      "--cfg=feature=\"default\"",
+      "--cfg=feature=\"event\"",
+      "--cfg=feature=\"fs\"",
+      "--cfg=feature=\"mm\"",
+      "--cfg=feature=\"net\"",
+      "--cfg=feature=\"param\"",
+      "--cfg=feature=\"pipe\"",
+      "--cfg=feature=\"process\"",
+      "--cfg=feature=\"pty\"",
+      "--cfg=feature=\"shm\"",
+      "--cfg=feature=\"std\"",
+      "--cfg=feature=\"stdio\"",
+      "--cfg=feature=\"system\"",
+      "--cfg=feature=\"termios\"",
+      "--cfg=feature=\"thread\"",
+      "--cfg=feature=\"time\"",
+      "--cfg=linux_kernel",
+      "--cfg=linux_like",
+      "--cfg=linux_raw",
+      "--cfg=linux_raw_dep",
+      "--cfg=lower_upper_exp_for_non_zero",
+      "--cfg=rustc_diagnostics",
+      "--edition=2021",
+      "--extern[0]=bitflags",
+      "--extern[1]=linux_raw_sys",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "57370a846dee5bca21c57e40e2607fa3d83fc920f43a9ed80b4c7800503b2f39"
+  },
+  {
+    "package": "serde_core-1.0.229",
+    "archive_sha256": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+    "files": 19,
+    "settings": [
+      "--cfg=feature=\"alloc\"",
+      "--cfg=feature=\"default\"",
+      "--cfg=feature=\"rc\"",
+      "--cfg=feature=\"result\"",
+      "--cfg=feature=\"std\"",
+      "--edition=2021",
+      "-Cdebug-assertions=on"
+    ],
+    "receipt": "1778708570a890d285ae1d81d85466896fee4fb49cbab49acdb0e3f0cd09d7a6"
+  }
+]

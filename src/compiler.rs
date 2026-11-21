@@ -185,6 +185,7 @@ fn rediscover(
     let mut plan = fingerprint::dependencies(probe.path())?;
     plan.nightly = recorded.nightly;
     plan.extended_admission = recorded.extended_admission;
+    plan.reviewed_assembly = recorded.reviewed_assembly;
     if recorded.native.is_some() {
         // A copied source tree has new directory inodes. Ask this rustc to
         // resolve modules again before revalidating the observed link inputs.
@@ -450,6 +451,16 @@ pub fn wrap(compiler: &OsStr, args: &[OsString]) -> Result<i32> {
             plan.nightly = channel == crate::admission::Channel::Nightly;
             let inputs = plan.inputs(&recipe, inv, since, Some(compiler))?;
             plan.extended_admission = inputs.extended_admission;
+            plan.reviewed_assembly = inputs.reviewed_assembly;
+            if let Some(profile) = inputs.origin {
+                if inputs.reviewed_assembly {
+                    ensure!(
+                        profile.verify_dependencies(&store, &externs.digests, &mut 24)?,
+                        "assembly input has an unverified source provider"
+                    );
+                }
+                plan.source_origin_v1 = Some(profile.origin(externs.digests)?);
+            }
             crate::admission::verify_conditions(compiler, inv, &store.dir, &inputs.nightly_guards)?;
             plan.large_input = inputs.large_input;
             plan.large_extern = externs.largest;

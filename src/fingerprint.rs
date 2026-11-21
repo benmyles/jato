@@ -47,6 +47,15 @@ pub fn recipe(
     let cwd = env::current_dir()?;
     let (root, toolchain) = toolchain::resolve(compiler, &cwd, store)?;
     let mut hash = blake3::Hasher::new_derive_key("jato local rustc recipe v9");
+    // Old entries for these providers predate recorded source origin. One
+    // new compilation can attach evidence for all of their consumers.
+    if args.first().is_some_and(|a| a == "--crate-name")
+        && args
+            .get(1)
+            .is_some_and(|a| crate::admission::Review::is_provider(a))
+    {
+        field(&mut hash, b"jato Rust source origin v1");
+    }
     if env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")) {
         field(&mut hash, b"jato worktree paths v1");
     }
@@ -105,6 +114,7 @@ struct SourceCheck<'a> {
     inv: &'a Invocation,
     observed: bool,
     nightly_guards: Option<&'a mut Vec<String>>,
+    review_site: Option<&'a mut bool>,
 }
 
 fn hash_open(
@@ -125,6 +135,7 @@ fn hash_open(
         inv,
         observed,
         nightly_guards,
+        review_site,
     }) = check
     {
         const MAX: u64 = 8 << 20;
@@ -142,23 +153,40 @@ fn hash_open(
                 crate::admission::check_root(buffer, guards)?;
             }
             if inv.codegen {
-                extended_admission =
-                    match crate::admission::verify_bytes(buffer, path, inv.deferred_links, observed)
-                    {
-                        Ok(extended) => extended,
-                        Err(reason) => {
-                            if !crate::admission::data_only(
-                                compiler,
-                                &inv.probe_args,
-                                path,
-                                &mut f,
-                                buffer,
-                            ) {
-                                return Err(reason);
-                            }
-                            true
-                        }
+                extended_admission = match crate::admission::verify_bytes(
+                    buffer,
+                    path,
+                    inv.deferred_links,
+                    observed,
+                    false,
+                ) {
+                    Ok(extended) => extended,
+                    Err(_) if review_site.is_some() => {
+                        // Repeat every native-link check. Only the assembly
+                        // tokens at this specific site are under review.
+                        crate::admission::verify_bytes(
+                            buffer,
+                            path,
+                            inv.deferred_links,
+                            observed,
+                            true,
+                        )?;
+                        *review_site.unwrap() = true;
+                        true
                     }
+                    Err(reason) => {
+                        if !crate::admission::data_only(
+                            compiler,
+                            &inv.probe_args,
+                            path,
+                            &mut f,
+                            buffer,
+                        ) {
+                            return Err(reason);
+                        }
+                        true
+                    }
+                }
             }
             blake3::hash(buffer)
         }
@@ -183,10 +211,14 @@ fn hash_open(
 
 #[derive(Serialize, Deserialize)]
 pub struct Plan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_origin_v1: Option<crate::admission::Origin>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nightly: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub extended_admission: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reviewed_assembly: bool,
     files: BTreeSet<PathBuf>,
     env: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,6 +300,8 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
     Ok(Plan {
         nightly: false,
         extended_admission: false,
+        source_origin_v1: None,
+        reviewed_assembly: false,
         files: files
             .into_iter()
             .map(|s| PathBuf::from(s.replace("\\ ", " ")))
@@ -280,6 +314,8 @@ pub fn dependencies(path: &Path) -> Result<Plan> {
 }
 
 pub struct Inputs {
+    pub origin: Option<&'static crate::admission::Candidate>,
+    pub reviewed_assembly: bool,
     pub extended_admission: bool,
     pub nightly_guards: Vec<String>,
     pub sources: Digest,
@@ -407,6 +443,9 @@ impl Plan {
         let mut nightly_guards = Vec::new();
         let mut extended_admission = false;
         let cwd = std::env::current_dir()?;
+        let mut review = recording.and_then(|_| {
+            crate::admission::Review::new(inv, &root, &cwd, self.files.len(), &self.env)
+        });
         let mut largest = None;
         let mut largest_size = 0;
         for (index, file) in self.files.iter().enumerate() {
@@ -439,6 +478,10 @@ impl Plan {
                     inv,
                     observed: self.native.is_some(),
                     nightly_guards: nightly_root.then_some(&mut nightly_guards),
+                    review_site: review
+                        .as_mut()
+                        .filter(|r| r.permits_site(&path))
+                        .map(|r| &mut r.used),
                 });
             let (digest, length, proved_data) = hash_open(opened, file, since, check)?;
             extended_admission |= proved_data;
@@ -451,6 +494,9 @@ impl Plan {
             // appears. Track the containing directories and the alternate name,
             // even when the alternate directory or file does not yet exist.
             let original = cwd.join(file);
+            if let Some(r) = &mut review {
+                r.record(&original, &path, &digest);
+            }
             for resolved in std::iter::once(&path).chain((original != path).then_some(&original)) {
                 let parent = resolved.parent().context("source without a parent")?;
                 namespace.insert(parent.to_owned());
@@ -476,8 +522,15 @@ impl Plan {
             );
         }
         ensure!(has_root, "crate root missing from dep-info");
+        let reviewed_assembly = review.as_ref().is_some_and(|r| r.used);
+        let origin = review
+            .map(crate::admission::Review::finish)
+            .transpose()?
+            .flatten();
         tracked_env(&mut hash, &self.env);
         Ok(Inputs {
+            origin,
+            reviewed_assembly,
             extended_admission,
             nightly_guards,
             sources: *hash.finalize().as_bytes(),
@@ -498,6 +551,9 @@ impl Inputs {
         externs: &Digest,
     ) -> Result<Digest> {
         let mut hash = blake3::Hasher::new_derive_key("jato verified compilation v3");
+        if plan.reviewed_assembly {
+            field(&mut hash, b"jato reviewed Rust assembly inputs v1");
+        }
         if plan.extended_admission {
             field(&mut hash, b"jato checked assembly and text inputs v1");
         }
@@ -627,6 +683,7 @@ impl Inputs {
 }
 
 pub struct Externs {
+    pub digests: Vec<Digest>,
     pub key: Digest,
     pub largest: Option<usize>,
     pub needs: Vec<Digest>,
@@ -706,10 +763,8 @@ pub fn certify_externs(
     // Small metadata reads are often on a busy, wide check graph. Give newly
     // ready Cargo units priority there; reserve finer stripes for codegen.
     let bytes_per_worker = if codegen { 2 << 20 } else { 8 << 20 };
-    for (input, digest) in inputs
-        .iter()
-        .zip(crate::content::digests(inputs, bytes_per_worker)?)
-    {
+    let digests = crate::content::digests(inputs, bytes_per_worker)?;
+    for (input, &digest) in inputs.iter().zip(&digests) {
         let path = input.path();
         if !store.knows_artifact(&digest, codegen)? {
             if !defer || !can_defer(input, since) {
@@ -721,6 +776,7 @@ pub fn certify_externs(
         field(&mut hash, &digest);
     }
     Ok(Externs {
+        digests,
         key: *hash.finalize().as_bytes(),
         largest: inputs
             .iter()

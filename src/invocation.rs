@@ -23,6 +23,7 @@ pub struct Invocation {
     pub source_arg: usize,
     pub outputs: Vec<PathBuf>, // dep-info is always first
     pub probe_args: Vec<OsString>,
+    pub review_settings: Option<Vec<String>>,
 }
 
 impl Invocation {
@@ -77,6 +78,14 @@ impl Invocation {
         let mut externs = Vec::new();
         let mut source_arg = 0;
         let mut probe_args = Vec::new();
+        // Only a few known Cargo libraries need an assembly receipt. Start at
+        // the first argument so no earlier binding or cfg can escape the key.
+        let mut review_settings = args
+            .first()
+            .filter(|a| *a == "--crate-name")
+            .and_then(|_| args.get(1))
+            .filter(|a| crate::admission::Review::is_candidate(a))
+            .map(|_| Vec::new());
         let mut i = 0;
         while i < args.len() {
             let start = i;
@@ -125,6 +134,13 @@ impl Invocation {
                 "--test" => test = true,
                 "--extern" => {
                     let arg = value()?;
+                    if let Some(opts) = &mut review_settings {
+                        opts.push(format!(
+                            "--extern[{}]={}",
+                            externs.len(),
+                            arg.split('=').next().unwrap_or(arg)
+                        ));
+                    }
                     if matches!(arg, "proc_macro" | "std" | "alloc" | "core" | "test") {
                         probe_args.extend_from_slice(&args[start..i]);
                         continue;
@@ -176,6 +192,13 @@ impl Invocation {
                         continue;
                     }
                     let (setting, v) = option.split_once('=').ok_or("codegen_option")?;
+                    if matches!(
+                        setting,
+                        "target-feature" | "target-cpu" | "panic" | "debug-assertions"
+                    ) && let Some(opts) = &mut review_settings
+                    {
+                        opts.push(format!("-C{option}"));
+                    }
                     match setting {
                         "incremental" => {
                             probe = false;
@@ -219,6 +242,9 @@ impl Invocation {
                 }
                 "--target" => {
                     let target = value()?;
+                    if let Some(opts) = &mut review_settings {
+                        opts.push(format!("--target={target}"));
+                    }
                     native_link &= target == "x86_64-unknown-linux-gnu";
                     deferred_links &= target == "x86_64-unknown-linux-gnu";
                     if target.ends_with(".json") || !safe_component(target) {
@@ -229,7 +255,12 @@ impl Invocation {
                 "--cfg" | "--check-cfg" | "--edition" | "--cap-lints" | "--allow" | "--warn"
                 | "--deny" | "--forbid" | "--force-warn" | "-A" | "-W" | "-D" | "-F"
                 | "--color" | "--diagnostic-width" => {
-                    value()?;
+                    let v = value()?;
+                    if matches!(flag, "--cfg" | "--edition")
+                        && let Some(opts) = &mut review_settings
+                    {
+                        opts.push(format!("{flag}={v}"));
+                    }
                 }
                 "--error-format" => {
                     if value()? != "json" {
@@ -322,7 +353,11 @@ impl Invocation {
                 dir.join(format!("lib{stem}.rlib"))
             });
         }
+        if let Some(opts) = &mut review_settings {
+            opts.sort_unstable();
+        }
         Ok(Self {
+            review_settings,
             name: name.into(),
             codegen: kinds.contains(&"link"),
             executable,
