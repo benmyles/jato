@@ -53,6 +53,26 @@ pub struct Walk {
     pub found: Vec<PathBuf>,
 }
 
+/// One compiler command of a whole build, as the build's record keeps it:
+/// which of the build's inputs it examined and which of its outputs it
+/// wrote, by their positions in those lists. Only commands Cargo started
+/// itself are kept so. Cargo knows what each of them writes, and runs one
+/// again when that is gone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Part {
+    pub inputs: Vec<u32>,
+    pub outputs: Vec<u32>,
+}
+
+/// An input that is not as it was recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Difference {
+    /// Its position among the inputs.
+    pub input: u32,
+    /// It is still a file, with other contents.
+    pub contents: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     pub inputs: Vec<Input>,
@@ -88,6 +108,19 @@ pub struct Manifest {
     /// When the state was saved, in seconds since 1970. Newer state takes
     /// the place of older.
     pub saved_at: u64,
+    /// The record of a whole build also says who examined what, so that a
+    /// build of sources that differ a little can start from this one.
+    /// These are the positions of the inputs whose change leaves nothing
+    /// to start from: what Cargo read or listed, and what any program
+    /// examined that Cargo did not start itself as a compiler.
+    pub own: Vec<u32>,
+    /// The positions of files Cargo itself asked about without opening
+    /// them. It takes from that whether they are there and when they last
+    /// changed, and looks again every time it runs.
+    pub asked: Vec<u32>,
+    /// The compiler commands Cargo started. An input in none of the three
+    /// lists counts with the first.
+    pub parts: Vec<Part>,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -230,6 +263,13 @@ impl Manifest {
         if !self.saved.is_empty() {
             w.number(self.saved_at);
         }
+        positions(&mut w, &self.own);
+        positions(&mut w, &self.asked);
+        w.number(self.parts.len() as u64);
+        for part in &self.parts {
+            positions(&mut w, &part.inputs);
+            positions(&mut w, &part.outputs);
+        }
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -325,9 +365,40 @@ impl Manifest {
         if !m.saved.is_empty() {
             m.saved_at = r.number()?;
         }
+        m.own = read_positions(&mut r, m.inputs.len())?;
+        m.asked = read_positions(&mut r, m.inputs.len())?;
+        for _ in 0..r.count()? {
+            m.parts.push(Part {
+                inputs: read_positions(&mut r, m.inputs.len())?,
+                outputs: read_positions(&mut r, m.outputs.len())?,
+            });
+        }
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
+}
+
+/// Write positions that rise, each as its distance from the one before.
+fn positions(w: &mut Writer, list: &[u32]) {
+    w.number(list.len() as u64);
+    let mut last = 0;
+    for &position in list {
+        w.number(u64::from(position - last));
+        last = position;
+    }
+}
+
+/// Read positions written by `positions`, all of them below `end`.
+fn read_positions(r: &mut Reader, end: usize) -> Result<Vec<u32>> {
+    let count = r.count()?;
+    let mut list = Vec::with_capacity(count.min(end));
+    let mut last = 0u64;
+    for _ in 0..count {
+        last += r.number()?;
+        ensure!(last < end as u64, "a position past the end of its list");
+        list.push(last as u32);
+    }
+    Ok(list)
 }
 
 /// The first program called `name` that the directories of PATH offer.
@@ -520,6 +591,86 @@ impl Manifest {
     /// Whether everything this manifest records holds here. An error says
     /// what does not.
     pub fn holds(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
+        self.settled(here)?;
+        // What is in the workspace changes most often, and what is outside
+        // both roots least. Looking in that order finds a change soonest.
+        let by_root = |root: u8| self.inputs.iter().filter(move |input| input.root == root);
+        let ordered = by_root(crate::roots::WORK)
+            .chain(by_root(crate::roots::TARGET))
+            .chain(by_root(crate::roots::ABSOLUTE));
+        for input in ordered {
+            self.as_recorded(input, here, store)
+                .map_err(|(why, _)| why)?;
+        }
+        Ok(())
+    }
+
+    /// Every input that is not as it was recorded, where everything else
+    /// the manifest records holds. An error says what else does not, or
+    /// that more than `most` inputs differ.
+    pub fn differences(
+        &self,
+        here: &mut Here<'_>,
+        store: &mut Store,
+        most: usize,
+    ) -> Result<Vec<Difference>, String> {
+        self.settled(here)?;
+        let mut found = Vec::new();
+        for (at, input) in self.inputs.iter().enumerate() {
+            if let Err((why, contents)) = self.as_recorded(input, here, store) {
+                if found.len() == most {
+                    return Err(format!("{why}, and more than {most} other files"));
+                }
+                found.push(Difference {
+                    input: at as u32,
+                    contents,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// Which parts a build that starts from this one has to make again,
+    /// given the inputs that differ. An error is the position of an input
+    /// whose change leaves nothing to start from.
+    pub fn stale_parts(&self, differences: &[Difference]) -> Result<Vec<bool>, u32> {
+        let mut again = vec![false; self.parts.len()];
+        for difference in differences {
+            let at = difference.input;
+            if self.own.binary_search(&at).is_ok() {
+                return Err(at);
+            }
+            let mut examined = false;
+            for (part, again) in self.parts.iter().zip(&mut again) {
+                if part.inputs.binary_search(&at).is_ok() {
+                    *again = true;
+                    examined = true;
+                }
+            }
+            // Cargo goes by whether a file it asks about is there. What
+            // the file holds is the business of whoever reads it.
+            let asked = self.asked.binary_search(&at).is_ok();
+            if (asked && !difference.contents) || !(asked || examined) {
+                return Err(at);
+            }
+        }
+        Ok(again)
+    }
+
+    /// What `position` among the inputs is called here.
+    pub fn named(&self, position: u32, roots: &Roots) -> String {
+        let input = &self.inputs[position as usize];
+        roots
+            .join(input.root, &input.path)
+            .unwrap_or_else(|| input.path.clone())
+            .display()
+            .to_string()
+    }
+
+    /// Whether what the result is tied to apart from its inputs is as it
+    /// was: where it is, the environment, the terminal, and what PATH and
+    /// a search above the workspace find.
+    fn settled(&self, here: &mut Here<'_>) -> Result<(), String> {
         for (root, recorded) in &self.pins {
             if here.roots.path(*root) != Some(recorded.as_path()) {
                 return Err(format!(
@@ -579,63 +730,75 @@ impl Manifest {
                 ));
             }
         }
-        // What is in the workspace changes most often, and what is outside
-        // both roots least. Looking in that order finds a change soonest.
-        let by_root = |root: u8| self.inputs.iter().filter(move |input| input.root == root);
-        let ordered = by_root(crate::roots::WORK)
-            .chain(by_root(crate::roots::TARGET))
-            .chain(by_root(crate::roots::ABSOLUTE));
-        for input in ordered {
-            let Some(path) = here.roots.join(input.root, &input.path) else {
-                return Err("it was recorded with a target directory this command lacks".into());
-            };
-            let seen = here
-                .examine(&path)
-                .map_err(|e| format!("{} cannot be examined: {e}", path.display()))?;
-            if seen.link != input.link {
-                return Err(format!("{} is a different link", path.display()));
-            }
-            let changed = || Err(format!("{} changed", path.display()));
-            match (&input.state, seen.kind) {
-                (State::Absent, Kind::Absent) => (),
-                (State::Absent, _) => return Err(format!("{} now exists", path.display())),
-                (_, Kind::Absent) => return Err(format!("{} is gone", path.display())),
-                (State::Dir(None), Kind::Dir) => (),
-                (State::Dir(Some(recorded)), Kind::Dir) => {
-                    let outputs = self
-                        .outputs
-                        .iter()
-                        .map(|out| (out.root, out.path.as_path()));
-                    let own = own_names((input.root, &input.path), &path, outputs, here.roots);
-                    match list(&path, &own) {
-                        Ok(names) if names == *recorded => (),
-                        Ok(_) => {
-                            return Err(format!("the entries of {} changed", path.display()));
-                        }
-                        Err(e) => return Err(format!("{}: {e}", path.display())),
-                    }
-                }
-                (State::File(recorded), Kind::File) => {
-                    let digest = match seen.digest {
-                        Some(digest) => digest,
-                        None => {
-                            let digest = store
-                                .digest_seen(&path, seen.stamp.unwrap())
-                                .map_err(|e| format!("{}: {e}", path.display()))?;
-                            if let Some(seen) = here.seen.get_mut(&path) {
-                                seen.digest = Some(digest);
-                            }
-                            digest
-                        }
-                    };
-                    if digest != *recorded {
-                        return changed();
-                    }
-                }
-                _ => return changed(),
-            }
-        }
         Ok(())
+    }
+
+    /// Whether one input is as it was recorded. An error says how it
+    /// differs, and whether it is only that a file holds something else.
+    fn as_recorded(
+        &self,
+        input: &Input,
+        here: &mut Here<'_>,
+        store: &mut Store,
+    ) -> Result<(), (String, bool)> {
+        let other = |why: String| Err((why, false));
+        let Some(path) = here.roots.join(input.root, &input.path) else {
+            return other("it was recorded with a target directory this command lacks".into());
+        };
+        let seen = match here.examine(&path) {
+            Ok(seen) => seen,
+            Err(e) => return other(format!("{} cannot be examined: {e}", path.display())),
+        };
+        if seen.link != input.link {
+            return other(format!("{} is a different link", path.display()));
+        }
+        let changed = || format!("{} changed", path.display());
+        match (&input.state, seen.kind) {
+            (State::Absent, Kind::Absent) => Ok(()),
+            (State::Absent, _) => other(format!("{} now exists", path.display())),
+            (_, Kind::Absent) => other(format!("{} is gone", path.display())),
+            (State::Dir(None), Kind::Dir) => Ok(()),
+            (State::Dir(Some(recorded)), Kind::Dir) => {
+                let outputs = self
+                    .outputs
+                    .iter()
+                    .map(|out| (out.root, out.path.as_path()));
+                let own = own_names((input.root, &input.path), &path, outputs, here.roots);
+                match list(&path, &own) {
+                    Ok(names) if names == *recorded => Ok(()),
+                    Ok(_) => other(format!("the entries of {} changed", path.display())),
+                    Err(e) => other(format!("{}: {e}", path.display())),
+                }
+            }
+            (State::File(recorded), Kind::File) => {
+                let digest = match seen.digest {
+                    Some(digest) => digest,
+                    None => {
+                        let digest = match store.digest_seen(&path, seen.stamp.unwrap()) {
+                            Ok(digest) => digest,
+                            Err(e) => return other(format!("{}: {e}", path.display())),
+                        };
+                        if let Some(seen) = here.seen.get_mut(&path) {
+                            seen.digest = Some(digest);
+                        }
+                        digest
+                    }
+                };
+                if digest == *recorded {
+                    Ok(())
+                } else {
+                    Err((changed(), true))
+                }
+            }
+            _ => other(changed()),
+        }
+    }
+
+    /// What a file among the inputs holds now, if it is one.
+    pub fn now(&self, position: u32, here: &mut Here<'_>) -> Option<State> {
+        let input = &self.inputs[position as usize];
+        let path = here.roots.join(input.root, &input.path)?;
+        here.seen.get(&path)?.digest.map(State::File)
     }
 }
 
@@ -743,6 +906,15 @@ mod tests {
             saved_in: [6; 32],
             saved_for: [8; 32],
             saved_at: 1_795_000_000,
+            own: vec![0, 2],
+            asked: vec![1],
+            parts: vec![
+                Part {
+                    inputs: vec![1],
+                    outputs: vec![0],
+                },
+                Part::default(),
+            ],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
@@ -751,12 +923,74 @@ mod tests {
         assert_ne!(key, m.key(&[2; 32]));
         let mut other = m.clone();
         other.outputs.clear();
+        other.parts.clear();
+        other.own.clear();
         assert_eq!(other.key(&[1; 32]), key);
+        // A position that leads nowhere is not believed.
+        let mut wrong = m.clone();
+        wrong.parts[0].outputs = vec![1];
+        assert!(Manifest::decode(&wrong.encode().unwrap()).is_err());
         other.saved_at += 1;
         assert_ne!(other.key(&[1; 32]), key);
         other.saved.clear();
         other.inputs[0].state = State::Absent;
         assert_ne!(other.key(&[1; 32]), key);
         assert!(Manifest::decode(b"junk").is_err());
+    }
+
+    #[test]
+    fn what_differs_says_which_compilers_run_again_or_that_nothing_is_left() {
+        let input = |path: &str| Input {
+            root: 1,
+            path: path.into(),
+            link: None,
+            state: State::File([1; 32]),
+        };
+        // Five inputs: the first is the build's own, the second is one
+        // Cargo asked about and the first compiler read, the third only
+        // the second compiler read, the fourth both read, and the last
+        // Cargo asked about and nobody opened.
+        let m = Manifest {
+            inputs: ["Cargo.toml", "a/lib.rs", "b/lib.rs", "shared.rs", "README"]
+                .map(input)
+                .to_vec(),
+            own: vec![0],
+            asked: vec![1, 4],
+            parts: vec![
+                Part {
+                    inputs: vec![1, 3],
+                    outputs: vec![0],
+                },
+                Part {
+                    inputs: vec![2, 3],
+                    outputs: vec![1],
+                },
+            ],
+            ..Manifest::default()
+        };
+        let other = |input: u32| Difference {
+            input,
+            contents: true,
+        };
+        let gone = |input: u32| Difference {
+            input,
+            contents: false,
+        };
+        assert_eq!(m.stale_parts(&[]), Ok(vec![false, false]));
+        assert_eq!(m.stale_parts(&[other(1)]), Ok(vec![true, false]));
+        assert_eq!(m.stale_parts(&[other(2)]), Ok(vec![false, true]));
+        assert_eq!(m.stale_parts(&[gone(2)]), Ok(vec![false, true]));
+        assert_eq!(m.stale_parts(&[other(3)]), Ok(vec![true, true]));
+        // A file only Cargo asked about holds something else: nobody
+        // read it.
+        assert_eq!(m.stale_parts(&[other(4)]), Ok(vec![false, false]));
+        // What Cargo read itself, and a file it asked about that is gone.
+        assert_eq!(m.stale_parts(&[other(2), other(0)]), Err(0));
+        assert_eq!(m.stale_parts(&[gone(1)]), Err(1));
+        assert_eq!(m.stale_parts(&[gone(4)]), Err(4));
+        // An input in no list is the build's own.
+        let mut loose = m.clone();
+        loose.own.clear();
+        assert_eq!(loose.stale_parts(&[other(0)]), Err(0));
     }
 }

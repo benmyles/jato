@@ -87,6 +87,18 @@ On a miss Cargo runs under the observer, with each compiler it starts asking Jat
 
 `jato test`, `bench` and `run` first get the build they need: restored if it is recorded, made on its own if not, showing only what is being compiled. Then Cargo runs the command you asked for and finds the build done. A test name filter and a program's arguments are not part of the build.
 
+### Builds that start from an earlier one
+
+The first build in a new worktree is often of sources nobody has built: a commit that is new, or an edit made before anything was built there. No recorded build stands for it. Cargo then has to carry the build out, with every compiler it starts answered from the cache, and for a workspace of some size that takes a while even when one file differs: checking the 121 packages of Olo in a new worktree took 23 s and 75 processor-seconds with one line changed in one program, and 37 s with a function added to a crate that 54 others use.
+
+Such a build starts from the nearest recorded one instead. The record of a whole build says who examined each of its inputs: Cargo itself, a build script or something a build script started, or one of the compilers Cargo started. If everything that differs was examined by those compilers alone, the earlier build's files are put in the target directory without the files those compilers wrote. Cargo finds them missing, runs those compilers, then whatever uses what they make, and finds the rest up to date. The same two builds took 7.2 s and 11.6 s, at a load of 18 to 25, and the next worktree with either change got its build whole in 2 s.
+
+File times play no part in which compilers run again. A changed file that looks older than the earlier build is compiled, and so is a crate whose procedural macro reads a file Cargo knows nothing about. When Cargo has finished, Jato checks that every file it left out is there again. Were one missing, it would take out of the target directory everything it had put there and have the build made from nothing.
+
+The finished build is recorded like one made from nothing, and the next checkout of those sources gets it whole. The exception is a build in which a build script was itself built again and ran in the directory its earlier version had written to: Cargo is content with what that leaves, but it need not be what a build from nothing leaves, so it is not put back anywhere else.
+
+A change to anything Cargo or a build script read leaves nothing to start from: a manifest, the lock file, a file a build script reads or C it compiles, a new file where Cargo looks for programs to build. Cargo carries such a build out as before. `JATO_NEAR=0` has it carry out every build that is not recorded.
+
 ### C, C++ and assembly in build scripts
 
 A build script that compiles C starts the compiler itself, and Cargo gives nobody a say in that. For the Cargo commands Jato runs, a directory at the head of `PATH` holds the names `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `nasm` and `yasm`, each leading back to Jato, for those of them the rest of `PATH` finds. Started by a build script under one of these names, Jato finds the program itself and treats its run like a run of rustc: looked up, and otherwise run under observation and recorded, with every header it opened or looked for among what the result depends on. gcc and clang are also told the workspace's and the target directory's other names, through `-ffile-prefix-map`, so that debugging information compiled from a file in the workspace does not tie the build to one checkout.
@@ -180,6 +192,7 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_EDIT_WINDOW=0` | Record every compilation, including each edit. |
 | `JATO_BUSY=8` | The load average from which compilations in a built target are left unwatched. Defaults to the number of processors; `0` always watches. |
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
+| `JATO_NEAR=0` | Never start a build from a recorded one whose sources differ. |
 | `JATO_TOOLS=0` | Leave the C compilers and assemblers that build scripts start to themselves. |
 | `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state in the cache or hand it to other checkouts. |
 | `JATO_NOTES=0` | Have the kernel report every file call of a watched program; none are told of by the program itself. |

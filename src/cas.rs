@@ -668,14 +668,19 @@ impl Store {
     /// the others are written on several threads, and if any were written
     /// all are given one modification time, so that Cargo finds none of
     /// them newer than another.
+    ///
+    /// The outputs `leave` marks are not put in place, and whatever is
+    /// where they belong is taken away: Cargo is to find them missing.
     pub fn restore(
         &mut self,
         candidate: &Candidate,
         manifest: &Manifest,
         roots: &Roots,
         tree: bool,
+        leave: Option<&[bool]>,
         damaged: &mut bool,
     ) -> Result<Option<Restored>> {
+        let left = |i: usize| leave.is_some_and(|leave| leave[i]);
         let mut dests = Vec::with_capacity(manifest.outputs.len());
         for output in &manifest.outputs {
             match roots.join(output.root, &output.path) {
@@ -685,7 +690,7 @@ impl Store {
         }
         let mut todo = Vec::with_capacity(dests.len());
         for (i, (output, dest)) in manifest.outputs.iter().zip(&dests).enumerate() {
-            if !tree || !self.holds(output, dest, roots) {
+            if !left(i) && (!tree || !self.holds(output, dest, roots)) {
                 todo.push(i);
             }
         }
@@ -790,6 +795,17 @@ impl Store {
             *damaged |= matches!(verdict, Ok(Some(false)));
             return verdict.map(|_| None);
         }
+        for (i, dest) in dests.iter().enumerate() {
+            if left(i)
+                && let Err(e) = fs::remove_file(dest)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                for (staging, _) in &staged {
+                    let _ = fs::remove_file(staging);
+                }
+                return Err(e.into());
+            }
+        }
         let mut done = 0;
         let renamed: io::Result<()> = staged.iter().try_for_each(|(staging, dest)| {
             fs::rename(staging, dest)?;
@@ -802,10 +818,7 @@ impl Store {
             }
             return Err(e.into());
         }
-        if tree
-            && !todo.is_empty()
-            && let Some(stamp) = dests.first().and_then(|dest| just_before_now(dest))
-        {
+        if tree && let Some(stamp) = todo.first().and_then(|&i| just_before_now(&dests[i])) {
             // Every file of the build gets one time, as if the build had
             // just ended: no source is newer, and one edited from here on
             // will be.
@@ -824,7 +837,10 @@ impl Store {
                 // the package, and it did not change now.
                 let source = manifest.outputs[i].root != crate::roots::TARGET
                     && todo.binary_search(&i).is_err();
-                if !source && let Ok(name) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+                if !source
+                    && !left(i)
+                    && let Ok(name) = std::ffi::CString::new(dest.as_os_str().as_bytes())
+                {
                     unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) };
                 }
             }

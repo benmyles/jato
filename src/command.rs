@@ -6,7 +6,9 @@
 //! was. What it looked at is observed, not inferred from its arguments.
 use crate::cas::{Staged, Store};
 use crate::facts::{Facts, keyed};
-use crate::manifest::{Env, Here, Input, Manifest, Output, Place, State, Walk, path_dirs, which};
+use crate::manifest::{
+    Difference, Env, Here, Input, Manifest, Output, Part, Place, State, Walk, path_dirs, which,
+};
 use crate::observe::{self, Kind, Report, Stamp};
 use crate::roots::{self, Roots, Surroundings};
 use crate::scan::Digest;
@@ -24,7 +26,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v5";
+const EPOCH: &str = "jato command v6";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -886,7 +888,7 @@ fn search(
             continue;
         }
         let mut damaged = false;
-        let restored = store.restore(candidate, &manifest, &job.roots, tree, &mut damaged)?;
+        let restored = store.restore(candidate, &manifest, &job.roots, tree, None, &mut damaged)?;
         let Some(restored) = restored else {
             if damaged {
                 forget.push(candidate.key);
@@ -1174,12 +1176,31 @@ pub struct Parts {
     differing: BTreeSet<Place>,
     /// Why the build as a whole cannot be recorded, if it cannot.
     pub unusable: Option<String>,
+    /// A number for each place a command examined.
+    numbers: HashMap<Place, u32>,
+    /// The commands Cargo started itself, each by the numbers of the
+    /// places it examined and by the places it wrote to.
+    units: Vec<(Vec<u32>, Vec<Place>)>,
+    /// The numbers of the places examined by commands that something else
+    /// started, or that wrote nothing by which Cargo could tell them done.
+    loose: HashSet<u32>,
+    /// The build made before that this one started from, if it did.
+    pub start: Option<Start>,
 }
 
 impl Parts {
+    /// The parts of a build that starts from `start`, if from any.
+    pub fn starting_from(start: Option<Start>) -> Self {
+        Self {
+            start,
+            ..Self::default()
+        }
+    }
+
     /// Take in the record of one command. Its paths are relative to the
-    /// roots of that command and are restated for the build's.
-    pub fn add(&mut self, manifest: &Manifest, from: &Roots, to: &Roots) {
+    /// roots of that command and are restated for the build's. `cargo`
+    /// says whether Cargo started the command itself.
+    pub fn add(&mut self, manifest: &Manifest, from: &Roots, to: &Roots, cargo: bool) {
         let place = |root: u8, path: &Path| -> Option<Place> {
             let absolute = from.join(root, path)?;
             let (root, rest) = to.split(&absolute);
@@ -1189,11 +1210,20 @@ impl Parts {
             Some(to.mark(&from.unmark(marked)?).into_owned())
         };
         let mut lost = false;
+        let apart = cargo && !manifest.outputs.is_empty();
+        let mut examined = Vec::with_capacity(manifest.inputs.len());
         for input in &manifest.inputs {
             let Some(at) = place(input.root, &input.path) else {
                 lost = true;
                 continue;
             };
+            let next = self.numbers.len() as u32;
+            let number = *self.numbers.entry(at.clone()).or_insert(next);
+            if apart {
+                examined.push(number);
+            } else {
+                self.loose.insert(number);
+            }
             let link = match &input.link {
                 Some(link) => match text(link) {
                     Some(link) => Some(link),
@@ -1252,6 +1282,7 @@ impl Parts {
                 }
             }
         }
+        let mut wrote = Vec::with_capacity(manifest.outputs.len());
         for output in &manifest.outputs {
             match place(output.root, &output.path) {
                 Some(at) => {
@@ -1260,10 +1291,14 @@ impl Parts {
                         path: at.1.clone(),
                         ..output.clone()
                     };
+                    wrote.push(at.clone());
                     self.outputs.insert(at, output);
                 }
                 None => lost = true,
             }
+        }
+        if apart {
+            self.units.push((examined, wrote));
         }
         for (root, path) in &manifest.removed {
             match place(*root, path) {
@@ -1278,9 +1313,257 @@ impl Parts {
     }
 }
 
-/// Turn what was observed into a cache entry. An error says why this run
-/// cannot be reused. `parts` holds the records of commands that ran inside
-/// this one under scopes of their own.
+/// A build made before that another starts from. Its files are put in the
+/// target directory, all but those written by the compilers whose inputs
+/// have changed since. Cargo finds those missing and runs their compilers
+/// again, and after them whatever uses what they make.
+pub struct Start {
+    pub manifest: Manifest,
+    /// Which of its parts have to be made again.
+    again: Vec<bool>,
+    /// Which of its outputs were put in place.
+    placed: Vec<bool>,
+    /// What the files hold now that Cargo had asked about and that have
+    /// changed since, by their positions among the inputs.
+    now: HashMap<u32, State>,
+    /// How long the build took that this one starts from.
+    cost_ms: u64,
+}
+
+impl Start {
+    fn place(&self, output: u32) -> Place {
+        let output = &self.manifest.outputs[output as usize];
+        (output.root, output.path.clone())
+    }
+
+    /// A file that was left out for Cargo to have made again, and is
+    /// still missing after a build that Cargo called done. Cargo runs a
+    /// compiler again when what it wrote is gone. If it ever did not, what
+    /// had been built on the missing file would be out of date and nothing
+    /// else would say so.
+    pub fn unmade(&self, roots: &Roots) -> Option<PathBuf> {
+        let left = self.manifest.outputs.iter().zip(&self.placed);
+        left.filter(|(_, placed)| !**placed)
+            .filter_map(|(output, _)| roots.join(output.root, &output.path))
+            .find(|path| !path.exists())
+    }
+
+    /// Take out of the target directory everything that was put in place,
+    /// and everything the build that started from it wrote there, with the
+    /// directories that leaves empty: what a build from nothing is to find
+    /// is nothing.
+    pub fn undo(&self, roots: &Roots, report: &Report, parts: &Parts) {
+        let Some(target) = roots.path(roots::TARGET) else {
+            return;
+        };
+        let placed = self.manifest.outputs.iter().zip(&self.placed);
+        let placed = placed
+            .filter(|(output, placed)| **placed && output.root == roots::TARGET)
+            .map(|(output, _)| target.join(&output.path));
+        let made = parts
+            .outputs
+            .keys()
+            .filter(|place| place.0 == roots::TARGET);
+        let made = made.map(|place| target.join(&place.1));
+        let written = report.paths.iter().filter(|(_, access)| access.written);
+        let written = written
+            .map(|(path, _)| path.clone())
+            .filter(|path| path.starts_with(target));
+        let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
+        for path in placed.chain(made).chain(written) {
+            if fs::remove_file(&path).is_ok() {
+                directories.extend(
+                    path.ancestors()
+                        .skip(1)
+                        .take_while(|dir| *dir != target)
+                        .map(Path::to_owned),
+                );
+            }
+        }
+        // The deepest first. One that still holds something stays.
+        for directory in directories.iter().rev() {
+            let _ = fs::remove_dir(directory);
+        }
+    }
+}
+
+/// How many recorded builds are looked at for one to start from, and how
+/// many inputs may differ from the one chosen.
+const NEAR: usize = 4;
+const MOST: usize = 4096;
+
+/// Look for a recorded build of this command that differs from the present
+/// only in what compilers read, and put its files in place except those the
+/// compilers wrote whose inputs differ.
+pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
+    if env::var_os("JATO_NEAR").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let begun = Instant::now();
+    store.begin_read();
+    let candidates = store.candidates(recipe).unwrap_or_default();
+    let mut here = Here::new(
+        &job.roots,
+        &job.request.env,
+        &job.path,
+        job.facts.width,
+        job.facts.ansi,
+    );
+    // The one with the fewest compilations to make again.
+    struct Near {
+        count: usize,
+        at: usize,
+        manifest: Manifest,
+        again: Vec<bool>,
+        differences: Vec<Difference>,
+    }
+    let mut best: Option<Near> = None;
+    let mut why = None;
+    for (at, candidate) in candidates.iter().enumerate().take(NEAR) {
+        let manifest = match Manifest::decode(&candidate.manifest) {
+            Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
+            _ => continue,
+        };
+        if manifest.parts.is_empty() {
+            continue;
+        }
+        let differences = match manifest.differences(&mut here, store, MOST) {
+            Ok(differences) => differences,
+            Err(reason) => {
+                why.get_or_insert(reason);
+                continue;
+            }
+        };
+        match manifest.stale_parts(&differences) {
+            Ok(again) => {
+                let count = again.iter().filter(|again| **again).count();
+                if best.as_ref().is_none_or(|best| count < best.count) {
+                    best = Some(Near {
+                        count,
+                        at,
+                        manifest,
+                        again,
+                        differences,
+                    });
+                }
+                // Near enough: looking at another costs as much as these
+                // few compilations might.
+                if count <= 4 {
+                    break;
+                }
+            }
+            Err(position) => {
+                why.get_or_insert_with(|| {
+                    format!(
+                        "{} differs, which the build itself examined",
+                        manifest.named(position, &job.roots)
+                    )
+                });
+            }
+        }
+    }
+    let Some(Near {
+        count,
+        at,
+        manifest,
+        again,
+        differences,
+    }) = best
+    else {
+        store.end_read();
+        if let Some(why) = why {
+            log(job.name(), format_args!("nothing to start from: {why}"));
+        }
+        return None;
+    };
+    let candidate = &candidates[at];
+    // What the compilers to be run again wrote is left out, and with it
+    // any copy Cargo made under another name: for a program, the copy is
+    // where Cargo looks.
+    let mut leave = vec![false; manifest.outputs.len()];
+    let mut kept: HashSet<u32> = HashSet::new();
+    let mut gone: HashSet<Digest> = HashSet::new();
+    for (part, again) in manifest.parts.iter().zip(&again) {
+        for &output in &part.outputs {
+            if *again {
+                leave[output as usize] = true;
+                gone.insert(manifest.outputs[output as usize].digest);
+            } else {
+                kept.insert(output);
+            }
+        }
+    }
+    for (at, output) in manifest.outputs.iter().enumerate() {
+        if output.size > 0 && gone.contains(&output.digest) && !kept.contains(&(at as u32)) {
+            leave[at] = true;
+        }
+    }
+    let mut damaged = false;
+    let restored = store.restore(
+        candidate,
+        &manifest,
+        &job.roots,
+        true,
+        Some(&leave),
+        &mut damaged,
+    );
+    store.end_read();
+    let restored = match restored {
+        Ok(Some(restored)) => restored,
+        Ok(None) => {
+            if damaged {
+                store.forget(&candidate.key);
+            }
+            log(
+                job.name(),
+                "nothing to start from: an earlier build's files are no longer in the cache",
+            );
+            return None;
+        }
+        Err(e) => {
+            log(job.name(), format_args!("nothing to start from: {e:#}"));
+            return None;
+        }
+    };
+    for (root, path) in &manifest.removed {
+        if let Some(path) = job.roots.join(*root, path) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let now = differences
+        .iter()
+        .filter(|difference| manifest.asked.binary_search(&difference.input).is_ok())
+        .filter_map(|difference| {
+            Some((difference.input, manifest.now(difference.input, &mut here)?))
+        })
+        .collect();
+    store.count("build_near", 1);
+    store.count("restored_bytes", restored.bytes);
+    let first = differences
+        .first()
+        .map(|difference| manifest.named(difference.input, &job.roots));
+    log(
+        job.name(),
+        format_args!(
+            "starting from an earlier build in {} ms: {count} of its {} compilations to make again, {} differs{}",
+            begun.elapsed().as_millis(),
+            manifest.parts.len(),
+            first.unwrap_or_default(),
+            match differences.len() {
+                0 | 1 => String::new(),
+                more => format!(" and {} more", more - 1),
+            }
+        ),
+    );
+    Some(Start {
+        placed: leave.iter().map(|left| !left).collect(),
+        manifest,
+        again,
+        now,
+        cost_ms: restored.cost_ms,
+    })
+}
+
 /// The directories in which git keeps the repositories a command looked
 /// at: those named `.git`, those a file of that name leads to, as it does
 /// in a worktree, and the one a worktree shares with the others.
@@ -1335,6 +1618,9 @@ fn leads_to(path: &Path, places: &[PathBuf]) -> bool {
         .any(|place| place != path && place.starts_with(path))
 }
 
+/// Turn what was observed into a cache entry. An error says why this run
+/// cannot be reused. `parts` holds the records of commands that ran inside
+/// this one under scopes of their own.
 pub fn record(
     job: &Job,
     store: &mut Store,
@@ -1393,6 +1679,35 @@ pub fn record(
     let mut made: HashSet<Place> = parts
         .map(|parts| parts.outputs.keys().cloned().collect())
         .unwrap_or_default();
+    // So is what an earlier build made that this one started from: the
+    // two are one build, of which this run made only what had changed.
+    let start = parts.and_then(|parts| parts.start.as_ref());
+    let mut carried: HashMap<Place, &Output> = HashMap::new();
+    if let Some(start) = start {
+        for (output, placed) in start.manifest.outputs.iter().zip(&start.placed) {
+            if *placed {
+                // And the directories it made to put its files in, which
+                // were there for this run to find.
+                for directory in output.path.ancestors().skip(1) {
+                    if directory.as_os_str().is_empty()
+                        || !made.insert((output.root, directory.to_owned()))
+                    {
+                        break;
+                    }
+                }
+                let place = (output.root, output.path.clone());
+                made.insert(place.clone());
+                carried.insert(place, output);
+            }
+        }
+    }
+    // Who examined each input, for a build that will start from this one.
+    // The inputs something other than a compiler of Cargo's examined, and
+    // among them the files Cargo itself only asked about.
+    let mut own: HashSet<Place> = HashSet::new();
+    let mut asked: HashSet<Place> = HashSet::new();
+    // Programs this run started from inside the target directory.
+    let mut started: Vec<(Place, PathBuf)> = Vec::new();
     // The names found in each listed directory. Those that turn out to be
     // this command's own outputs are taken out before they are recorded.
     let mut listings: HashMap<Place, Vec<OsString>> = HashMap::new();
@@ -1455,6 +1770,9 @@ pub fn record(
         }
         let (root, rel) = roots.split(path);
         let now = fs::symlink_metadata(path);
+        if access.executed && root == roots::TARGET && start.is_some() {
+            started.push(((root, rel.to_owned()), path.clone()));
+        }
         if access.written {
             // Cargo compares what it is about to write with what is there,
             // and rewrites. What was there does not change what it writes.
@@ -1484,7 +1802,8 @@ pub fn record(
             continue;
         }
         if access.removed {
-            if access.kind == Kind::Absent {
+            // A file the build made, in the part of it that ran earlier.
+            if access.kind == Kind::Absent || carried.contains_key(&(root, rel.to_owned())) {
                 continue;
             }
             if access.read || root == roots::ABSOLUTE {
@@ -1592,6 +1911,17 @@ pub fn record(
             }
             Kind::Other => continue,
         };
+        // Cargo asks whether a source file is there and when it changed,
+        // and does so again every time it runs. Whoever opens the file is
+        // the one its contents matter to.
+        let only_asked = job.scope == Scope::Build
+            && matches!(state, State::File(_))
+            && !(access.others || access.read || access.executed);
+        if only_asked {
+            asked.insert((root, rel.to_owned()));
+        } else {
+            own.insert((root, rel.to_owned()));
+        }
         manifest.inputs.push(Input {
             root,
             path: rel.to_owned(),
@@ -1630,6 +1960,7 @@ pub fn record(
         {
             continue;
         }
+        own.insert((root, rel.to_owned()));
         manifest.inputs.push(Input {
             root,
             path: rel.to_owned(),
@@ -1666,6 +1997,7 @@ pub fn record(
             .filter(|m| m.file_type().is_symlink())
             .and_then(|_| fs::read_link(&loader).ok())
             .map(|target| roots.mark_os(target.as_os_str()).into_owned());
+        own.insert((root, rel.to_owned()));
         manifest.inputs.push(Input {
             root,
             path: rel.to_owned(),
@@ -1729,6 +2061,10 @@ pub fn record(
     // Everything the parts wrote is this command's output too, and what
     // they depended on from outside is its input.
     let mut known: HashMap<Digest, &Output> = HashMap::new();
+    // Compilers of the build this one started from that were not run again,
+    // and directories that build recorded the entries of.
+    let mut kept: Vec<&Part> = Vec::new();
+    let mut listed_earlier: HashSet<Place> = HashSet::new();
     if let Some(parts) = parts {
         let mut listed: HashSet<Place> = outputs
             .iter()
@@ -1761,6 +2097,105 @@ pub fn record(
                     link: link.clone(),
                     state: state.clone(),
                 });
+            }
+        }
+        // The build this one started from is the rest of this build. What
+        // it examined itself, a build of these sources from nothing would
+        // have examined: all of that is as it was, or this one could not
+        // have started there. Its compilers that were not run again are
+        // this build's as they were.
+        if let Some(start) = start {
+            let base = &start.manifest;
+            let mut have: HashSet<Place> = manifest
+                .inputs
+                .iter()
+                .map(|i| (i.root, i.path.clone()))
+                .collect();
+            let mut carry = |position: u32, manifest: &mut Manifest| -> Place {
+                let input = &base.inputs[position as usize];
+                let place = (input.root, input.path.clone());
+                if !made.contains(&place) && have.insert(place.clone()) {
+                    let mut input = input.clone();
+                    if let Some(state) = start.now.get(&position) {
+                        input.state = state.clone();
+                    }
+                    if matches!(input.state, State::Dir(Some(_))) {
+                        listed_earlier.insert(place.clone());
+                    }
+                    manifest.inputs.push(input);
+                }
+                place
+            };
+            let mut apart = vec![false; base.inputs.len()];
+            for (part, again) in base.parts.iter().zip(&start.again) {
+                let made_again = |output: &&u32| parts.outputs.contains_key(&start.place(**output));
+                let remade = part.outputs.iter().filter(made_again).count();
+                for &position in &part.inputs {
+                    apart[position as usize] = true;
+                }
+                if remade == part.outputs.len() {
+                    continue;
+                }
+                if *again || remade > 0 {
+                    let missing = part.outputs.iter().find(|output| !made_again(output));
+                    let missing = missing.map(|output| start.place(*output).1);
+                    return Err(format!(
+                        "{} was not made again",
+                        missing.unwrap_or_default().display()
+                    ));
+                }
+                for &position in &part.inputs {
+                    carry(position, &mut manifest);
+                }
+                kept.push(part);
+            }
+            for &position in &base.asked {
+                asked.insert(carry(position, &mut manifest));
+            }
+            for position in 0..base.inputs.len() as u32 {
+                let listed = base.own.binary_search(&position).is_ok();
+                let nowhere =
+                    !apart[position as usize] && base.asked.binary_search(&position).is_err();
+                if listed || nowhere {
+                    own.insert(carry(position, &mut manifest));
+                }
+            }
+            manifest.env.extend(base.env.iter().cloned());
+            manifest.which.extend(base.which.iter().cloned());
+            manifest.pins.extend(base.pins.iter().cloned());
+            manifest.removed.extend(base.removed.iter().cloned());
+            for (place, output) in &carried {
+                known.insert(output.digest, output);
+                if !listed.contains(place)
+                    && let Some(path) = roots.join(place.0, &place.1)
+                    && path.is_file()
+                {
+                    listed.insert(place.clone());
+                    outputs.push((place.0, place.1.clone(), path));
+                }
+            }
+            // A build script that was built again ran in the directory the
+            // earlier one had written to, and may have left there what a
+            // build from nothing would not have. The build is right as
+            // Cargo sees it, and is not one to put back somewhere else.
+            for (place, path) in &started {
+                let was = base
+                    .outputs
+                    .binary_search_by(|o| (o.root, &o.path).cmp(&(place.0, &place.1)))
+                    .ok()
+                    .map(|at| &base.outputs[at]);
+                let same = match (was, fs::metadata(path)) {
+                    (Some(was), Ok(meta)) if !was.marked => store
+                        .digest_known(path, Stamp::of(&meta))
+                        .is_ok_and(|digest| digest == was.digest),
+                    _ => false,
+                };
+                if !same {
+                    return Err(format!(
+                        "{} was built again and ran where the one before it had",
+                        path.display()
+                    ));
+                }
             }
         }
         // A variable a compiler read with the value this command was
@@ -1942,9 +2377,10 @@ pub fn record(
             // A part listed this directory and left out its own outputs.
             // With other parts writing here, nothing says what it saw.
             (State::Dir(Some(_)), None)
-                if outputs
-                    .iter()
-                    .any(|(root, rel, _)| *root == place.0 && rel.parent() == Some(&place.1)) =>
+                if !listed_earlier.contains(&place)
+                    && outputs.iter().any(|(root, rel, _)| {
+                        *root == place.0 && rel.parent() == Some(&place.1)
+                    }) =>
             {
                 return Err(format!(
                     "a compiler listed {}, where the build writes",
@@ -2002,7 +2438,79 @@ pub fn record(
     let detail = encode_detail(0, &roots.mark(stdout), &roots.mark(stderr));
     manifest.detail = *blake3::hash(&detail).as_bytes();
     manifest.normalize();
-    let stored = store.commit(recipe, &manifest, &detail, ran.millis, &mut staged);
+    if job.scope == Scope::Build
+        && let Some(parts) = parts
+    {
+        // Who examined what, by where each input and output now stands.
+        let input_at = |place: &Place| {
+            let found = manifest
+                .inputs
+                .binary_search_by(|i| (i.root, &i.path).cmp(&(place.0, &place.1)));
+            found.ok().map(|at| at as u32)
+        };
+        let output_at = |place: &Place| {
+            let found = manifest
+                .outputs
+                .binary_search_by(|o| (o.root, &o.path).cmp(&(place.0, &place.1)));
+            found.ok().map(|at| at as u32)
+        };
+        let ordered = |mut list: Vec<u32>| {
+            list.sort_unstable();
+            list.dedup();
+            list
+        };
+        let mut position = vec![None; parts.numbers.len()];
+        for (place, number) in &parts.numbers {
+            position[*number as usize] = input_at(place);
+        }
+        let mut apart: Vec<Part> = Vec::with_capacity(parts.units.len() + kept.len());
+        let mut theirs: Vec<u32> = parts
+            .loose
+            .iter()
+            .filter_map(|number| position[*number as usize])
+            .collect();
+        for (examined, wrote) in &parts.units {
+            let inputs = examined.iter().filter_map(|n| position[*n as usize]);
+            let inputs = ordered(inputs.collect());
+            let outputs = ordered(wrote.iter().filter_map(output_at).collect());
+            // With nothing left of what it wrote there is nothing Cargo
+            // could find missing.
+            if outputs.is_empty() {
+                theirs.extend(inputs);
+            } else {
+                apart.push(Part { inputs, outputs });
+            }
+        }
+        if let Some(start) = start {
+            let base = &start.manifest;
+            for part in &kept {
+                let place = |position: &u32| {
+                    let input = &base.inputs[*position as usize];
+                    (input.root, input.path.clone())
+                };
+                let inputs = part.inputs.iter().filter_map(|at| input_at(&place(at)));
+                let outputs = part.outputs.iter().map(|at| start.place(*at));
+                let outputs = ordered(outputs.filter_map(|place| output_at(&place)).collect());
+                let inputs = ordered(inputs.collect());
+                if outputs.is_empty() {
+                    theirs.extend(inputs);
+                } else {
+                    apart.push(Part { inputs, outputs });
+                }
+            }
+        }
+        theirs.extend(own.iter().filter_map(input_at));
+        let theirs = ordered(theirs);
+        let asked = ordered(asked.iter().filter_map(input_at).collect());
+        manifest.asked = asked
+            .into_iter()
+            .filter(|at| theirs.binary_search(at).is_err())
+            .collect();
+        manifest.own = theirs;
+        manifest.parts = apart;
+    }
+    let cost = ran.millis + start.map_or(0, |start| start.cost_ms);
+    let stored = store.commit(recipe, &manifest, &detail, cost, &mut staged);
     match stored {
         Ok(true) => {
             if !manifest.pins.is_empty() {

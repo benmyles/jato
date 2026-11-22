@@ -124,6 +124,8 @@ fn place(compiles: bool) -> Option<crate::jobs::Place> {
 struct Server {
     scopes: Scopes,
     roots: Roots,
+    /// The process Cargo was started in.
+    cargo: u32,
     parts: Mutex<Parts>,
     stores: Mutex<Vec<Store>>,
     stop: AtomicBool,
@@ -146,9 +148,33 @@ impl Server {
         parts.unusable.get_or_insert_with(|| why.to_owned());
     }
 
-    fn used(&self, job: &Job, manifest: &crate::manifest::Manifest) {
+    fn used(&self, job: &Job, manifest: &crate::manifest::Manifest, cargo: bool) {
         let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
-        parts.add(manifest, &job.roots, &self.roots);
+        parts.add(manifest, &job.roots, &self.roots, cargo);
+    }
+
+    /// Whether the process that started `pid` runs the program Cargo runs:
+    /// Cargo itself, where Jato started it or where one of its own
+    /// subcommands did for the build. What Cargo starts as a compiler it
+    /// runs again when the compiler's output is missing. What a build
+    /// script starts is that script's affair.
+    fn started_by_cargo(&self, pid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let parent = || {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // After the name, which may hold anything: the state, then
+            // the parent.
+            let rest = stat.rsplit_once(") ")?.1;
+            rest.split(' ').nth(1)?.parse::<u32>().ok()
+        };
+        let program = |id: u32| {
+            let meta = std::fs::metadata(format!("/proc/{id}/exe")).ok()?;
+            Some((meta.dev(), meta.ino()))
+        };
+        parent().is_some_and(|parent| {
+            parent == self.cargo
+                || program(parent).is_some_and(|theirs| program(self.cargo) == Some(theirs))
+        })
     }
 
     /// Serve one compiler wrapper from its request to its last message.
@@ -174,6 +200,7 @@ impl Server {
         if tool && self.scopes.inside(pid) {
             return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
         }
+        let cargo = !tool && self.started_by_cargo(pid);
         let request = Request {
             program,
             args,
@@ -214,7 +241,7 @@ impl Server {
             (lock, found) = command::before_running(&job, &mut store, &recipe);
         }
         if let Some((outcome, manifest)) = found {
-            self.used(&job, &manifest);
+            self.used(&job, &manifest, cargo);
             store.flush();
             self.stores
                 .lock()
@@ -258,7 +285,7 @@ impl Server {
         );
         let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
             Ok(manifest) => {
-                self.used(&job, &manifest);
+                self.used(&job, &manifest, cargo);
                 Some(report)
             }
             // A build goes on after a command that failed where the
@@ -598,10 +625,61 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
         return command::passthrough(cmd);
     }
     let prepared = Prepared { job, store, recipe };
-    match supervise(cmd, prepared, name, begun, true)? {
+    match make(cmd, prepared, name, begun, true)? {
         Supervised::Ran(code) => Ok(code),
         Supervised::Unwatched(cmd) => command::passthrough(cmd),
+        Supervised::Doubted => bail!("a build from nothing cannot be in doubt"),
     }
+}
+
+/// Have Cargo make a build that is not recorded, under one observer. If
+/// sources that differ only a little were built before, the build starts
+/// from that one. Should Cargo then leave unmade what had to be made again,
+/// everything put in place is taken away and the build is made from
+/// nothing.
+fn make(
+    cmd: Command,
+    prepared: Prepared,
+    name: &str,
+    begun: Instant,
+    whole: bool,
+) -> Result<Supervised> {
+    let Prepared {
+        job,
+        mut store,
+        recipe,
+    } = prepared;
+    let start = command::start_from(&job, &mut store, &recipe);
+    let again = start.is_some().then(|| copy_of(&cmd));
+    let prepared = Prepared { job, store, recipe };
+    match supervise(cmd, prepared, name, begun, whole, start)? {
+        Supervised::Doubted => {
+            let Some(cmd) = again else {
+                bail!("the build could not be started again");
+            };
+            match prepare(&cmd, name)? {
+                Some(prepared) => supervise(cmd, prepared, name, begun, whole, None),
+                None => Ok(Supervised::Unwatched(cmd)),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+/// The same command, to be started a second time.
+fn copy_of(cmd: &Command) -> Command {
+    let mut copy = Command::new(cmd.get_program());
+    copy.args(cmd.get_args());
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => copy.env(name, value),
+            None => copy.env_remove(name),
+        };
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        copy.current_dir(dir);
+    }
+    copy
 }
 
 /// Get the build done that a command needs before it runs what was built:
@@ -628,7 +706,7 @@ pub fn ready(cmd: Command, name: &str) {
         return;
     }
     let prepared = Prepared { job, store, recipe };
-    if let Err(e) = supervise(cmd, prepared, name, begun, false) {
+    if let Err(e) = make(cmd, prepared, name, begun, false) {
         log(
             name,
             format_args!("the build ahead of the command failed: {e:#}"),
@@ -649,17 +727,22 @@ enum Supervised {
     Ran(i32),
     /// It could not be watched and has not been started.
     Unwatched(Command),
+    /// Cargo called it done without making again what had to be. What it
+    /// started from has been taken out of the target directory.
+    Doubted,
 }
 
 /// Run Cargo under one observer and record the build as a whole. With
 /// `whole` unset only Cargo's progress is shown, and what it printed is
-/// kept for the record alone.
+/// kept for the record alone. `start` is an earlier build whose files have
+/// been put in place for this one to start from.
 fn supervise(
     mut cmd: Command,
     prepared: Prepared,
     name: &str,
     begun: Instant,
     whole: bool,
+    start: Option<command::Start>,
 ) -> Result<Supervised> {
     let Prepared {
         job,
@@ -715,7 +798,8 @@ fn supervise(
     let server = Arc::new(Server {
         scopes: session.scopes(),
         roots: job.roots.clone(),
-        parts: Mutex::new(Parts::default()),
+        cargo: child.id(),
+        parts: Mutex::new(Parts::starting_from(start)),
         stores: Mutex::new(Vec::new()),
         stop: AtomicBool::new(false),
         busy: std::sync::atomic::AtomicUsize::new(0),
@@ -799,6 +883,34 @@ fn supervise(
             report.events
         ),
     );
+    // Cargo runs a compiler again when what it wrote is missing. Nothing
+    // else stands between a changed source and what was built from the
+    // unchanged one, so it is checked that Cargo did.
+    let unmade = parts
+        .start
+        .as_ref()
+        .filter(|_| ran.success)
+        .and_then(|start| {
+            // The tests name a file here to go through what follows.
+            let pretended = || std::env::var_os("JATO_TEST_DOUBT").map(PathBuf::from);
+            start.unmade(&job.roots).or_else(pretended)
+        });
+    if let Some(unmade) = unmade {
+        log(
+            name,
+            format_args!(
+                "Cargo did not make {} again: taking away what this build started from, and building from nothing",
+                unmade.display()
+            ),
+        );
+        if let Some(start) = &parts.start {
+            start.undo(&job.roots, &report, &parts);
+        }
+        drop(parts);
+        store.count("build_doubted", 1);
+        store.settle();
+        return Ok(Supervised::Doubted);
+    }
     let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
     drop(parts);
     // The stores that served the compilers are done with, and the index

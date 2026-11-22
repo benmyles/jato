@@ -11,6 +11,8 @@ through the same steps:
   new_target  a target directory that has never been used
   copy        the same sources at another path, building into ./target there
   copy_edit   one source file changed in that copy, where nothing was compiled
+  copy_new    the sources at a third path with one file changed already, and
+              nothing built there yet: a new worktree with an edit in it
   edit_first  one source file changed, in the target that was restored
   edit        the median of further changes to that file
   undo        the file as it was before the changes
@@ -34,7 +36,7 @@ import tempfile
 import time
 
 TOOLS = ["cargo", "jato", "jato-wrapper", "kache", "kache-shim", "sccache"]
-STEPS = ["cold", "fresh", "restore", "new_target", "copy", "copy_edit", "edit_first", "edit", "undo"]
+STEPS = ["cold", "fresh", "restore", "new_target", "copy", "copy_edit", "copy_new", "edit_first", "edit", "undo"]
 TICK = os.sysconf("SC_CLK_TCK")
 
 
@@ -267,6 +269,12 @@ def main():
                         changed = copy / options.edit
                         changed.write_bytes(changed.read_bytes() + f"\npub fn changed_in_the_copy_{trial}() -> u64 {{ {time.time_ns()} }}\n".encode())
                         record("copy_edit", step("copy_edit", copy, copy / "target"))
+                        third = private / "third" / "project"
+                        third.parent.mkdir()
+                        copy_project(third)
+                        changed = third / options.edit
+                        changed.write_bytes(changed.read_bytes() + f"\npub fn changed_before_any_build_{trial}() -> u64 {{ {time.time_ns()} }}\n".encode())
+                        record("copy_new", step("copy_new", third, third / "target"))
                     edited = project / options.edit
                     original = edited.read_bytes()
                     later = []

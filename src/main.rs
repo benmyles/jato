@@ -73,6 +73,8 @@ Environment
                       is already built are not watched; default the number
                       of processors, 0 always watches
   JATO_WHOLE_BUILDS=0 Reuse single compilations only
+  JATO_NEAR=0         Never start a build from an earlier one whose sources
+                      differ; have Cargo carry out the whole of it
   JATO_TOOLS=0        Leave the C compilers and assemblers that build scripts
                       start to themselves
   JATO_SAVED_STATE=0  Leave rustc's incremental state out of the cache
@@ -515,6 +517,13 @@ fn report(stats: &cas::Stats) -> String {
             "Builds     {whole} put back whole, {made} made and {} of those recorded, {left} left to Cargo in a built target",
             count("build_stored")
         );
+        let near = count("build_near");
+        if near > 0 {
+            let _ = writeln!(
+                out,
+                "           {near} of those made started from an earlier build of other sources"
+            );
+        }
     }
     if let Some((ago, why)) = &stats.unrecorded {
         let ago = match *ago {

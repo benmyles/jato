@@ -34,7 +34,16 @@
 - [x] Let a build outlive the checkout that made it: the directories a workspace is inside are no inputs.
 - [x] Take a name for searched for only where the places it was seen in follow one another up from the workspace. A crate kept in `lib` had made every program's look at `/lib` a search, and its build was never found again.
 
+## 0.15
+
+- [x] Start a build of sources that differ a little from the nearest recorded build: its files are put in place without what the compilers wrote whose inputs differ, Cargo makes those again and what depends on them, and the result is recorded like a build from nothing. Who examined each input is part of a whole build's record.
+- [x] Do not take a call for missed that a thread never made because its program exited while the call waited to be looked at. One in four checks of all of Olo went unrecorded for it on a busy machine.
+
 ## Open
+
+- [ ] A build can start from an earlier one only when what differs was read by compilers Cargo started. A changed manifest or lock file, a changed input of a build script and changed C that a build script compiles leave Cargo to carry the build out: 22 s for a check of all of Olo. For C, leaving out what Cargo remembers of the build script's run would have Cargo run the script again. For a manifest, the parts whose command lines are unchanged could be found in the earlier build by what they wrote.
+- [ ] A build in which a build script was built again is not recorded when it started from an earlier one, because the script ran where its earlier version had written. Clearing what the earlier version wrote first would make the build one that can be recorded.
+- [ ] A build in a target directory that is already built is left to Cargo and not recorded as a whole, so sources arrived at by editing in one worktree are built again, from the nearest recorded build, by the next worktree that has them. Recording such builds as they are made needs a cheaper record than one that names every input again.
 
 - [ ] Cargo, asking git for a package's files, lists the top directory of the repository and each one on the way to the package. A file git does not track in one of those, in one checkout and not in another, keeps their builds apart although Cargo passes it over. So does a checkout without `.git`, such as an exported copy or a second Jujutsu workspace, beside one that has it.
 

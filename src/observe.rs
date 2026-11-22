@@ -747,6 +747,28 @@ mod imp {
             .replace('\0', " ")
     }
 
+    /// Whether a thread has ended or is ending. A program that exits takes
+    /// its other threads with it, and one of them may have been waiting
+    /// here for its call to be looked at. That call is never made, so
+    /// nothing is missing from the record when it cannot be made out.
+    fn gone(tid: u32) -> bool {
+        let ended = || match fs::read(format!("/proc/{tid}/stat")) {
+            Err(_) => true,
+            // After the name, which may hold anything, comes the state.
+            Ok(stat) => {
+                let state = stat.rsplitn(2, |b| *b == b')').next();
+                state.is_some_and(|rest| matches!(rest.get(1), Some(b'Z' | b'X')))
+            }
+        };
+        // A thread that is ending takes a moment to be seen as ended.
+        (0..20).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            ended()
+        })
+    }
+
     impl Tracker {
         fn incomplete(&mut self, why: &str) {
             self.report.incomplete.get_or_insert_with(|| why.to_owned());
@@ -766,12 +788,31 @@ mod imp {
             if n > 0 {
                 return Some(n as usize);
             }
-            // A bad address fails in the caller as well and touches no file.
-            // Anything else means this process cannot see what the call names.
-            if n < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EFAULT) {
-                self.incomplete("a program's memory could not be read");
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    // A bad address fails in the caller as well and
+                    // touches no file.
+                    Some(libc::EFAULT) => (),
+                    // The caller has ended: see `gone`.
+                    Some(libc::ESRCH) => (),
+                    _ if gone(pid) => (),
+                    // Anything else means this process cannot see what
+                    // the call names.
+                    _ => self.incomplete(&format!(
+                        "the memory of `{}` could not be read: {error}",
+                        command_line(pid)
+                    )),
+                }
             }
             None
+        }
+
+        /// A call of a thread that is still there could not be made out.
+        fn lost(&mut self, tid: u32, what: &str) {
+            if !gone(tid) {
+                self.incomplete(&format!("{what}, in `{}`", command_line(tid)));
+            }
         }
 
         /// A NUL-terminated string in the caller's memory. Each read stays
@@ -925,6 +966,8 @@ mod imp {
             }
             let access = self.report.paths.get_mut(&path).unwrap();
             access.others |= self.others;
+            // A program that was run was run, whoever made it and whenever.
+            access.executed |= matches!(how, Use::Execute);
             match how {
                 // What the command removed is no longer there to be read.
                 Use::Read | Use::Execute if access.removed => access.probed = true,
@@ -990,7 +1033,7 @@ mod imp {
             };
             match self.resolve(tid, dirfd, &name) {
                 Some(path) => self.touch(path, how),
-                None => self.incomplete("a path could not be resolved"),
+                None => self.lost(tid, "a path could not be resolved"),
             }
         }
 
@@ -1062,7 +1105,7 @@ mod imp {
                     if name.is_empty() {
                         match fs::read_link(format!("/proc/{tid}/fd/{}", a[0] as i32)) {
                             Ok(path) if path.is_absolute() => self.touch(path, Use::Execute),
-                            _ => self.incomplete("a program was run from a descriptor"),
+                            _ => self.lost(tid, "a program was run from a descriptor"),
                         }
                     } else if let Some(path) = self.resolve(tid, a[0] as i32, &name) {
                         self.touch(path, Use::Execute)
@@ -1071,7 +1114,7 @@ mod imp {
                 nr::GETDENTS64 | nr::GETDENTS => {
                     match fs::read_link(format!("/proc/{tid}/fd/{}", a[0] as i32)) {
                         Ok(path) if path.is_absolute() => self.touch(path, Use::List),
-                        _ => self.incomplete("a listed directory could not be named"),
+                        _ => self.lost(tid, "a listed directory could not be named"),
                     }
                 }
                 nr::RENAME => self.moved(tid, CWD, a[0], CWD, a[1]),
@@ -1147,7 +1190,7 @@ mod imp {
                 return;
             };
             let Some(path) = self.resolve(tid, dirfd, &name) else {
-                return self.incomplete("a path could not be resolved");
+                return self.lost(tid, "a path could not be resolved");
             };
             let how = if fs::symlink_metadata(&path).is_ok() {
                 Use::Probe
@@ -1165,7 +1208,7 @@ mod imp {
                 .string(tid, from)
                 .and_then(|name| self.resolve(tid, from_dir, &name));
             let Some(source) = source else {
-                return self.incomplete("a moved file could not be named");
+                return self.lost(tid, "a moved file could not be named");
             };
             // Linkers try to move an earlier output aside. With nothing
             // there the call fails and only shows that nothing was there.
@@ -1181,7 +1224,7 @@ mod imp {
                 .string(tid, to)
                 .and_then(|name| self.resolve(tid, to_dir, &name))
             else {
-                return self.incomplete("a moved file could not be named");
+                return self.lost(tid, "a moved file could not be named");
             };
             // The destination now holds what the source held: the command's
             // own data, or contents from before it started.
