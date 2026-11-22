@@ -872,6 +872,11 @@ impl Store {
                 .is_ok_and(|digest| digest == output.digest)
     }
 
+    /// Count a record as used now, when the index is next written.
+    pub fn touch(&mut self, key: &Digest) {
+        self.used.push(*key);
+    }
+
     /// Drop a result whose objects turned out to be missing or damaged.
     pub fn forget(&mut self, key: &Digest) {
         self.count("damaged", 1);
@@ -1091,46 +1096,6 @@ impl Store {
                 .execute(params![entry, output.digest])?;
         }
         add(&tx, "bytes", charge as i64)?;
-        // The compiler's saved state is as large as what it compiled, and
-        // only the latest for an output directory is any use: earlier
-        // results of this command keep their outputs and give theirs up.
-        if !record.saved.is_empty() {
-            let others: Vec<(i64, Vec<u8>)> = tx
-                .prepare_cached("SELECT id,manifest FROM entries WHERE recipe=?1 AND id<>?2")?
-                .query_map(params![recipe, entry], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (id, stored) in others {
-                let Ok(mut earlier) = Manifest::decode(&stored) else {
-                    continue;
-                };
-                if earlier.saved.is_empty() || earlier.saved_for != record.saved_for {
-                    continue;
-                }
-                let saved = std::mem::take(&mut earlier.saved);
-                tx.prepare_cached("UPDATE entries SET manifest=?1 WHERE id=?2")?
-                    .execute(params![earlier.encode()?, id])?;
-                let mut freed = 0i64;
-                for file in saved {
-                    if earlier.outputs.iter().any(|o| o.digest == file.digest) {
-                        continue;
-                    }
-                    tx.prepare_cached("DELETE FROM outputs WHERE entry=?1 AND object=?2")?
-                        .execute(params![id, file.digest])?;
-                    let gone: Option<(i64, bool)> = tx
-                        .prepare_cached(
-                            "DELETE FROM objects WHERE digest=?1
-                             AND NOT EXISTS(SELECT 1 FROM outputs WHERE object=?1) RETURNING stored,packed",
-                        )?
-                        .query_row([&file.digest], |r| Ok((r.get(0)?, r.get(1)?)))
-                        .optional()?;
-                    if let Some((stored, packed)) = gone {
-                        let _ = fs::remove_file(object_path(&dir, &file.digest, packed));
-                        freed += stored;
-                    }
-                }
-                add(&tx, "bytes", -freed)?;
-            }
-        }
         // Keep a bounded history for each command line.
         let surplus: Vec<i64> = tx
             .prepare_cached(

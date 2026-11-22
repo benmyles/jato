@@ -30,7 +30,6 @@ use std::time::Instant;
 const HIT: u8 = 0;
 const RUN: u8 = 1;
 const DECLINE: u8 = 2;
-const EXEC: u8 = 3;
 
 fn os(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
@@ -100,22 +99,6 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString]) -> Result<Option
             }
             Ok(Some(ran.code))
         }
-        EXEC => {
-            // Run it and report nothing.
-            let mut argv = Vec::new();
-            for _ in 0..r.count()? {
-                argv.push(os(r.bytes()?));
-            }
-            let place = place(r.byte()? != 0);
-            drop(stream);
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
-            if let Some(place) = place {
-                cmd.env(crate::jobs::HELD, "1");
-                place.keep_through_exec();
-            }
-            command::passthrough(cmd).map(Some)
-        }
         _ => Ok(None),
     }
 }
@@ -172,7 +155,7 @@ impl Server {
             let name = os(r.bytes()?);
             env.insert(name, os(r.bytes()?));
         }
-        let job = Job::unit(
+        let mut job = Job::unit(
             Request {
                 program,
                 args,
@@ -217,36 +200,18 @@ impl Server {
                 .push(store);
             return reply(&mut stream, &outcome).map_err(Into::into);
         }
+        // Inside a build that is recorded whole, every compilation is.
+        command::choose(&mut job, &mut store, &recipe, true);
         let argv = job.argv();
-        let command = |tag: u8| {
-            let mut w = Writer(vec![tag]);
-            w.number(argv.len() as u64);
-            for arg in &argv {
-                w.bytes(arg.as_bytes());
-            }
-            // Whether to wait for a processor before running it.
-            w.0.push(job.facts.compiles().into());
-            w
-        };
-        if command::continues(&job, &mut store, &recipe) {
-            log(
-                job.name(),
-                "one of a run of edits: left to rustc, unrecorded",
-            );
-            store.count("continued", 1);
-            // Nothing says what this compilation depended on.
-            self.unusable("a compilation was left unrecorded");
-            store.flush();
-            self.stores
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(store);
-            return wire::send(&mut stream, &command(EXEC).0).map_err(Into::into);
+        let mut w = Writer(vec![RUN]);
+        w.number(argv.len() as u64);
+        for arg in &argv {
+            w.bytes(arg.as_bytes());
         }
-        command::give_saved_state(&job, &mut store, &recipe);
+        // Whether to wait for a processor before running it.
+        w.0.push(job.facts.compiles().into());
         store.count(job.counter("miss"), 1);
         self.scopes.begin(pid, job.observer(&store));
-        let w = command(RUN);
         let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
         let report = self.scopes.end(pid).unwrap_or_default();
         let Ok(done) = done else {
@@ -700,7 +665,6 @@ fn supervise(
     let config = observe::Config {
         ignore: vec![store.dir.clone()],
         unlisted: Vec::new(),
-        state: None,
     };
     let (mut child, session) = match observe::spawn(&mut cmd, config) {
         Ok(started) => started,
