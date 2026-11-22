@@ -1,5 +1,13 @@
 # Work journal
 
+## 2026-11-22 — git worktrees (0.14.1)
+
+- Every whole build measured so far was made in a copy without a repository, or in a copy of one that was the same byte for byte. In a git checkout Cargo asks git which files a package has, for any package of the workspace whose build script has not said what it reads, and on a first build that is every package with a build script. It reads `HEAD`, the index, the configuration, the packed references and the list of packs. All of that differs in a worktree and in a clone, and the index changes with every commit. So a build was put back after `cargo clean` and never anywhere else: not in a worktree, which is where agents build.
+- What Cargo itself reads in a repository's own directory is now left out of a build's inputs. All it takes from there is the list of files whose times it compares, and the files it then asks about are inputs as before. Cargo is told from what it starts by the program a process runs: the observer notes for each path whether any program other than the command's own used it. A build script that reads `.git/HEAD` still gets a build for each branch.
+- The directories on the way to a repository, and those a workspace is inside, were inputs too: Cargo asks about each to find where a path really leads. A build made in a checkout that was deleted afterwards with the directory it was in could not be found again.
+- The check of all of Olo, 121 packages, in a clone of the real repository: 574 s from nothing at a load of 32 to 77. In a worktree of that clone the build was put back in 1.9 s, and in the clone itself on another branch after a commit in 0.9 s.
+- 0.14.0 had a fault of its own, found by the first experiment: a workspace with a crate in a directory called `lib` took every program's look at `/lib` for a search through the directories above, which nothing later matched. A search goes through every directory on its way, and only names seen in places that follow one another from the workspace count as one now.
+
 ## 2026-11-22 — programs that tell of their own reads (0.14)
 
 - A watched program used to wait for Jato at every call that names a file. Counted for one check of `olo-system`: 2,600 reported calls, and 18,000 more times that the command gave up the processor than unwatched. On a machine with every processor in use that is where the time went.

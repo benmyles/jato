@@ -28,7 +28,15 @@
 - [x] Test through real Cargo projects: restores, edits and undo, other checkouts and targets, proc macros that read files and directories, build scripts, linkers, damaged and evicted objects, concurrent builds, the network, PATH changes.
 - [x] Compare with kache, sccache and bare Cargo on ripgrep and Olo, with private stores and daemons.
 
+## 0.14.1
+
+- [x] Put a build back in another git worktree, in a clone, on another branch and after a commit: what Cargo itself reads of a repository is not an input of a build, what a build script reads there is.
+- [x] Let a build outlive the checkout that made it: the directories a workspace is inside are no inputs.
+- [x] Take a name for searched for only where the places it was seen in follow one another up from the workspace. A crate kept in `lib` had made every program's look at `/lib` a search, and its build was never found again.
+
 ## Open
+
+- [ ] Cargo, asking git for a package's files, lists the top directory of the repository and each one on the way to the package. A file git does not track in one of those, in one checkout and not in another, keeps their builds apart although Cargo passes it over. So does a checkout without `.git`, such as an exported copy or a second Jujutsu workspace, beside one that has it.
 
 - [ ] What a compiler writes is still reported by the kernel one call at a time, and rustc writes hundreds of files into the directory of its saved state, which Jato does not record. A check of `olo-system` is down from about 2,600 reported calls to 160; a full build of a crate has many more. The library in watched programs could make those calls unreported for directories Jato names to it, if the filter let more than reads through from its address.
 - [ ] With programs telling of their own reads, whether compilations in a built target still need to go unwatched on a busy machine has to be measured again at a load of 45 and more.

@@ -558,6 +558,212 @@ fn settings_above_a_checkout_are_looked_for_above_each_checkout() {
 }
 
 #[test]
+fn a_directory_named_like_one_at_the_top_of_the_filesystem_was_not_searched_for() {
+    if !observes() {
+        return;
+    }
+    // Every program looks in `/lib`. A crate kept in `lib` does not make
+    // that a search for `lib` in each directory above the workspace, which
+    // would have had to look in the ones between as well.
+    let p = Project::whole();
+    fs::rename(p.root.join("leaf"), p.root.join("lib")).unwrap();
+    write(
+        p.root.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nleaf={path='lib'}\n",
+    );
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
+fn a_build_is_put_back_after_the_checkout_that_made_it_is_gone() {
+    if !observes() {
+        return;
+    }
+    // Cargo asks about every directory on the way to a workspace. A
+    // build made in one that has since been deleted, with the directory
+    // it was in, is none the worse for that.
+    let p = Project::whole();
+    let first = p.temp.path().join("first/deep/checkout");
+    populate(&first);
+    let out = success(p.command_in(&first).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    let second = p.temp.path().join("second/checkout");
+    populate(&second);
+    fs::copy(first.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
+    fs::remove_dir_all(p.temp.path().join("first")).unwrap();
+    let out = success(p.command_in(&second).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+/// Whether git is installed.
+fn has_git() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Run git in `dir` as someone with a name, whatever this machine's own
+/// settings for git are.
+fn git(dir: &Path, args: &[&str]) {
+    success(
+        Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args([
+                "-c",
+                "user.name=Jato",
+                "-c",
+                "user.email=jato@example.invalid",
+            ])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args),
+    );
+}
+
+/// Make `p` a repository with everything committed, and give its root
+/// package a build script that names no inputs: Cargo then asks git which
+/// files the package has, to compare their times.
+fn commit_all(p: &Project) {
+    write(p.root.join("build.rs"), "fn main() {}\n");
+    write(p.root.join(".gitignore"), "/target\n");
+    p.run(&["cargo", "generate-lockfile"]);
+    git(&p.root, &["init", "-q"]);
+    git(&p.root, &["add", "-A"]);
+    git(&p.root, &["commit", "-q", "-m", "first"]);
+}
+
+#[test]
+fn a_build_is_put_back_in_another_worktree_and_after_a_commit() {
+    if !observes() || !has_git() {
+        return;
+    }
+    let p = Project::whole();
+    commit_all(&p);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 0, "{}", p.stats());
+    // What git keeps about the repository changes with a commit, with the
+    // branch, and when it only looks. The files that were built do not.
+    git(&p.root, &["commit", "-q", "--allow-empty", "-m", "nothing"]);
+    git(&p.root, &["checkout", "-q", "-b", "topic"]);
+    git(&p.root, &["status"]);
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // A worktree keeps its part of the repository somewhere else, under
+    // the first checkout, and has a file where that has a directory.
+    let tree = p.temp.path().join("trees/second");
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            tree.to_str().unwrap(),
+        ],
+    );
+    let out = success(p.command_in(&tree).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    // A clone is a repository of its own.
+    let clone = p.temp.path().join("clone");
+    git(
+        p.temp.path(),
+        &["clone", "-q", p.root.to_str().unwrap(), "clone"],
+    );
+    let out = success(p.command_in(&clone).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 3, "{}", p.stats());
+    // So is a worktree of a repository that has no files checked out.
+    let bare = p.temp.path().join("bare.git");
+    git(
+        p.temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            p.root.to_str().unwrap(),
+            "bare.git",
+        ],
+    );
+    let third = p.temp.path().join("third");
+    git(
+        &bare,
+        &["worktree", "add", "-q", third.to_str().unwrap(), "topic"],
+    );
+    let out = success(p.command_in(&third).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 4, "{}", p.stats());
+    // What is committed in one worktree and built there from nothing is
+    // found by the next one to check it out.
+    edit_leaf(&tree, "two");
+    git(&tree, &["commit", "-q", "-a", "-m", "second"]);
+    success(p.command_in(&tree).args(["cargo", "clean"]));
+    let out = success(p.command_in(&tree).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"two\n");
+    assert_eq!(p.count("build_hit"), 4, "{}", p.stats());
+    git(&p.root, &["checkout", "-q", "--detach", "other"]);
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"two\n");
+    assert_eq!(p.count("build_hit"), 5, "{}", p.stats());
+}
+
+#[test]
+fn what_a_build_script_reads_of_a_repository_is_an_input() {
+    if !observes() || !has_git() {
+        return;
+    }
+    // Cargo's own look at the repository is no input of a build. A build
+    // script that puts the branch into the program has read it for itself.
+    let p = Project::whole();
+    commit_all(&p);
+    write(
+        p.root.join("build.rs"),
+        r#"fn main() {
+    let head = std::fs::read_to_string(".git/HEAD").unwrap();
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/head.rs"), format!("const HEAD: &str = {:?};", head.trim())).unwrap();
+}
+"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/head.rs\"));\nfn main() { println!(\"{HEAD} {}\", leaf::value()); }",
+    );
+    git(&p.root, &["commit", "-q", "-a", "-m", "say where"]);
+    assert_eq!(
+        p.run(&["run", "-q"]).stdout,
+        b"ref: refs/heads/main one:none\n"
+    );
+    git(&p.root, &["checkout", "-q", "-b", "topic"]);
+    p.clean();
+    assert_eq!(
+        p.run(&["run", "-q"]).stdout,
+        b"ref: refs/heads/topic one:none\n"
+    );
+    assert_eq!(p.count("build_hit"), 0, "{}", p.stats());
+    git(&p.root, &["checkout", "-q", "main"]);
+    p.clean();
+    assert_eq!(
+        p.run(&["run", "-q"]).stdout,
+        b"ref: refs/heads/main one:none\n"
+    );
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
 fn an_edit_right_after_a_build_is_put_back_is_compiled() {
     if !observes() {
         return;

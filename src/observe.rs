@@ -106,6 +106,9 @@ pub struct Access {
     pub origin: Option<PathBuf>,
     /// The command line of the program that wrote over what was there.
     pub writer: Option<Box<str>>,
+    /// Used by a program other than the one the command itself is: one it
+    /// started, or a part of it that was recorded apart.
+    pub others: bool,
     /// When the command first used the path and when it made the file its
     /// own, counted in the system calls reported until then. Zero for a
     /// file it never made.
@@ -152,6 +155,7 @@ impl Access {
         if whole.writer.is_none() {
             whole.writer = later.writer;
         }
+        whole.others |= later.others;
         *self = whole;
     }
 }
@@ -726,6 +730,9 @@ mod imp {
         /// calls the whole command has reported so far.
         caller: u32,
         now: u64,
+        /// Whether that thread runs another program than the command's
+        /// own.
+        others: bool,
     }
 
     /// The command line of the program a thread belongs to, for telling
@@ -910,12 +917,14 @@ mod imp {
                         appeared: false,
                         origin: None,
                         writer: None,
+                        others: false,
                         first: self.now,
                         made: 0,
                     },
                 );
             }
             let access = self.report.paths.get_mut(&path).unwrap();
+            access.others |= self.others;
             match how {
                 // What the command removed is no longer there to be read.
                 Use::Read | Use::Execute if access.removed => access.probed = true,
@@ -1254,6 +1263,11 @@ mod imp {
         /// Where watched programs send notes of what they are about to
         /// read. See `fast/shim.rs`.
         notes: Option<OwnedFd>,
+        /// The command's first process, which is the first to report.
+        leader: Option<u32>,
+        /// Whether each thread runs the program the leader runs, and when
+        /// that was last worked out.
+        program: HashMap<u32, (bool, u64)>,
     }
 
     /// The process a thread belongs to and that process's parent.
@@ -1327,9 +1341,11 @@ mod imp {
                 None if ids(process).is_some() => Some(self.scope_of(process)),
                 None => None,
             };
+            let others = !matches!(scope, Some(None)) || !self.own_program(process);
             let record = |tracker: &mut Tracker| {
                 tracker.caller = process;
                 tracker.now = now;
+                tracker.others = others;
                 tracker.report.noted += 1;
                 tracker.touch(path.clone(), how());
             };
@@ -1344,6 +1360,44 @@ mod imp {
                     record(&mut self.whole);
                     self.scopes.values_mut().for_each(record);
                 }
+            }
+        }
+
+        /// Whether a thread runs the program the command itself is: the
+        /// one its first process runs now. Cargo is that program in the
+        /// process a toolchain manager started it in, and again where one
+        /// of its own subcommands starts it for the build.
+        fn own_program(&mut self, tid: u32) -> bool {
+            let Some(leader) = self.leader else {
+                return false;
+            };
+            if tid == leader {
+                return true;
+            }
+            // As long as an answer about whose scope a thread is in.
+            if let Some((own, at)) = self.program.get(&tid)
+                && self.events - at < 200_000
+            {
+                return *own;
+            }
+            let program = |id: u32| {
+                let meta = fs::metadata(format!("/proc/{id}/exe")).ok()?;
+                Some((meta.dev(), meta.ino()))
+            };
+            let own = program(leader).is_some_and(|theirs| program(tid) == Some(theirs));
+            self.program.insert(tid, (own, self.events));
+            own
+        }
+
+        /// A thread is about to become another program, if the call
+        /// succeeds.
+        fn becomes_another(&mut self, tid: u32) {
+            match self.leader {
+                // Every answer was a comparison with the leader's program.
+                Some(leader) if ids(tid).is_none_or(|(process, _)| process == leader) => {
+                    self.program.clear()
+                }
+                _ => drop(self.program.remove(&tid)),
             }
         }
 
@@ -1426,17 +1480,24 @@ mod imp {
             let (data, tid) = (notif.data, notif.pid);
             let state = &mut *state;
             let now = state.events;
-            let tracker = match state.scope_of(tid) {
+            state.leader.get_or_insert(tid);
+            let scope = state.scope_of(tid);
+            let others = scope.is_some() || !state.own_program(tid);
+            let tracker = match scope {
                 Some(scope) => state.scopes.get_mut(&scope).unwrap(),
                 None => &mut state.whole,
             };
             tracker.now = now;
+            tracker.others = others;
             // Recording must never keep the command from continuing.
             let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tracker.handle(&data, tid)
             }));
             if recorded.is_err() {
                 tracker.incomplete("the observer failed");
+            }
+            if matches!(data.nr as u32, nr::EXECVE | nr::EXECVEAT) {
+                state.becomes_another(tid);
             }
         }
         let resp = Resp {
@@ -1466,6 +1527,7 @@ mod imp {
                     buffer: Vec::new(),
                     caller: 0,
                     now: 0,
+                    others: true,
                 },
             );
         }
@@ -1593,11 +1655,14 @@ mod imp {
                 buffer: Vec::new(),
                 caller: 0,
                 now: 0,
+                others: false,
             },
             scopes: HashMap::new(),
             owner: HashMap::new(),
             events: 0,
             notes: reading,
+            leader: None,
+            program: HashMap::new(),
         }));
         let noted = {
             let state = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1830,6 +1895,7 @@ mod tests {
             appeared: false,
             origin: None,
             writer: None,
+            others: false,
             first,
             made: 0,
         }

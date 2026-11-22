@@ -1281,6 +1281,60 @@ impl Parts {
 /// Turn what was observed into a cache entry. An error says why this run
 /// cannot be reused. `parts` holds the records of commands that ran inside
 /// this one under scopes of their own.
+/// The directories in which git keeps the repositories a command looked
+/// at: those named `.git`, those a file of that name leads to, as it does
+/// in a worktree, and the one a worktree shares with the others.
+fn git_directories(report: &Report) -> Vec<PathBuf> {
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut pointers = 0;
+    for (path, access) in &report.paths {
+        // The path as far as the name, whatever it leads to.
+        let mut own = PathBuf::new();
+        for part in path.components() {
+            own.push(part);
+            if part.as_os_str() == ".git" {
+                found.insert(own);
+                break;
+            }
+        }
+        let pointer = access.kind == Kind::File
+            && path.file_name() == Some(OsStr::new(".git"))
+            && fs::metadata(path).is_ok_and(|meta| meta.len() <= 4096);
+        if !pointer || pointers == 64 {
+            continue;
+        }
+        pointers += 1;
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(named) = text.strip_prefix("gitdir:") else {
+            continue;
+        };
+        let directory = path.parent().unwrap_or(path).join(named.trim());
+        let shared = fs::read_to_string(directory.join("commondir"))
+            .map(|common| directory.join(common.trim()));
+        for place in [Some(directory), shared.ok()].into_iter().flatten() {
+            // By the name a program was given and by where that leads.
+            found.extend(fs::canonicalize(&place));
+            found.insert(place);
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Whether `path` is inside a git repository's own directory, or asks
+/// whether there is one.
+fn of_git(path: &Path, repositories: &[PathBuf]) -> bool {
+    repositories.iter().any(|dir| path.starts_with(dir))
+}
+
+/// Whether `path` is a directory on the way to one of `places`.
+fn leads_to(path: &Path, places: &[PathBuf]) -> bool {
+    places
+        .iter()
+        .any(|place| place != path && place.starts_with(path))
+}
+
 pub fn record(
     job: &Job,
     store: &mut Store,
@@ -1344,10 +1398,44 @@ pub fn record(
     let mut listings: HashMap<Place, Vec<OsString>> = HashMap::new();
     let mut watched: BTreeSet<Vec<u8>> = BTreeSet::new();
     let siblings = job.scope == Scope::Unit && job.facts.compiles() && !job.facts.links;
+    let repositories = match job.scope {
+        Scope::Build => git_directories(report),
+        Scope::Unit => Vec::new(),
+    };
+    let homes: Vec<PathBuf> = [roots::WORK, roots::TARGET]
+        .iter()
+        .filter_map(|root| job.roots.path(*root).map(Path::to_owned))
+        .collect();
     let mut paths: Vec<_> = report.paths.iter().collect();
     paths.sort_by_key(|(path, _)| *path);
     for (path, access) in paths {
         if job.state(path) {
+            continue;
+        }
+        // Cargo asks git which files a package has, in order to compare
+        // their times with what it built. That is all it takes from a
+        // repository, whose own files differ from one checkout to the next
+        // and after every commit. What any other program read there is an
+        // input like anything else.
+        let examined = !(access.written || access.removed || access.executed);
+        // That a directory is there, and is no link to another, is all
+        // that a look at it says unless it was listed.
+        let passed = examined
+            && access.kind == Kind::Dir
+            && access.listing.is_none()
+            && access.link.is_none();
+        if job.scope == Scope::Build
+            && examined
+            && !access.others
+            && (of_git(path, &repositories) || (passed && leads_to(path, &repositories)))
+        {
+            continue;
+        }
+        // The directories a workspace or a target directory is inside were
+        // there for the command to be started in it. That they still are,
+        // where the command ran, says nothing about a workspace somewhere
+        // else, or about this one once those are gone.
+        if passed && leads_to(path, &homes) {
             continue;
         }
         // For a Rust library the compiler takes only metadata from other
@@ -1732,22 +1820,29 @@ pub fn record(
                     }
                 }
             }
-            let walks: Vec<Walk> = levels
+            // A search passes through every directory on its way up, so
+            // the places it looked in follow one another from the
+            // workspace. A name seen in the workspace and again far above
+            // it, as a directory `lib` is in `/lib`, was not searched for.
+            let walks: Vec<(Walk, usize)> = levels
                 .iter()
-                .filter(|(name, at)| at.len() + usize::from(inside.contains(*name)) > 1)
                 .filter_map(|(name, at)| {
-                    let last = *at.keys().next_back()?;
-                    Some(Walk {
+                    let last = (1..).take_while(|level| at.contains_key(level)).last()?;
+                    let places = last + usize::from(inside.contains(*name));
+                    (places > 1).then_some(())?;
+                    let walk = Walk {
                         name: name.to_path_buf(),
                         top: above.get(last - 1)?.to_path_buf(),
                         found: at
-                            .values()
+                            .range(1..=last)
+                            .map(|(_, input)| *input)
                             .filter(|input| {
                                 input.state != State::Absent && !around.named(&input.path)
                             })
                             .map(|input| input.path.clone())
                             .collect(),
-                    })
+                    };
+                    Some((walk, last))
                 })
                 .collect();
             // Anything else near the workspace may have been reached from
@@ -1755,10 +1850,11 @@ pub fn record(
             // own. It is recorded a second time by the way from the
             // workspace, and has to be as it was both ways.
             let walked = |path: &Path| {
-                walks.iter().any(|walk| {
+                walks.iter().any(|(walk, last)| {
                     walk.found.iter().any(|found| path.starts_with(found))
                         || above
                             .iter()
+                            .take(*last)
                             .any(|dir| path.strip_prefix(dir) == Ok(walk.name.as_path()))
                 })
             };
@@ -1777,6 +1873,7 @@ pub fn record(
                     }
                 })
                 .collect();
+            let walks = walks.into_iter().map(|(walk, _)| walk).collect();
             (walks, again)
         };
         manifest.walks = walks;
