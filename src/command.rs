@@ -24,7 +24,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v3";
+const EPOCH: &str = "jato command v4";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -323,6 +323,16 @@ impl Job {
         }
         arg.push(Path::new(WORK_ALIAS).join(rest));
         Some((at, arg))
+    }
+
+    /// Identifies the output directory as the compiler is given it.
+    fn out_dir_given(&self) -> Digest {
+        let given = match (self.aliased_out_dir(), self.facts.out_dir_at) {
+            (Some((_, arg)), _) => arg,
+            (None, Some(at)) => self.request.args[at].clone(),
+            (None, None) => OsString::new(),
+        };
+        *blake3::hash(given.as_bytes()).as_bytes()
     }
 
     /// The command line to run, which for a compilation names aliases for
@@ -1412,6 +1422,7 @@ pub fn record(
             Some(saved) if !saved.is_empty() => {
                 manifest.saved = saved;
                 manifest.saved_in = whereabouts(roots);
+                manifest.saved_for = job.out_dir_given();
                 store.count("state_saved", 1);
             }
             _ => staged.truncate(before),
@@ -1626,28 +1637,53 @@ pub fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) {
     let Some(directory) = &job.facts.incremental else {
         return;
     };
-    if job.scope != Scope::Unit || !saved_state_wanted() || has_saved_work(directory, job.name()) {
+    if job.scope != Scope::Unit || !saved_state_wanted() {
         return;
     }
     let Ok(candidates) = store.candidates(recipe) else {
         return;
     };
-    for candidate in &candidates {
-        let Ok(manifest) = Manifest::decode(&candidate.manifest) else {
-            continue;
-        };
+    let mut with_state: Vec<Manifest> = candidates
+        .iter()
+        .filter_map(|candidate| match Manifest::decode(&candidate.manifest) {
+            Ok(manifest) if manifest.key(recipe) == candidate.key => Some(manifest),
+            _ => None,
+        })
+        .filter(|manifest| !manifest.saved.is_empty())
+        .collect();
+    // State made for this output directory first: all of it is of use.
+    let here = job.out_dir_given();
+    with_state.sort_by_key(|manifest| manifest.saved_for != here);
+    for manifest in &with_state {
         let Some(first) = manifest.saved.first() else {
             continue;
         };
-        let session = job
-            .roots
-            .join(first.root, &first.path)
-            .and_then(|file| file.parent().map(Path::to_owned));
+        // One session directory, two levels into the directory rustc was
+        // told to keep its state in, holds every file.
+        let within = |file: &Output| {
+            job.roots
+                .join(file.root, &file.path)
+                .and_then(|path| path.parent().map(Path::to_owned))
+        };
         let Some(session) =
-            session.filter(|s| s.parent().and_then(Path::parent) == Some(directory))
+            within(first).filter(|s| s.parent().and_then(Path::parent) == Some(directory))
         else {
             continue;
         };
+        if manifest
+            .saved
+            .iter()
+            .any(|file| within(file).as_ref() != Some(&session))
+        {
+            continue;
+        }
+        // The compiler's own state for this crate is better than any other.
+        if session
+            .parent()
+            .is_some_and(|crate_dir| finished_session(crate_dir).is_some())
+        {
+            return;
+        }
         if !store.place_saved(&manifest.saved, &job.roots) {
             continue;
         }

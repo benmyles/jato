@@ -1092,8 +1092,8 @@ impl Store {
         }
         add(&tx, "bytes", charge as i64)?;
         // The compiler's saved state is as large as what it compiled, and
-        // only the latest is any use: earlier results of this command keep
-        // their outputs and give theirs up.
+        // only the latest for an output directory is any use: earlier
+        // results of this command keep their outputs and give theirs up.
         if !record.saved.is_empty() {
             let others: Vec<(i64, Vec<u8>)> = tx
                 .prepare_cached("SELECT id,manifest FROM entries WHERE recipe=?1 AND id<>?2")?
@@ -1103,7 +1103,7 @@ impl Store {
                 let Ok(mut earlier) = Manifest::decode(&stored) else {
                     continue;
                 };
-                if earlier.saved.is_empty() {
+                if earlier.saved.is_empty() || earlier.saved_for != record.saved_for {
                     continue;
                 }
                 let saved = std::mem::take(&mut earlier.saved);

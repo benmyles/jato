@@ -64,6 +64,10 @@ pub struct Manifest {
     /// Identifies the workspace and target directory the state was saved
     /// in, where the compiler accepts it as it is.
     pub saved_in: Digest,
+    /// Identifies the output directory as the compiler was given it. With
+    /// any other, the compiler takes its analysis from the state and
+    /// generates all code again.
+    pub saved_for: Digest,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -186,6 +190,7 @@ impl Manifest {
             w.number(file.size);
         }
         w.0.extend_from_slice(&self.saved_in);
+        w.0.extend_from_slice(&self.saved_for);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -265,6 +270,7 @@ impl Manifest {
             });
         }
         m.saved_in = r.digest()?;
+        m.saved_for = r.digest()?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -571,6 +577,7 @@ mod tests {
                 marked: false,
             }],
             saved_in: [6; 32],
+            saved_for: [8; 32],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();

@@ -233,7 +233,8 @@ def main():
                 if server:
                     subprocess.run([exe, *server[0]], env=env, cwd=project, check=True, capture_output=True)
                 try:
-                    one, two = private / "target-one", private / "target-two"
+                    # Where Cargo builds by default, and somewhere it has not been.
+                    one, two = project / "target", private / "target-two"
                     record = lambda name, sample: (samples[tool][name].append(sample), print(trial + 1, tool, name, sample, file=sys.stderr, flush=True))
                     record("cold", step("cold", project, one))
                     record("fresh", step("fresh", project, one))
