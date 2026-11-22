@@ -36,7 +36,7 @@ const HELP: &str = "\
 Jato — remembers Rust builds, so the same build is never done twice
 
 Usage
-  jato check|build|test|run|clippy [CARGO_ARGUMENTS...]
+  jato check|build|test|bench|run|clippy [CARGO_ARGUMENTS...]
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
   jato dev [ACTION] [ARGS...]       Use the fast development profile (default build)
   jato watch [OPTIONS]             Check on save, with changed packages first
@@ -378,7 +378,9 @@ fn run() -> Result<i32> {
             return say(concat!("jato ", env!("CARGO_PKG_VERSION"), "\n"));
         }
         Some("--help" | "-h" | "help") => return say(HELP),
-        Some("check" | "build" | "test" | "run" | "clippy") => return cargo(args, options),
+        Some("check" | "build" | "test" | "bench" | "run" | "clippy") => {
+            return cargo(args, options);
+        }
         Some("watch") => return watch::run(&args[1..], options),
         Some("cargo") => return cargo(&args[1..], options),
         // Started by this program to see a command's stragglers out.

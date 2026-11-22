@@ -744,6 +744,50 @@ fn tests_and_programs_start_from_a_recorded_build() {
     assert_eq!(text.matches("cannot find function").count(), 1, "{text}");
 }
 
+#[test]
+fn stopping_the_build_ahead_of_a_test_stops_the_command() {
+    use std::io::{BufRead, BufReader, Read};
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // A build that takes long enough to be interrupted.
+    write(
+        p.root.join("build.rs"),
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(8)); }",
+    );
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() {}\n#[test] fn never_reached() { println!(\"the test ran\"); }",
+    );
+    let mut child = p
+        .command()
+        .args(["test", "--", "--nocapture"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Cargo says so when it starts on the package with the build script.
+    let mut progress = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("Compiling app") {
+        line.clear();
+        assert_ne!(progress.read_line(&mut line).unwrap(), 0, "no build began");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    success(Command::new("kill").args(["-INT", &child.id().to_string()]));
+    let status = child.wait().unwrap();
+    let mut printed = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut printed)
+        .unwrap();
+    assert_eq!(status.code(), Some(130), "{printed}");
+    assert!(!printed.contains("the test ran"), "{printed}");
+}
+
 /// A procedural macro crate whose macros read things the compiler is never
 /// told about: a file, the names in a directory, and a variable.
 fn add_macros(root: &Path) {

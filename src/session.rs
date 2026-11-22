@@ -638,7 +638,14 @@ pub fn ready(cmd: Command, name: &str) {
             format_args!("the build ahead of the command failed: {e:#}"),
         );
     }
+    // Whoever stopped the build did not mean for the command to start.
+    if STOPPED.load(Ordering::Acquire) {
+        std::process::exit(130);
+    }
 }
+
+/// Set when this process was asked to stop while a build it supervises ran.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 /// How a build that was to be watched went.
 enum Supervised {
@@ -731,8 +738,9 @@ fn supervise(
     // Stopping this process alone would leave the compilers waiting for
     // answers to their system calls. Pass the signal on and wait.
     let pid = child.id() as i32;
-    let _ = ctrlc::set_handler(move || unsafe {
-        libc::kill(pid, libc::SIGTERM);
+    let _ = ctrlc::set_handler(move || {
+        STOPPED.store(true, Ordering::Release);
+        unsafe { libc::kill(pid, libc::SIGTERM) };
     });
     let out = child.stdout.take().unwrap();
     let copy_out = std::thread::spawn(move || {

@@ -115,6 +115,8 @@ def main():
     parser.add_argument("--jato", default="jato")
     parser.add_argument("--kache", default="kache")
     parser.add_argument("--sccache", default="sccache")
+    parser.add_argument("--no-rebuilds", nargs="+", choices=TOOLS, default=[], metavar="TOOL",
+                        help="leave out restore, new_target and copy for these contenders, for which each is a cold build again")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--edits", type=int, default=3)
     parser.add_argument("--jobs", type=int, help="Cargo jobs; default is Cargo's")
@@ -238,12 +240,13 @@ def main():
                     detail["store_extents"] = extents(store)
                     detail["target_bytes"] = tree_bytes(one)
                     detail["target_extents"] = extents(one)
-                    shutil.rmtree(one)
-                    record("restore", step("restore", project, one))
-                    record("new_target", step("new_target", project, two))
-                    copy.parent.mkdir()
-                    copy_project(copy)
-                    record("copy", step("copy", copy, copy / "target"))
+                    if tool not in options.no_rebuilds:
+                        shutil.rmtree(one)
+                        record("restore", step("restore", project, one))
+                        record("new_target", step("new_target", project, two))
+                        copy.parent.mkdir()
+                        copy_project(copy)
+                        record("copy", step("copy", copy, copy / "target"))
                     edited = project / options.edit
                     original = edited.read_bytes()
                     later = []
@@ -279,7 +282,8 @@ def main():
     width = max(len(t) for t in options.tools) + 2
     print("".ljust(12) + "".join(t.rjust(width) for t in options.tools), file=sys.stderr)
     for name in STEPS:
-        print(name.ljust(12) + "".join(f"{median[t][name]['seconds']:.2f}".rjust(width) for t in options.tools), file=sys.stderr)
+        cells = [f"{median[t][name]['seconds']:.2f}" if name in median[t] else "-" for t in options.tools]
+        print(name.ljust(12) + "".join(c.rjust(width) for c in cells), file=sys.stderr)
 
 
 if __name__ == "__main__":
