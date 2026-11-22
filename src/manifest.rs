@@ -68,6 +68,9 @@ pub struct Manifest {
     /// any other, the compiler takes its analysis from the state and
     /// generates all code again.
     pub saved_for: Digest,
+    /// When the state was saved, in seconds since 1970. Newer state takes
+    /// the place of older.
+    pub saved_at: u64,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -162,6 +165,11 @@ impl Manifest {
         let mut hash = blake3::Hasher::new_derive_key("jato command result v1");
         hash.update(recipe);
         hash.update(&self.conditions());
+        // Saved state depends on nothing. One lot is told from the next by
+        // when it was saved.
+        if !self.saved.is_empty() {
+            hash.update(&self.saved_at.to_le_bytes());
+        }
         *hash.finalize().as_bytes()
     }
 
@@ -191,6 +199,9 @@ impl Manifest {
         }
         w.0.extend_from_slice(&self.saved_in);
         w.0.extend_from_slice(&self.saved_for);
+        if !self.saved.is_empty() {
+            w.number(self.saved_at);
+        }
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -271,6 +282,9 @@ impl Manifest {
         }
         m.saved_in = r.digest()?;
         m.saved_for = r.digest()?;
+        if !m.saved.is_empty() {
+            m.saved_at = r.number()?;
+        }
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -578,6 +592,7 @@ mod tests {
             }],
             saved_in: [6; 32],
             saved_for: [8; 32],
+            saved_at: 1_795_000_000,
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
@@ -586,8 +601,10 @@ mod tests {
         assert_ne!(key, m.key(&[2; 32]));
         let mut other = m.clone();
         other.outputs.clear();
-        other.saved.clear();
         assert_eq!(other.key(&[1; 32]), key);
+        other.saved_at += 1;
+        assert_ne!(other.key(&[1; 32]), key);
+        other.saved.clear();
         other.inputs[0].state = State::Absent;
         assert_ne!(other.key(&[1; 32]), key);
         assert!(Manifest::decode(b"junk").is_err());

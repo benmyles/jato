@@ -881,6 +881,11 @@ impl Store {
     /// Drop a result whose objects turned out to be missing or damaged.
     pub fn forget(&mut self, key: &Digest) {
         self.count("damaged", 1);
+        self.retire(key);
+    }
+
+    /// Take a record out of the cache, with the files nothing else uses.
+    pub fn retire(&mut self, key: &Digest) {
         let dir = self.dir.clone();
         let _ = (|| -> Result<()> {
             let tx = self

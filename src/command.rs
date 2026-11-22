@@ -1482,6 +1482,9 @@ fn state_recipe(job: &Job, recipe: &Digest) -> Digest {
     *hash.finalize().as_bytes()
 }
 
+/// How long kept state stays before a newer lot may take its place.
+const KEEP_FOR: u64 = 3600;
+
 /// Says which of rustc's sessions a compilation that just ended left.
 pub enum Left<'a> {
     /// The compilation was watched: these are the names it used directly
@@ -1505,7 +1508,21 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
         return;
     };
     let kept = state_recipe(job, recipe);
-    if store.candidates(&kept).is_ok_and(|found| !found.is_empty()) {
+    // State is of most use next to the sources it was saved for, and those
+    // move on. What is kept is replaced once it has been there a while.
+    let lasts = env::var("JATO_KEEP_FOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(KEEP_FOR);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let earlier = store.candidates(&kept).unwrap_or_default();
+    let fresh = earlier.iter().any(|candidate| {
+        Manifest::decode(&candidate.manifest)
+            .is_ok_and(|m| m.key(&kept) == candidate.key && now.saturating_sub(m.saved_at) < lasts)
+    });
+    if fresh {
         return;
     }
     let kept = (|| {
@@ -1566,12 +1583,20 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
         }
         record.saved_in = whereabouts(&job.roots);
         record.saved_for = job.out_dir_given();
+        record.saved_at = now;
         let detail = encode_detail(0, b"", b"");
         record.detail = *blake3::hash(&detail).as_bytes();
-        store
+        let stored = store
             .commit(&kept, &record, &detail, 0, &mut staged)
             .ok()
-            .filter(|stored| *stored)
+            .filter(|stored| *stored)?;
+        // The new state is in. What it replaces goes, apart from the
+        // files the two have in common.
+        let new = record.key(&kept);
+        for candidate in earlier.iter().filter(|c| c.key != new) {
+            store.retire(&candidate.key);
+        }
+        Some(stored)
     })();
     if kept.is_some() {
         store.count("state_saved", 1);
@@ -1682,11 +1707,16 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
     let Ok(candidates) = store.candidates(&kept) else {
         return false;
     };
-    for candidate in &candidates {
-        let manifest = match Manifest::decode(&candidate.manifest) {
-            Ok(manifest) if manifest.key(&kept) == candidate.key => manifest,
-            _ => continue,
-        };
+    let mut lots: Vec<(&crate::cas::Candidate, Manifest)> = candidates
+        .iter()
+        .filter_map(|candidate| match Manifest::decode(&candidate.manifest) {
+            Ok(manifest) if manifest.key(&kept) == candidate.key => Some((candidate, manifest)),
+            _ => None,
+        })
+        .collect();
+    // The newest first: there is more than one only while one is replaced.
+    lots.sort_by_key(|(_, manifest)| std::cmp::Reverse(manifest.saved_at));
+    for (candidate, manifest) in &lots {
         let Some(first) = manifest.saved.first() else {
             continue;
         };

@@ -434,15 +434,18 @@ fn shown(line: &[u8]) -> (&[u8], Line) {
 fn replayed(recorded: &[u8], elapsed: f64, quiet: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(recorded.len());
     for line in recorded.split_inclusive(|b| *b == b'\n') {
-        match shown(line) {
-            (_, Line::Progress) => (),
-            (shown, Line::Finished) => {
+        let (shown, kind) = shown(line);
+        // Without what erased a progress bar that is not drawn this time.
+        let shown = shown.strip_prefix(b"\x1b[K").unwrap_or(shown);
+        match kind {
+            Line::Progress => (),
+            Line::Finished => {
                 if !quiet && let Some(at) = memchr::memmem::rfind(shown, b" in ") {
                     out.extend_from_slice(&shown[..at]);
                     out.extend_from_slice(format!(" in {elapsed:.2}s\n").as_bytes());
                 }
             }
-            (shown, Line::Other) => out.extend_from_slice(shown),
+            Line::Other => out.extend_from_slice(shown),
         }
     }
     out
@@ -800,7 +803,7 @@ mod tests {
     fn a_restored_build_reads_like_one_with_nothing_to_do() {
         let recorded = [
             "\x1b[1m\x1b[92m   Compiling\x1b[0m leaf v0.1.0 (/w/leaf)\n",
-            "warning: unused variable: `x`\n",
+            "    Building [>   ] 0/2: leaf\r\x1b[Kwarning: unused variable: `x`\n",
             " --> leaf/src/lib.rs:1:5\n",
             "\n",
             "warning: `leaf` (lib) generated 1 warning\n",

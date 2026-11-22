@@ -33,4 +33,4 @@ jobs:
           rustup toolchain install nightly-2026-11-14 --profile minimal
           JATO_TEST_MOLD="$RUNNER_TEMP/mold-3.0.0-x86_64-linux/bin/mold" \
             JATO_TEST_NIGHTLY="$(rustup which --toolchain nightly-2026-11-14 rustc)" \
-            cargo +stable test --locked --test cargo -- mold nightly
+            cargo +stable test --locked --test cargo -- mold nightly saved_state

@@ -60,6 +60,10 @@ Eight builds of ripgrep started at the same moment, each in its own copy with a 
 
 Without the limit eight builds ran 119 compilers on 15 processors and held three times the memory. With it they used 8 to 14% less processor time and finished sooner in both runs. kache's daemon limits compilers in the same way. Bare Cargo's first run happened to start on a much quieter machine than the others'. Memory is the sum of resident sizes, which counts pages shared between compilers once for each. [Samples](concurrent-ripgrep-0.12.json)
 
+## Checks on save
+
+`jato watch` on a workspace of two crates, seven saves each way, while the machine's load average was above 50. A save that breaks the code reached the compiler's error in a median 137 ms, and the save that repairs it reached a clean check of the workspace in 154 ms. Four further runs alternated the cache on and off (`JATO_DISABLE=1`) at a load of 56 to 58: 129 and 150 ms to the error with it on against 160 and 179 ms with it off, and 153 and 173 ms to the clean check against 259 and 338 ms, since the repair returns to a state that is already recorded. The idle watcher held 4.5 MiB. [Samples of the first run](feedback-0.12.json)
+
 ## What observation costs
 
 The same incremental compilation of `olo-system` (1.1 to 1.7 s unwatched) was run alternately with and without the observer. With the machine's load average at 22 the two were indistinguishable: 1.07 to 1.44 s unwatched, 1.00 to 1.69 s watched and recorded. With it between 35 and 50 the watched runs took 2.1 to 2.4 s: each of about 5,700 reported system calls waits for the observer to be given a processor. This is why a crate that is being edited is compiled unwatched, and why cold builds, which take minutes, show no cost.

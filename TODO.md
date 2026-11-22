@@ -15,7 +15,6 @@
 ## Open
 
 - [ ] Saved state is kept for one output directory, and a target directory outside the workspace has a different one in every place. Naming it through a descriptor held open for the compiler, `/proc/self/fd/N`, would read the same anywhere, if every program rustc starts kept the descriptor. An option to rustc that left real paths out of what it compares would make the adjustment of its state unnecessary; `-Zremap-cwd-prefix` does not, since it too records the real directory.
-- [ ] Kept state is never renewed while it is in the cache. As the sources move away from it, less of it is of use. Replace it when a compilation that was given it has finished and it is some days old.
 - [ ] rustc's incremental state doubles the size of a build made from scratch, in the target directory and in the cache. Leaving it out of such builds would need another source for the state handed on at the first edit: on Olo, compiling a crate without it was no cheaper than compiling it incrementally from nothing (116 to 127 against about 110 processor-seconds), so nothing is gained by leaving it out of first edits.
 - [ ] Reuse test results: a test program whose own file and everything it read are unchanged could report what it reported before. It needs a rule for the environment, which a program reads unseen, and for tests that depend on time or chance.
 - [ ] Evict by what a result costs to rebuild and how much room it takes, not only by when it was last used. A linked program is large and quick to make again; a library is the reverse.

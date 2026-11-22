@@ -916,6 +916,40 @@ fn the_compiler_s_saved_state_is_kept_for_other_checkouts() {
     assert_eq!(run(&p.root).unwrap(), "here\n");
     assert_eq!(p.count("state_given"), 4, "{}", p.stats());
 
+    // What is kept is replaced by newer state once it has been there a
+    // while, so that it follows the sources. The older lot goes.
+    let kept = p.stats()["entries"].as_u64().unwrap();
+    let third = p.temp.path().join("third/checkout");
+    populate(&third);
+    fs::copy(p.root.join("Cargo.lock"), third.join("Cargo.lock")).unwrap();
+    success(command(&third).args(["build"]));
+    edit_leaf(&third, "renewed");
+    let out = success(
+        command(&third)
+            .env("JATO_KEEP_FOR", "0")
+            .args(["run", "-q"]),
+    );
+    assert_eq!(out.stdout, b"renewed\n");
+    assert_eq!(p.count("state_given"), 6, "{}", p.stats());
+    assert_eq!(p.count("state_saved"), 4, "{}", p.stats());
+    // Two more results, for the two crates compiled, and no more state.
+    assert_eq!(
+        p.stats()["entries"].as_u64().unwrap(),
+        kept + 2,
+        "{}",
+        p.stats()
+    );
+    assert_eq!(p.count("damaged"), 0, "{}", p.stats());
+    // The next checkout is handed the newer lot.
+    let fourth = p.temp.path().join("fourth/checkout");
+    populate(&fourth);
+    fs::copy(p.root.join("Cargo.lock"), fourth.join("Cargo.lock")).unwrap();
+    success(command(&fourth).args(["build"]));
+    edit_leaf(&fourth, "after that");
+    assert_eq!(run(&fourth).unwrap(), "after that\n");
+    assert_eq!(p.count("state_given"), 8, "{}", p.stats());
+    assert_eq!(p.count("state_saved"), 4, "{}", p.stats());
+
     // Asked not to, Jato leaves rustc to start from nothing.
     p.clean();
     edit_leaf(&p.root, "from nothing");
@@ -925,7 +959,7 @@ fn the_compiler_s_saved_state_is_kept_for_other_checkouts() {
             .args(["run", "-q"]),
     );
     assert_eq!(out.stdout, b"from nothing\n");
-    assert_eq!(p.count("state_given"), 4, "{}", p.stats());
+    assert_eq!(p.count("state_given"), 8, "{}", p.stats());
 }
 
 #[test]
