@@ -969,6 +969,38 @@ mod imp {
         }
     }
 
+    /// Ask the scheduler to run this thread as soon as it has something to
+    /// do. Every reported call waits for it, and it needs the processor for
+    /// a few microseconds at a time, so on a busy machine queueing it behind
+    /// whole time slices of other work is what makes observation slow. A
+    /// short slice of its own puts it at the front. Kernels before 6.12
+    /// ignore the request.
+    fn answer_promptly() {
+        #[repr(C)]
+        struct Attr {
+            size: u32,
+            policy: u32,
+            flags: u64,
+            nice: i32,
+            priority: u32,
+            runtime: u64,
+            deadline: u64,
+            period: u64,
+        }
+        let attr = Attr {
+            size: std::mem::size_of::<Attr>() as u32,
+            policy: libc::SCHED_OTHER as u32,
+            flags: 0,
+            // Unchanged: asking for a better one would be refused.
+            nice: unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) },
+            priority: 0,
+            runtime: 100_000,
+            deadline: 0,
+            period: 0,
+        };
+        unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
+    }
+
     /// Answer one pending report. Returns false when there was none.
     fn serve_one(listener: RawFd, state: Option<&Mutex<State>>) -> bool {
         let mut notif = Notif::default();
@@ -1108,6 +1140,7 @@ mod imp {
                 drop(ours);
                 let mut flags = FD_SYNC_WAKE_UP;
                 unsafe { libc::ioctl(listener.as_raw_fd(), IOCTL_SET_FLAGS as _, &raw mut flags) };
+                answer_promptly();
                 let fd = listener.as_raw_fd();
                 loop {
                     let (ready, closed, woken) = readable(fd, wake_read.as_raw_fd(), true);

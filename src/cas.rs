@@ -43,6 +43,7 @@ CREATE INDEX outputs_by_object ON outputs(object);
 CREATE TABLE objects(
     digest BLOB PRIMARY KEY, size INTEGER NOT NULL, stored INTEGER NOT NULL, packed INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE ran(key BLOB PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE stamps(
     dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
     ctime INTEGER NOT NULL, digest BLOB NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY(dev, ino)
@@ -211,6 +212,7 @@ pub struct Store {
     learned: Vec<(Stamp, Digest)>,
     counts: BTreeMap<String, i64>,
     used: Vec<Digest>,
+    noted: Vec<Digest>,
 }
 
 /// Whether an error says the index file itself cannot be trusted.
@@ -467,6 +469,7 @@ impl Store {
             learned: Vec::new(),
             counts: BTreeMap::new(),
             used: Vec::new(),
+            noted: Vec::new(),
         })
     }
 
@@ -587,6 +590,17 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How long ago `key` was last noted, in seconds, and note it now.
+    pub fn since_noted(&mut self, key: &Digest) -> Option<u64> {
+        let at: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT at FROM ran WHERE key=?1")
+            .and_then(|mut s| s.query_row([key], |r| r.get(0)).optional())
+            .unwrap_or(None);
+        self.noted.push(*key);
+        at.map(|at| (now() - at).max(0) as u64 / 1_000_000)
     }
 
     /// Changes whenever another process commits to the index.
@@ -1045,12 +1059,17 @@ impl Store {
 
     /// Write what this process learned in one transaction.
     pub fn flush(&mut self) {
-        if self.learned.is_empty() && self.counts.is_empty() && self.used.is_empty() {
+        if self.learned.is_empty()
+            && self.counts.is_empty()
+            && self.used.is_empty()
+            && self.noted.is_empty()
+        {
             return;
         }
         let learned = std::mem::take(&mut self.learned);
         let counts = std::mem::take(&mut self.counts);
         let used = std::mem::take(&mut self.used);
+        let noted = std::mem::take(&mut self.noted);
         let _ = (|| -> Result<()> {
             let tx = self
                 .conn
@@ -1080,6 +1099,12 @@ impl Store {
                     params![time, key],
                 )?;
             }
+            for key in &noted {
+                tx.execute(
+                    "INSERT OR REPLACE INTO ran VALUES(?1,?2)",
+                    params![key, time],
+                )?;
+            }
             for (name, value) in &counts {
                 add(&tx, name, *value)?;
             }
@@ -1103,6 +1128,10 @@ impl Store {
         evict(&tx, &dir, limit, limit)?;
         tx.execute(
             "DELETE FROM stamps WHERE seen < ?1",
+            [now() - 45 * 86_400_000_000i64],
+        )?;
+        tx.execute(
+            "DELETE FROM ran WHERE at < ?1",
             [now() - 45 * 86_400_000_000i64],
         )?;
         let after: u64 = tx.query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;

@@ -90,6 +90,9 @@ impl Project {
             .env_remove("JATO_MAX_SIZE")
             .env_remove("JATO_KEY_ENV")
             .env_remove("JATO_OBSERVED")
+            // Tests edit and build within seconds and expect each result to
+            // be recorded. The test of editing spells says otherwise.
+            .env("JATO_EDIT_WINDOW", "0")
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("RUSTC_BOOTSTRAP")
@@ -539,6 +542,75 @@ fn a_recorded_build_gives_way_to_anything_that_changed() {
     let before = builds();
     success(p.command().env("JATO_WHOLE_BUILDS", "0").args(["build"]));
     assert_eq!(builds(), before);
+}
+
+#[test]
+fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    // As a person would have it: results of edits made minutes apart.
+    let spell = || {
+        let mut cmd = p.command();
+        cmd.env_remove("JATO_EDIT_WINDOW");
+        cmd
+    };
+    let run = |cmd: &mut Command| String::from_utf8(success(cmd.args(["run", "-q"])).stdout);
+    assert_eq!(run(&mut spell()).unwrap(), "one:none\n");
+    let stored = p.count("stored");
+    assert_eq!((stored, p.count("continued")), (2, 0), "{}", p.stats());
+
+    // Edits that follow at once are compiled by rustc from what it saved,
+    // unwatched, and leave nothing in the cache.
+    for text in ["two", "three"] {
+        write(p.root.join("leaf/src/text file"), text);
+        assert_eq!(run(&mut spell()).unwrap(), format!("{text}:none\n"));
+        success(spell().args(["build", "-q"]));
+    }
+    assert_eq!(p.count("stored"), stored, "{}", p.stats());
+    assert_eq!(p.count("continued"), 4, "{}", p.stats());
+
+    // The state before them is still known.
+    write(p.root.join("leaf/src/text file"), "one");
+    let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "one:none\n"));
+    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+    assert_eq!(p.count("continued"), 4, "{}", p.stats());
+
+    // After a pause the next compilation is recorded again, so that a
+    // checkout in long use still adds what it builds to the cache.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    write(p.root.join("leaf/src/text file"), "four");
+    let after_pause = run(spell().env("JATO_EDIT_WINDOW", "1")).unwrap();
+    assert_eq!(after_pause, "four:none\n");
+    assert_eq!(p.count("stored"), stored + 2, "{}", p.stats());
+    assert_eq!(p.count("continued"), 4, "{}", p.stats());
+    p.clean();
+    let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "four:none\n"));
+    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+}
+
+#[test]
+fn a_target_directory_filled_in_from_a_record_is_marked_as_cargo_marks_it() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    // The build is recorded in a target directory that another command
+    // had already made, so Cargo does not write its mark during the build.
+    p.run(&["check", "-q"]);
+    let tag = fs::read(p.root.join("target/CACHEDIR.TAG")).unwrap();
+    p.run(&["build", "-q"]);
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    let elsewhere = p.temp.path().join("other/target");
+    success(
+        p.command()
+            .env("CARGO_TARGET_DIR", &elsewhere)
+            .args(["build", "-q"]),
+    );
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(fs::read(elsewhere.join("CACHEDIR.TAG")).unwrap(), tag);
+    assert_eq!(p.stale_for_cargo(&p.root, &elsewhere), 0);
 }
 
 #[test]

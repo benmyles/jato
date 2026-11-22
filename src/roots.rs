@@ -75,12 +75,18 @@ fn target_above(hint: &Path) -> Option<&Path> {
 
 impl Roots {
     /// `hint` is any path inside the target directory, such as the
-    /// compiler's output directory.
-    pub fn detect(cwd: &Path, hint: Option<&Path>) -> Self {
+    /// compiler's output directory. `known` is the target directory if
+    /// something other than Cargo's mark says where it is; it counts only
+    /// when the hint is inside it.
+    pub fn detect(cwd: &Path, hint: Option<&Path>, known: Option<&Path>) -> Self {
         if std::env::var_os("JATO_RELOCATE").is_some_and(|v| v == "0") {
             return Self::default();
         }
-        let target = hint.and_then(target_above).and_then(Root::new);
+        let target = hint
+            .and_then(|hint| {
+                target_above(hint).or_else(|| known.filter(|known| hint.starts_with(known)))
+            })
+            .and_then(Root::new);
         // A workspace that is a whole filesystem or a home directory would
         // claim every path on the machine.
         let work = Root::new(cwd).filter(|_| cwd.components().count() > 2);
@@ -290,6 +296,38 @@ mod tests {
         assert_eq!(
             inside.split(Path::new("/t/debug/a")),
             (TARGET, Path::new("debug/a"))
+        );
+    }
+
+    #[test]
+    fn a_target_directory_is_known_by_its_mark_or_by_being_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (marked, bare) = (base.join("marked"), base.join("bare"));
+        for target in [&marked, &bare] {
+            std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        }
+        std::fs::write(marked.join("CACHEDIR.TAG"), "Signature: x").unwrap();
+        let found = |hint: &Path, known: Option<&Path>| {
+            Roots::detect(&base.join("ws"), Some(hint), known)
+                .path(TARGET)
+                .map(Path::to_owned)
+        };
+        assert_eq!(
+            found(&marked.join("debug/deps"), None),
+            Some(marked.clone())
+        );
+        assert_eq!(found(&bare.join("debug/deps"), None), None);
+        assert_eq!(
+            found(&bare.join("debug/deps"), Some(&bare)),
+            Some(bare.clone())
+        );
+        // Being told of a directory the command does not write to is no
+        // reason to treat it as this command's target directory.
+        assert_eq!(found(&bare.join("debug/deps"), Some(&marked)), None);
+        assert_eq!(
+            found(&marked.join("debug/deps"), Some(&bare)),
+            Some(marked.clone())
         );
     }
 

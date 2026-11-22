@@ -30,6 +30,8 @@ const EPOCH: &str = "jato command v1";
 const WORK_ALIAS: &str = "/proc/self/cwd";
 const TARGET_ALIAS: &str = "/proc/self/cwd/target";
 const CAPTURE_LIMIT: usize = 4 << 20;
+/// The file Cargo puts in a target directory it creates.
+const TARGET_TAG: &str = "CACHEDIR.TAG";
 
 pub fn exit_code(status: ExitStatus) -> i32 {
     status
@@ -157,8 +159,10 @@ pub struct Job {
 }
 
 impl Job {
-    /// A compiler command as Cargo runs it.
-    pub fn unit(request: Request) -> Self {
+    /// A compiler command as Cargo runs it. `target` is the target
+    /// directory when whoever started the build knows it; otherwise it is
+    /// found from the directory the command writes to.
+    pub fn unit(request: Request, target: Option<&Path>) -> Self {
         let mut facts = Facts::parse(&request.args, &request.cwd);
         if facts.name == "rustc"
             && let Some(name) = request.env.get(OsStr::new("CARGO_CRATE_NAME"))
@@ -169,7 +173,13 @@ impl Job {
             .hint
             .clone()
             .or_else(|| request.env.get(OsStr::new("OUT_DIR")).map(PathBuf::from));
-        let roots = Roots::detect(&request.cwd, hint.as_deref());
+        // A target directory named in the environment reaches the compiler
+        // with everything else in it.
+        let named = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
+            .iter()
+            .find_map(|name| request.env.get(OsStr::new(name)))
+            .map(|path| request.cwd.join(path));
+        let roots = Roots::detect(&request.cwd, hint.as_deref(), target.or(named.as_deref()));
         let remap = facts.compiles()
             && !facts.keeps_real_paths
             && cfg!(target_os = "linux")
@@ -939,6 +949,16 @@ pub fn record(
         if access.created || made.contains(&(root, rel.to_owned())) {
             continue;
         }
+        if job.scope == Scope::Build && root == roots::TARGET {
+            // Which directories a target directory already has is how far
+            // an earlier command got in laying it out. Cargo makes those it
+            // needs. And what it remembers of the compiler's answers it
+            // checks against the compiler before believing it.
+            let layout = access.kind == Kind::Dir && access.listing.is_none();
+            if layout || rel == Path::new(".rustc_info.json") {
+                continue;
+            }
+        }
         // Cargo decides whether a crate or a build script is up to date
         // partly from environment variables, which it reads unseen. The
         // files that say which ones are among those it opened.
@@ -1199,6 +1219,17 @@ pub fn record(
         manifest.removed.extend(parts.removed.iter().cloned());
     }
     if job.scope == Scope::Build {
+        // Cargo marks a target directory when it creates one, and this
+        // build may have found its own already made. A target directory
+        // filled in from this record has to carry the mark too: backup
+        // tools skip what has it, and it is how the directory is told from
+        // any other.
+        if let Some(tag) = roots.path(roots::TARGET).map(|t| t.join(TARGET_TAG))
+            && tag.is_file()
+            && !outputs.iter().any(|(_, _, path)| *path == tag)
+        {
+            outputs.push((roots::TARGET, PathBuf::from(TARGET_TAG), tag));
+        }
         for (root, rel, path) in &outputs {
             if *root == roots::TARGET
                 && matches!(
@@ -1362,6 +1393,34 @@ pub fn before_running(
     (lock, None)
 }
 
+/// How long after a compilation another of the same crate in the same
+/// target directory counts as part of the same spell of editing.
+const EDIT_WINDOW: u64 = 600;
+
+/// Whether this compilation is one of a run of edits: rustc compiles this
+/// crate incrementally, and did so here a short while ago. Such a
+/// compilation is quick because of the work rustc saved, another follows
+/// within minutes, and what it produces is replaced before anything else
+/// could use it. Watching it would cost a good part of the time it takes on
+/// a busy machine, and keeping its output would fill the cache with states
+/// nobody returns to. So it is looked up but neither watched nor recorded.
+/// The first compilation after a pause is recorded as usual, which is how
+/// a checkout that is built for months keeps contributing results.
+pub fn continues(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
+    let Some(saved) = &job.facts.incremental else {
+        return false;
+    };
+    let window = env::var("JATO_EDIT_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EDIT_WINDOW);
+    let mut hash = blake3::Hasher::new_derive_key("jato compiled here v1");
+    hash.update(recipe);
+    hash.update(saved.as_os_str().as_bytes());
+    let since = store.since_noted(hash.finalize().as_bytes());
+    since.is_some_and(|seconds| seconds < window) && saved.is_dir()
+}
+
 /// Record a command that has run, and say what became of it.
 pub fn finish(
     job: &Job,
@@ -1374,11 +1433,21 @@ pub fn finish(
     if !ran.success {
         return Err("it failed".into());
     }
+    let begun = Instant::now();
     let recorded = record(job, store, recipe, ran, report, parts);
     match &recorded {
-        Ok(_) => {
+        Ok(manifest) => {
             store.count(job.counter("stored"), 1);
-            log(job.name(), "stored");
+            log(
+                job.name(),
+                format_args!(
+                    "stored: ran {} ms, then {} inputs and {} outputs recorded in {} ms",
+                    ran.millis,
+                    manifest.inputs.len(),
+                    manifest.outputs.len(),
+                    begun.elapsed().as_millis()
+                ),
+            );
         }
         Err(why) => {
             store.count(job.counter("uncacheable"), 1);
@@ -1390,7 +1459,7 @@ pub fn finish(
 
 /// A compiler command that only this process is watching.
 fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
-    let job = Job::unit(Request::current(program, args)?);
+    let job = Job::unit(Request::current(program, args)?, None);
     let mut store = match Store::open() {
         Ok(store) => store,
         Err(e) => {
@@ -1419,6 +1488,17 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         (_, Some((outcome, _))) => return print(outcome),
         (lock, None) => lock,
     };
+    if continues(&job, &mut store, &recipe) {
+        log(
+            job.name(),
+            "one of a run of edits: left to rustc, unrecorded",
+        );
+        store.count("continued", 1);
+        drop(lock);
+        drop(store);
+        let argv = job.argv();
+        return passthrough(original(&argv[0], &argv[1..]));
+    }
     store.count(job.counter("miss"), 1);
     let (ran, report) = match run_piped(&job.argv(), Some((&job, &store))) {
         Ok(ran) => ran,
