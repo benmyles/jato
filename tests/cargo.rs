@@ -94,11 +94,33 @@ impl Project {
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("RUSTC_BOOTSTRAP")
             .env_remove("LEAF_ENV");
+        // To see why a test went as it did, name a file here.
+        if let Some(log) = std::env::var_os("JATO_TEST_LOG") {
+            cmd.env("JATO_LOG", log);
+        }
         cmd
     }
 
     fn run(&self, args: &[&str]) -> Output {
         success(self.command().args(args))
+    }
+
+    /// How many of the crates built in `root` Cargo itself would compile
+    /// again, asked without Jato.
+    fn stale_for_cargo(&self, root: &Path, target: &Path) -> usize {
+        let mut cmd = self.command_in(root);
+        let output = success(
+            cmd.env("JATO_DISABLE", "1")
+                .env("CARGO_TARGET_DIR", target)
+                .args(["cargo", "build", "--message-format=json"]),
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter(|message| message["fresh"] == false)
+            .count()
     }
     fn clean(&self) {
         self.run(&["cargo", "clean"]);
@@ -237,8 +259,16 @@ fn diagnostics_are_replayed_and_failures_are_never_reused() {
     let first = warnings(&p.run(&args));
     assert!(first.iter().any(|w| w.contains("unused_marker")));
     p.clean();
-    let (hits, _) = p.during(|| assert_eq!(warnings(&p.run(&args)), first));
+    assert_eq!(warnings(&p.run(&args)), first);
     if observes() {
+        // The whole check was recorded, so it is put back as one.
+        assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+        // And each crate is, when Cargo asks for them one at a time.
+        p.clean();
+        let (hits, _) = p.during(|| {
+            let out = success(p.command().env("JATO_WHOLE_BUILDS", "0").args(args));
+            assert_eq!(warnings(&out), first);
+        });
         assert!(hits >= 2, "{}", p.stats());
     }
 
@@ -373,6 +403,159 @@ fn a_path_cargo_must_escape_keeps_its_results_where_they_were_made() {
     }
     write(p.root.join("leaf/src/text file"), "two");
     assert_eq!(p.run(&["run", "-q"]).stdout, b"two:none\n");
+}
+
+#[test]
+fn a_build_recorded_once_is_filled_in_without_running_cargo() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { let unused_marker = 1; println!(\"{}\", leaf::value()); }",
+    );
+    let text = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+    let first = text(&p.run(&["build"]));
+    assert!(
+        first.contains("Compiling leaf") && first.contains("unused_marker"),
+        "{first}"
+    );
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    let original = fs::read(p.root.join("target/debug/app")).unwrap();
+
+    // Nothing changed: Cargo is not started, and what it would have said
+    // about a build with nothing to do is said for it.
+    let again = text(&p.run(&["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert!(!again.contains("Compiling"), "{again}");
+    assert!(
+        again.contains("unused_marker") && again.contains("Finished"),
+        "{again}"
+    );
+    assert!(again.contains("generated 1 warning"), "{again}");
+
+    // The whole target directory comes back, and Cargo finds nothing in
+    // it that it would build again.
+    p.clean();
+    let (hits, misses) = p.during(|| drop(p.run(&["build"])));
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_hit"), 2);
+    assert_eq!(fs::read(p.root.join("target/debug/app")).unwrap(), original);
+    assert_eq!(p.stale_for_cargo(&p.root, &p.root.join("target")), 0);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+
+    // Another target directory, and the same sources somewhere else.
+    let elsewhere = p.temp.path().join("other/target");
+    let before = p.count("build_hit");
+    success(
+        p.command()
+            .env("CARGO_TARGET_DIR", &elsewhere)
+            .args(["build"]),
+    );
+    assert_eq!(p.count("build_hit"), before + 1, "{}", p.stats());
+    assert_eq!(p.stale_for_cargo(&p.root, &elsewhere), 0);
+    let copy = p.temp.path().join("second/checkout");
+    populate(&copy);
+    fs::copy(p.root.join("src/main.rs"), copy.join("src/main.rs")).unwrap();
+    fs::copy(p.root.join("Cargo.lock"), copy.join("Cargo.lock")).unwrap();
+    success(p.command_in(&copy).args(["build"]));
+    assert_eq!(p.count("build_hit"), before + 2, "{}", p.stats());
+    assert_eq!(p.count("build_miss"), 1, "{}", p.stats());
+    assert_eq!(fs::read(copy.join("target/debug/app")).unwrap(), original);
+    assert_eq!(p.stale_for_cargo(&copy, &copy.join("target")), 0);
+    assert_eq!(
+        success(p.command_in(&copy).args(["run", "-q"])).stdout,
+        b"one:none\n"
+    );
+}
+
+#[test]
+fn a_recorded_build_gives_way_to_anything_that_changed() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    p.run(&["build"]);
+    let builds = || (p.count("build_hit"), p.count("build_miss"));
+    assert_eq!(builds(), (0, 1));
+    p.run(&["build"]);
+    assert_eq!(builds(), (1, 1));
+
+    // An edit, and its undoing.
+    write(p.root.join("leaf/src/text file"), "two");
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"two:none\n");
+    p.run(&["build"]);
+    write(p.root.join("leaf/src/text file"), "one");
+    p.run(&["build"]);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+
+    // A variable the code reads at compile time.
+    let before = builds();
+    success(p.command().env("LEAF_ENV", "set").args(["build"]));
+    assert_eq!(builds().1, before.1 + 1, "{}", p.stats());
+    assert_eq!(
+        success(p.command().env("LEAF_ENV", "set").args(["run", "-q"])).stdout,
+        b"one:set\n"
+    );
+    // One it does not read.
+    let before = builds();
+    p.run(&["build"]);
+    success(p.command().env("UNRELATED", "x").args(["build"]));
+    assert_eq!(builds(), (before.0 + 2, before.1), "{}", p.stats());
+
+    // A manifest.
+    let manifest = fs::read_to_string(p.root.join("leaf/Cargo.toml")).unwrap();
+    write(
+        p.root.join("leaf/Cargo.toml"),
+        &format!("{manifest}\n[features]\nextra=[]\n"),
+    );
+    let before = builds();
+    p.run(&["build"]);
+    assert_eq!(builds().1, before.1 + 1, "{}", p.stats());
+
+    // A file that makes the build fail must fail it, and a failed build
+    // is not something to restore. Cargo itself does not look for this
+    // file, so the target is cleared to make it run the compiler.
+    write(p.root.join("leaf/src/value/mod.rs"), "pub fn value() {}");
+    p.clean();
+    for _ in 0..2 {
+        let fail = p.command().arg("build").output().unwrap();
+        assert!(!fail.status.success());
+        assert!(String::from_utf8_lossy(&fail.stderr).contains("E0761"));
+    }
+    fs::remove_dir_all(p.root.join("leaf/src/value")).unwrap();
+    p.run(&["build"]);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+
+    // Without whole builds, every command goes to Cargo.
+    let before = builds();
+    success(p.command().env("JATO_WHOLE_BUILDS", "0").args(["build"]));
+    assert_eq!(builds(), before);
+}
+
+#[test]
+fn tests_and_programs_start_from_a_recorded_build() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        "mod value; pub use value::value;\n#[test] fn works() { assert_eq!(value(), \"one:none\"); }",
+    );
+    let passed = |out: &Output| String::from_utf8_lossy(&out.stdout).contains("1 passed");
+    p.run(&["test", "-p", "leaf", "--no-run"]);
+    p.run(&["build"]);
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    p.clean();
+    // Nothing is compiled or fetched one command at a time: the build the
+    // test needs is put back whole, and Cargo then runs the tests.
+    let (hits, misses) = p.during(|| assert!(passed(&p.run(&["test", "-p", "leaf"]))));
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    let (hits, misses) = p.during(|| assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n"));
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
 }
 
 /// A procedural macro crate whose macros read things the compiler is never
@@ -1033,68 +1216,6 @@ fn a_program_found_earlier_on_path_is_noticed() {
     p.clean();
     let (hits, misses) = p.during(|| assert_eq!(build(Some(&shim)).stdout, b"one:none\n"));
     assert_eq!((hits, misses), (1, 1), "{}", p.stats());
-}
-
-#[test]
-fn kept_cargo_state_delivers_to_new_targets_and_rechecks_edits() {
-    let p = Project::new();
-    let a = p.temp.path().join("delivery a");
-    let b = p.temp.path().join("delivery b");
-    let command = |target: &Path| {
-        let mut cmd = p.command();
-        cmd.env("CARGO_TARGET_DIR", target).arg("--keep-build");
-        cmd
-    };
-    let metadata = |cmd: &mut Command| -> Value {
-        serde_json::from_slice(
-            &success(cmd.args(["cargo", "metadata", "--format-version=1", "--no-deps"])).stdout,
-        )
-        .unwrap()
-    };
-    let layout = metadata(&mut command(&a));
-    let Some(build) = layout["build_directory"].as_str().map(Path::new) else {
-        // Cargo before 1.91 uses its ordinary target layout.
-        assert_eq!(
-            success(command(&a).args(["run", "-q"])).stdout,
-            b"one:none\n"
-        );
-        return;
-    };
-    assert!(build.starts_with(p.temp.path().join("cargo/jato-build")));
-    assert_eq!(
-        metadata(&mut command(&b))["build_directory"],
-        layout["build_directory"]
-    );
-    let explicit = p.temp.path().join("explicit state");
-    assert_eq!(
-        metadata(command(&a).env("CARGO_BUILD_BUILD_DIR", &explicit))["build_directory"],
-        explicit.to_str().unwrap()
-    );
-    let other = Project::new();
-    let other_layout = metadata(command(&a).current_dir(&other.root));
-    assert_ne!(other_layout["build_directory"], layout["build_directory"]);
-    let build_at = |dir: &Path| {
-        let output = success(command(dir).args(["build", "--message-format=json"]));
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|message| message["reason"] == "compiler-artifact")
-            .map(|message| message["fresh"].as_bool().unwrap())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(build_at(&a), [false, false]);
-    let original = fs::read(a.join("debug/app")).unwrap();
-    fs::remove_dir_all(&a).unwrap();
-    assert_eq!(build_at(&b), [true, true]);
-    assert_eq!(fs::read(b.join("debug/app")).unwrap(), original);
-    write(p.root.join("leaf/src/text file"), "two");
-    assert_eq!(
-        success(command(&a).args(["run", "-q"])).stdout,
-        b"two:none\n"
-    );
-    success(command(&a).args(["cargo", "clean"]));
-    assert_eq!(build_at(&b), [false, false]);
 }
 
 #[test]

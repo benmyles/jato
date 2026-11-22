@@ -8,7 +8,8 @@ use crate::cas::Store;
 use crate::observe::{Kind, Stamp, kind_of, listing_digest};
 use crate::roots::Roots;
 use crate::scan::Digest;
-use anyhow::{Context as _, Result, bail, ensure};
+use crate::wire::{Reader, Writer};
+use anyhow::{Result, bail, ensure};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -71,89 +72,6 @@ pub struct Output {
 }
 
 const MAX_MANIFEST: usize = 64 << 20;
-
-struct Writer(Vec<u8>);
-
-impl Writer {
-    fn number(&mut self, mut value: u64) {
-        loop {
-            let byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value == 0 {
-                return self.0.push(byte);
-            }
-            self.0.push(byte | 0x80);
-        }
-    }
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.number(bytes.len() as u64);
-        self.0.extend_from_slice(bytes);
-    }
-    fn path(&mut self, root: u8, path: &Path) {
-        self.0.push(root);
-        self.bytes(path.as_os_str().as_bytes());
-    }
-    fn optional(&mut self, bytes: Option<&[u8]>) {
-        match bytes {
-            Some(bytes) => {
-                self.0.push(1);
-                self.bytes(bytes)
-            }
-            None => self.0.push(0),
-        }
-    }
-}
-
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn byte(&mut self) -> Result<u8> {
-        let (first, rest) = self.0.split_first().context("truncated manifest")?;
-        self.0 = rest;
-        Ok(*first)
-    }
-    fn number(&mut self) -> Result<u64> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.byte()?;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        bail!("malformed manifest number")
-    }
-    fn count(&mut self) -> Result<usize> {
-        let n = self.number()? as usize;
-        // Every item takes at least a byte.
-        ensure!(n <= self.0.len(), "malformed manifest count");
-        Ok(n)
-    }
-    fn bytes(&mut self) -> Result<&'a [u8]> {
-        let len = self.number()? as usize;
-        ensure!(len <= self.0.len(), "truncated manifest");
-        let (bytes, rest) = self.0.split_at(len);
-        self.0 = rest;
-        Ok(bytes)
-    }
-    fn path(&mut self) -> Result<(u8, PathBuf)> {
-        let root = self.byte()?;
-        ensure!(root <= crate::roots::TARGET, "unknown manifest root");
-        Ok((root, PathBuf::from(OsStr::from_bytes(self.bytes()?))))
-    }
-    fn optional(&mut self) -> Result<Option<&'a [u8]>> {
-        Ok(match self.byte()? {
-            0 => None,
-            _ => Some(self.bytes()?),
-        })
-    }
-    fn digest(&mut self) -> Result<Digest> {
-        ensure!(self.0.len() >= 32, "truncated manifest");
-        let (digest, rest) = self.0.split_at(32);
-        self.0 = rest;
-        Ok(digest.try_into().unwrap())
-    }
-}
 
 impl Manifest {
     /// Put the lists in the one order that identifies their contents.
@@ -335,10 +253,13 @@ pub fn which(name: &OsStr, dirs: &[PathBuf]) -> Option<PathBuf> {
     })
 }
 
-pub fn path_dirs(cwd: &Path) -> Vec<PathBuf> {
-    std::env::var_os("PATH")
+/// A command's environment.
+pub type Env = std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>;
+
+pub fn path_dirs(cwd: &Path, env: &Env) -> Vec<PathBuf> {
+    env.get(OsStr::new("PATH"))
         .map(|path| {
-            std::env::split_paths(&path)
+            std::env::split_paths(path)
                 .map(|dir| cwd.join(dir))
                 .collect()
         })
@@ -348,6 +269,7 @@ pub fn path_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// The situation a manifest is checked against.
 pub struct Here<'a> {
     pub roots: &'a Roots,
+    pub env: &'a Env,
     pub path: &'a [PathBuf],
     pub width: Option<u16>,
     pub ansi: bool,
@@ -365,9 +287,16 @@ struct Seen {
 }
 
 impl<'a> Here<'a> {
-    pub fn new(roots: &'a Roots, path: &'a [PathBuf], width: Option<u16>, ansi: bool) -> Self {
+    pub fn new(
+        roots: &'a Roots,
+        env: &'a Env,
+        path: &'a [PathBuf],
+        width: Option<u16>,
+        ansi: bool,
+    ) -> Self {
         Self {
             roots,
+            env,
             path,
             width,
             ansi,
@@ -460,8 +389,7 @@ impl Manifest {
         }
         for (name, recorded) in &self.env {
             let name = OsStr::from_bytes(name);
-            let current = std::env::var_os(name);
-            let current = current.as_ref().map(|v| here.roots.mark_os(v));
+            let current = here.env.get(name).map(|v| here.roots.mark_os(v));
             if current.as_deref() != recorded.as_deref() {
                 return Err(format!(
                     "the environment variable {} changed",

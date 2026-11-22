@@ -1,12 +1,27 @@
 mod cas;
 mod command;
 mod dev;
-mod keep;
+mod facts;
 mod manifest;
 mod observe;
 mod roots;
 mod scan;
+#[cfg(target_os = "linux")]
+mod session;
+#[cfg(not(target_os = "linux"))]
+mod session {
+    //! Whole builds are only recorded where commands can be observed.
+    use anyhow::Result;
+    use std::ffi::{OsStr, OsString};
+    pub fn ask(_: &OsStr, _: &OsStr, _: &[OsString]) -> Result<Option<i32>> {
+        Ok(None)
+    }
+    pub fn build(cmd: std::process::Command, _: &str) -> Result<i32> {
+        crate::command::passthrough(cmd)
+    }
+}
 mod watch;
+mod wire;
 
 use anyhow::{Context, Result, bail};
 use cas::{Store, cache_dir, parse_size};
@@ -26,7 +41,6 @@ Usage
   jato stats [--json]              Show cache contents and counters
   jato limit [SIZE|--unset]         Read or set this cache directory's budget
   jato gc [SIZE]                   Evict least-recently-used results to SIZE
-  jato --keep-build build [...]    Retain Cargo intermediates when changing target directories
   jato --version
 
 Examples
@@ -62,7 +76,6 @@ fn main() {
 #[derive(Clone, Copy, Default)]
 struct CargoOptions {
     dev: bool,
-    keep_build: bool,
 }
 
 fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
@@ -73,13 +86,52 @@ fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
         cmd.args(args);
     }
     cmd.env("RUSTC_WRAPPER", env::current_exe()?);
-    if options.keep_build {
-        keep::configure(&mut cmd);
-    }
     if env::var_os("JATO_CACHE_DIR").is_some() {
         cmd.env("JATO_CACHE_DIR", cache_dir()?);
     }
     Ok(cmd)
+}
+
+/// The Cargo subcommand among `args`, and where it stands.
+fn subcommand(args: &[OsString]) -> Option<(usize, &str)> {
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut i = 0;
+    while i < end {
+        match args[i].to_str() {
+            Some("--config" | "--color" | "-Z" | "-C" | "--explain") => i += 1,
+            Some(word) if word.starts_with('-') || word.starts_with('+') => (),
+            Some(word) => return Some((i, word)),
+            None => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Run Cargo with Jato as its compiler wrapper. A command that only builds
+/// is looked up as a whole first, and recorded as a whole if it runs. One
+/// that goes on to run what it built has its build filled in when that is
+/// known, and is otherwise left to Cargo.
+fn cargo(args: &[OsString], options: CargoOptions) -> Result<i32> {
+    let cmd = cargo_command(args, options)?;
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let flag = |name: &str| args[..end].iter().any(|a| a == name);
+    match subcommand(args) {
+        Some((_, "build" | "b" | "check" | "c" | "clippy")) => session::build(cmd, "cargo"),
+        Some((_, "test" | "t" | "bench")) if flag("--no-run") => session::build(cmd, "cargo"),
+        Some((at, verb @ ("test" | "t" | "bench" | "run" | "r"))) => {
+            // What this command builds before it runs anything.
+            let mut build: Vec<OsString> = args[..end].to_vec();
+            if matches!(verb, "run" | "r") {
+                build[at] = "build".into();
+            } else {
+                build.insert(at + 1, "--no-run".into());
+            }
+            session::restore(&cargo_command(&build, options)?, "cargo");
+            command::passthrough(cmd)
+        }
+        _ => command::passthrough(cmd),
+    }
 }
 
 fn mib(bytes: u64) -> String {
@@ -92,7 +144,6 @@ fn run() -> Result<i32> {
     let mut args = &args[..];
     while let Some(flag) = args.first() {
         match flag.to_str() {
-            Some("--keep-build") => options.keep_build = true,
             Some("dev") => options.dev = true,
             _ => break,
         }
@@ -113,18 +164,16 @@ fn run() -> Result<i32> {
         {
             let mut build = vec![OsString::from("build")];
             build.extend_from_slice(args);
-            return command::passthrough(cargo_command(&build, options)?);
+            return cargo(&build, options);
         }
     }
     let first = args.first().map(OsString::as_os_str);
     match first.and_then(OsStr::to_str) {
         Some("--version" | "-V") => println!("jato {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h" | "help") => print!("{HELP}"),
-        Some("check" | "build" | "test" | "run" | "clippy") => {
-            return command::passthrough(cargo_command(args, options)?);
-        }
+        Some("check" | "build" | "test" | "run" | "clippy") => return cargo(args, options),
         Some("watch") => return watch::run(&args[1..], options),
-        Some("cargo") => return command::passthrough(cargo_command(&args[1..], options)?),
+        Some("cargo") => return cargo(&args[1..], options),
         // Started by this program to see a command's stragglers out.
         Some("__answer") if args.len() == 2 => {
             let fd = args[1].to_str().and_then(|s| s.parse().ok());

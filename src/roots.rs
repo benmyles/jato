@@ -46,7 +46,7 @@ fn plain(path: &Path) -> bool {
 }
 
 impl Root {
-    fn new(path: &Path) -> Option<Self> {
+    pub fn new(path: &Path) -> Option<Self> {
         if !plain(path) {
             return None;
         }

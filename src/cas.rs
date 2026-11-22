@@ -274,6 +274,111 @@ fn object_path(dir: &Path, digest: &Digest, packed: bool) -> PathBuf {
     path
 }
 
+/// One output to put in place.
+struct Work<'a> {
+    output: &'a crate::manifest::Output,
+    dest: &'a PathBuf,
+    source: File,
+    packed: bool,
+}
+
+struct How<'a> {
+    verify: bool,
+    clone: bool,
+    roots: &'a Roots,
+}
+
+/// Write one output to a staging file beside its destination. Returns the
+/// staging file if one was created, and Some(true) if it holds the output,
+/// Some(false) if the object is not what it should be, None if this
+/// command lacks a root the output names.
+fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>>) {
+    let Work {
+        output,
+        dest,
+        mut source,
+        packed,
+    } = work;
+    let Some(file_name) = dest.file_name() else {
+        return (None, Err(anyhow::anyhow!("output without a file name")));
+    };
+    let mut name = file_name.to_owned();
+    name.push(format!(".jato-{}", std::process::id()));
+    let staging = dest.with_file_name(name);
+    let open = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(output.mode & 0o777)
+            .open(path)
+    };
+    let mut out = match open(&staging) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let made = fs::create_dir_all(staging.parent().unwrap()).and_then(|()| open(&staging));
+            match made {
+                Ok(f) => f,
+                Err(e) => return (None, Err(e.into())),
+            }
+        }
+        Err(e) => return (None, Err(e.into())),
+    };
+    let written = (|| -> Result<Option<bool>> {
+        if output.marked {
+            ensure!(output.size <= TEXT_LIMIT * 4, "oversized text object");
+            let mut text = Vec::with_capacity(output.size as usize);
+            source.read_to_end(&mut text)?;
+            if blake3::hash(&text).as_bytes() != &output.digest {
+                return Ok(Some(false));
+            }
+            let Some(text) = how.roots.unmark(&text) else {
+                return Ok(None);
+            };
+            out.write_all(&text)?;
+        } else if packed {
+            let mut hasher = blake3::Hasher::new();
+            let mut decoder = zstd::stream::read::Decoder::new(&mut source)?;
+            let mut buffer = vec![0u8; 256 * 1024];
+            let mut written = 0u64;
+            loop {
+                let n = decoder.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+                out.write_all(&buffer[..n])?;
+                written += n as u64;
+            }
+            if written != output.size || hasher.finalize().as_bytes() != &output.digest {
+                return Ok(Some(false));
+            }
+        } else {
+            // An object's length is part of its identity.
+            if source.metadata()?.len() != output.size {
+                return Ok(Some(false));
+            }
+            if !how.clone || clone_file(&source, &out).is_err() {
+                let copied = io::copy(&mut source, &mut out)?;
+                ensure!(copied == output.size, "short copy of a cached object");
+            }
+            if how.verify {
+                use std::io::Seek;
+                out.rewind()?;
+                let (digest, length, _) = scan::digest_open(&mut out, &[])?;
+                if length != output.size || digest != output.digest {
+                    return Ok(Some(false));
+                }
+            }
+        }
+        // The umask applied at creation. Outputs keep their mode.
+        out.set_permissions(fs::Permissions::from_mode(output.mode & 0o777))?;
+        Ok(Some(true))
+    })();
+    (Some(staging), written)
+}
+
 impl Store {
     pub fn open() -> Result<Self> {
         let env_limit = env::var("JATO_MAX_SIZE")
@@ -497,11 +602,17 @@ impl Store {
     /// command printed. None if an object is gone or damaged, or the result
     /// names a root this command lacks; nothing is left behind in that case
     /// and `damaged` says whether the result should be forgotten.
+    ///
+    /// With `tree`, files that already hold the right bytes are left alone,
+    /// the others are written on several threads, and if any were written
+    /// all are given one modification time, so that Cargo finds none of
+    /// them newer than another.
     pub fn restore(
         &mut self,
         candidate: &Candidate,
         manifest: &Manifest,
         roots: &Roots,
+        tree: bool,
         damaged: &mut bool,
     ) -> Result<Option<Restored>> {
         let mut dests = Vec::with_capacity(manifest.outputs.len());
@@ -511,19 +622,31 @@ impl Store {
                 None => return Ok(None),
             }
         }
+        let mut todo = Vec::with_capacity(dests.len());
+        for (i, (output, dest)) in manifest.outputs.iter().zip(&dests).enumerate() {
+            if !tree || !self.holds(output, dest, roots) {
+                todo.push(i);
+            }
+        }
         // Open every object before writing anything, so a result evicted
         // meanwhile leaves the target untouched.
-        let mut sources = Vec::with_capacity(dests.len());
-        for output in &manifest.outputs {
-            let plain = File::open(object_path(&self.dir, &output.digest, false));
+        let mut sources = Vec::with_capacity(todo.len());
+        for &i in &todo {
+            let digest = &manifest.outputs[i].digest;
+            let plain = File::open(object_path(&self.dir, digest, false));
             let found = match plain {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    File::open(object_path(&self.dir, &output.digest, true)).map(|f| (f, true))
+                    File::open(object_path(&self.dir, digest, true)).map(|f| (f, true))
                 }
                 other => other.map(|f| (f, false)),
             };
             match found {
-                Ok(source) => sources.push(source),
+                Ok((source, packed)) => sources.push(Work {
+                    output: &manifest.outputs[i],
+                    dest: &dests[i],
+                    source,
+                    packed,
+                }),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     *damaged = true;
                     return Ok(None);
@@ -543,115 +666,114 @@ impl Store {
             *damaged = true;
             return Ok(None);
         }
-        let (verify, clone) = (self.verify, self.clone);
-        let mut bytes = 0;
-        let mut staged: Vec<PathBuf> = Vec::with_capacity(dests.len());
-        // Ok(Some(false)): the stored bytes are not what the result names.
-        let result = (|| -> Result<Option<bool>> {
-            for ((output, dest), (mut source, packed)) in
-                manifest.outputs.iter().zip(&dests).zip(sources)
-            {
-                let mut name = dest
-                    .file_name()
-                    .context("output without a file name")?
-                    .to_owned();
-                name.push(format!(".jato-{}", std::process::id()));
-                let staging = dest.with_file_name(name);
-                let open = |path: &Path| {
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(output.mode & 0o777)
-                        .open(path)
-                };
-                let mut out = match open(&staging) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        fs::create_dir_all(staging.parent().unwrap())?;
-                        open(&staging)?
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                staged.push(staging);
-                if output.marked {
-                    ensure!(output.size <= TEXT_LIMIT * 4, "oversized text object");
-                    let mut text = Vec::with_capacity(output.size as usize);
-                    source.read_to_end(&mut text)?;
-                    if blake3::hash(&text).as_bytes() != &output.digest {
-                        return Ok(Some(false));
-                    }
-                    let Some(text) = roots.unmark(&text) else {
-                        return Ok(None);
-                    };
-                    out.write_all(&text)?;
-                } else if packed {
-                    let mut hasher = blake3::Hasher::new();
-                    let mut decoder = zstd::stream::read::Decoder::new(&mut source)?;
-                    let mut buffer = vec![0u8; 256 * 1024];
-                    let mut written = 0u64;
-                    loop {
-                        let n = decoder.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
-                        }
-                        hasher.update(&buffer[..n]);
-                        out.write_all(&buffer[..n])?;
-                        written += n as u64;
-                    }
-                    if written != output.size || hasher.finalize().as_bytes() != &output.digest {
-                        return Ok(Some(false));
-                    }
-                } else {
-                    // An object's length is part of its identity.
-                    if source.metadata()?.len() != output.size {
-                        return Ok(Some(false));
-                    }
-                    if !clone || clone_file(&source, &out).is_err() {
-                        let copied = io::copy(&mut source, &mut out)?;
-                        ensure!(copied == output.size, "short copy of a cached object");
-                    }
-                    if verify {
-                        use std::io::Seek;
-                        out.rewind()?;
-                        let (digest, length, _) = scan::digest_open(&mut out, &[])?;
-                        if length != output.size || digest != output.digest {
-                            return Ok(Some(false));
-                        }
-                    }
+        let how = How {
+            verify: self.verify,
+            clone: self.clone,
+            roots,
+        };
+        let bytes: u64 = sources.iter().map(|w| w.output.size).sum();
+        // Each piece of work leaves a staged file beside its destination.
+        let threads = if tree {
+            8.min(sources.len() / 16 + 1)
+        } else {
+            1
+        };
+        let mut lanes: Vec<Vec<Work<'_>>> = (0..threads).map(|_| Vec::new()).collect();
+        for (i, work) in sources.into_iter().enumerate() {
+            lanes[i % threads].push(work);
+        }
+        // A lane's staged files with where each belongs, and how it went.
+        type Lane<'a> = (Vec<(PathBuf, &'a PathBuf)>, Result<Option<bool>>);
+        fn run<'a>(lane: Vec<Work<'a>>, how: &How<'_>) -> Lane<'a> {
+            let mut staged = Vec::with_capacity(lane.len());
+            for work in lane {
+                let dest = work.dest;
+                let (staging, placed) = place(work, how);
+                staged.extend(staging.map(|s| (s, dest)));
+                if !matches!(placed, Ok(Some(true))) {
+                    return (staged, placed);
                 }
-                // The umask applied at creation. Outputs keep their mode.
-                out.set_permissions(fs::Permissions::from_mode(output.mode & 0o777))?;
-                bytes += output.size;
             }
-            Ok(Some(true))
-        })();
-        if !matches!(result, Ok(Some(true))) {
-            for staging in &staged {
+            (staged, Ok(Some(true)))
+        }
+        let results: Vec<Lane<'_>> = if threads == 1 {
+            lanes.into_iter().map(|lane| run(lane, &how)).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = lanes
+                    .into_iter()
+                    .map(|lane| scope.spawn(|| run(lane, &how)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            (Vec::new(), Err(anyhow::anyhow!("a restore failed")))
+                        })
+                    })
+                    .collect()
+            })
+        };
+        let mut staged: Vec<(PathBuf, &PathBuf)> = Vec::new();
+        let mut verdict = Ok(Some(true));
+        for (files, result) in results {
+            staged.extend(files);
+            if !matches!(result, Ok(Some(true))) {
+                verdict = result;
+            }
+        }
+        if !matches!(verdict, Ok(Some(true))) {
+            for (staging, _) in &staged {
                 let _ = fs::remove_file(staging);
             }
-            *damaged |= matches!(result, Ok(Some(false)));
-            return result.map(|_| None);
+            *damaged |= matches!(verdict, Ok(Some(false)));
+            return verdict.map(|_| None);
         }
         let mut done = 0;
-        let renamed: io::Result<()> = staged.iter().zip(&dests).try_for_each(|(staging, dest)| {
+        let renamed: io::Result<()> = staged.iter().try_for_each(|(staging, dest)| {
             fs::rename(staging, dest)?;
             done += 1;
             Ok(())
         });
         if let Err(e) = renamed {
-            for staging in &staged[done..] {
+            for (staging, _) in &staged[done..] {
                 let _ = fs::remove_file(staging);
             }
             return Err(e.into());
         }
-        for (output, dest) in manifest.outputs.iter().zip(&dests) {
-            // Later commands read this file. They need not hash it again.
-            if !output.marked
-                && let Ok(meta) = fs::metadata(dest)
-            {
-                self.remember(Stamp::of(&meta), output.digest);
+        if tree && !todo.is_empty() {
+            // Now, to the microsecond: no source file can be newer.
+            let stamp = now();
+            let times = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: (stamp / 1_000_000) as _,
+                    tv_nsec: ((stamp % 1_000_000) * 1000) as _,
+                },
+            ];
+            for dest in &dests {
+                if let Ok(name) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+                    unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) };
+                }
+            }
+        }
+        if !todo.is_empty() {
+            let touched: Box<dyn Iterator<Item = usize>> = if tree {
+                Box::new(0..dests.len())
+            } else {
+                Box::new(todo.iter().copied())
+            };
+            for i in touched {
+                // Later commands read this file. They need not hash it again.
+                let output = &manifest.outputs[i];
+                if !output.marked
+                    && let Ok(meta) = fs::metadata(&dests[i])
+                {
+                    self.remember(Stamp::of(&meta), output.digest);
+                }
             }
         }
         // Which results were used lately decides what is evicted. An hour
@@ -664,6 +786,27 @@ impl Store {
             cost_ms,
             bytes,
         }))
+    }
+
+    /// Whether the file at `dest` already is this output.
+    fn holds(&mut self, output: &crate::manifest::Output, dest: &Path, roots: &Roots) -> bool {
+        let Ok(meta) = fs::symlink_metadata(dest) else {
+            return false;
+        };
+        if !meta.is_file() || meta.permissions().mode() & 0o777 != output.mode & 0o777 {
+            return false;
+        }
+        if output.marked {
+            // Text is stored with marks for the roots. Compare it that way.
+            return meta.len() <= TEXT_LIMIT * 4
+                && fs::read(dest).is_ok_and(|text| {
+                    blake3::hash(&roots.mark(&text)).as_bytes() == &output.digest
+                });
+        }
+        meta.len() == output.size
+            && self
+                .digest_known(dest, Stamp::of(&meta))
+                .is_ok_and(|digest| digest == output.digest)
     }
 
     /// Drop a result whose objects turned out to be missing or damaged.
@@ -734,10 +877,14 @@ impl Store {
                 } else {
                     (&bytes[..]).into()
                 };
-                let mut out = create()?;
-                out.write_all(&stored)?;
-                out.set_permissions(fs::Permissions::from_mode(0o444))?;
                 staged.digest = *blake3::hash(&stored).as_bytes();
+                if object_path(&self.dir, &staged.digest, false).is_file() {
+                    staged.temp = None;
+                } else {
+                    let mut out = create()?;
+                    out.write_all(&stored)?;
+                    out.set_permissions(fs::Permissions::from_mode(0o444))?;
+                }
                 staged.size = stored.len() as u64;
                 staged.stored = stored.len() as u64;
                 staged.marked = text;
@@ -808,12 +955,13 @@ impl Store {
     pub fn commit(
         &mut self,
         recipe: &Digest,
-        key: &Digest,
-        manifest: &[u8],
+        record: &Manifest,
         detail: &[u8],
         cost_ms: u64,
         staged: &mut [Staged],
     ) -> Result<bool> {
+        let key = record.key(recipe);
+        let manifest = record.encode()?;
         let limit = self.budget()?;
         let total: u64 = staged.iter().map(|s| s.stored).sum();
         if total + (manifest.len() + detail.len()) as u64 > limit / 2 {
@@ -843,17 +991,22 @@ impl Store {
                 .prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE digest=?1)")?
                 .query_row([&output.digest], |r| r.get(0))?;
             if !known {
-                let temp = output.temp.take().context("output staged twice")?;
                 let path = object_path(&dir, &output.digest, output.packed);
-                let moved = fs::create_dir(path.parent().unwrap())
-                    .or_else(|e| match e.kind() {
-                        io::ErrorKind::AlreadyExists => Ok(()),
-                        _ => Err(e),
-                    })
-                    .and_then(|()| fs::rename(&temp, &path));
-                if let Err(e) = moved {
-                    let _ = fs::remove_file(&temp);
-                    return Err(e.into());
+                match output.temp.take() {
+                    Some(temp) => {
+                        let moved = fs::create_dir(path.parent().unwrap())
+                            .or_else(|e| match e.kind() {
+                                io::ErrorKind::AlreadyExists => Ok(()),
+                                _ => Err(e),
+                            })
+                            .and_then(|()| fs::rename(&temp, &path));
+                        if let Err(e) = moved {
+                            let _ = fs::remove_file(&temp);
+                            return Err(e.into());
+                        }
+                    }
+                    // The file was found in place when the output was read.
+                    None => ensure!(path.is_file(), "a stored output went away"),
                 }
                 tx.execute(
                     "INSERT INTO objects VALUES(?1,?2,?3,?4)",
@@ -861,6 +1014,14 @@ impl Store {
                 )?;
                 charge += output.stored;
             }
+        }
+        // Outputs that were already stored by another result are shared
+        // with it, and must still be there.
+        for output in &record.outputs {
+            let known: bool = tx
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE digest=?1)")?
+                .query_row([&output.digest], |r| r.get(0))?;
+            ensure!(known, "an output was evicted while it was being recorded");
             tx.prepare_cached("INSERT OR IGNORE INTO outputs VALUES(?1,?2)")?
                 .execute(params![entry, output.digest])?;
         }

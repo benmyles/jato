@@ -17,6 +17,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Identity of a file's contents as far as the kernel can tell without
@@ -76,7 +77,7 @@ pub struct Access {
     pub probed: bool,
     /// Names in the directory when it was first enumerated, except those the
     /// command had created itself.
-    pub listing: Option<Digest>,
+    pub listing: Option<Vec<OsString>>,
     pub executed: bool,
     /// Created, truncated, renamed into place or opened for writing.
     pub written: bool,
@@ -86,6 +87,9 @@ pub struct Access {
     /// Opened for writing while it still held earlier contents.
     pub updated: bool,
     pub removed: bool,
+    /// Nothing was there at first, and later something was that the
+    /// command read without having written it.
+    pub appeared: bool,
     /// Where those earlier contents were when the command started, if the
     /// command moved them here.
     pub origin: Option<PathBuf>,
@@ -625,6 +629,7 @@ mod imp {
                         created: false,
                         updated: false,
                         removed: false,
+                        appeared: false,
                         origin: None,
                     },
                 );
@@ -635,10 +640,7 @@ mod imp {
                 Use::Read | Use::Execute if access.removed => access.probed = true,
                 Use::Read | Use::Execute if access.kind == Kind::Absent && !access.written => {
                     access.probed = true;
-                    if fs::symlink_metadata(&path).is_ok() {
-                        let why = format!("{} appeared while the command ran", path.display());
-                        self.incomplete(&why);
-                    }
+                    access.appeared |= fs::symlink_metadata(&path).is_ok();
                 }
                 Use::Read if !access.created => access.read = true,
                 Use::Probe if !access.created => access.probed = true,
@@ -669,7 +671,7 @@ mod imp {
             }
         }
 
-        fn snapshot(&mut self, dir: &Path) -> Option<Digest> {
+        fn snapshot(&mut self, dir: &Path) -> Option<Vec<OsString>> {
             let mut names = Vec::new();
             for entry in fs::read_dir(dir).ok()? {
                 let name = entry.ok()?.file_name();
@@ -683,7 +685,7 @@ mod imp {
                 }
                 names.push(name);
             }
-            Some(listing_digest(names))
+            Some(names)
         }
 
         fn at(&mut self, tid: u32, dirfd: i32, name: u64, how: Use) {
@@ -723,7 +725,6 @@ mod imp {
         }
 
         fn handle(&mut self, data: &Data, tid: u32) {
-            self.report.events += 1;
             let a = &data.args;
             let call = data.nr as u32;
             if data.arch != nr::ARCH || (cfg!(target_arch = "x86_64") && call >= 0x4000_0000) {
@@ -914,17 +915,83 @@ mod imp {
         )
     }
 
+    /// Everything recorded for one observed command: what the command and
+    /// its children did, and separately what happened beneath each process
+    /// that asked for a record of its own.
+    struct State {
+        whole: Tracker,
+        scopes: HashMap<u32, Tracker>,
+        /// The scope each thread's reports belong to, and when that was
+        /// last worked out.
+        owner: HashMap<u32, (Option<u32>, u64)>,
+        events: u64,
+    }
+
+    /// The process a thread belongs to and that process's parent.
+    fn ids(tid: u32) -> Option<(u32, u32)> {
+        let status = fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        };
+        Some((field("Tgid:")?, field("PPid:")?))
+    }
+
+    impl State {
+        /// The scope whose root process is an ancestor of this thread.
+        fn scope_of(&mut self, tid: u32) -> Option<u32> {
+            if self.scopes.is_empty() {
+                return None;
+            }
+            // A thread id is not given out again until the whole range has
+            // been used, so an answer stays right for a while. It is looked
+            // up again long before the range could wrap.
+            if let Some((scope, at)) = self.owner.get(&tid)
+                && self.events - at < 200_000
+            {
+                return *scope;
+            }
+            let mut found = None;
+            if let Some((process, mut parent)) = ids(tid) {
+                // A scope's root reports for itself, not for the scope.
+                if !self.scopes.contains_key(&process) {
+                    for _ in 0..64 {
+                        if self.scopes.contains_key(&parent) {
+                            found = Some(parent);
+                            break;
+                        }
+                        match ids(parent) {
+                            Some((_, next)) if parent > 1 => parent = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            self.owner.insert(tid, (found, self.events));
+            found
+        }
+    }
+
     /// Answer one pending report. Returns false when there was none.
-    fn serve_one(listener: RawFd, tracker: Option<&mut Tracker>) -> bool {
+    fn serve_one(listener: RawFd, state: Option<&Mutex<State>>) -> bool {
         let mut notif = Notif::default();
         if unsafe { libc::ioctl(listener, IOCTL_RECV as _, &raw mut notif) } != 0 {
             return false;
         }
-        if let Some(tracker) = tracker {
+        if let Some(state) = state {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.events += 1;
+            let (data, tid) = (notif.data, notif.pid);
+            let state = &mut *state;
+            let tracker = match state.scope_of(tid) {
+                Some(scope) => state.scopes.get_mut(&scope).unwrap(),
+                None => &mut state.whole,
+            };
             // Recording must never keep the command from continuing.
-            let (data, pid) = (notif.data, notif.pid);
             let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tracker.handle(&data, pid)
+                tracker.handle(&data, tid)
             }));
             if recorded.is_err() {
                 tracker.incomplete("the observer failed");
@@ -940,9 +1007,40 @@ mod imp {
         true
     }
 
+    /// Hands out records for parts of an observed command.
+    #[derive(Clone)]
+    pub struct Scopes(Arc<Mutex<State>>);
+
+    impl Scopes {
+        /// From now on, record what the descendants of `root` do apart
+        /// from the rest of the command.
+        pub fn begin(&self, root: u32, config: Config) {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.scopes.insert(
+                root,
+                Tracker {
+                    report: Report::default(),
+                    config,
+                    buffer: Vec::new(),
+                },
+            );
+        }
+
+        /// The record for `root`'s descendants, which have all exited.
+        pub fn end(&self, root: u32) -> Option<Report> {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let tracker = state.scopes.remove(&root)?;
+            state.owner.retain(|_, (scope, _)| *scope != Some(root));
+            let mut report = tracker.report;
+            report.events = state.events;
+            Some(report)
+        }
+    }
+
     pub struct Session {
-        thread: JoinHandle<(Report, Option<OwnedFd>)>,
+        thread: JoinHandle<Option<OwnedFd>>,
         wake: OwnedFd,
+        state: Arc<Mutex<State>>,
     }
 
     fn pair(kind: libc::c_int) -> io::Result<(OwnedFd, OwnedFd)> {
@@ -986,19 +1084,30 @@ mod imp {
         // The command's own exec is reported, and the spawn below waits for
         // that exec, so the listener has to be served from another thread
         // before the spawn returns.
+        let state = Arc::new(Mutex::new(State {
+            whole: Tracker {
+                report: Report::default(),
+                config,
+                buffer: Vec::new(),
+            },
+            scopes: HashMap::new(),
+            owner: HashMap::new(),
+            events: 0,
+        }));
+        let shared = state.clone();
         let thread = std::thread::Builder::new()
             .name("jato-observer".into())
             .spawn(move || {
-                let mut tracker = Tracker {
-                    report: Report::default(),
-                    config,
-                    buffer: Vec::new(),
+                let state = &*shared;
+                let fail = |why: String| {
+                    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.whole.report.incomplete.get_or_insert(why);
                 };
                 let listener = match receive_listener(&ours) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        tracker.report.incomplete = Some(format!("no observer: {e}"));
-                        return (tracker.report, None);
+                        fail(format!("no observer: {e}"));
+                        return None;
                     }
                 };
                 drop(ours);
@@ -1008,19 +1117,18 @@ mod imp {
                 loop {
                     let (ready, closed, woken) = readable(fd, wake_read.as_raw_fd(), true);
                     if ready {
-                        serve_one(fd, Some(&mut tracker));
+                        serve_one(fd, Some(state));
                     } else if closed {
-                        return (tracker.report, None);
+                        return None;
                     } else if woken {
                         // The command exited. Record what was already asked
                         // and leave any surviving program to a helper.
                         loop {
                             let (ready, closed, _) = readable(fd, wake_read.as_raw_fd(), false);
-                            if ready && serve_one(fd, Some(&mut tracker)) {
+                            if ready && serve_one(fd, Some(state)) {
                                 continue;
                             }
-                            tracker.report.survivors = !closed;
-                            return (tracker.report, (!closed).then_some(listener));
+                            return (!closed).then_some(listener);
                         }
                     }
                 }
@@ -1028,7 +1136,14 @@ mod imp {
         let spawned = cmd.spawn();
         drop(theirs);
         match spawned {
-            Ok(child) => Ok((child, Session { thread, wake })),
+            Ok(child) => Ok((
+                child,
+                Session {
+                    thread,
+                    wake,
+                    state,
+                },
+            )),
             Err(e) => {
                 let _ = thread.join();
                 Err(e)
@@ -1037,20 +1152,29 @@ mod imp {
     }
 
     impl Session {
-        /// Call after the command has exited.
+        pub fn scopes(&self) -> Scopes {
+            Scopes(self.state.clone())
+        }
+
+        /// Call after the command has exited. Returns what was recorded
+        /// outside every scope.
         pub fn finish(self) -> Report {
             let _ = unsafe { libc::write(self.wake.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-            let (report, survivors) = self.thread.join().unwrap_or_else(|_| {
-                (
-                    Report {
-                        incomplete: Some("the observer failed".into()),
-                        ..Report::default()
-                    },
-                    None,
-                )
-            });
-            if let Some(listener) = survivors {
-                keep_answering(listener);
+            let survivors = self.thread.join();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut report = std::mem::take(&mut state.whole.report);
+            report.events = state.events;
+            match survivors {
+                Ok(Some(listener)) => {
+                    report.survivors = true;
+                    keep_answering(listener);
+                }
+                Ok(None) => (),
+                Err(_) => {
+                    report
+                        .incomplete
+                        .get_or_insert_with(|| "the observer failed".into());
+                }
             }
             report
         }
@@ -1129,7 +1253,18 @@ mod imp {
 mod imp {
     use super::*;
     pub struct Session;
+    #[derive(Clone)]
+    pub struct Scopes;
+    impl Scopes {
+        pub fn begin(&self, _: u32, _: Config) {}
+        pub fn end(&self, _: u32) -> Option<Report> {
+            None
+        }
+    }
     impl Session {
+        pub fn scopes(&self) -> Scopes {
+            Scopes
+        }
         pub fn finish(self) -> Report {
             Report::default()
         }
@@ -1145,4 +1280,4 @@ mod imp {
     }
 }
 
-pub use imp::{answer, available, spawn};
+pub use imp::{Scopes, Session, answer, available, spawn};
