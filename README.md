@@ -14,7 +14,18 @@ On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measu
 | Later edits | 8.0 | 7.8 | 9.9 |
 | The edits undone | 0.12 | 6.3 | 9.0 |
 
-A build from nothing takes what it takes with bare Cargo: 769 processor-seconds against 763. On ripgrep, a small project, the restores took 0.07 to 0.34 s with Jato, 0.38 to 0.70 s with kache and 5 to 8 s with sccache, and a build from nothing 5 to 8% more processor time than bare Cargo's. [All measurements, with conditions and reproduction commands](bench/README.md)
+Checking all 121 packages of that workspace, with the 1,100 C, C++ and assembly files its build scripts compile, at a load of 29 to 41:
+
+| Seconds | Jato | kache |
+| --- | ---: | ---: |
+| The same check again | 0.67 | 1.14 |
+| Target directory removed | 1.30 | 13.6 |
+| A target directory never used | 1.04 | 25.6 |
+| The sources copied to another path | 2.22 | 13.1 |
+| A function added to `olo-system` in that copy | 9.7 | 16.5 |
+| The edits undone | 0.36 | 10.3 |
+
+A build from nothing takes the processor time it takes with bare Cargo: 769 processor-seconds against 763. On a machine whose processors are all in use it takes longer on the clock, because every compiler is watched: the cold check of the whole workspace took 508 s against kache's 547 s when the machine was moderately busy and 1,490 s against 642 s when it was very busy, for the same processor time. On ripgrep, a small project, the restores took 0.07 to 0.34 s with Jato, 0.38 to 0.70 s with kache and 5 to 8 s with sccache, and a build from nothing 5 to 8% more processor time than bare Cargo's. [All measurements, with conditions and reproduction commands](bench/README.md)
 
 ## Get started
 

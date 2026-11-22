@@ -1,4 +1,6 @@
-# Jato 0.12 measurements
+# Jato measurements
+
+The whole Olo workspace was measured with Jato 0.13.0, everything else with 0.12.0.
 
 Benchmarks ran on an Intel Core Ultra 7 356H (16 logical processors, 15 available to the session, 62 GiB) with Fedora 45, Linux 7.3.4 and Btrfs with zstd compression. The machine was shared with other people's builds throughout: its load average is given with each set of numbers, and wall-clock times moved with it. Comparisons within one table were taken in one sitting, rotating the order of contenders where there was more than one run.
 
@@ -25,6 +27,30 @@ The cold builds used 769, 758 and 763 processor-seconds: watching every compiler
 In Jato's restores Cargo does not start; kache answers 279 compiler invocations one after another, and for a target directory it has not seen it fills in what it can before Cargo looks. The first edit in a checkout where nothing has been compiled used 53 processor-seconds with Jato, which handed rustc the state it had saved in the first checkout, and 125 with kache, where rustc compiled the crate from nothing. In the restored target the same took 21 against 47 processor-seconds; Cargo's own target, built in place, still had rustc's state and took 19. Before Jato handed saved state on, both of these edits cost it 108 to 127 processor-seconds.
 
 After the cold build Jato's store held 1,212 MiB: the build's outputs (616 MiB) and the state rustc saved for the workspace's 15 crates. 12 MiB of that was not shared with the target directory it was cloned from. kache's store held 625 MiB with 11 MiB of its own; kache builds without incremental state. The target directory was 1,209 MiB under Jato and bare Cargo and 646 MiB under kache. A target Jato restores takes 1.3 MiB of its own until something in it is compiled. kache's daemon held 21 MiB of memory between builds; Jato has no daemon. [Samples, processor time and disk accounting](olo-0.12.json)
+
+## The whole Olo workspace
+
+`cargo check --workspace` at Olo commit `97c9f58e4`: 121 packages, 1,502 Rust compilations, and 113 build scripts that between them compile about 1,100 C, C++ and assembly files. Each contender handled C its own way: kache as `kache cc` in `CC`, `CXX`, `HOST_CC` and `HOST_CXX`, as its setup leaves them, and Jato through the names it puts on `PATH`. One run with Jato 0.13.0, kache first; the load average was 29 to 41 at the start of each step and rose past 65 during Jato's cold check.
+
+| Seconds, processor-seconds | Jato 0.13.0 | | kache 2.3.0 | |
+| --- | ---: | ---: | ---: | ---: |
+| Nothing stored, nothing built | 1,489.86 | 2,613 | 642.31 | 2,439 |
+| The same check again | 0.67 | 0.5 | 1.14 | 1.0 |
+| Target directory removed | 1.30 | 2.1 | 13.59 | 53 |
+| A target directory never used | 1.04 | 2.1 | 25.58 | 119 |
+| The sources copied to another path | 2.22 | 2.2 | 13.11 | 66 |
+| A function added to `olo-system` in that copy | 9.74 | 31 | 16.47 | 90 |
+| A function added in the restored target | 7.07 | 27 | 13.14 | 32 |
+| Further such edits, median of three | 5.10 | 22 | 35.72 | 60 |
+| The edits undone | 0.36 | 0.3 | 10.32 | 31 |
+
+Putting a build back is one command's result for Jato and 2,600 for kache, of which the C compilations and the build scripts that start them are most of the processor time. Before Jato remembered C, the copied checkout was the worst case it had: every Rust compilation was restored, the whole build was not, because two C object files with debugging information named the first checkout, and Cargo ran all 113 build scripts, which compiled everything again. That took 929 s and 630 processor-seconds at a load of 40 to 70, 545 of them in C compilers and assemblers.
+
+The check from nothing is where Jato pays for watching. The processor time is the same as kache's within what two runs differ by: 2,449 against 2,609 in a run the day's first, with Jato first, and 2,613 against 2,439 in this one. The time on the clock follows the machine: 508 s against kache's 547 s in the first run, where the load average was 18 when Jato started, and 1,490 s against 642 s here. With every processor in use, each file a watched compiler asks about costs it a turn at the processor. The checklist describes watching from inside the compiler's own process, which would end that.
+
+In the first run compilations in a built target were still watched whatever the load, and the edits went the other way: 18.14 s for the first edit after the restore against kache's 7.01 s, and 8.98 s against 5.18 s for the later ones, for the same processor time. `olo-system` has 54 dependents in the workspace, and a check of each is one short compilation. They are now left unwatched while the load average is at or above the number of processors, which gave the numbers above. kache's times for the same steps moved between the runs by more than that. [Samples and disk accounting](olo-workspace-0.13.json) · [the first run](olo-workspace-0.13-watched.json)
+
+After the cold check Jato's store held 3,099 MiB and kache's 1,609 MiB, the target directories 3,069 and 1,600 MiB: rustc's incremental state again, which kache builds without. kache's daemon held 62 to 82 MiB between builds.
 
 ## ripgrep
 
@@ -79,9 +105,12 @@ RUSTUP_TOOLCHAIN=stable python3 bench/compare.py --offline --project /path/to/ri
 python3 bench/compare.py --offline --project /path/to/olo --package olo-system \
     --edit crates/system/src/lib.rs --verify "nm-fake --help" \
     --tools cargo jato kache --no-rebuilds cargo --runs 1
+python3 bench/compare.py --offline --project /path/to/olo --command check --c-compilers own \
+    --edit crates/system/src/lib.rs --tools jato kache --runs 1 --cache-gib 40 \
+    --cargo-args --workspace
 RUSTUP_TOOLCHAIN=stable python3 bench/concurrent.py --offline --project /path/to/ripgrep-14.1.1 \
     --verify "rg --version" --builds 8 --tools cargo jato jato-unlimited kache
 python3 bench/feedback.py --jato /path/to/jato
 ```
 
-`compare.py` takes each contender through a cold build, the same build again, the target directory removed, a new target directory, a copy of the sources at another path, edits to one file and their undoing. `jato` is Jato run as `jato build`; `jato-wrapper` is Jato named as `RUSTC_WRAPPER` under plain Cargo, which reuses single compilations only. `concurrent.py` starts several builds at once that share nothing, to show how they share the machine. `feedback.py` measures a save to the compiler's diagnostic under `jato watch`.
+`compare.py` takes each contender through a cold build, the same build again, the target directory removed, a new target directory, a copy of the sources at another path, edits to one file and their undoing. By default build scripts are given the C compilers by their paths and no contender caches C; `--c-compilers own` gives kache and sccache their wrappers and leaves Jato the names it puts on `PATH`. `jato` is Jato run as `jato build`; `jato-wrapper` is Jato named as `RUSTC_WRAPPER` under plain Cargo, which reuses single compilations only. `concurrent.py` starts several builds at once that share nothing, to show how they share the machine. `feedback.py` measures a save to the compiler's diagnostic under `jato watch`.
