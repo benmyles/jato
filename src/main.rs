@@ -69,6 +69,7 @@ Environment
   JATO_EDIT_WINDOW    Seconds within which a crate compiled again counts as
                       being edited and is not recorded; default 600, 0 never
   JATO_WHOLE_BUILDS=0 Reuse single compilations only
+  JATO_SAVED_STATE=0  Leave rustc's incremental state out of the cache
   JATO_COALESCE=0     Let identical concurrent compilations run independently
   JATO_REMAP=0        Leave real workspace and target paths in compiled output
   JATO_STORAGE=packed Keep compressed copies even where files can be cloned

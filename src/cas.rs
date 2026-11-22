@@ -1403,7 +1403,14 @@ fn sweep_strays(tx: &Transaction<'_>, dir: &Path) -> Result<()> {
         .flatten()
     {
         if old(&lock, 86_400) {
-            let _ = fs::remove_file(lock.path());
+            // What an interrupted look at the compiler left behind is a
+            // directory; a lock is a file, and so are the places in `jobs`,
+            // which stay.
+            if lock.file_name().to_string_lossy().starts_with("probe-") {
+                let _ = fs::remove_dir_all(lock.path());
+            } else {
+                let _ = fs::remove_file(lock.path());
+            }
         }
     }
     for shard in fs::read_dir(dir.join("objects"))

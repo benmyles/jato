@@ -84,7 +84,9 @@ Output that still names where it was built, such as a program that embeds `env!(
 
 A crate compiled again within ten minutes of its last compilation in the same target directory is being edited. rustc compiles it incrementally, Jato looks for a recorded result (which is how undo works) and otherwise leaves the compiler unwatched and its output unrecorded, because the next edit replaces it. The first compilation after a pause is recorded again. `JATO_EDIT_WINDOW` sets the pause in seconds; `0` records every compilation.
 
-In a target directory that was restored, rustc has no saved state yet, so the first edit of a crate compiles that crate from scratch. Later edits are incremental.
+A target directory that was restored holds none of the state rustc saves for compiling a crate again, so the first edit of a crate there would compile the whole crate. Jato keeps that state with the recorded compilation, the latest for each crate, and hands it to a compilation that has none: the first edit in a new checkout is compiled incrementally, from the state of the checkout the build was recorded in. FIRST-EDIT
+
+rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. rustc still checks each saved result against the sources before using it. If the compiler's state does not begin the way Jato expects, the state is left out and the crate is compiled from scratch. The target directory has to lie inside the workspace for this; `JATO_SAVED_STATE=0` turns it off.
 
 ### Builds at the same time
 
@@ -145,6 +147,7 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_JOBS=8` | Compilers running at once across the builds sharing this cache. |
 | `JATO_EDIT_WINDOW=0` | Record every compilation, including each edit. |
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
+| `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state with results or hand it to later compilations. |
 | `JATO_STORAGE=packed` | Keep compressed copies even where files can be cloned. |
 | `JATO_VERIFY=1` | Check the digest of restored files on a filesystem that checksums them. |
 | `JATO_DISABLE=1` | Run Cargo and the compiler directly. |
