@@ -76,6 +76,8 @@ Environment
   JATO_TOOLS=0        Leave the C compilers and assemblers that build scripts
                       start to themselves
   JATO_SAVED_STATE=0  Leave rustc's incremental state out of the cache
+  JATO_NOTES=0        Have the kernel report every file call of a watched
+                      program; none are told of by the program itself
   JATO_COALESCE=0     Let identical concurrent compilations run independently
   JATO_REMAP=0        Leave real workspace and target paths in compiled output
   JATO_STORAGE=packed Keep compressed copies even where files can be cloned
@@ -544,6 +546,13 @@ fn report(stats: &cas::Stats) -> String {
         "Saved      {:.1} s of earlier work not done again",
         count("saved_ms") as f64 / 1000.0
     );
+    let (noted, reported) = (count("noted"), count("reported"));
+    if noted + reported > 0 {
+        let _ = writeln!(
+            out,
+            "Watching   {noted} file calls told of by the programs themselves, {reported} reported by the kernel"
+        );
+    }
     if count("queued") > 0 {
         let _ = writeln!(
             out,

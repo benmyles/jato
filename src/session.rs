@@ -57,7 +57,7 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
     for arg in args {
         w.bytes(arg.as_bytes());
     }
-    let vars: Vec<_> = std::env::vars_os().collect();
+    let vars: Vec<_> = command::own_environment().collect();
     w.number(vars.len() as u64);
     for (name, value) in &vars {
         w.bytes(name.as_bytes());
@@ -507,7 +507,7 @@ fn prepare(cmd: &Command, name: &str) -> Result<Option<Prepared>> {
     {
         return Ok(None);
     }
-    let mut env: Env = std::env::vars_os().collect();
+    let mut env: Env = command::own_environment().collect();
     for (name, value) in cmd.get_envs() {
         match value {
             Some(value) => env.insert(name.to_owned(), value.to_owned()),
@@ -693,6 +693,7 @@ fn supervise(
         }
     };
     let config = observe::Config {
+        fast: observe::fast_library(&store.dir),
         ignore: vec![store.dir.clone()],
         unlisted: Vec::new(),
         state: None,
@@ -791,7 +792,12 @@ fn supervise(
     let parts = server.parts.lock().unwrap_or_else(|e| e.into_inner());
     log(
         name,
-        format_args!("ran, with {} file accesses of its own", report.paths.len()),
+        format_args!(
+            "ran, with {} file accesses of its own, {} of {} calls told of by the programs themselves",
+            report.paths.len(),
+            report.noted,
+            report.events
+        ),
     );
     let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
     drop(parts);

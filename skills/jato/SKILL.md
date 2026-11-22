@@ -31,6 +31,8 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 - A checkout with a different crate beside it (`path = "../shared"`), or with Cargo settings in a directory above it, gets a build of its own.
 - Builds started at the same time through Jato take turns at the processors. A build that seems to wait is queued behind others; `jato stats` shows `queued`.
 - Jato records on Linux (x86-64 and aarch64, kernel 5.5 or later). Elsewhere its commands run Cargo unchanged.
+- Programs in a recorded build run with `LD_PRELOAD` naming a small library of Jato's, through which they say which files they read. If a program misbehaves under it, `JATO_NOTES=0` leaves it out.
+- With every processor in use, compilations in a target that is already built are not recorded (`continued` in the stats). A build made from nothing always is.
 
 ## Choose an edit loop
 

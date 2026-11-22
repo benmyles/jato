@@ -11,7 +11,7 @@
 //! never mentions.
 use crate::scan::Digest;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -177,6 +177,10 @@ impl Report {
             self.incomplete = part.incomplete;
         }
         self.survivors |= part.survivors;
+        self.noted += part.noted;
+        for (call, count) in part.reported {
+            *self.reported.entry(call).or_default() += count;
+        }
     }
 }
 
@@ -193,6 +197,11 @@ pub struct Report {
     /// A program the command started was still running when it exited.
     pub survivors: bool,
     pub events: u64,
+    /// How many of the command's file calls it told of itself, without
+    /// waiting to be asked. See `fast/shim.rs`.
+    pub noted: u64,
+    /// How many calls of each kind the kernel reported, by call number.
+    pub reported: std::collections::BTreeMap<u32, u64>,
     /// Names used directly inside the directory `Config::state` names.
     pub state: std::collections::BTreeSet<OsString>,
 }
@@ -206,6 +215,49 @@ pub struct Config {
     /// One of the ignored directories, for which the names used directly
     /// inside it are noted all the same.
     pub state: Option<PathBuf>,
+    /// The library to load into the command, through which it tells of
+    /// the files it reads without waiting to be asked. See `fast/shim.rs`.
+    pub fast: Option<PathBuf>,
+}
+
+/// The library that watched programs load, as it was built with this
+/// program. Empty where there is none.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SHIM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libjato_fast.so"));
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+const SHIM: &[u8] = &[];
+
+/// Whether a path names a copy of that library, wherever it is kept.
+pub fn is_fast_library(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with("jato-fast-") && name.ends_with(".so"))
+}
+
+/// A file holding that library inside the cache directory, written if it
+/// is not there yet. None where there is no such library, or when
+/// `JATO_NOTES=0` asks for every call to be reported by the kernel.
+pub fn fast_library(cache: &Path) -> Option<PathBuf> {
+    if SHIM.is_empty() || std::env::var_os("JATO_NOTES").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let name = format!(
+        "jato-fast-{}.so",
+        &blake3::hash(SHIM).to_hex().as_str()[..16]
+    );
+    let path = cache.join("lib").join(name);
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() == SHIM.len() as u64) {
+        return Some(path);
+    }
+    // Written under another name and moved into place whole: a program
+    // being started must never load half of it.
+    fs::create_dir_all(path.parent()?).ok()?;
+    let making = path.with_extension(format!("{}", std::process::id()));
+    fs::write(&making, SHIM).ok()?;
+    if fs::rename(&making, &path).is_err() {
+        let _ = fs::remove_file(&making);
+    }
+    path.is_file().then_some(path)
 }
 
 /// Digest of a set of directory entry names.
@@ -327,6 +379,15 @@ mod imp {
     const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
     const FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
     const FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 5;
+    /// What this program and the library in watched programs agree on.
+    mod abi {
+        #![allow(dead_code)]
+        include!("fast/abi.rs");
+    }
+    /// The descriptor a watched program is given the socket for its notes
+    /// on.
+    const NOTES_FD: RawFd = 217;
+
     const RET_USER_NOTIF: u32 = 0x7fc0_0000;
     const RET_ALLOW: u32 = 0x7fff_0000;
     const NOTIF_FLAG_CONTINUE: u32 = 1;
@@ -410,14 +471,66 @@ mod imp {
         nr::SECCOMP,
     ];
 
-    fn filter() -> Vec<Insn> {
-        let simple: Vec<u32> = ALWAYS.iter().chain(nr::LEGACY).copied().collect();
+    /// The filter. `listing` has the calls that read a directory's entries
+    /// reported as well, for a command that is started with a directory
+    /// already open: any other has to open one first, and that is seen.
+    fn filter(listing: bool) -> Vec<Insn> {
+        let simple: Vec<u32> = ALWAYS
+            .iter()
+            .chain(nr::LEGACY)
+            .copied()
+            .filter(|call| listing || !matches!(*call, nr::GETDENTS64 | nr::GETDENTS))
+            .collect();
         let insn = |code, jt, jf, k| Insn { code, jt, jf, k };
         let mut prog = vec![
             insn(LD_ABS, 0, 0, 4), // architecture
             insn(JEQ, 0, 0, nr::ARCH),
-            insn(LD_ABS, 0, 0, 0), // call number
         ];
+        // A call made from the one address the library in a watched
+        // program calls from, of a kind that only reads, has been noted by
+        // that library and goes ahead. An open is looked at again here:
+        // it must not create, empty or write.
+        if cfg!(target_arch = "x86_64") {
+            let quiet = [
+                nr::STAT,
+                nr::LSTAT,
+                nr::ACCESS,
+                nr::NEWFSTATAT,
+                nr::STATX,
+                nr::FACCESSAT,
+                nr::FACCESSAT2,
+            ];
+            let writes = (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC | libc::O_TMPFILE) as u32
+                & !(libc::O_DIRECTORY as u32);
+            // The block's instructions: five to compare the address, one
+            // for each call, three for the open, and the one that lets a
+            // call through, which is the last.
+            let block = quiet.len() + 9;
+            let start = prog.len();
+            let past = |from: usize| (start + block - from - 1) as u8;
+            prog.push(insn(LD_ABS, 0, 0, 8)); // where the call was made, low half
+            prog.push(insn(JEQ, 0, past(start + 1), abi::STUB_RETURN as u32));
+            prog.push(insn(LD_ABS, 0, 0, 12)); // and high half
+            prog.push(insn(
+                JEQ,
+                0,
+                past(start + 3),
+                (abi::STUB_RETURN >> 32) as u32,
+            ));
+            prog.push(insn(LD_ABS, 0, 0, 0)); // call number
+            for call in quiet {
+                let here = prog.len();
+                prog.push(insn(JEQ, past(here) - 1, 0, call));
+            }
+            let here = prog.len();
+            prog.push(insn(JEQ, 0, past(here), nr::OPENAT));
+            prog.push(insn(LD_ABS, 0, 0, 16 + 8 * 2)); // its flags
+            prog.push(insn(JSET, 1, 0, writes));
+            prog.push(insn(RET, 0, 0, RET_ALLOW));
+            debug_assert_eq!(prog.len(), start + block);
+        }
+        let number = prog.len();
+        prog.push(insn(LD_ABS, 0, 0, 0)); // call number
         // The x32 ABI shares the architecture value and sets a high bit.
         let x32 = cfg!(target_arch = "x86_64");
         if x32 {
@@ -449,7 +562,7 @@ mod imp {
         // Another call table is reported, which marks the record incomplete.
         prog[1].jf = (notify - 1 - 1) as u8;
         if x32 {
-            prog[3].jt = (notify - 3 - 1) as u8;
+            prog[number + 1].jt = (notify - (number + 1) - 1) as u8;
         }
         assert!(prog.len() < 250, "jump offsets must fit a byte");
         prog
@@ -561,6 +674,26 @@ mod imp {
     }
 
     const MAX_PATHS: usize = 400_000;
+
+    /// `name` as a path from the directory `base`, which is empty for a
+    /// name that starts at the root. `.` and empty components are dropped.
+    fn joined(base: &[u8], name: &[u8]) -> PathBuf {
+        let mut cleaned = Vec::with_capacity(base.len() + name.len() + 1);
+        cleaned.extend_from_slice(base);
+        for part in name.split(|b| *b == b'/') {
+            if part.is_empty() || part == b"." {
+                continue;
+            }
+            if cleaned.last() != Some(&b'/') {
+                cleaned.push(b'/');
+            }
+            cleaned.extend_from_slice(part);
+        }
+        if cleaned.is_empty() {
+            cleaned.push(b'/');
+        }
+        PathBuf::from(OsString::from_vec(cleaned))
+    }
 
     enum Use {
         Read,
@@ -691,21 +824,7 @@ mod imp {
                     _ => return None,
                 }
             };
-            let mut cleaned = Vec::with_capacity(base.as_os_str().len() + name.len() + 1);
-            cleaned.extend_from_slice(base.as_os_str().as_bytes());
-            for part in name.split(|b| *b == b'/') {
-                if part.is_empty() || part == b"." {
-                    continue;
-                }
-                if cleaned.last() != Some(&b'/') {
-                    cleaned.push(b'/');
-                }
-                cleaned.extend_from_slice(part);
-            }
-            if cleaned.is_empty() {
-                cleaned.push(b'/');
-            }
-            Some(PathBuf::from(OsString::from_vec(cleaned)))
+            Some(joined(base.as_os_str().as_bytes(), name))
         }
 
         fn ignored(&self, path: &Path) -> bool {
@@ -723,6 +842,20 @@ mod imp {
                 }
                 return;
             }
+            // A directory is opened for reading in order to list it, and
+            // the listing itself is not reported: it names no path. What
+            // the directory held is taken down when it is opened.
+            let how = match how {
+                Use::Read
+                    if match self.report.paths.get(&path) {
+                        Some(known) => known.kind == Kind::Dir,
+                        None => fs::metadata(&path).is_ok_and(|meta| meta.is_dir()),
+                    } =>
+                {
+                    Use::List
+                }
+                how => how,
+            };
             let listing = matches!(how, Use::List)
                 && self
                     .report
@@ -849,7 +982,14 @@ mod imp {
                 || flags & (libc::O_CREAT | libc::O_TRUNC) != 0
                 || flags & libc::O_TMPFILE == libc::O_TMPFILE;
             if !writes {
-                return self.at(tid, dirfd, name, Use::Read);
+                // Opened only to name the place, it cannot be read or
+                // listed.
+                let how = if flags & libc::O_PATH != 0 {
+                    Use::Probe
+                } else {
+                    Use::Read
+                };
+                return self.at(tid, dirfd, name, how);
             }
             // An unnamed temporary file never appears in the directory.
             if flags & libc::O_TMPFILE == libc::O_TMPFILE {
@@ -872,6 +1012,7 @@ mod imp {
             self.caller = tid;
             let a = &data.args;
             let call = data.nr as u32;
+            *self.report.reported.entry(call).or_default() += 1;
             if data.arch != nr::ARCH || (cfg!(target_arch = "x86_64") && call >= 0x4000_0000) {
                 return self.incomplete("a program used another system call table");
             }
@@ -1041,21 +1182,42 @@ mod imp {
         }
     }
 
-    fn readable(fd: RawFd, wake: RawFd, block: bool) -> (bool, bool, bool) {
-        let mut fds = [
-            libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: wake,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+    /// Whether a command started by this process would find a directory
+    /// already open on one of its descriptors, to list without opening.
+    fn inherits_a_directory() -> bool {
+        let Ok(open) = fs::read_dir("/proc/self/fd") else {
+            return true;
+        };
+        open.flatten().any(|entry| {
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<RawFd>().ok())
+            else {
+                return false;
+            };
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            // One that is closed when a program starts is not passed on,
+            // and one that only names a place cannot be read.
+            flags >= 0
+                && flags & libc::FD_CLOEXEC == 0
+                && status & libc::O_PATH == 0
+                && fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir())
+        })
+    }
+
+    /// Wait for a report, for the command to end, or for a note. `notes`
+    /// is -1 where there is no socket for notes, and is then left out.
+    fn readable(fd: RawFd, wake: RawFd, notes: RawFd, block: bool) -> (bool, bool, bool, bool) {
+        let entry = |fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut fds = [entry(fd), entry(wake), entry(notes)];
         loop {
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, if block { -1 } else { 0 }) };
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 3, if block { -1 } else { 0 }) };
             if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -1065,6 +1227,7 @@ mod imp {
             fds[0].revents & libc::POLLIN != 0,
             fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0,
             fds[1].revents != 0,
+            fds[2].revents & libc::POLLIN != 0,
         )
     }
 
@@ -1078,6 +1241,9 @@ mod imp {
         /// last worked out.
         owner: HashMap<u32, (Option<u32>, u64)>,
         events: u64,
+        /// Where watched programs send notes of what they are about to
+        /// read. See `fast/shim.rs`.
+        notes: Option<OwnedFd>,
     }
 
     /// The process a thread belongs to and that process's parent.
@@ -1093,6 +1259,84 @@ mod imp {
     }
 
     impl State {
+        /// Take in every note that has arrived. A program writes its note
+        /// before it makes the call, and a call that changes anything is
+        /// held until this process has looked, so taking the notes in
+        /// before each report is looked at keeps things in the order they
+        /// happened.
+        fn take_notes(&mut self) {
+            let Some(socket) = self.notes.as_ref().map(AsRawFd::as_raw_fd) else {
+                return;
+            };
+            let mut note = [0u8; abi::LONGEST];
+            loop {
+                let n = unsafe {
+                    libc::recv(
+                        socket,
+                        note.as_mut_ptr().cast(),
+                        note.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if n <= 0 {
+                    return;
+                }
+                self.noted(&note[..n as usize]);
+            }
+        }
+
+        /// One note: a program is about to open a file for reading, or to
+        /// ask about a path.
+        fn noted(&mut self, note: &[u8]) {
+            let field = |at: usize| u16::from_le_bytes([note[at], note[at + 1]]) as usize;
+            if note.len() < abi::HEADER
+                || field(0) != note.len()
+                || abi::HEADER + field(8) > note.len()
+                || note[2] > abi::ASKED
+            {
+                return self
+                    .whole
+                    .incomplete("a note from a watched program could not be read");
+            }
+            let process = u32::from_le_bytes([note[4], note[5], note[6], note[7]]);
+            let (directory, name) = note[abi::HEADER..].split_at(field(8));
+            let path = joined(directory, name);
+            let how = || {
+                if note[2] == abi::OPENED {
+                    Use::Read
+                } else {
+                    Use::Probe
+                }
+            };
+            self.events += 1;
+            let now = self.events;
+            // The program may be gone by now. What it belonged to is known
+            // from its first report, which came before any note.
+            let scope = match self.owner.get(&process) {
+                Some((scope, _)) => Some(*scope),
+                None if ids(process).is_some() => Some(self.scope_of(process)),
+                None => None,
+            };
+            let record = |tracker: &mut Tracker| {
+                tracker.caller = process;
+                tracker.now = now;
+                tracker.report.noted += 1;
+                tracker.touch(path.clone(), how());
+            };
+            match scope {
+                Some(Some(root)) => match self.scopes.get_mut(&root) {
+                    Some(tracker) => record(tracker),
+                    None => record(&mut self.whole),
+                },
+                Some(None) => record(&mut self.whole),
+                // Nothing says whose it was: then it was everyone's.
+                None => {
+                    record(&mut self.whole);
+                    self.scopes.values_mut().for_each(record);
+                }
+            }
+        }
+
         /// The scope whose root process is an ancestor of this thread.
         fn scope_of(&mut self, tid: u32) -> Option<u32> {
             if self.scopes.is_empty() {
@@ -1167,6 +1411,7 @@ mod imp {
         }
         if let Some(state) = state {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.take_notes();
             state.events += 1;
             let (data, tid) = (notif.data, notif.pid);
             let state = &mut *state;
@@ -1231,6 +1476,7 @@ mod imp {
         /// The record for `root`'s descendants, which have all exited.
         pub fn end(&self, root: u32) -> Option<Report> {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.take_notes();
             let tracker = state.scopes.remove(&root)?;
             state.owner.retain(|_, (scope, _)| *scope != Some(root));
             let mut report = tracker.report;
@@ -1266,13 +1512,57 @@ mod imp {
     }
 
     pub fn spawn(cmd: &mut Command, config: Config) -> io::Result<(Child, Session)> {
-        static FILTER: std::sync::OnceLock<Vec<Insn>> = std::sync::OnceLock::new();
-        let insns: &'static [Insn] = FILTER.get_or_init(filter);
+        static FILTERS: [std::sync::OnceLock<Vec<Insn>>; 2] =
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+        let listing = inherits_a_directory();
+        let insns: &'static [Insn] = FILTERS[usize::from(listing)].get_or_init(|| filter(listing));
         let (ours, theirs) = pair(libc::SOCK_SEQPACKET)?;
         let (wake_read, wake) = pair(0)?;
         let child_sock = theirs.as_raw_fd();
+        // A socket for the command's notes of what it reads, and the
+        // library that writes them, where there is one and the descriptor
+        // for it is free.
+        let free = unsafe { libc::fcntl(NOTES_FD, libc::F_GETFD) } == -1;
+        let notes = config
+            .fast
+            .as_ref()
+            .filter(|_| free)
+            .and_then(|library| Some((library, pair(libc::SOCK_DGRAM).ok()?)));
+        let (reading, writing) = match notes {
+            Some((library, (reading, writing))) => {
+                let inode = fs::File::from(writing.try_clone()?).metadata()?.ino();
+                cmd.env(abi::SOCKET, format!("{NOTES_FD}:{inode}"));
+                // Ahead of whatever else the command loads that way.
+                let given = cmd
+                    .get_envs()
+                    .find(|(name, _)| *name == "LD_PRELOAD")
+                    .map(|(_, value)| value.map(OsStr::to_owned))
+                    .unwrap_or_else(|| std::env::var_os("LD_PRELOAD"));
+                let mut load = library.as_os_str().to_owned();
+                let others = given.unwrap_or_default();
+                for other in others
+                    .as_bytes()
+                    .split(|b| *b == b':' || *b == b' ')
+                    .filter(|other| !other.is_empty())
+                    .filter(|other| !is_fast_library(Path::new(OsStr::from_bytes(other))))
+                {
+                    load.push(":");
+                    load.push(OsStr::from_bytes(other));
+                }
+                cmd.env("LD_PRELOAD", load);
+                (Some(reading), Some(writing))
+            }
+            None => (None, None),
+        };
+        let notes_to = writing.as_ref().map(AsRawFd::as_raw_fd);
         unsafe {
             cmd.pre_exec(move || {
+                // The copy stays open in the command and all it starts.
+                if let Some(socket) = notes_to
+                    && libc::dup2(socket, NOTES_FD) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 let prog = Program {
                     len: insns.len() as u16,
                     filter: insns.as_ptr(),
@@ -1297,7 +1587,12 @@ mod imp {
             scopes: HashMap::new(),
             owner: HashMap::new(),
             events: 0,
+            notes: reading,
         }));
+        let noted = {
+            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.notes.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+        };
         let shared = state.clone();
         let thread = std::thread::Builder::new()
             .name("jato-observer".into())
@@ -1320,7 +1615,8 @@ mod imp {
                 answer_promptly();
                 let fd = listener.as_raw_fd();
                 loop {
-                    let (ready, closed, woken) = readable(fd, wake_read.as_raw_fd(), true);
+                    let (ready, closed, woken, notes) =
+                        readable(fd, wake_read.as_raw_fd(), noted, true);
                     if ready {
                         serve_one(fd, Some(state));
                     } else if closed {
@@ -1329,17 +1625,24 @@ mod imp {
                         // The command exited. Record what was already asked
                         // and leave any surviving program to a helper.
                         loop {
-                            let (ready, closed, _) = readable(fd, wake_read.as_raw_fd(), false);
+                            let (ready, closed, ..) =
+                                readable(fd, wake_read.as_raw_fd(), -1, false);
                             if ready && serve_one(fd, Some(state)) {
                                 continue;
                             }
                             return (!closed).then_some(listener);
                         }
+                    } else if notes {
+                        // Nothing to answer, and programs are reading:
+                        // make room for more of what they say.
+                        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.take_notes();
                     }
                 }
             })?;
         let spawned = cmd.spawn();
         drop(theirs);
+        drop(writing);
         match spawned {
             Ok(child) => Ok((
                 child,
@@ -1367,6 +1670,10 @@ mod imp {
             let _ = unsafe { libc::write(self.wake.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
             let survivors = self.thread.join();
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.take_notes();
+            // Whatever is still running finds nobody listening, and has
+            // its calls reported again.
+            state.notes = None;
             let mut report = std::mem::take(&mut state.whole.report);
             report.events = state.events;
             match survivors {
@@ -1415,7 +1722,7 @@ mod imp {
 
     pub fn answer(fd: RawFd) -> i32 {
         loop {
-            let (ready, closed, _) = readable(fd, -1, true);
+            let (ready, closed, ..) = readable(fd, -1, -1, true);
             if ready {
                 serve_one(fd, None);
             } else if closed {

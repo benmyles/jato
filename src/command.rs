@@ -16,7 +16,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -140,10 +140,32 @@ impl Request {
             program: program.to_owned(),
             args: args.to_vec(),
             cwd: env::current_dir()?,
-            env: env::vars_os().collect(),
+            env: own_environment().collect(),
             spare: descriptor_spare(),
         })
     }
+}
+
+/// This process's environment as whoever set it meant it: without what a
+/// Jato watching this process added for its own use, the library it has
+/// watched programs load and the socket that library writes to. A command
+/// is the same command watched or not.
+pub fn own_environment() -> impl Iterator<Item = (OsString, OsString)> {
+    env::vars_os().filter_map(|(name, value)| {
+        if name == "JATO_NOTES_TO" {
+            return None;
+        }
+        if name != "LD_PRELOAD" {
+            return Some((name, value));
+        }
+        let kept: Vec<&[u8]> = value
+            .as_bytes()
+            .split(|b| *b == b':' || *b == b' ')
+            .filter(|entry| !entry.is_empty())
+            .filter(|entry| !observe::is_fast_library(Path::new(OsStr::from_bytes(entry))))
+            .collect();
+        (!kept.is_empty()).then(|| (name, OsString::from_vec(kept.join(&b':'))))
+    })
 }
 
 /// Something found out about a program by trying it, remembered with the
@@ -287,7 +309,13 @@ fn maps_prefixes(request: &Request) -> bool {
 /// Have `cmd` start with the directory `dir` open on descriptor `HELD_FD`.
 pub fn hold(cmd: &mut Command, dir: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let dir = fs::File::open(dir)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Opened to name the place and nothing more: the directory cannot be
+    // listed through it, which would go unseen.
+    let dir = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(dir)?;
     unsafe {
         cmd.pre_exec(move || {
             // The copy stays open in the program that is started.
@@ -743,6 +771,7 @@ impl Job {
         let mut ignore = vec![store.dir.clone()];
         ignore.extend(self.facts.incremental.clone());
         observe::Config {
+            fast: observe::fast_library(&store.dir),
             ignore,
             // rustc enumerates every search directory to find crates by
             // name. The files it settles on are opened, and recorded.
@@ -1417,7 +1446,13 @@ pub fn record(
         let state = match access.kind {
             // Something that came to be there during the run and was then
             // read is only accounted for if a part of this command made it.
-            Kind::Absent if access.appeared => {
+            // And what was not there when the command looked has to be
+            // missing still: a program that says what it is about to ask
+            // has asked a moment later, and the answer may have changed in
+            // between.
+            // A link that leads nowhere, or nowhere this user may go, was
+            // missing in the same sense and is still.
+            Kind::Absent if access.appeared || (now.is_ok() && fs::metadata(path).is_ok()) => {
                 return Err(format!("{} appeared while it ran", path.display()));
             }
             Kind::Absent => State::Absent,
@@ -2417,17 +2452,28 @@ pub fn finish(
     }
     let begun = Instant::now();
     let recorded = record(job, store, recipe, ran, report, parts);
+    // How the command was watched: what it told of itself and what the
+    // kernel had to report.
+    store.count("noted", report.noted);
+    store.count("reported", report.reported.values().sum());
     match &recorded {
         Ok(manifest) => {
             store.count(job.counter("stored"), 1);
             log(
                 job.name(),
                 format_args!(
-                    "stored: ran {} ms, then {} inputs and {} outputs recorded in {} ms",
+                    "stored: ran {} ms, then {} inputs and {} outputs recorded in {} ms{}",
                     ran.millis,
                     manifest.inputs.len(),
                     manifest.outputs.len(),
-                    begun.elapsed().as_millis()
+                    begun.elapsed().as_millis(),
+                    match report.noted {
+                        0 => String::new(),
+                        noted => format!(
+                            "; it told of {noted} of its file calls itself and the kernel of {}",
+                            report.reported.values().sum::<u64>(),
+                        ),
+                    }
                 ),
             );
         }

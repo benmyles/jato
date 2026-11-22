@@ -18,13 +18,21 @@
 - [x] Give restored files a time that an edit made right afterwards is certain to be newer than, and leave a lock file that is already right alone.
 - [x] Say which program and which file kept a build from being recorded or with one checkout.
 - [x] Leave compilations in a built target unwatched while every processor is in use.
+
+## 0.14
+
+- [x] Have watched programs tell of the files they read themselves, through a library loaded ahead of their C library, with the kernel's filter letting only those calls through unreported and reporting everything else as before.
+- [x] Take a directory's listing down when it is opened for reading, and stop having the calls that read its entries reported.
+- [x] Turn a record down when a path the command found missing is there by the time it ends.
 - [x] Keep objects as clones of compiler output where the filesystem allows, compressed copies elsewhere, under one budget with least-recently-used eviction.
 - [x] Test through real Cargo projects: restores, edits and undo, other checkouts and targets, proc macros that read files and directories, build scripts, linkers, damaged and evicted objects, concurrent builds, the network, PATH changes.
 - [x] Compare with kache, sccache and bare Cargo on ripgrep and Olo, with private stores and daemons.
 
 ## Open
 
-- [ ] Watch a compiler from inside its own process. Every file a watched program asks about is reported to another process, and the program gives up the processor until that process has been scheduled and has answered. On a machine with processors to spare this costs about 1%; with all of them in use it can take a short compilation several times as long, which is why compilations in a built target are not watched then, and why a build from nothing takes longer on the clock than bare Cargo's on a busy machine. A small library loaded into the program ahead of its C library could note the calls that only read, as the program makes them, in a pipe to Jato, and make each from one fixed address that the filter lets through; every other call, and every program without the library, would be reported as now, so nothing could be missed. Calls that write have to stay as they are: what was there before must be looked at while the program waits. Opens for reading and questions about paths are nearly all of what a compiler asks.
+- [ ] What a compiler writes is still reported by the kernel one call at a time, and rustc writes hundreds of files into the directory of its saved state, which Jato does not record. A check of `olo-system` is down from about 2,600 reported calls to 160; a full build of a crate has many more. The library in watched programs could make those calls unreported for directories Jato names to it, if the filter let more than reads through from its address.
+- [ ] With programs telling of their own reads, whether compilations in a built target still need to go unwatched on a busy machine has to be measured again at a load of 45 and more.
+- [ ] The library for watched programs exists for x86-64. On aarch64 every call is reported by the kernel.
 
 - [ ] rustc generates all of a program's code again in a target directory other than the one its state was saved in, and Jato cannot hand state for a program to a target directory outside the workspace at all. rustc goes by the real location of every library a program links, whatever name it is given, and compares its options with the real workspace path in them. Compiling inside a mount namespace of the build's own, in which the workspace and the target directory are always at the same two paths, would make all of rustc's state fit everywhere, and would do away with the other names for directories, the adjustment of the state's option bytes and results that only suit one checkout. It needs unprivileged user namespaces, which some systems and most containers withhold, so the present way would have to stay beside it.
 - [ ] Where a whole build does not apply, Cargo runs every build script again in a target directory that has none of their output, even those whose inputs are as they were: 113 of them on Olo, about 11 processor-seconds and most of the minute such a build takes. A build script's run could be recorded as a part and its output put back before Cargo looks, with what Cargo remembers of it. Cargo would have to find that as it expects, which for a build script that names no inputs includes the time of the newest file in the package.

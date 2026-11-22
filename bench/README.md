@@ -92,7 +92,17 @@ Without the limit eight builds ran 119 compilers on 15 processors and held three
 
 ## What observation costs
 
-The same incremental compilation of `olo-system` (1.1 to 1.7 s unwatched) was run alternately with and without the observer. With the machine's load average at 22 the two were indistinguishable: 1.07 to 1.44 s unwatched, 1.00 to 1.69 s watched and recorded. With it between 35 and 50 the watched runs took 2.1 to 2.4 s: each of about 5,700 reported system calls waits for the observer to be given a processor. This is why a crate that is being edited is compiled unwatched, and why cold builds, which take minutes, show no cost.
+Measured with 0.12, where the kernel reported every file call: the same incremental compilation of `olo-system` (1.1 to 1.7 s unwatched) was run alternately with and without the observer. With the machine's load average at 22 the two were indistinguishable: 1.07 to 1.44 s unwatched, 1.00 to 1.69 s watched and recorded. With it between 35 and 50 the watched runs took 2.1 to 2.4 s: each of the reported system calls waits for the observer to be given a processor, and the compiler for its next turn after that. Checking `olo-system` and its 54 dependents after an edit took 17 to 25 s watched and 7 to 14 s unwatched at a load of 45 to 55.
+
+With 0.14 programs tell of their own reads. For one check of `olo-system`, three runs each way in alternation at a load of 23:
+
+| | Unwatched | Watched, kernel alone | Watched, with notes |
+| --- | ---: | ---: | ---: |
+| Calls the kernel reported | | 2,600 before, 796 without listings | 158 |
+| Times the command gave up the processor | 3,500 to 5,400 | 20,900 to 22,200 | 6,950 to 7,980 |
+| Seconds | 1.86 to 2.02 | 1.99 to 3.12 | 1.81 to 2.81 |
+
+A build from nothing has slack that hides those waits: two cold checks of `olo-system` run side by side at a load of 50, one watched each way, took 397.88 and 397.91 s for 429 and 430 processor-seconds. ripgrep from nothing at a load of 31, three runs in alternation: bare Cargo 8.2 to 9.5 s and 25.0 to 26.5 processor-seconds, Jato with the kernel alone 9.9 to 11.5 s and 27.0 to 28.2, Jato with notes 9.7 to 10.8 s and 26.9 to 28.5.
 
 ## Reproduction
 

@@ -1,5 +1,15 @@
 # Work journal
 
+## 2026-11-22 — programs that tell of their own reads (0.14)
+
+- A watched program used to wait for Jato at every call that names a file. Counted for one check of `olo-system`: 2,600 reported calls, and 18,000 more times that the command gave up the processor than unwatched. On a machine with every processor in use that is where the time went.
+- Wrote a library of 14 KB that every watched program loads ahead of its C library. It stands in for `open`, `stat`, `access`, `opendir` and their relatives: for a call that only reads it sends a note of the path down a socket and makes the call from one fixed address, and the filter lets calls of those kinds through from that address alone, an open only if its flags neither create nor write. Calls that change anything are reported as before, since Jato has to look first, and so is everything from a program without the library. Notes are taken in ahead of each report, which keeps the order things happened in.
+- The library needs nothing but `errno` and `fdopendir` from whatever C library the program has, names no library it depends on, and defines only the functions it stands in for. A first build of it left `rust_eh_personality` undefined, which would have kept it out of every program that is not Rust; defining it for all to see would have replaced rustc's own.
+- rustc with Cargo's new layout lists a directory for every dependency: over 200 of them for `olo-system`, three reported calls each. A directory opened for reading now counts as listed and the calls that read entries are no longer reported, unless the command starts with a directory already open. The descriptor Jato gives a library's compiler for its target directory now only names the place.
+- The same check: 160 reported calls, 3,000 more times giving up the processor than unwatched. Two cold checks of `olo-system` run side by side at a load of 50, one each way, both took 397.9 s: a build from nothing has slack that hides the waits. Compilations that someone is waiting for do not.
+- A record is now turned down when a path the command found missing is there by the end. Between a program's note and its call the answer can change, and so it could between a report and the call.
+- Qualified with 27 unit and 58 Cargo-project tests, with notes and with the kernel alone, on Rust 1.100 and 1.89 and with compressed storage.
+
 ## 2026-11-22 — the whole workspace, C in build scripts, and what is around a checkout (0.13)
 
 - Ran `check --workspace` on all of Olo, 121 packages, where until now one package had been measured. In a copy of a checkout that had been built, every Rust compilation was restored and the build still took 630 processor-seconds: the whole build was kept with the first checkout by two C object files that a build script compiled with debugging information, and Cargo then ran 113 build scripts, which compiled 545 processor-seconds of C, C++ and assembly again. kache caches those; Jato had taken kache's stand-ins off PATH and put nothing in their place.

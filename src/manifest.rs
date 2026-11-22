@@ -399,10 +399,14 @@ impl<'a> Here<'a> {
         if let Some(seen) = self.seen.get(path) {
             return Ok(seen.clone());
         }
+        // Not there, or in a place this user may not look, which is the
+        // same to a command run by this user and is recorded the same.
         let absent = |e: &io::Error| {
             matches!(
                 e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::NotADirectory
+                    | io::ErrorKind::PermissionDenied
             )
         };
         let seen = match fs::symlink_metadata(path) {

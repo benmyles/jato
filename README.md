@@ -29,7 +29,7 @@ A build from nothing takes the processor time it takes with bare Cargo: 769 proc
 
 ## Get started
 
-Build Jato on Linux with Rust 1.89 or later and a C toolchain. SQLite and Zstandard are bundled. From this repository, run
+Build Jato on Linux with Rust 1.89 or later and a C toolchain. SQLite and Zstandard are bundled, and so is the library watched programs load, which is built with Jato on x86-64. From this repository, run
 
 ```sh
 cargo install --locked --path .
@@ -73,7 +73,9 @@ Agents that each work in a checkout of their own are what Jato is built for. A n
 
 Jato knows nothing about what rustc computes. A **result** is the files a command wrote and what it printed. It can stand in for a later run of the same command line when everything the earlier run examined is unchanged.
 
-What a command examined is observed, not worked out from its arguments. The command runs under a seccomp filter that reports each file it opens, each path it asks about, each directory it lists and each program it starts to Jato, which lets the call continue. A procedural macro that reads a file, a linker that searches a directory and a build script that starts a compiler are all seen the same way. Environment variables are the one thing a program reads unseen: for those Jato keys every result on the variables Cargo and rustc are known to act on, takes the ones a crate reads through `env!` from the compiler's own report, and the ones a build script declares from Cargo's records. A variable a procedural macro reads with `std::env::var` has to be named in `JATO_KEY_ENV`.
+What a command examined is observed, not worked out from its arguments. The command runs under a seccomp filter that reports each file it opens, each path it asks about and each program it starts to Jato, which lets the call continue. A directory opened for reading counts as listed.
+
+Being asked about every call costs a program a turn at the processor each time, which on a busy machine is most of what watching costs. So the programs tell of most of it themselves. Each loads a small library ahead of its C library, which stands in for the functions that open a file for reading or ask about a path: it sends Jato a note of the path and makes the call from one fixed address, and the filter lets a call from that address through if it is of a kind that only reads. Every other call is reported as before: one that creates, writes, renames or removes, for which Jato has to see what was there first, and any call at all from a program that does not load the library or reaches the kernel some other way. Nothing depends on the library being there, only how many calls have to wait. A check of `olo-system` makes about 2,600 such calls, of which the kernel now reports 160. `JATO_NOTES=0` has the kernel report everything. A procedural macro that reads a file, a linker that searches a directory and a build script that starts a compiler are all seen the same way. Environment variables are the one thing a program reads unseen: for those Jato keys every result on the variables Cargo and rustc are known to act on, takes the ones a crate reads through `env!` from the compiler's own report, and the ones a build script declares from Cargo's records. A variable a procedural macro reads with `std::env::var` has to be named in `JATO_KEY_ENV`.
 
 A lookup hashes the command line and its keyed environment, finds the results recorded for that command, and checks one after another whether every file, link, directory listing and variable it depended on is as it was. Files are compared by content; an unchanged file is recognized by its size and timestamps and not read again.
 
@@ -178,6 +180,7 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
 | `JATO_TOOLS=0` | Leave the C compilers and assemblers that build scripts start to themselves. |
 | `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state in the cache or hand it to other checkouts. |
+| `JATO_NOTES=0` | Have the kernel report every file call of a watched program; none are told of by the program itself. |
 | `JATO_STORAGE=packed` | Keep compressed copies even where files can be cloned. |
 | `JATO_VERIFY=1` | Check the digest of restored files on a filesystem that checksums them. |
 | `JATO_DISABLE=1` | Run Cargo and the compiler directly. |
@@ -207,7 +210,7 @@ What leaves no trace in files or in the variables above is not seen at all: the 
 
 - BuildXL and Bazel record what an action read and key its result on that. Jato applies the two-step lookup to Cargo without a build description of its own: Cargo stays in charge, and the observation supplies the dependency list. [BuildXL two-phase lookup](https://github.com/microsoft/BuildXL/blob/main/Documentation/Wiki/Advanced-Features/Two-Phase-Cache-Lookup.md) · [Bazel remote caching](https://bazel.build/remote/caching)
 - ccache's direct mode checks a manifest of the files a compilation included before running the preprocessor. Jato's manifests are the same idea with the list taken from the kernel. [ccache manual](https://ccache.dev/manual/latest.html)
-- seccomp user notification lets a supervisor see a system call before it happens and let it proceed. [seccomp_unotify(2)](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html)
+- seccomp user notification lets a supervisor see a system call before it happens and let it proceed. A filter can also tell where in a program a call was made from, which is what lets a library in the program vouch for the calls it makes itself. [seccomp_unotify(2)](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html) · [seccomp(2)](https://man7.org/linux/man-pages/man2/seccomp.2.html)
 - Reflinks let a restored file share its extents with the cache until someone writes to it. [FICLONE](https://man7.org/linux/man-pages/man2/ioctl_ficlone.2.html)
 - kache and sccache cache single rustc invocations keyed on their arguments and declared inputs. Jato is measured against both. [kache](https://github.com/kunobi-ninja/kache) · [sccache](https://github.com/mozilla/sccache) · [Measurements](bench/README.md)
 

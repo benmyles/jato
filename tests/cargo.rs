@@ -1071,7 +1071,8 @@ fn a_file_that_may_not_be_read_is_known_by_what_can_be_seen_of_it() {
     }
     let p = Project::whole();
     // Somewhere on the machine a build script looks around in, as one
-    // that searches for a library does, is a file kept from this user.
+    // that searches for a library does, is a file kept from this user, and
+    // a link to something in a directory kept from this user.
     let kept = p.temp.path().join("elsewhere/kept");
     let keep = |text: &str| {
         if kept.exists() {
@@ -1081,6 +1082,13 @@ fn a_file_that_may_not_be_read_is_known_by_what_can_be_seen_of_it() {
         fs::set_permissions(&kept, fs::Permissions::from_mode(0o000)).unwrap();
     };
     keep("nobody's business");
+    // The link is there, and where it leads cannot even be asked about:
+    // to the build script that is as good as nothing being there.
+    let closed = p.temp.path().join("elsewhere/closed");
+    write(closed.join("inside"), "out of reach");
+    let link = p.temp.path().join("elsewhere/link");
+    std::os::unix::fs::symlink(closed.join("inside"), &link).unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
     write(
         p.root.join("build.rs"),
         &format!(
@@ -1088,6 +1096,7 @@ fn a_file_that_may_not_be_read_is_known_by_what_can_be_seen_of_it() {
                 let path = {kept:?};
                 let size = std::fs::metadata(path).unwrap().len();
                 let _ = std::fs::read(path);
+                assert!(std::fs::metadata({link:?}).is_err());
                 let to = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("size.txt");
                 std::fs::write(to, size.to_string()).unwrap();
             }}"#
@@ -1109,6 +1118,7 @@ fn a_file_that_may_not_be_read_is_known_by_what_can_be_seen_of_it() {
     assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
     assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
     fs::set_permissions(&kept, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// Give the project in `root` a build script that compiles C from the
@@ -1396,6 +1406,161 @@ fn a_tool_given_another_path_by_its_build_script_does_not_hide_the_build() {
     // to the build is what its own PATH finds, and that is as it was.
     p.clean();
     assert_eq!(p.run(&["run", "-q"]).stdout, b"42\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+/// Whether watched programs tell of their own reads here: the library
+/// they load for that is built for one kind of machine.
+fn notes() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && std::env::var_os("JATO_NOTES").is_none_or(|v| v != "0")
+}
+
+#[test]
+fn programs_tell_of_what_they_read_and_are_watched_as_well_without() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    compile_c(&p.root);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"42\n");
+    // The compilers said much of what they read themselves. What a
+    // program's loader opens before the program runs is always reported.
+    let noted = p.count("noted");
+    if notes() {
+        assert!(noted > 500 && p.count("reported") > 0, "{}", p.stats());
+    } else {
+        assert_eq!(noted, 0, "{}", p.stats());
+    }
+    // Watched by the kernel alone, the same build is the same build: the
+    // record made one way is found the other, and what is recorded the
+    // other way round is found again too.
+    let alone = |root: &Path| {
+        let mut cmd = p.command_in(root);
+        cmd.env("JATO_NOTES", "0");
+        cmd
+    };
+    p.clean();
+    assert_eq!(success(alone(&p.root).args(["run", "-q"])).stdout, b"42\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    write(p.root.join("native/answer.h"), "#define ANSWER 44\n");
+    p.clean();
+    let before = p.count("noted");
+    assert_eq!(success(alone(&p.root).args(["run", "-q"])).stdout, b"44\n");
+    assert_eq!(p.count("noted"), before, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"44\n");
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    // And a header the compiler read is still what the result depends
+    // on, told of or reported.
+    write(p.root.join("native/answer.h"), "#define ANSWER 45\n");
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"45\n");
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+}
+
+#[test]
+fn the_library_in_watched_programs_stands_in_for_nothing_else() {
+    if !observes() || !notes() {
+        return;
+    }
+    let p = Project::whole();
+    p.run(&["build"]);
+    let library = fs::read_dir(p.temp.path().join("cache/lib"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension() == Some(OsStr::new("so")))
+        .expect("the library is kept in the cache");
+    // Every program Jato watches loads this ahead of its C library, and
+    // anything it defined would be taken for the program's own. It may
+    // define the functions it stands in for and nothing more: no memory
+    // functions, and nothing a Rust program brings itself.
+    let Ok(listed) = Command::new("nm")
+        .args(["-D", "--defined-only"])
+        .arg(&library)
+        .output()
+    else {
+        return;
+    };
+    let defined: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+        .collect();
+    assert!(defined.len() > 10, "{defined:?}");
+    for name in &defined {
+        let stood_in_for = ["open", "stat", "access"]
+            .iter()
+            .any(|kind| name.trim_start_matches('_').contains(kind));
+        assert!(stood_in_for, "{name} is defined for every watched program");
+    }
+    // And it asks nothing of the system but what every C library has, so
+    // that it loads into a program built against another one.
+    let needed = Command::new("readelf")
+        .arg("-d")
+        .arg(&library)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&needed.stdout).contains("NEEDED"),
+        "the library names another it needs"
+    );
+}
+
+#[test]
+fn a_program_that_gives_up_the_way_to_tell_is_watched_all_the_same() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // Something outside the package that nothing but the build script
+    // reads, so that only watching the build script can know of it.
+    let data = p.temp.path().join("elsewhere/data.txt");
+    write(&data, "first");
+    // The build script closes every descriptor it was started with above
+    // the usual three, as some programs do, opens a file of its own where
+    // the one for telling Jato was, and only then reads.
+    write(
+        p.root.join("build.rs"),
+        &format!(
+            r#"use std::os::fd::IntoRawFd;
+            unsafe extern "C" {{
+                fn close(fd: i32) -> i32;
+                fn dup2(from: i32, to: i32) -> i32;
+            }}
+            fn main() {{
+                let out = std::env::var("OUT_DIR").unwrap();
+                for fd in 3..1024 {{
+                    unsafe {{ close(fd) }};
+                }}
+                let mine = std::fs::File::create(format!("{{out}}/mine.txt")).unwrap().into_raw_fd();
+                assert_eq!(unsafe {{ dup2(mine, 217) }}, 217);
+                let text = std::fs::read_to_string({data:?}).unwrap();
+                assert!(std::fs::metadata("Cargo.toml").unwrap().is_file());
+                std::fs::write(format!("{{out}}/data.txt"), text).unwrap();
+                println!("cargo:rerun-if-changed=build.rs");
+            }}"#
+        ),
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() {
+            let mine = include_bytes!(concat!(env!("OUT_DIR"), "/mine.txt"));
+            println!("{} {}", include_str!(concat!(env!("OUT_DIR"), "/data.txt")), mine.len());
+        }"#,
+    );
+    // Nothing was written into the build script's own file.
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"first 0\n");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"first 0\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // What it read after that was seen: with the file changed, the build
+    // is another one.
+    write(&data, "second");
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"second 0\n");
     assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
 }
 
