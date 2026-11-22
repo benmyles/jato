@@ -109,6 +109,9 @@ pub struct Access {
     /// Used by a program other than the one the command itself is: one it
     /// started, or a part of it that was recorded apart.
     pub others: bool,
+    /// Listed by such a program. What the command's own program lists and
+    /// another only asks about was listed by the first alone.
+    pub listed_by_others: bool,
     /// When the command first used the path and when it made the file its
     /// own, counted in the system calls reported until then. Zero for a
     /// file it never made.
@@ -156,6 +159,7 @@ impl Access {
             whole.writer = later.writer;
         }
         whole.others |= later.others;
+        whole.listed_by_others |= later.listed_by_others;
         *self = whole;
     }
 }
@@ -959,6 +963,7 @@ mod imp {
                         origin: None,
                         writer: None,
                         others: false,
+                        listed_by_others: false,
                         first: self.now,
                         made: 0,
                     },
@@ -966,6 +971,7 @@ mod imp {
             }
             let access = self.report.paths.get_mut(&path).unwrap();
             access.others |= self.others;
+            access.listed_by_others |= self.others && matches!(how, Use::List);
             // A program that was run was run, whoever made it and whenever.
             access.executed |= matches!(how, Use::Execute);
             match how {
@@ -1939,6 +1945,7 @@ mod tests {
             origin: None,
             writer: None,
             others: false,
+            listed_by_others: false,
             first,
             made: 0,
         }

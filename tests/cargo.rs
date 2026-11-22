@@ -731,6 +731,19 @@ fn what_cargo_passes_over_in_a_directory_it_lists_keeps_no_build_away() {
     // directory an earlier build was made in.
     let p = Project::whole();
     commit_all(&p);
+    // The build script asks where its package really is, as one does that
+    // goes on to read files beside it. That is a question about each
+    // directory on the way, and no look at what they hold.
+    write(
+        p.root.join("build.rs"),
+        r#"fn main() {
+    let here = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let real = std::fs::canonicalize(format!("{here}/leaf/..")).unwrap();
+    assert!(std::fs::metadata(&real).unwrap().is_dir());
+}
+"#,
+    );
+    git(&p.root, &["commit", "-q", "-a", "-m", "ask"]);
     assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
     let tree = p.temp.path().join("trees/second");
     git(
@@ -1160,6 +1173,117 @@ fn a_change_to_c_that_a_build_script_compiles_leaves_nothing_to_start_from() {
     let out = success(p.command_in(&second).args(["run", "-q"]));
     assert_eq!(out.stdout, b"44\n");
     assert_eq!(p.count("build_near"), 0, "{}", p.stats());
+}
+
+/// Run a command whose input and output are a terminal of so many
+/// columns. Returns whether it succeeded and everything it wrote there.
+fn on_terminal(cmd: &mut Command, columns: u16) -> (bool, Vec<u8>) {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::Stdio;
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    size.ws_col = columns;
+    size.ws_row = 40;
+    let (mut ours, mut theirs) = (0, 0);
+    let made = unsafe {
+        libc::openpty(
+            &raw mut ours,
+            &raw mut theirs,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &raw const size,
+        )
+    };
+    assert_eq!(made, 0);
+    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(ours), OwnedFd::from_raw_fd(theirs)) };
+    let mut child = cmd
+        .stdin(theirs.try_clone().unwrap())
+        .stdout(theirs.try_clone().unwrap())
+        .stderr(theirs)
+        .spawn()
+        .unwrap();
+    // The command keeps its ends until it is told of others, and the
+    // terminal would never be seen to close.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut written = Vec::new();
+    let mut terminal = fs::File::from(ours);
+    let mut buffer = [0u8; 4096];
+    // Reading fails once nobody holds the other end.
+    while let Ok(n) = terminal.read(&mut buffer) {
+        if n == 0 {
+            break;
+        }
+        written.extend_from_slice(&buffer[..n]);
+    }
+    (child.wait().unwrap().success(), written)
+}
+
+#[test]
+fn a_build_is_the_same_build_on_any_terminal_and_on_none() {
+    if !observes() {
+        return;
+    }
+    const FINISHED: &[u8] = b"\x1b[1m\x1b[92m    Finished\x1b[0m";
+    let within = |text: &[u8], part: &[u8]| text.windows(part.len()).any(|at| at == part);
+    let p = Project::whole();
+    // Made with nobody watching, as an agent makes it.
+    p.run(&["build"]);
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // Put back for someone at a terminal, in the terminal's colours, at
+    // whatever width.
+    for (round, columns) in [(1, 100), (2, 60)] {
+        p.clean();
+        let (worked, shown) = on_terminal(p.command().args(["build"]), columns);
+        assert!(worked, "{}", String::from_utf8_lossy(&shown));
+        assert_eq!(p.count("build_hit"), round, "{}", p.stats());
+        assert!(
+            within(&shown, FINISHED),
+            "{}",
+            String::from_utf8_lossy(&shown)
+        );
+    }
+    // A build with a warning, made on a terminal: the compiler's warning
+    // is in colour there.
+    write(
+        p.root.join("leaf/src/value.rs"),
+        "pub fn value() -> String { let unused = 1; String::from(\"three\") }",
+    );
+    p.clean();
+    let (worked, shown) = on_terminal(p.command().args(["build"]), 100);
+    assert!(worked && within(&shown, b"unused"));
+    assert!(within(&shown, b"\x1b[33mwarning") || within(&shown, b"mwarning"));
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    // Put back in a narrower window as it was laid out, which is what
+    // Cargo does with the warnings of a crate it finds up to date.
+    p.clean();
+    let (worked, shown) = on_terminal(p.command().args(["build"]), 60);
+    assert!(worked && within(&shown, b"unused") && within(&shown, FINISHED));
+    assert_eq!(p.count("build_hit"), 3, "{}", p.stats());
+    // And where there is no terminal, without the colours.
+    p.clean();
+    let out = p.run(&["build"]);
+    assert_eq!(p.count("build_hit"), 4, "{}", p.stats());
+    assert!(
+        !out.stderr.contains(&0x1b),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(within(&out.stderr, b"warning: unused variable: `unused`"));
+    assert!(within(&out.stderr, b"    Finished"));
+    // The other way round: recorded without a terminal, with the warning.
+    write(
+        p.root.join("leaf/src/value.rs"),
+        "pub fn value() -> String { let idle = 1; String::from(\"four\") }",
+    );
+    p.clean();
+    let out = p.run(&["build"]);
+    assert!(within(&out.stderr, b"warning: unused variable: `idle`"));
+    p.clean();
+    let (worked, shown) = on_terminal(p.command().args(["build"]), 100);
+    assert!(worked && within(&shown, b"unused variable: `idle`") && within(&shown, FINISHED));
+    assert_eq!(p.count("build_hit"), 5, "{}", p.stats());
 }
 
 #[test]

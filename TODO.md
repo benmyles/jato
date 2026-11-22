@@ -38,6 +38,7 @@
 
 - [x] Start a build of sources that differ a little from the nearest recorded build: its files are put in place without what the compilers wrote whose inputs differ, Cargo makes those again and what depends on them, and the result is recorded like a build from nothing. Who examined each input is part of a whole build's record.
 - [x] Do not take a call for missed that a thread never made because its program exited while the call waited to be looked at. One in four checks of all of Olo went unrecorded for it on a busy machine.
+- [x] Take the terminal out of what tells one build from another. A person at a terminal was never given a build an agent had made, nor one made in a window of another width, and a crate with a warning was compiled again for each width. Colours are left out where a build is put back without a terminal, as Cargo leaves them out.
 - [x] Count the names in a directory Cargo lists only where Cargo goes by them. In a git checkout Cargo lists the top of the repository, and a file git does not track there, or a `target` directory beside a build made elsewhere, kept builds from being put back.
 
 ## Open

@@ -83,6 +83,8 @@ A lookup hashes the command line and its keyed environment, finds the results re
 
 `jato build`, `check`, `clippy`, and `test` or `bench` with `--no-run` are looked up as one result. On a hit Cargo is not started: the files it would have left in the target directory are put there, those already holding the right bytes are left alone, and Cargo's summary and any compiler warnings are printed as they were. Cargo afterwards finds everything in that target directory up to date.
 
+Where a build is shown is no part of which build it is. Cargo has the compilers colour their diagnostics whether or not it will show them in colour, and leaves the colours out where there is no terminal. Jato does the same with a build it puts back, so one an agent made is put back for a person at a terminal and the other way round. Warnings keep the layout of the terminal their crate was compiled on, as they do when Cargo itself finds a crate up to date.
+
 On a miss Cargo runs under the observer, with each compiler it starts asking Jato for its result or reporting it. When the build ends it is recorded as a whole, depending on what Cargo and its compilers examined outside what the build itself made.
 
 `jato test`, `bench` and `run` first get the build they need: restored if it is recorded, made on its own if not, showing only what is being compiled. Then Cargo runs the command you asked for and finds the build done. A test name filter and a program's arguments are not part of the build.

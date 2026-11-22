@@ -432,13 +432,11 @@ enum Line {
     Other,
 }
 
-/// What a terminal would show of a line, which is the text after the last
-/// return to the start of the line, and what kind of line it is.
-fn shown(line: &[u8]) -> (&[u8], Line) {
-    let shown = line.rsplit(|b| *b == b'\r').find(|part| part.len() > 1);
-    let shown = shown.unwrap_or(line);
-    let mut plain = Vec::with_capacity(shown.len());
-    let mut bytes = shown.iter().copied().peekable();
+/// Text without what sets its colour and weight on a terminal, and
+/// without what makes part of it a link there.
+fn unstyled(text: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(text.len());
+    let mut bytes = text.iter().copied().peekable();
     while let Some(b) = bytes.next() {
         if b == 0x1b && bytes.peek() == Some(&b'[') {
             for c in bytes.by_ref() {
@@ -446,10 +444,26 @@ fn shown(line: &[u8]) -> (&[u8], Line) {
                     break;
                 }
             }
+        } else if b == 0x1b && bytes.peek() == Some(&b']') {
+            // Up to a bell, or to an escape and a backslash.
+            while let Some(c) = bytes.next() {
+                if c == 0x07 || (c == 0x1b && bytes.next_if_eq(&b'\\').is_some()) {
+                    break;
+                }
+            }
         } else {
             plain.push(b);
         }
     }
+    plain
+}
+
+/// What a terminal would show of a line, which is the text after the last
+/// return to the start of the line, and what kind of line it is.
+fn shown(line: &[u8]) -> (&[u8], Line) {
+    let shown = line.rsplit(|b| *b == b'\r').find(|part| part.len() > 1);
+    let shown = shown.unwrap_or(line);
+    let plain = unstyled(shown);
     let text = String::from_utf8_lossy(&plain);
     let word = text.trim_start().split(' ').next().unwrap_or_default();
     let kind = if !text.starts_with(' ') {
@@ -467,8 +481,11 @@ fn shown(line: &[u8]) -> (&[u8], Line) {
 /// What Cargo would print for a build in which nothing had to be done,
 /// taken from what it printed when everything was. Lines that report
 /// progress go; diagnostics and the summary stay, with the time it took
-/// this time.
-fn replayed(recorded: &[u8], elapsed: f64, quiet: bool) -> Vec<u8> {
+/// this time. With `colour` unset, as it is where no terminal shows them,
+/// they are printed without colours, as Cargo prints there. The summary
+/// is in Cargo's colours on a terminal even if the build was recorded
+/// without one.
+fn replayed(recorded: &[u8], elapsed: f64, quiet: bool, colour: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(recorded.len());
     for line in recorded.split_inclusive(|b| *b == b'\n') {
         let (shown, kind) = shown(line);
@@ -478,11 +495,20 @@ fn replayed(recorded: &[u8], elapsed: f64, quiet: bool) -> Vec<u8> {
             Line::Progress => (),
             Line::Finished => {
                 if !quiet && let Some(at) = memchr::memmem::rfind(shown, b" in ") {
-                    out.extend_from_slice(&shown[..at]);
+                    let plain = unstyled(&shown[..at]);
+                    let said = plain.trim_ascii_start();
+                    let said = said.strip_prefix(b"Finished").unwrap_or(said);
+                    out.extend_from_slice(if colour {
+                        b"\x1b[1m\x1b[92m    Finished\x1b[0m"
+                    } else {
+                        b"    Finished"
+                    });
+                    out.extend_from_slice(said);
                     out.extend_from_slice(format!(" in {elapsed:.2}s\n").as_bytes());
                 }
             }
-            Line::Other => out.extend_from_slice(shown),
+            Line::Other if colour => out.extend_from_slice(shown),
+            Line::Other => out.extend_from_slice(&unstyled(shown)),
         }
     }
     out
@@ -549,13 +575,12 @@ fn prepare(cmd: &Command, name: &str) -> Result<Option<Prepared>> {
         spare: false,
     };
     let (roots, skipped) = locate(&request);
-    // Diagnostics are laid out for the terminal they are shown on.
-    let terminal_out = io::stderr().is_terminal();
-    let mut salt = vec![u8::from(terminal_out), u8::from(io::stdout().is_terminal())];
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if terminal_out && unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &raw mut size) } == 0 {
-        salt.extend_from_slice(&size.ws_col.to_le_bytes());
-    }
+    // Where a build is shown is no part of which build it is. Cargo has
+    // the compilers colour their diagnostics whether or not it will show
+    // them in colour, and shows those of a crate it finds up to date as
+    // they were laid out when the crate was compiled, however wide the
+    // terminal was then.
+    let mut salt = Vec::new();
     // Whether the command stops before running what it built is a property
     // of the build, wherever the option stands. How much Cargo says about
     // its progress is not: none of that is repeated for a restored build.
@@ -605,7 +630,8 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
             io::stdout().write_all(fresh.as_bytes())?;
             let quiet = cmd.get_args().any(|a| a == "-q" || a == "--quiet");
             let elapsed = begun.elapsed().as_secs_f64();
-            io::stderr().write_all(&replayed(&outcome.stderr, elapsed, quiet))?;
+            let colour = io::stderr().is_terminal();
+            io::stderr().write_all(&replayed(&outcome.stderr, elapsed, quiet, colour))?;
             return Ok(outcome.code);
         }
         Ok(None) => (),
@@ -940,7 +966,7 @@ mod tests {
             "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.50s\n",
         ]
         .concat();
-        let text = String::from_utf8(replayed(recorded.as_bytes(), 0.031, false)).unwrap();
+        let text = String::from_utf8(replayed(recorded.as_bytes(), 0.031, false, false)).unwrap();
         let expected = [
             "warning: unused variable: `x`\n",
             " --> leaf/src/lib.rs:1:5\n",
@@ -949,12 +975,34 @@ mod tests {
             "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s\n",
         ];
         assert_eq!(text, expected.concat());
-        let quiet = String::from_utf8(replayed(recorded.as_bytes(), 0.031, true)).unwrap();
+        let quiet = String::from_utf8(replayed(recorded.as_bytes(), 0.031, true, false)).unwrap();
         assert_eq!(quiet, expected[..expected.len() - 1].concat());
         // Text that merely starts with such a word is a diagnostic.
         assert_eq!(
-            replayed(b"Running out of ideas\n", 1.0, false),
+            replayed(b"Running out of ideas\n", 1.0, false, false),
             b"Running out of ideas\n"
+        );
+        // The summary is styled for where it is shown now, whichever way
+        // it was recorded.
+        let plain = b"    Finished `dev` profile [unoptimized] target(s) in 3.00s\n";
+        let styled =
+            b"\x1b[1m\x1b[92m    Finished\x1b[0m `dev` profile [unoptimized] target(s) in 3.00s\n";
+        for recorded in [&plain[..], &styled[..]] {
+            assert_eq!(
+                replayed(recorded, 0.5, false, false),
+                b"    Finished `dev` profile [unoptimized] target(s) in 0.50s\n"
+            );
+            assert_eq!(
+                replayed(recorded, 0.5, false, true),
+                b"\x1b[1m\x1b[92m    Finished\x1b[0m `dev` profile [unoptimized] target(s) in 0.50s\n"
+            );
+        }
+        // A diagnostic recorded on a terminal, shown where there is none.
+        let warning = b"\x1b[1m\x1b[33mwarning\x1b[0m: unused, see \x1b]8;;https://example.invalid\x1b\\E0001\x1b]8;;\x1b\\\n";
+        assert_eq!(replayed(warning, 1.0, false, true), warning);
+        assert_eq!(
+            replayed(warning, 1.0, false, false),
+            b"warning: unused, see E0001\n"
         );
     }
 

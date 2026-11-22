@@ -1769,7 +1769,9 @@ pub fn record(
         // What a listing of the directory told whoever listed it. Cargo
         // itself goes by the names in few of the directories it lists.
         let listing = access.listing.as_ref().filter(|names| {
-            job.scope != Scope::Build || access.others || goes_by_names(path, names, report)
+            job.scope != Scope::Build
+                || access.listed_by_others
+                || goes_by_names(path, names, report)
         });
         // That a directory is there, and is no link to another, is all
         // that a look at it says unless it was listed.
@@ -2089,8 +2091,11 @@ pub fn record(
         } else {
             !stderr.is_empty()
         };
+        // Whether the compiler coloured what it said is part of what it
+        // printed. How wide it was told the terminal is, is not: Cargo
+        // shows a crate's diagnostics again later as they were laid out
+        // when the crate was compiled, in a window of any width.
         if rendered {
-            manifest.width = Some(job.facts.width);
             manifest.ansi = Some(job.facts.ansi);
         }
     }
