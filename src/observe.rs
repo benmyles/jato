@@ -262,6 +262,16 @@ pub fn fast_library(cache: &Path) -> Option<PathBuf> {
 
 /// Digest of a set of directory entry names.
 pub fn listing_digest(mut names: Vec<OsString>) -> Digest {
+    // What tools put down and take away as they run is no part of what a
+    // directory holds: Cargo's locks and the journals of its database,
+    // which come and go in its home directory, and the files Jato itself
+    // stages beside the ones it puts back.
+    names.retain(|name| {
+        let name = name.as_bytes();
+        let lock = name.starts_with(b".cargo-") && name.ends_with(b"lock");
+        let own = memchr::memmem::find(name, b".jato-").is_some();
+        !(lock || own || name.starts_with(b".package-cache") || name.starts_with(b".global-cache"))
+    });
     names.sort_unstable();
     let mut hash = blake3::Hasher::new_derive_key("jato directory listing v1");
     for name in &names {

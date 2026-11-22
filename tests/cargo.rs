@@ -2094,8 +2094,87 @@ pub fn names(_: TokenStream) -> TokenStream {
 pub fn setting(_: TokenStream) -> TokenStream {
     literal(std::env::var("MACRO_SETTING").unwrap_or_default())
 }
+// The nearest `.settings/value` in the directories above the crate, the
+// way tools look for the settings that apply to a project.
+#[proc_macro]
+pub fn nearest(_: TokenStream) -> TokenStream {
+    let found = std::path::Path::new(&dir())
+        .ancestors()
+        .skip(1)
+        .find_map(|above| std::fs::read_to_string(above.join(".settings/value")).ok());
+    literal(found.unwrap_or_default())
+}
 "#,
     );
+}
+
+#[test]
+fn settings_found_above_a_crate_are_found_again_from_where_it_is_kept() {
+    if !observes() {
+        return;
+    }
+    // A workspace kept inside a directory whose name is how the settings
+    // it looks for begin, as the crates Cargo downloads are kept inside
+    // its home directory, where its settings are.
+    let p = Project::named("top/.settings/ws");
+    let ready = |root: &Path, value: &str| {
+        add_macros(root);
+        write(
+            root.join("leaf/Cargo.toml"),
+            "[package]\nname='leaf'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nmacros={path='../macros'}\n",
+        );
+        write(root.join("leaf/src/lib.rs"), "pub use macros::*;");
+        write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"{}\", leaf::nearest!()); }",
+        );
+        write(root.parent().unwrap().join("value"), value);
+    };
+    ready(&p.root, "from above");
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"from above\n");
+    // The same crate, compiled where it is, finds the same settings.
+    p.clean();
+    let (hits, misses) = p.during(|| assert_eq!(p.run(&["run", "-q"]).stdout, b"from above\n"));
+    assert_eq!((hits, misses), (3, 0), "{}", p.stats());
+    // A second workspace below the same settings, further down, finds
+    // them too, and is given the result.
+    let below = p.temp.path().join("top/.settings/deeper/ws");
+    populate(&below);
+    ready(&below, "unused");
+    fs::remove_file(below.parent().unwrap().join("value")).unwrap();
+    fs::copy(p.root.join("Cargo.lock"), below.join("Cargo.lock")).unwrap();
+    let (hits, misses) = p.during(|| {
+        let out = success(p.command_in(&below).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"from above\n");
+    });
+    assert_eq!((hits, misses), (3, 0), "{}", p.stats());
+    // Settings nearer to that workspace are found first.
+    write(
+        below.parent().unwrap().join(".settings/value"),
+        "from nearer",
+    );
+    let touch = |root: &Path| {
+        let main = root.join("src/main.rs");
+        let text = fs::read_to_string(&main).unwrap();
+        write(&main, &format!("{text} "));
+        write(&main, &text);
+    };
+    touch(&below);
+    assert_eq!(
+        success(p.command_in(&below).args(["run", "-q"])).stdout,
+        b"from nearer\n"
+    );
+    // A copy somewhere else has other files above it, whatever they say:
+    // the crate that looked is compiled there.
+    let other = p.temp.path().join("other/.settings/ws");
+    populate(&other);
+    ready(&other, "from elsewhere");
+    fs::copy(p.root.join("Cargo.lock"), other.join("Cargo.lock")).unwrap();
+    let (hits, misses) = p.during(|| {
+        let out = success(p.command_in(&other).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"from elsewhere\n");
+    });
+    assert_eq!((hits, misses), (2, 1), "{}", p.stats());
 }
 
 #[test]

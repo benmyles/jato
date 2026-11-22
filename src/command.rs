@@ -1704,18 +1704,18 @@ pub fn record(
     if let Some(work) = roots.path(roots::WORK) {
         let around = Surroundings::of(work, &job.request.env);
         let (walks, again) = {
-            let outside: Vec<(&Input, usize, &Path)> = manifest
+            let outside: Vec<&Input> = manifest
                 .inputs
                 .iter()
                 .filter(|input| input.root == roots::ABSOLUTE)
-                .map(|input| {
-                    let (up, rest) = around.above(&input.path);
-                    (input, up, rest)
-                })
                 .collect();
             // A name looked for in one directory above the workspace
             // after another, or in the workspace and above it, was looked
-            // for from the workspace.
+            // for from the workspace. Such names are short, and a path may
+            // be one in more than one way: the settings in Cargo's home
+            // directory are `config.toml` there and `.cargo/config.toml`
+            // in the directory above.
+            let above: Vec<&Path> = work.ancestors().skip(1).collect();
             let inside: HashSet<&Path> = manifest
                 .inputs
                 .iter()
@@ -1723,9 +1723,13 @@ pub fn record(
                 .map(|input| input.path.as_path())
                 .collect();
             let mut levels: BTreeMap<&Path, BTreeMap<usize, &Input>> = BTreeMap::new();
-            for (input, up, rest) in &outside {
-                if !rest.as_os_str().is_empty() {
-                    levels.entry(rest).or_default().insert(*up, input);
+            for input in &outside {
+                for (up, dir) in above.iter().enumerate() {
+                    if let Ok(name) = input.path.strip_prefix(dir)
+                        && (1..=3).contains(&name.components().count())
+                    {
+                        levels.entry(name).or_default().insert(up + 1, input);
+                    }
                 }
             }
             let walks: Vec<Walk> = levels
@@ -1735,7 +1739,7 @@ pub fn record(
                     let last = *at.keys().next_back()?;
                     Some(Walk {
                         name: name.to_path_buf(),
-                        top: work.ancestors().nth(last)?.to_owned(),
+                        top: above.get(last - 1)?.to_path_buf(),
                         found: at
                             .values()
                             .filter(|input| {
@@ -1750,23 +1754,27 @@ pub fn record(
             // it, as a crate named by `../shared` is, or by a name of its
             // own. It is recorded a second time by the way from the
             // workspace, and has to be as it was both ways.
-            let walked = |rest: &Path, path: &Path| {
+            let walked = |path: &Path| {
                 walks.iter().any(|walk| {
-                    walk.name == rest || walk.found.iter().any(|found| path.starts_with(found))
+                    walk.found.iter().any(|found| path.starts_with(found))
+                        || above
+                            .iter()
+                            .any(|dir| path.strip_prefix(dir) == Ok(walk.name.as_path()))
                 })
             };
             let again: Vec<Input> = outside
                 .iter()
-                .filter(|(input, _, rest)| {
-                    around.beside(&input.path)
-                        && !around.named(&input.path)
-                        && !walked(rest, &input.path)
+                .filter(|input| {
+                    around.beside(&input.path) && !around.named(&input.path) && !walked(&input.path)
                 })
-                .map(|(input, up, rest)| Input {
-                    root: roots::WORK,
-                    path: Surroundings::from_inside(*up, rest),
-                    link: input.link.clone(),
-                    state: input.state.clone(),
+                .map(|input| {
+                    let (up, rest) = around.above(&input.path);
+                    Input {
+                        root: roots::WORK,
+                        path: Surroundings::from_inside(up, rest),
+                        link: input.link.clone(),
+                        state: input.state.clone(),
+                    }
                 })
                 .collect();
             (walks, again)
