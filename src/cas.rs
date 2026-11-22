@@ -196,11 +196,14 @@ pub struct Stats {
     /// Why the latest build that ran under watch was not recorded as a
     /// whole, and how many seconds ago that was.
     pub unrecorded: Option<(u64, String)>,
+    /// Why the latest build that was recorded is only put back in the
+    /// target directory it was made in, if that is so.
+    pub only_there: Option<(u64, String)>,
 }
 
+/// A record that may stand for a command, before it has been read.
 pub struct Candidate {
     pub key: Digest,
-    pub manifest: Vec<u8>,
     used: i64,
 }
 
@@ -661,19 +664,29 @@ impl Store {
         let _ = self.conn.execute_batch("COMMIT");
     }
 
-    /// Earlier results for a command line, most recently used first.
+    /// Earlier results for a command line, most recently used first. The
+    /// records themselves are read one at a time as they are looked at: a
+    /// whole build's is megabytes, and the first is usually the one.
     pub fn candidates(&self, recipe: &Digest) -> Result<Vec<Candidate>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT key,manifest,used FROM entries WHERE recipe=?1 ORDER BY used DESC LIMIT ?2",
+            "SELECT key,used FROM entries WHERE recipe=?1 ORDER BY used DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![recipe, VARIANTS as i64], |r| {
             Ok(Candidate {
                 key: r.get(0)?,
-                manifest: r.get(1)?,
-                used: r.get(2)?,
+                used: r.get(1)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A candidate's record as it is stored, if it is still kept.
+    pub fn record(&self, candidate: &Candidate) -> Option<Vec<u8>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT manifest FROM entries WHERE key=?1")
+            .ok()?;
+        stmt.query_row([&candidate.key], |r| r.get(0)).ok()
     }
 
     /// How long ago `key` was last noted, in seconds, and note it now.
@@ -958,12 +971,11 @@ impl Store {
     pub fn entry(&self, key: &Digest) -> Result<Option<Candidate>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT key,manifest,used FROM entries WHERE key=?1")?;
+            .prepare_cached("SELECT key,used FROM entries WHERE key=?1")?;
         let found = stmt.query_row([key], |r| {
             Ok(Candidate {
                 key: r.get(0)?,
-                manifest: r.get(1)?,
-                used: r.get(2)?,
+                used: r.get(1)?,
             })
         });
         Ok(found.optional()?)
@@ -1358,35 +1370,48 @@ impl Store {
             objects: one("SELECT count(*) FROM objects")?,
             remembered_files: one("SELECT count(*) FROM stamps")?,
             counters,
-            unrecorded: self
-                .conn
-                .query_row(
-                    "SELECT value FROM settings WHERE name='unrecorded'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .unwrap_or(None)
-                .and_then(|noted| {
-                    let (at, why) = noted.split_once('\t')?;
-                    let ago = (now() / 1_000_000 - at.parse::<i64>().ok()?).max(0);
-                    Some((ago as u64, why.to_owned()))
-                }),
+            unrecorded: self.noted("unrecorded"),
+            only_there: self.noted("only_there"),
         })
+    }
+
+    /// What was last noted under `name`, and how many seconds ago.
+    fn noted(&self, name: &str) -> Option<(u64, String)> {
+        let noted: String = self
+            .conn
+            .query_row("SELECT value FROM settings WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap_or(None)?;
+        let (at, why) = noted.split_once('\t')?;
+        let ago = (now() / 1_000_000 - at.parse::<i64>().ok()?).max(0);
+        Some((ago as u64, why.to_owned()))
+    }
+
+    /// Note `why` under `name` with the time, or forget what was noted.
+    fn note(&mut self, name: &str, why: Option<&str>) {
+        let _ = match why {
+            Some(why) => self.conn.execute(
+                "INSERT INTO settings VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                params![name, format!("{}\t{why}", now() / 1_000_000)],
+            ),
+            None => self
+                .conn
+                .execute("DELETE FROM settings WHERE name=?1", [name]),
+        };
+    }
+
+    /// Keep why a whole build that was recorded is only put back where it
+    /// was made, or forget the last such reason once one is not.
+    pub fn note_only_there(&mut self, why: Option<&str>) {
+        self.note("only_there", why);
     }
 
     /// Keep why a build could not be recorded as a whole, or forget the
     /// last such reason once one has been.
     pub fn note_unrecorded(&mut self, why: Option<&str>) {
-        let _ = match why {
-            Some(why) => self.conn.execute(
-                "INSERT INTO settings VALUES('unrecorded',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
-                [format!("{}\t{why}", now() / 1_000_000)],
-            ),
-            None => self
-                .conn
-                .execute("DELETE FROM settings WHERE name='unrecorded'", []),
-        };
+        self.note("unrecorded", why);
     }
 }
 

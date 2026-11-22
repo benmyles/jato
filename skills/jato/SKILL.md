@@ -24,6 +24,7 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 ## What to expect
 
+- A project's first build with Jato has to be made in an empty target directory to be of use anywhere else: run `cargo clean` first, or build in a new worktree. In a target directory that Cargo or another cache filled, Cargo finds everything up to date and Jato has nothing to keep; `jato stats` then says that the last build is only put back where it was made.
 - The first build of a state compiles and records. Later builds of that state, anywhere on the machine that shares the cache, are restored: in another git worktree or clone, on another branch, after a commit that left the built files alone.
 - In a new worktree, build with `jato` before or after editing, as suits the task. A first build of sources that differ from ones built before only in Rust source starts from that earlier build: Cargo compiles what changed and what depends on it. `jato stats` counts these as `build_near`. A changed manifest, lock file or build script input has Cargo carry out the whole build, with each compiler answered from the cache.
 - After editing, Cargo and rustc compile what changed at their usual speed. Undoing an edit returns to a recorded build at once.

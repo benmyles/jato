@@ -54,6 +54,8 @@ jato stats
 
 The first build of a state compiles and is recorded. After that, the same command in the same state is restored instead of built, wherever on the machine it is asked for. An edit is compiled by Cargo and rustc as usual, and undoing the edit returns to the recorded build at once.
 
+Make a project's first build with Jato in an empty target directory: after `cargo clean`, or in a new worktree. In a target directory that Cargo or another cache has already filled, Cargo finds everything up to date and nothing is compiled that Jato could keep. That build is recorded for its own directory alone, and `jato stats` says so.
+
 Jato records on Linux, on x86-64 and aarch64, with kernel 5.5 or later. On other systems its commands run Cargo unchanged.
 
 ### Use Jato with coding agents
@@ -218,6 +220,8 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 ## Storage
 
 The cache directory holds an SQLite index and the files commands wrote, each stored once under the BLAKE3 digest of its contents. On a filesystem that can clone files, such as Btrfs or XFS, a stored file is a clone of the compiler's output and a restored file is a clone of that: the bytes exist once on disk however many target directories hold them, and each copy can still be written without affecting the others. On other filesystems objects are compressed with Zstandard and restores are copies.
+
+Measured on Btrfs, for builds and tests of two programs of Olo: a cache of 807 MiB and four target directories filled from it, 2,651 MiB by their sizes, held 22 MiB between them that only one of the five had. Each worktree's target directory had 0 to 3 MiB of its own. One that bare Cargo built beside them had all 153 MiB of its own.
 
 A result becomes visible in one transaction, after its files are in place. Each record says itself which command it belongs to and which files it needs; the index only finds records and counts references. A restored file's digest is checked unless the filesystem checksums data itself. A record that cannot be read or whose files are gone is dropped and the command runs.
 

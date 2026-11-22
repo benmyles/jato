@@ -38,6 +38,8 @@
 
 - [x] Start a build of sources that differ a little from the nearest recorded build: its files are put in place without what the compilers wrote whose inputs differ, Cargo makes those again and what depends on them, and the result is recorded like a build from nothing. Who examined each input is part of a whole build's record.
 - [x] Do not take a call for missed that a thread never made because its program exited while the call waited to be looked at. One in four checks of all of Olo went unrecorded for it on a busy machine.
+- [x] Say in `jato stats` when the last build recorded is of use only in its own target directory: someone who starts using Jato where Cargo has already built gets nothing in the next worktree, and was not told why.
+- [x] Read the records that may stand for a command one at a time. All of them were read at once, three times for a build that had to be made: for a workspace of Olo's size that is 90 MB each time once two dozen builds are recorded.
 - [x] Record a build made where another command's build already was as resting on it, with that build's files and conditions, so that it is put back in a target directory the other command never used. Clippy first in a new worktree of Olo had been 55 s for one package.
 - [x] Take a build that Cargo runs for clippy for Cargo's own: the command's own program is any its first process has been.
 - [x] Know text in the target directory that names a root by what it says without the name, as a compiler reads it. A crate that includes generated source with full paths in it was compiled again in every checkout.

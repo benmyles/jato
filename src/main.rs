@@ -536,6 +536,12 @@ fn report(stats: &cas::Stats) -> String {
             "           the last build made was not recorded ({ago} ago): {why}"
         );
     }
+    if let Some((_, why)) = &stats.only_there {
+        let _ = writeln!(
+            out,
+            "           the last build recorded is only put back where it was made: {why}"
+        );
+    }
     let (hits, misses, edits) = (count("hit"), count("miss"), count("continued"));
     let _ = writeln!(
         out,

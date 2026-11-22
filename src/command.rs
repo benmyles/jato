@@ -873,7 +873,8 @@ fn search(
     );
     let mut nearest = None;
     for candidate in &candidates {
-        let manifest = match Manifest::decode(&candidate.manifest) {
+        let stored = store.record(candidate).unwrap_or_default();
+        let manifest = match Manifest::decode(&stored) {
             // The index said this result belongs to this command. Only a
             // record that says so itself is believed.
             Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
@@ -942,7 +943,8 @@ pub fn mostly_built(job: &Job, store: &Store, recipe: &Digest) -> bool {
     };
     let Some(manifest) = candidates
         .first()
-        .and_then(|c| Manifest::decode(&c.manifest).ok())
+        .and_then(|candidate| store.record(candidate))
+        .and_then(|stored| Manifest::decode(&stored).ok())
     else {
         return false;
     };
@@ -1430,7 +1432,8 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     let mut best: Option<Near> = None;
     let mut why = None;
     for (at, candidate) in candidates.iter().enumerate().take(NEAR) {
-        let manifest = match Manifest::decode(&candidate.manifest) {
+        let stored = store.record(candidate).unwrap_or_default();
+        let manifest = match Manifest::decode(&stored) {
             Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
             _ => continue,
         };
@@ -1650,7 +1653,8 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
         let Ok(Some(entry)) = store.entry(&key) else {
             continue;
         };
-        let manifest = match Manifest::decode(&entry.manifest) {
+        let stored = store.record(&entry).unwrap_or_default();
+        let manifest = match Manifest::decode(&stored) {
             Ok(manifest) if manifest.key(&theirs) == key => manifest,
             _ => continue,
         };
@@ -2802,7 +2806,8 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
         .map_or(0, |d| d.as_secs());
     let earlier = store.candidates(&kept).unwrap_or_default();
     let fresh = earlier.iter().any(|candidate| {
-        Manifest::decode(&candidate.manifest)
+        let stored = store.record(candidate).unwrap_or_default();
+        Manifest::decode(&stored)
             .is_ok_and(|m| m.key(&kept) == candidate.key && now.saturating_sub(m.saved_at) < lasts)
     });
     if fresh {
@@ -2995,9 +3000,12 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
     };
     let mut lots: Vec<(&crate::cas::Candidate, Manifest)> = candidates
         .iter()
-        .filter_map(|candidate| match Manifest::decode(&candidate.manifest) {
-            Ok(manifest) if manifest.key(&kept) == candidate.key => Some((candidate, manifest)),
-            _ => None,
+        .filter_map(|candidate| {
+            let stored = store.record(candidate)?;
+            match Manifest::decode(&stored) {
+                Ok(manifest) if manifest.key(&kept) == candidate.key => Some((candidate, manifest)),
+                _ => None,
+            }
         })
         .collect();
     // The newest first: there is more than one only while one is replaced.
@@ -3294,6 +3302,27 @@ pub fn finish(
     }
     if job.scope == Scope::Build {
         store.note_unrecorded(recorded.as_ref().err().map(String::as_str));
+        // A build made where Cargo found things built that Jato has no
+        // record of rests on them, and is of no use anywhere else. Whoever
+        // wonders why a new worktree compiles everything is told.
+        let found: Vec<&Input> = recorded
+            .iter()
+            .flat_map(|manifest| &manifest.inputs)
+            .filter(|input| input.root == roots::TARGET && matches!(input.state, State::File(_)))
+            .collect();
+        let why = found.first().map(|first| {
+            format!(
+                "Cargo used {} files that were in the target directory already and that Jato has no record of, {} for one; a build made in an empty target directory is put back anywhere",
+                found.len(),
+                first.path.display()
+            )
+        });
+        if let Some(why) = &why {
+            log(job.name(), format_args!("only put back here: {why}"));
+        }
+        if recorded.is_ok() {
+            store.note_only_there(why.as_deref());
+        }
     }
     recorded
 }

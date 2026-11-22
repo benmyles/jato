@@ -899,6 +899,44 @@ fn a_build_cargo_makes_for_one_of_its_subcommands_is_cargo_s_own() {
 }
 
 #[test]
+fn a_build_in_a_target_made_without_jato_is_said_to_be_of_use_only_there() {
+    if !observes() {
+        return;
+    }
+    // Someone who has been building with Cargo alone starts using Jato.
+    // Cargo finds everything in the target directory up to date, and
+    // nothing is compiled that Jato could keep.
+    let p = Project::whole();
+    success(
+        p.command()
+            .env("JATO_DISABLE", "1")
+            .args(["cargo", "build"]),
+    );
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    let said = p.stats()["only_there"][1].as_str().map(str::to_owned);
+    let said = said.unwrap_or_default();
+    assert!(said.contains("in the target directory already"), "{said}");
+    let shown = String::from_utf8(p.run(&["stats"]).stdout).unwrap();
+    assert!(shown.contains("only put back where it was made"), "{shown}");
+    // Another checkout gets nothing from it, and makes a build that any
+    // checkout can have.
+    let second = p.temp.path().join("second/checkout");
+    populate(&second);
+    fs::copy(p.root.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
+    let out = success(p.command_in(&second).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 0, "{}", p.stats());
+    assert!(p.stats()["only_there"].is_null(), "{}", p.stats());
+    let third = p.temp.path().join("third/checkout");
+    populate(&third);
+    fs::copy(p.root.join("Cargo.lock"), third.join("Cargo.lock")).unwrap();
+    let out = success(p.command_in(&third).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
 fn a_build_in_a_target_another_command_used_is_put_back_where_that_command_s_is() {
     if !observes() {
         return;
