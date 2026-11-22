@@ -24,7 +24,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v1";
+const EPOCH: &str = "jato command v2";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
