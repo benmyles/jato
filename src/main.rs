@@ -33,7 +33,7 @@ use std::path::Path;
 use std::process::Command;
 
 const HELP: &str = "\
-Jato — a local Rust build cache and workspace edit runner
+Jato — remembers Rust builds, so the same build is never done twice
 
 Usage
   jato check|build|test|run|clippy [CARGO_ARGUMENTS...]
@@ -51,18 +51,29 @@ Examples
   jato cargo +stable build --release
   jato gc 20GiB
 
-To use Jato for every Cargo command, name it in ~/.cargo/config.toml:
+For tools that start Cargo themselves, name Jato as the compiler wrapper in
+~/.cargo/config.toml. Single compilations are then reused; whole builds are
+recorded and restored only by the commands above.
   [build]
   rustc-wrapper = \"jato\"
 
 Environment
-  JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
-  JATO_MAX_SIZE     Cache budget when none is stored with `jato limit`
-  JATO_LOG=debug    Explain each decision on stderr; an absolute path appends to that file
-  JATO_KEY_ENV      Comma-separated variables a proc macro reads from the environment
-  JATO_COALESCE=0   Let identical concurrent compilations run independently
-  JATO_REMAP=0      Leave real workspace and target paths in compiled output
-  JATO_DISABLE=1    Run the compiler directly
+  JATO_CACHE_DIR      Private local cache, default $XDG_CACHE_HOME/jato
+  JATO_MAX_SIZE       Cache budget when none is stored with `jato limit`
+  JATO_JOBS           Compilers running at once across all builds using this
+                      cache; default is the number of processors, 0 any number
+  JATO_LOG=debug      Explain each decision on stderr; an absolute path
+                      appends to that file
+  JATO_KEY_ENV        Comma-separated variables a proc macro reads from the
+                      environment
+  JATO_EDIT_WINDOW    Seconds within which a crate compiled again counts as
+                      being edited and is not recorded; default 600, 0 never
+  JATO_WHOLE_BUILDS=0 Reuse single compilations only
+  JATO_COALESCE=0     Let identical concurrent compilations run independently
+  JATO_REMAP=0        Leave real workspace and target paths in compiled output
+  JATO_STORAGE=packed Keep compressed copies even where files can be cloned
+  JATO_VERIFY=1       Check restored bytes on filesystems that checksum them
+  JATO_DISABLE=1      Run Cargo and the compiler directly
 ";
 
 fn main() {
@@ -247,6 +258,92 @@ fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / 1048576.0)
 }
 
+/// Print, and end quietly if whoever was reading has stopped.
+fn say(text: &str) -> Result<i32> {
+    use std::io::Write;
+    match std::io::stdout().write_all(text.as_bytes()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(0),
+    }
+}
+
+/// What the cache holds and what it has done, for a person to read.
+fn report(stats: &cas::Stats) -> String {
+    use std::fmt::Write;
+    let count = |name: &str| stats.counters.get(name).copied().unwrap_or(0);
+    let mut out = String::new();
+    let _ = writeln!(out, "Cache      {}", stats.directory.display());
+    let (whole, made, left) = (
+        count("build_hit"),
+        count("build_miss"),
+        count("build_left_to_cargo"),
+    );
+    if whole + made + left > 0 {
+        let _ = writeln!(
+            out,
+            "Builds     {whole} put back whole, {made} made and {} of those recorded, {left} left to Cargo in a built target",
+            count("build_stored")
+        );
+    }
+    let (hits, misses, edits) = (count("hit"), count("miss"), count("continued"));
+    let _ = writeln!(
+        out,
+        "Compilers  {hits} results reused, {misses} run ({} of those could not be stored), {edits} run during edits",
+        count("uncacheable")
+    );
+    let _ = writeln!(
+        out,
+        "Saved      {:.1} s of earlier work not done again",
+        count("saved_ms") as f64 / 1000.0
+    );
+    if count("queued") > 0 {
+        let _ = writeln!(
+            out,
+            "Waiting    {} compilers waited {:.1} s in all for other builds",
+            count("queued"),
+            count("queued_ms") as f64 / 1000.0
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Results    {} stored, {} distinct files",
+        stats.entries, stats.objects
+    );
+    let _ = writeln!(
+        out,
+        "Disk       {} of {} budget, holding {} of outputs",
+        mib(stats.stored_bytes),
+        mib(stats.limit_bytes),
+        mib(stats.artifact_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "Index      {}, {} file digests remembered",
+        mib(stats.database_bytes),
+        stats.remembered_files
+    );
+    const SHOWN: &[&str] = &[
+        "hit",
+        "miss",
+        "uncacheable",
+        "saved_ms",
+        "stored",
+        "continued",
+        "queued",
+        "queued_ms",
+        "build_hit",
+        "build_miss",
+        "build_stored",
+        "build_left_to_cargo",
+    ];
+    for (name, value) in &stats.counters {
+        if !SHOWN.contains(&name.as_str()) {
+            let _ = writeln!(out, "{name:<18} {value}");
+        }
+    }
+    out
+}
+
 fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let mut options = CargoOptions::default();
@@ -263,8 +360,7 @@ fn run() -> Result<i32> {
             args.first().and_then(|a| a.to_str()),
             Some("-h" | "--help" | "help")
         ) {
-            print!("{}", dev::HELP);
-            return Ok(0);
+            return say(dev::HELP);
         }
         if args.is_empty()
             || (args[0].as_encoded_bytes().starts_with(b"-")
@@ -278,8 +374,10 @@ fn run() -> Result<i32> {
     }
     let first = args.first().map(OsString::as_os_str);
     match first.and_then(OsStr::to_str) {
-        Some("--version" | "-V") => println!("jato {}", env!("CARGO_PKG_VERSION")),
-        Some("--help" | "-h" | "help") => print!("{HELP}"),
+        Some("--version" | "-V") => {
+            return say(concat!("jato ", env!("CARGO_PKG_VERSION"), "\n"));
+        }
+        Some("--help" | "-h" | "help") => return say(HELP),
         Some("check" | "build" | "test" | "run" | "clippy") => return cargo(args, options),
         Some("watch") => return watch::run(&args[1..], options),
         Some("cargo") => return cargo(&args[1..], options),
@@ -291,46 +389,9 @@ fn run() -> Result<i32> {
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
             if args.len() == 2 {
-                println!("{}", serde_json::to_string_pretty(&stats)?);
-                return Ok(0);
+                return say(&format!("{}\n", serde_json::to_string_pretty(&stats)?));
             }
-            let count = |name: &str| stats.counters.get(name).copied().unwrap_or(0);
-            let (hits, misses) = (count("hit"), count("miss"));
-            println!("Cache      {}", stats.directory.display());
-            println!(
-                "Commands   {hits} reused, {misses} run ({} of those could not be stored)",
-                count("uncacheable")
-            );
-            if hits + misses > 0 {
-                println!(
-                    "Reuse      {:.1}% of commands, {:.1} s of compiler time not spent",
-                    100.0 * hits as f64 / (hits + misses) as f64,
-                    count("saved_ms") as f64 / 1000.0
-                );
-            }
-            println!(
-                "Results    {} stored, {} distinct files",
-                stats.entries, stats.objects
-            );
-            println!(
-                "Disk       {} of {} budget, holding {} of outputs",
-                mib(stats.stored_bytes),
-                mib(stats.limit_bytes),
-                mib(stats.artifact_bytes)
-            );
-            println!(
-                "Index      {}, {} file digests remembered",
-                mib(stats.database_bytes),
-                stats.remembered_files
-            );
-            for (name, value) in &stats.counters {
-                if !matches!(
-                    name.as_str(),
-                    "hit" | "miss" | "uncacheable" | "saved_ms" | "stored"
-                ) {
-                    println!("{name:<18} {value}");
-                }
-            }
+            return say(&report(&stats));
         }
         Some("limit") if args.len() <= 2 => {
             let mut store = Store::open()?;
@@ -354,7 +415,7 @@ fn run() -> Result<i32> {
                 println!("Removed {} left by earlier versions of Jato", mib(earlier));
             }
         }
-        None => print!("{HELP}"),
+        None => return say(HELP),
         // Cargo runs its compiler wrapper as `jato <compiler> <arguments>`.
         _ if first.is_some_and(|driver| {
             Path::new(driver).components().count() > 1

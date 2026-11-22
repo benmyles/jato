@@ -780,7 +780,15 @@ fn supervise(
         format_args!("ran, with {} file accesses of its own", report.paths.len()),
     );
     let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
-    store.flush();
+    drop(parts);
+    // The stores that served the compilers are done with, and the index
+    // has taken a whole build's worth of writes.
+    server
+        .stores
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    store.settle();
     Ok(Supervised::Ran(ran.code))
 }
 

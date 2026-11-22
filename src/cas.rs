@@ -1058,6 +1058,14 @@ impl Store {
     // ---- bookkeeping ------------------------------------------------------
 
     /// Write what this process learned in one transaction.
+    /// Move what the write-ahead log holds into the index, so that the
+    /// next process to open it has nothing to read back. Worth doing after
+    /// a whole build's worth of writes; skipped if anyone else is writing.
+    pub fn settle(&mut self) {
+        self.flush();
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+
     pub fn flush(&mut self) {
         if self.learned.is_empty()
             && self.counts.is_empty()

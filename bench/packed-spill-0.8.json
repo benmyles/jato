@@ -1,9 +1,0 @@
-{
-  "artifact_mib": 272,
-  "revisions": 2,
-  "build_profile": "cargo test (unoptimized)",
-  "peak_process_rss_kib": 8848,
-  "user_seconds": 1.51,
-  "system_seconds": 0.32,
-  "wall_seconds": 1.97
-}

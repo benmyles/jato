@@ -122,13 +122,12 @@ impl Workspace {
         let cache = cas::cache_dir()?;
         if roots.iter().any(|r| r.starts_with(&cache)) {
             for name in [
-                "artifacts-v1.sqlite3",
-                "artifacts-v1.sqlite3-wal",
-                "artifacts-v1.sqlite3-shm",
-                "schema.lock",
-                "objects-v1",
-                "frames-v1",
-                ".jato-staging-v1",
+                "index-v2.sqlite3",
+                "index-v2.sqlite3-wal",
+                "index-v2.sqlite3-shm",
+                "init.lock",
+                "objects",
+                "locks",
             ] {
                 excluded.push(cache.join(name));
             }
@@ -136,14 +135,6 @@ impl Workspace {
             excluded.push(cache);
         }
         excluded.extend(meta.build_directory);
-        if std::env::var_os("JATO_WORKTREE_ACTIVE").as_deref() == Some(OsStr::new("1")) {
-            excluded.extend(
-                ["JATO_WORKTREE_TARGET_ALIAS", "JATO_WORKTREE_BUILD_ALIAS"]
-                    .into_iter()
-                    .filter_map(std::env::var_os)
-                    .map(PathBuf::from),
-            );
-        }
         Ok(Self {
             roots,
             excluded,

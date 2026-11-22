@@ -7,7 +7,6 @@ pub const HELP: &str = "\
 Usage
   jato dev [build|run|test|check|clippy] [CARGO_ARGUMENTS...]
   jato dev watch [WATCH_OPTIONS...]
-  jato dev worktree [WORKTREE_OPTIONS...] ACTION
 
 With no action, build the workspace's default members. The jato-dev Cargo
 profile inherits dev, uses 16 codegen units, keeps workspace line tables, and
