@@ -153,28 +153,19 @@ impl Server {
         parts.add(manifest, &job.roots, &self.roots, cargo);
     }
 
-    /// Whether the process that started `pid` runs the program Cargo runs:
-    /// Cargo itself, where Jato started it or where one of its own
-    /// subcommands did for the build. What Cargo starts as a compiler it
-    /// runs again when the compiler's output is missing. What a build
-    /// script starts is that script's affair.
+    /// Whether the process that started `pid` is Cargo: runs a program
+    /// the command itself is or has been, in the process Jato started or
+    /// in one a subcommand of Cargo's started for the build. What Cargo
+    /// starts as a compiler it runs again when the compiler's output is
+    /// missing. What a build script starts is that script's affair.
     fn started_by_cargo(&self, pid: u32) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let parent = || {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            // After the name, which may hold anything: the state, then
-            // the parent.
-            let rest = stat.rsplit_once(") ")?.1;
-            rest.split(' ').nth(1)?.parse::<u32>().ok()
-        };
-        let program = |id: u32| {
-            let meta = std::fs::metadata(format!("/proc/{id}/exe")).ok()?;
-            Some((meta.dev(), meta.ino()))
-        };
-        parent().is_some_and(|parent| {
-            parent == self.cargo
-                || program(parent).is_some_and(|theirs| program(self.cargo) == Some(theirs))
-        })
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // After the name, which may hold anything: the state, then the
+        // parent.
+        let parent = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split(' ').nth(1)?.parse::<u32>().ok());
+        parent.is_some_and(|parent| parent == self.cargo || self.scopes.own_program(parent))
     }
 
     /// Serve one compiler wrapper from its request to its last message.
@@ -675,7 +666,8 @@ fn make(
         mut store,
         recipe,
     } = prepared;
-    let start = command::start_from(&job, &mut store, &recipe);
+    let start = command::start_from(&job, &mut store, &recipe)
+        .or_else(|| command::rest_on(&job, &mut store, &recipe));
     let again = start.is_some().then(|| copy_of(&cmd));
     let prepared = Prepared { job, store, recipe };
     match supervise(cmd, prepared, name, begun, whole, start)? {

@@ -614,6 +614,41 @@ impl Store {
         }
     }
 
+    /// What a command learned from a file it read inside one of its
+    /// roots that the build itself may have written: a generated source
+    /// file, something Cargo keeps about a build script. Text that names
+    /// a root is known by what it says with the roots' names taken out,
+    /// as it is stored when it is a command's output, so that it is the
+    /// same file in every checkout.
+    pub fn digest_placed(
+        &mut self,
+        path: &Path,
+        stamp: Stamp,
+        roots: &Roots,
+    ) -> io::Result<Digest> {
+        if let Some(digest) = self.recall(&stamp) {
+            return Ok(digest);
+        }
+        if stamp.size <= TEXT_LIMIT
+            && let Ok(bytes) = fs::read(path)
+        {
+            let spellings = roots.spellings();
+            let names = spellings
+                .iter()
+                .any(|(_, spelling)| scan::names_path(&bytes, spelling));
+            if names && memchr::memchr(0, &bytes).is_none() {
+                let read = fs::metadata(path).map(|meta| Stamp::of(&meta))?;
+                if !stamp.same_contents(&read) {
+                    return Err(io::Error::other("file changed while it was read"));
+                }
+                let digest = *blake3::hash(&roots.mark(&bytes)).as_bytes();
+                self.remember(read, digest);
+                return Ok(digest);
+            }
+        }
+        self.digest_seen(path, stamp)
+    }
+
     // ---- lookups ----------------------------------------------------------
 
     /// Read from one consistent state of the index until `end_read`,
@@ -854,9 +889,7 @@ impl Store {
             for i in touched {
                 // Later commands read this file. They need not hash it again.
                 let output = &manifest.outputs[i];
-                if !output.marked
-                    && let Ok(meta) = fs::metadata(&dests[i])
-                {
+                if let Ok(meta) = fs::metadata(&dests[i]) {
                     self.remember(Stamp::of(&meta), output.digest);
                 }
             }
@@ -921,8 +954,23 @@ impl Store {
         placed
     }
 
+    /// The record with this key, if it is kept.
+    pub fn entry(&self, key: &Digest) -> Result<Option<Candidate>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT key,manifest,used FROM entries WHERE key=?1")?;
+        let found = stmt.query_row([key], |r| {
+            Ok(Candidate {
+                key: r.get(0)?,
+                manifest: r.get(1)?,
+                used: r.get(2)?,
+            })
+        });
+        Ok(found.optional()?)
+    }
+
     /// Whether the file at `dest` already is this output.
-    fn holds(&mut self, output: &crate::manifest::Output, dest: &Path, roots: &Roots) -> bool {
+    pub fn holds(&mut self, output: &crate::manifest::Output, dest: &Path, roots: &Roots) -> bool {
         let Ok(meta) = fs::symlink_metadata(dest) else {
             return false;
         };
@@ -1043,9 +1091,10 @@ impl Store {
                     "{} changed while it was stored",
                     file.display()
                 );
-                if !text {
-                    self.remember(before, staged.digest);
-                }
+                // For text that names a root this is what it says with
+                // the roots' names taken out, which is all a command that
+                // reads it there learns that it would not learn anywhere.
+                self.remember(before, staged.digest);
                 return Ok(staged);
             }
             use std::io::Seek;

@@ -751,6 +751,12 @@ mod imp {
             .replace('\0', " ")
     }
 
+    /// The program a process is running, by its file.
+    fn running(id: u32) -> Option<(u64, u64)> {
+        let meta = fs::metadata(format!("/proc/{id}/exe")).ok()?;
+        Some((meta.dev(), meta.ino()))
+    }
+
     /// Whether a thread has ended or is ending. A program that exits takes
     /// its other threads with it, and one of them may have been waiting
     /// here for its call to be looked at. That call is never made, so
@@ -1314,7 +1320,14 @@ mod imp {
         notes: Option<OwnedFd>,
         /// The command's first process, which is the first to report.
         leader: Option<u32>,
-        /// Whether each thread runs the program the leader runs, and when
+        /// The programs the leader has been, after the one that started
+        /// it: a toolchain manager's stand-in for Cargo, then Cargo, then
+        /// perhaps a subcommand of Cargo's that starts Cargo again for the
+        /// build. Each by its file's device and number.
+        been: Vec<(u64, u64)>,
+        /// How many programs the leader has tried to become.
+        became: u32,
+        /// Whether each thread runs one of the leader's programs, and when
         /// that was last worked out.
         program: HashMap<u32, (bool, u64)>,
     }
@@ -1412,10 +1425,11 @@ mod imp {
             }
         }
 
-        /// Whether a thread runs the program the command itself is: the
-        /// one its first process runs now. Cargo is that program in the
-        /// process a toolchain manager started it in, and again where one
-        /// of its own subcommands starts it for the build.
+        /// Whether a thread runs the program the command itself is: one
+        /// that its first process runs or has run. Cargo is that program
+        /// in the process a toolchain manager started it in, and again
+        /// where a subcommand such as clippy's, which Cargo turned into,
+        /// starts Cargo for the build.
         fn own_program(&mut self, tid: u32) -> bool {
             let Some(leader) = self.leader else {
                 return false;
@@ -1429,11 +1443,9 @@ mod imp {
             {
                 return *own;
             }
-            let program = |id: u32| {
-                let meta = fs::metadata(format!("/proc/{id}/exe")).ok()?;
-                Some((meta.dev(), meta.ino()))
-            };
-            let own = program(leader).is_some_and(|theirs| program(tid) == Some(theirs));
+            let own = running(tid).is_some_and(|theirs| {
+                running(leader) == Some(theirs) || self.been.contains(&theirs)
+            });
             self.program.insert(tid, (own, self.events));
             own
         }
@@ -1442,8 +1454,17 @@ mod imp {
         /// succeeds.
         fn becomes_another(&mut self, tid: u32) {
             match self.leader {
-                // Every answer was a comparison with the leader's program.
                 Some(leader) if ids(tid).is_none_or(|(process, _)| process == leader) => {
+                    // What the leader ran until now stays one of its
+                    // programs, all but the one that started the command.
+                    if self.became > 0
+                        && let Some(program) = running(leader)
+                        && !self.been.contains(&program)
+                    {
+                        self.been.push(program);
+                    }
+                    self.became += 1;
+                    // Every answer was a comparison with these.
                     self.program.clear()
                 }
                 _ => drop(self.program.remove(&tid)),
@@ -1581,6 +1602,13 @@ mod imp {
             );
         }
 
+        /// Whether `process` runs a program the command itself is or has
+        /// been.
+        pub fn own_program(&self, process: u32) -> bool {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.own_program(process)
+        }
+
         /// Whether `process` is the root of a scope or runs inside one.
         pub fn inside(&self, process: u32) -> bool {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -1711,6 +1739,8 @@ mod imp {
             events: 0,
             notes: reading,
             leader: None,
+            been: Vec::new(),
+            became: 0,
             program: HashMap::new(),
         }));
         let noted = {
@@ -1893,6 +1923,9 @@ mod imp {
     pub struct Scopes;
     impl Scopes {
         pub fn begin(&self, _: u32, _: Config) {}
+        pub fn own_program(&self, _: u32) -> bool {
+            false
+        }
         pub fn inside(&self, _: u32) -> bool {
             false
         }

@@ -845,6 +845,167 @@ fn a_package_added_where_a_workspace_looks_for_packages_is_built() {
 }
 
 #[test]
+fn a_build_cargo_makes_for_one_of_its_subcommands_is_cargo_s_own() {
+    if !observes() || !has_git() {
+        return;
+    }
+    // For clippy, Cargo turns into a small program of clippy's that starts
+    // Cargo again. That Cargo reads the repository and lists directories
+    // like any other, and what it starts as compilers are its own.
+    // Only with the toolchain's own clippy: another toolchain's, found
+    // along PATH, would compile with another compiler.
+    if !Path::new(env!("CARGO"))
+        .with_file_name("clippy-driver")
+        .exists()
+    {
+        return;
+    }
+    let p = Project::whole();
+    commit_all(&p);
+    success(p.command().args(["clippy"]));
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    let tree = p.temp.path().join("trees/second");
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            tree.to_str().unwrap(),
+        ],
+    );
+    write(tree.join("notes.txt"), "to self");
+    success(p.command_in(&tree).args(["clippy"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // And a worktree with a change starts from that build.
+    let third = p.temp.path().join("trees/third");
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "more",
+            third.to_str().unwrap(),
+        ],
+    );
+    edit_leaf(&third, "two");
+    make_old(&third.join("leaf/src/value.rs"));
+    success(p.command_in(&third).args(["clippy"]));
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+}
+
+#[test]
+fn a_build_in_a_target_another_command_used_is_put_back_where_that_command_s_is() {
+    if !observes() {
+        return;
+    }
+    // A check and a build share what Cargo builds for the machine doing
+    // the building: build scripts, and what running them leaves. A build
+    // made after a check, in the same target directory, has read some of
+    // what the check left there, and that names the checkout.
+    let p = Project::whole();
+    let ready = |root: &Path| {
+        write(
+            root.join("build.rs"),
+            r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/made.rs"), "const MADE: u32 = 7;").unwrap();
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"#,
+        );
+        write(
+            root.join("src/main.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/made.rs\"));\nfn main() { println!(\"{MADE} {}\", leaf::value()); }",
+        );
+    };
+    ready(&p.root);
+    p.run(&["check"]);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"7 one:none\n");
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    // Another checkout, where the check is put back and then the build.
+    let second = p.temp.path().join("second/checkout");
+    populate(&second);
+    ready(&second);
+    fs::copy(p.root.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
+    success(p.command_in(&second).args(["check"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    let out = success(p.command_in(&second).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"7 one:none\n");
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    // Where nothing was checked first, the build is put back with what it
+    // had taken from the check: it was recorded as resting on it.
+    let third = p.temp.path().join("third/checkout");
+    populate(&third);
+    ready(&third);
+    fs::copy(p.root.join("Cargo.lock"), third.join("Cargo.lock")).unwrap();
+    let out = success(p.command_in(&third).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"7 one:none\n");
+    assert_eq!(p.count("build_hit"), 3, "{}", p.stats());
+    assert_eq!(p.stale_for_cargo(&third, &third.join("target")), 0);
+    // And a change there starts from it like from any other build.
+    let fourth = p.temp.path().join("fourth/checkout");
+    populate(&fourth);
+    ready(&fourth);
+    fs::copy(p.root.join("Cargo.lock"), fourth.join("Cargo.lock")).unwrap();
+    edit_leaf(&fourth, "two");
+    make_old(&fourth.join("leaf/src/value.rs"));
+    let out = success(p.command_in(&fourth).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"7 two\n");
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    // What the check had made of the changed crate was left out, and the
+    // build had no use for it. A check there makes it.
+    success(p.command_in(&fourth).args(["check"]));
+    assert_eq!(p.stale_for_cargo(&fourth, &fourth.join("target")), 0);
+}
+
+#[test]
+fn a_file_a_build_script_writes_that_names_its_checkout_is_the_same_file_in_another() {
+    if !observes() {
+        return;
+    }
+    // The script writes source that names a file by its full path, as
+    // generated code does. The crate that includes it is compiled once.
+    let p = Project::new();
+    let ready = |root: &Path| {
+        write(
+            root.join("build.rs"),
+            r#"fn main() {
+    let here = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out = std::env::var("OUT_DIR").unwrap();
+    let code = format!("const TEXT: &str = include_str!({:?});", format!("{here}/leaf/src/text file"));
+    std::fs::write(format!("{out}/made.rs"), code).unwrap();
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"#,
+        );
+        write(
+            root.join("src/main.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/made.rs\"));\nfn main() { println!(\"{TEXT} {}\", leaf::value()); }",
+        );
+    };
+    ready(&p.root);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one one:none\n");
+    let second = p.temp.path().join("second/checkout");
+    populate(&second);
+    ready(&second);
+    fs::copy(p.root.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
+    let (hits, misses) = p.during(|| {
+        let out = success(p.command_in(&second).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"one one:none\n");
+    });
+    assert_eq!((hits, misses), (3, 0), "{}", p.stats());
+    // The file it names is that checkout's own.
+    write(second.join("leaf/src/text file"), "two");
+    let out = success(p.command_in(&second).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"two two:none\n");
+}
+
+#[test]
 fn what_a_build_script_reads_of_a_repository_is_an_input() {
     if !observes() || !has_git() {
         return;

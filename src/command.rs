@@ -911,6 +911,9 @@ fn search(
         store.count(job.counter("hit"), 1);
         store.count("saved_ms", restored.cost_ms);
         store.count("restored_bytes", restored.bytes);
+        if tree {
+            note_build(&job.roots, recipe, &candidate.key);
+        }
         log(job.name(), "hit");
         let outcome = Outcome {
             code,
@@ -1321,8 +1324,15 @@ pub struct Start {
     pub manifest: Manifest,
     /// Which of its parts have to be made again.
     again: Vec<bool>,
-    /// Which of its outputs were put in place.
+    /// Which of its outputs are in place: put there, or found there.
     placed: Vec<bool>,
+    /// Which of those left out Cargo has to have made again: what this
+    /// command's own compilers wrote. What another command's wrote, in a
+    /// build this one rests on, is left out when its inputs have changed
+    /// and made again only if this command needs it.
+    owed: Vec<bool>,
+    /// The build is another command's, found in the target directory.
+    other: bool,
     /// What the files hold now that Cargo had asked about and that have
     /// changed since, by their positions among the inputs.
     now: HashMap<u32, State>,
@@ -1342,8 +1352,8 @@ impl Start {
     /// had been built on the missing file would be out of date and nothing
     /// else would say so.
     pub fn unmade(&self, roots: &Roots) -> Option<PathBuf> {
-        let left = self.manifest.outputs.iter().zip(&self.placed);
-        left.filter(|(_, placed)| !**placed)
+        let owed = self.manifest.outputs.iter().zip(&self.owed);
+        owed.filter(|(_, owed)| **owed)
             .filter_map(|(output, _)| roots.join(output.root, &output.path))
             .find(|path| !path.exists())
     }
@@ -1481,21 +1491,31 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     // any copy Cargo made under another name: for a program, the copy is
     // where Cargo looks.
     let mut leave = vec![false; manifest.outputs.len()];
+    let mut owed = vec![false; manifest.outputs.len()];
     let mut kept: HashSet<u32> = HashSet::new();
-    let mut gone: HashSet<Digest> = HashSet::new();
-    for (part, again) in manifest.parts.iter().zip(&again) {
+    // What was left out, by its bytes, and whether it is owed.
+    let mut gone: HashMap<Digest, bool> = HashMap::new();
+    for (at, (part, again)) in manifest.parts.iter().zip(&again).enumerate() {
+        let own = manifest.theirs.binary_search(&(at as u32)).is_err();
         for &output in &part.outputs {
             if *again {
                 leave[output as usize] = true;
-                gone.insert(manifest.outputs[output as usize].digest);
+                owed[output as usize] = own;
+                *gone
+                    .entry(manifest.outputs[output as usize].digest)
+                    .or_default() |= own;
             } else {
                 kept.insert(output);
             }
         }
     }
     for (at, output) in manifest.outputs.iter().enumerate() {
-        if output.size > 0 && gone.contains(&output.digest) && !kept.contains(&(at as u32)) {
+        if output.size > 0
+            && !kept.contains(&(at as u32))
+            && let Some(own) = gone.get(&output.digest)
+        {
             leave[at] = true;
+            owed[at] |= *own;
         }
     }
     let mut damaged = false;
@@ -1557,11 +1577,129 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     );
     Some(Start {
         placed: leave.iter().map(|left| !left).collect(),
+        owed,
+        other: false,
         manifest,
         again,
         now,
         cost_ms: restored.cost_ms,
     })
+}
+
+/// The name of the file in a target directory in which Jato notes the
+/// whole builds it recorded or put back there, the latest last: each by
+/// its command and its record.
+const BUILDS: &str = ".jato-builds";
+
+/// The builds noted in this target directory.
+fn builds_here(roots: &Roots) -> Vec<(Digest, Digest)> {
+    let Some(target) = roots.path(roots::TARGET) else {
+        return Vec::new();
+    };
+    let text = fs::read_to_string(target.join(BUILDS)).unwrap_or_default();
+    let digest = |hex: &str| {
+        blake3::Hash::from_hex(hex)
+            .ok()
+            .map(|hash| *hash.as_bytes())
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (recipe, key) = line.split_once(' ')?;
+            Some((digest(recipe)?, digest(key)?))
+        })
+        .collect()
+}
+
+/// Note that the files of a whole build are in this target directory.
+pub fn note_build(roots: &Roots, recipe: &Digest, key: &Digest) {
+    let Some(target) = roots.path(roots::TARGET) else {
+        return;
+    };
+    let mut builds = builds_here(roots);
+    builds.retain(|known| known != &(*recipe, *key));
+    builds.push((*recipe, *key));
+    let from = builds.len().saturating_sub(16);
+    let hex = |digest: &Digest| blake3::Hash::from(*digest).to_hex();
+    let text: String = builds[from..]
+        .iter()
+        .map(|(recipe, key)| format!("{} {}\n", hex(recipe), hex(key)))
+        .collect();
+    // Whole, or not at all.
+    let staging = target.join(format!("{BUILDS}.{}", std::process::id()));
+    if fs::write(&staging, text).is_ok() && fs::rename(&staging, target.join(BUILDS)).is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+}
+
+/// A whole build of another command whose files are in this target
+/// directory, and whose every input is as it was. Cargo will use some of
+/// what that build made, the build scripts for one, without making it
+/// again. This build is then recorded as resting on that one: with its
+/// files, and under what it depended on. Where this build is put back,
+/// those files are put back with it, whether or not the other command was
+/// ever run there.
+pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
+    if env::var_os("JATO_NEAR").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let begun = Instant::now();
+    for (theirs, key) in builds_here(&job.roots).into_iter().rev().take(4) {
+        if theirs == *recipe {
+            continue;
+        }
+        let Ok(Some(entry)) = store.entry(&key) else {
+            continue;
+        };
+        let manifest = match Manifest::decode(&entry.manifest) {
+            Ok(manifest) if manifest.key(&theirs) == key => manifest,
+            _ => continue,
+        };
+        if manifest.parts.is_empty() {
+            continue;
+        }
+        let mut here = Here::new(
+            &job.roots,
+            &job.request.env,
+            &job.path,
+            job.facts.width,
+            job.facts.ansi,
+        );
+        if manifest.holds(&mut here, store).is_err() {
+            continue;
+        }
+        // What is still there of it as it was made.
+        let placed: Vec<bool> = manifest
+            .outputs
+            .iter()
+            .map(|output| {
+                job.roots
+                    .join(output.root, &output.path)
+                    .is_some_and(|path| store.holds(output, &path, &job.roots))
+            })
+            .collect();
+        let there = placed.iter().filter(|placed| **placed).count();
+        if there * 2 < placed.len() {
+            continue;
+        }
+        log(
+            job.name(),
+            format_args!(
+                "resting on another command's build in this target directory, {there} of its {} files, looked over in {} ms",
+                placed.len(),
+                begun.elapsed().as_millis()
+            ),
+        );
+        return Some(Start {
+            again: vec![false; manifest.parts.len()],
+            owed: vec![false; placed.len()],
+            other: true,
+            placed,
+            manifest,
+            now: HashMap::new(),
+            cost_ms: 0,
+        });
+    }
+    None
 }
 
 /// The directories in which git keeps the repositories a command looked
@@ -1935,6 +2073,8 @@ pub fn record(
                 // it may be read, and only its contents say what.
                 let digest = if access.executed {
                     store.digest_known(path, stamp)
+                } else if root == roots::TARGET {
+                    store.digest_placed(path, stamp, roots)
                 } else {
                     store.digest_seen(path, stamp)
                 }
@@ -2104,7 +2244,7 @@ pub fn record(
     let mut known: HashMap<Digest, &Output> = HashMap::new();
     // Compilers of the build this one started from that were not run again,
     // and directories that build recorded the entries of.
-    let mut kept: Vec<&Part> = Vec::new();
+    let mut kept: Vec<(&Part, bool)> = Vec::new();
     let mut listed_earlier: HashSet<Place> = HashSet::new();
     if let Some(parts) = parts {
         let mut listed: HashSet<Place> = outputs
@@ -2168,13 +2308,19 @@ pub fn record(
                 place
             };
             let mut apart = vec![false; base.inputs.len()];
-            for (part, again) in base.parts.iter().zip(&start.again) {
+            for (at, (part, again)) in base.parts.iter().zip(&start.again).enumerate() {
                 let made_again = |output: &&u32| parts.outputs.contains_key(&start.place(**output));
                 let remade = part.outputs.iter().filter(made_again).count();
                 for &position in &part.inputs {
                     apart[position as usize] = true;
                 }
                 if remade == part.outputs.len() {
+                    continue;
+                }
+                // Another command's, out of date and left out: this
+                // command had no use for it.
+                let theirs = start.other || base.theirs.binary_search(&(at as u32)).is_ok();
+                if *again && theirs && remade == 0 {
                     continue;
                 }
                 if *again || remade > 0 {
@@ -2188,7 +2334,7 @@ pub fn record(
                 for &position in &part.inputs {
                     carry(position, &mut manifest);
                 }
-                kept.push(part);
+                kept.push((part, theirs));
             }
             for &position in &base.asked {
                 asked.insert(carry(position, &mut manifest));
@@ -2229,6 +2375,8 @@ pub fn record(
                     (Some(was), Ok(meta)) if !was.marked => store
                         .digest_known(path, Stamp::of(&meta))
                         .is_ok_and(|digest| digest == was.digest),
+                    // One the earlier build never had ran where none had.
+                    (None, _) => true,
                     _ => false,
                 };
                 if !same {
@@ -2522,9 +2670,10 @@ pub fn record(
                 apart.push(Part { inputs, outputs });
             }
         }
+        let mut borrowed = Vec::new();
         if let Some(start) = start {
             let base = &start.manifest;
-            for part in &kept {
+            for (part, another) in &kept {
                 let place = |position: &u32| {
                     let input = &base.inputs[*position as usize];
                     (input.root, input.path.clone())
@@ -2536,10 +2685,14 @@ pub fn record(
                 if outputs.is_empty() {
                     theirs.extend(inputs);
                 } else {
+                    if *another {
+                        borrowed.push(apart.len() as u32);
+                    }
                     apart.push(Part { inputs, outputs });
                 }
             }
         }
+        manifest.theirs = borrowed;
         theirs.extend(own.iter().filter_map(input_at));
         let theirs = ordered(theirs);
         let asked = ordered(asked.iter().filter_map(input_at).collect());
@@ -2556,6 +2709,9 @@ pub fn record(
         Ok(true) => {
             if !manifest.pins.is_empty() {
                 store.count("pinned", 1);
+            }
+            if job.scope == Scope::Build {
+                note_build(roots, recipe, &manifest.key(recipe));
             }
             Ok(manifest)
         }

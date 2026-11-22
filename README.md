@@ -94,6 +94,10 @@ On a miss Cargo runs under the observer, with each compiler it starts asking Jat
 
 `jato test`, `bench` and `run` first get the build they need: restored if it is recorded, made on its own if not, showing only what is being compiled. Then Cargo runs the command you asked for and finds the build done. A test name filter and a program's arguments are not part of the build.
 
+### One target directory, several commands
+
+A check, a build, clippy and the tests of a workspace share one target directory, and Cargo uses for each what the others made: build scripts and procedural macros are built once, and clippy checks dependencies exactly as `cargo check` does. A build made where another command's recorded build already is, with all of that build's inputs as they were, is recorded as resting on it. The record holds that build's files with its own, under everything either depended on, and is put back whole in a worktree where the other command was never run. For one package of Olo, clippy first in a new worktree took 55 s without this and 0.5 s with it.
+
 ### Builds that start from an earlier one
 
 The first build in a new worktree is often of sources nobody has built: a commit that is new, or an edit made before anything was built there. No recorded build stands for it. Cargo then has to carry the build out, with every compiler it starts answered from the cache, and for a workspace of some size that takes a while even when one file differs: checking the 121 packages of Olo in a new worktree took 23 s and 75 processor-seconds with one line changed in one program, and 37 s with a function added to a crate that 54 others use.
@@ -117,6 +121,8 @@ On the whole Olo workspace this was most of what a second checkout cost. Of 630 
 ### Other checkouts and target directories
 
 Results are stored relative to the workspace and the target directory, so a second checkout or a new target directory finds them. For that to be true of the compiled bytes, Jato asks rustc to write `/proc/self/cwd` in place of the workspace's location and `/proc/self/cwd/target` in place of the target directory's, through `--remap-path-prefix`. A debugger started in the workspace opens the right sources through those names. Diagnostics, `file!()` and panic messages are unchanged.
+
+Text inside the target directory that names the workspace or the target directory is known by what it says without those names, to a compiler that reads it as to the build script that wrote it: source generated with full paths in it is the same source in every checkout, and the crate that includes it is compiled once.
 
 Output that still names where it was built, such as a program that embeds `env!("CARGO_MANIFEST_DIR")`, is reused only in that checkout. `JATO_REMAP=0` keeps real paths in everything, and results then stay with the directory they were made in.
 

@@ -38,6 +38,9 @@
 
 - [x] Start a build of sources that differ a little from the nearest recorded build: its files are put in place without what the compilers wrote whose inputs differ, Cargo makes those again and what depends on them, and the result is recorded like a build from nothing. Who examined each input is part of a whole build's record.
 - [x] Do not take a call for missed that a thread never made because its program exited while the call waited to be looked at. One in four checks of all of Olo went unrecorded for it on a busy machine.
+- [x] Record a build made where another command's build already was as resting on it, with that build's files and conditions, so that it is put back in a target directory the other command never used. Clippy first in a new worktree of Olo had been 55 s for one package.
+- [x] Take a build that Cargo runs for clippy for Cargo's own: the command's own program is any its first process has been.
+- [x] Know text in the target directory that names a root by what it says without the name, as a compiler reads it. A crate that includes generated source with full paths in it was compiled again in every checkout.
 - [x] Take the terminal out of what tells one build from another. A person at a terminal was never given a build an agent had made, nor one made in a window of another width, and a crate with a warning was compiled again for each width. Colours are left out where a build is put back without a terminal, as Cargo leaves them out.
 - [x] Count the names in a directory Cargo lists only where Cargo goes by them. In a git checkout Cargo lists the top of the repository, and a file git does not track there, or a `target` directory beside a build made elsewhere, kept builds from being put back.
 
@@ -45,6 +48,8 @@
 
 - [ ] A build can start from an earlier one only when what differs was read by compilers Cargo started. A changed manifest or lock file, a changed input of a build script and changed C that a build script compiles leave Cargo to carry the build out: 22 s for a check of all of Olo. For C, leaving out what Cargo remembers of the build script's run would have Cargo run the script again. For a manifest, the parts whose command lines are unchanged could be found in the earlier build by what they wrote.
 - [ ] A build in which a build script was built again is not recorded when it started from an earlier one, because the script ran where its earlier version had written. Clearing what the earlier version wrote first would make the build one that can be recorded.
+- [ ] A build rests on another command's build only while that build's inputs are all as they were. Made after an edit, in a target directory the other command had used, it is recorded with what it found there as a condition, and is put back only where the same was done before it.
+- [ ] A build script that prints `rerun-if-changed` with a full path is run again by Cargo in every new checkout, after a build is put back and Cargo next runs: Cargo keeps the path in what it remembers of the script. Olo has two, and the first `cargo test` in a new worktree spends 20 s on one of them.
 - [ ] A build in a target directory that is already built is left to Cargo and not recorded as a whole, so sources arrived at by editing in one worktree are built again, from the nearest recorded build, by the next worktree that has them. Recording such builds as they are made needs a cheaper record than one that names every input again.
 
 

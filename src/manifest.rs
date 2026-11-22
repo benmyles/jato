@@ -121,6 +121,11 @@ pub struct Manifest {
     /// The compiler commands Cargo started. An input in none of the three
     /// lists counts with the first.
     pub parts: Vec<Part>,
+    /// The positions of the parts that another command's build made, on
+    /// which this one rests: a check's, in the record of a build made
+    /// where the check had been. This command does not make all of them
+    /// again when their inputs change.
+    pub theirs: Vec<u32>,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -270,6 +275,7 @@ impl Manifest {
             positions(&mut w, &part.inputs);
             positions(&mut w, &part.outputs);
         }
+        positions(&mut w, &self.theirs);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -373,6 +379,7 @@ impl Manifest {
                 outputs: read_positions(&mut r, m.outputs.len())?,
             });
         }
+        m.theirs = read_positions(&mut r, m.parts.len())?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -774,7 +781,13 @@ impl Manifest {
                 let digest = match seen.digest {
                     Some(digest) => digest,
                     None => {
-                        let digest = match store.digest_seen(&path, seen.stamp.unwrap()) {
+                        let stamp = seen.stamp.unwrap();
+                        let digest = if input.root == crate::roots::TARGET {
+                            store.digest_placed(&path, stamp, here.roots)
+                        } else {
+                            store.digest_seen(&path, stamp)
+                        };
+                        let digest = match digest {
                             Ok(digest) => digest,
                             Err(e) => return other(format!("{}: {e}", path.display())),
                         };
@@ -915,6 +928,7 @@ mod tests {
                 },
                 Part::default(),
             ],
+            theirs: vec![1],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();

@@ -1,5 +1,13 @@
 # Work journal
 
+## 2026-11-22 — one target directory, several commands (0.15)
+
+- Tried the commands an agent uses, one after another in one target directory of Olo and then in worktrees: check, build, clippy, test. Three things showed that a single command in an empty target never had.
+- Clippy's build was not put back in a worktree: "`.git` changed". For clippy Cargo turns into a program of clippy's that starts Cargo again, so the Cargo that builds was not the program the command began with, and nothing it read of the repository or listed was taken for Cargo's. The command's own program is now any that its first process has been.
+- A build made after a check had read what the check left in the target directory, which names the checkout, and was only ever found again there. Two changes. Text in the target directory that names a root is now known by what it says without the name, to a compiler that reads it as to the script that wrote it, which also lets a crate that includes generated source with full paths in it be compiled once for all checkouts. And a build made where another command's recorded build is, with that build's inputs as they were, is recorded as resting on it: with its files and conditions, its compilers kept apart from this command's own.
+- Clippy first in a new worktree, for one package of Olo: 55 s before, 0.5 s now. Then the tests, the build and the check there: put back, 0.05 s each for the last two.
+- A build that starts from a record resting on another command's build leaves out what that command made of the changed crates too, and need not make it again: Cargo makes it when that command is next run.
+
 ## 2026-11-22 — what Cargo lists, terminals, and comparing side by side (0.15)
 
 - The comparison with kache on the whole of Olo, now in a clone of the repository, showed a check into a second target directory taking 77 s where 0.13 had taken one. In a repository Cargo lists the top directory on its way to a package's files, and the first target directory was still standing there. Cargo goes by the names in a directory only where it looks for a package's targets and where it finds packages by a pattern, which shows in its reading the manifest of every directory there. Its other listings are no longer inputs. It took two attempts: a build script that asks where its package really is had made the top directory one that another program used, so who listed a directory is now kept apart from who asked about it.
