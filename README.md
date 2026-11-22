@@ -117,6 +117,8 @@ A build can also depend on what is around its checkout. A crate named by `path =
 
 Cargo asks git which files a package has when the package's build script names no inputs, to compare their times with what it built. A repository's own files differ between a checkout, a worktree of it and a clone, and they change with every commit. What Cargo itself reads inside a repository's directory is therefore not counted among a build's inputs: a build made in one worktree is put back in another, on another branch, and after a commit that left the built files alone. What any other program reads there counts like everything else, so a build script that puts the current commit into the program gets a build for each commit. The directories a workspace is inside are not inputs either, and a build outlives the checkout that made it.
 
+On its way to a package's files Cargo lists the top of the repository and every directory of the package. It goes by the names in a directory only where it looks for a package's programs, tests, examples and benchmarks, and where a workspace finds its packages by a pattern such as `crates/*`. What it lists elsewhere is not counted: a file git does not track, an editor's leftovers, or the `target` directory of an earlier build beside a build made into another, keep no build from being put back. A directory that a build script or a compiler lists counts in full.
+
 The files of a build that is put back all get one time, taken from the filesystem and set just before the present, so that no source looks newer than the build and any file edited from then on does. A file outside the target directory that already holds what the build wrote, such as `Cargo.lock`, is left as it is.
 
 ### Edits

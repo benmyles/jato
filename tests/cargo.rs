@@ -721,6 +721,117 @@ fn a_build_is_put_back_in_another_worktree_and_after_a_commit() {
 }
 
 #[test]
+fn what_cargo_passes_over_in_a_directory_it_lists_keeps_no_build_away() {
+    if !observes() || !has_git() {
+        return;
+    }
+    // To ask git for the files of a package, Cargo lists the top of the
+    // repository and the directories of the package. It takes nothing from
+    // the names there: not from a file git does not track, not from the
+    // directory an earlier build was made in.
+    let p = Project::whole();
+    commit_all(&p);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    let tree = p.temp.path().join("trees/second");
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            tree.to_str().unwrap(),
+        ],
+    );
+    write(tree.join("notes.txt"), "to self");
+    write(tree.join("scratch/more/notes.txt"), "to self");
+    write(tree.join("leaf/src/.swap"), "");
+    let out = success(p.command_in(&tree).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // Another target directory, with the first still where it was.
+    let elsewhere = p.temp.path().join("another-target");
+    let out = success(
+        p.command()
+            .env("CARGO_TARGET_DIR", &elsewhere)
+            .args(["run", "-q"]),
+    );
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    // A copy that is no repository at all: Cargo lists other directories
+    // there, for the same files.
+    let export = p.temp.path().join("export");
+    fs::create_dir_all(&export).unwrap();
+    let archive = success(
+        Command::new("git")
+            .current_dir(&p.root)
+            .args(["archive", "HEAD"]),
+    );
+    let mut unpack = Command::new("tar")
+        .current_dir(&export)
+        .arg("-x")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(unpack.stdin.as_mut().unwrap(), &archive.stdout).unwrap();
+    assert!(unpack.wait_with_output().unwrap().status.success());
+    let out = success(p.command_in(&export).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    assert_eq!(p.count("build_hit"), 3, "{}", p.stats());
+}
+
+#[test]
+fn a_package_added_where_a_workspace_looks_for_packages_is_built() {
+    if !observes() {
+        return;
+    }
+    // A workspace that finds its packages by a pattern.
+    let p = Project::whole();
+    let ready = |root: &Path| {
+        fs::remove_dir_all(root.join("src")).unwrap();
+        write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\n    # Wherever they are.\n    \"crates/*\",\n]\n",
+        );
+        write(
+            root.join("crates/first/Cargo.toml"),
+            "[package]\nname='first'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write(root.join("crates/first/src/main.rs"), "fn main() {}");
+    };
+    let package = |root: &Path, at: &str, name: &str| {
+        write(
+            root.join(at).join("Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        );
+        write(root.join(at).join("src/main.rs"), "fn main() {}");
+    };
+    ready(&p.root);
+    p.run(&["build"]);
+    assert!(p.root.join("target/debug/first").exists());
+    let copy = |name: &str| {
+        let root = p.temp.path().join(name).join("checkout");
+        populate(&root);
+        ready(&root);
+        root
+    };
+    // The same again is put back.
+    let same = copy("same");
+    fs::copy(p.root.join("Cargo.lock"), same.join("Cargo.lock")).unwrap();
+    success(p.command_in(&same).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // A package beside the first one, before Cargo has had a chance to
+    // put it in the lock file.
+    let second = copy("second");
+    fs::copy(p.root.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
+    package(&second, "crates/second", "second");
+    success(p.command_in(&second).args(["build"]));
+    assert!(second.join("target/debug/second").exists());
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
 fn what_a_build_script_reads_of_a_repository_is_an_input() {
     if !observes() || !has_git() {
         return;
@@ -1252,14 +1363,40 @@ fn a_package_cargo_walks_is_recorded_with_its_target_inside_it() {
         success(p.command_in(&copy).args(["run", "-q"])).stdout,
         b"one:none\n"
     );
-    // A file added anywhere in the package is a change to it: Cargo would
-    // run the build script again.
+    // A file added to the package is nothing this build examined. Cargo
+    // listed the directories to compare the files' times with what it had
+    // built, and would run the build script again to be safe. The script
+    // was watched, and looked at none of this.
     for added in ["notes/another.txt", "extra.txt"] {
         let before = p.count("build_hit");
         write(p.root.join(added), "more");
         p.run(&["build"]);
-        assert_eq!(p.count("build_hit"), before, "{added}: {}", p.stats());
+        assert_eq!(p.count("build_hit"), before + 1, "{added}: {}", p.stats());
     }
+    // A build script that looks at what a directory holds has examined
+    // it, and a file added there makes another build.
+    write(
+        p.root.join("build.rs"),
+        r#"fn main() {
+    let count = std::fs::read_dir("notes").unwrap().count();
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/count.rs"), format!("const COUNT: usize = {count};")).unwrap();
+}
+"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/count.rs\"));\nfn main() { println!(\"{COUNT}\"); }",
+    );
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"2\n");
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"2\n");
+    let before = p.count("build_hit");
+    write(p.root.join("notes/third.txt"), "more");
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"3\n");
+    assert_eq!(p.count("build_hit"), before, "{}", p.stats());
 }
 
 #[test]

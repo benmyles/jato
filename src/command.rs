@@ -1605,6 +1605,39 @@ fn git_directories(report: &Report) -> Vec<PathBuf> {
     found.into_iter().collect()
 }
 
+/// Whether Cargo goes by the names in a directory it listed: where it
+/// looks for the programs, tests and examples of a package, and where a
+/// workspace finds its packages by a pattern. There it reads the manifest
+/// of every directory it finds, and fails for one that has none. It lists
+/// other directories too, to compare the times of a package's files with
+/// what it built, and takes nothing from their names. In those it asks of
+/// each directory whether a manifest is there, without reading it.
+fn goes_by_names(directory: &Path, names: &[OsString], report: &Report) -> bool {
+    fn name(path: &Path) -> Option<&str> {
+        path.file_name().and_then(OsStr::to_str)
+    }
+    let looked_in = |path: &Path| match name(path) {
+        Some("examples" | "tests" | "benches") => true,
+        Some("bin") => path.parent().and_then(name) == Some("src"),
+        _ => false,
+    };
+    if looked_in(directory) || directory.parent().is_some_and(looked_in) {
+        return true;
+    }
+    let mut packages = 0;
+    for name in names {
+        let inside = directory.join(name);
+        if inside.is_dir() {
+            let manifest = report.paths.get(&inside.join("Cargo.toml"));
+            if !manifest.is_some_and(|manifest| manifest.read && manifest.kind == Kind::File) {
+                return false;
+            }
+            packages += 1;
+        }
+    }
+    packages > 0
+}
+
 /// Whether `path` is inside a git repository's own directory, or asks
 /// whether there is one.
 fn of_git(path: &Path, repositories: &[PathBuf]) -> bool {
@@ -1733,12 +1766,15 @@ pub fn record(
         // and after every commit. What any other program read there is an
         // input like anything else.
         let examined = !(access.written || access.removed || access.executed);
+        // What a listing of the directory told whoever listed it. Cargo
+        // itself goes by the names in few of the directories it lists.
+        let listing = access.listing.as_ref().filter(|names| {
+            job.scope != Scope::Build || access.others || goes_by_names(path, names, report)
+        });
         // That a directory is there, and is no link to another, is all
         // that a look at it says unless it was listed.
-        let passed = examined
-            && access.kind == Kind::Dir
-            && access.listing.is_none()
-            && access.link.is_none();
+        let passed =
+            examined && access.kind == Kind::Dir && listing.is_none() && access.link.is_none();
         if job.scope == Scope::Build
             && examined
             && !access.others
@@ -1825,7 +1861,7 @@ pub fn record(
             // an earlier command got in laying it out. Cargo makes those it
             // needs. And what it remembers of the compiler's answers it
             // checks against the compiler before believing it.
-            let layout = access.kind == Kind::Dir && access.listing.is_none();
+            let layout = access.kind == Kind::Dir && listing.is_none();
             if layout || rel == Path::new(".rustc_info.json") {
                 continue;
             }
@@ -1865,9 +1901,9 @@ pub fn record(
             Kind::Absent => State::Absent,
             // The compiler was told to search this directory. What it took
             // from there is recorded; that the directory exists adds nothing.
-            Kind::Dir if access.listing.is_none() && job.facts.search.contains(path) => continue,
+            Kind::Dir if listing.is_none() && job.facts.search.contains(path) => continue,
             Kind::Dir => {
-                if let Some(names) = &access.listing {
+                if let Some(names) = listing {
                     listings.insert((root, rel.to_owned()), names.clone());
                 }
                 State::Dir(None)

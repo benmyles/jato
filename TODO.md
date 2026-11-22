@@ -38,6 +38,7 @@
 
 - [x] Start a build of sources that differ a little from the nearest recorded build: its files are put in place without what the compilers wrote whose inputs differ, Cargo makes those again and what depends on them, and the result is recorded like a build from nothing. Who examined each input is part of a whole build's record.
 - [x] Do not take a call for missed that a thread never made because its program exited while the call waited to be looked at. One in four checks of all of Olo went unrecorded for it on a busy machine.
+- [x] Count the names in a directory Cargo lists only where Cargo goes by them. In a git checkout Cargo lists the top of the repository, and a file git does not track there, or a `target` directory beside a build made elsewhere, kept builds from being put back.
 
 ## Open
 
@@ -45,7 +46,6 @@
 - [ ] A build in which a build script was built again is not recorded when it started from an earlier one, because the script ran where its earlier version had written. Clearing what the earlier version wrote first would make the build one that can be recorded.
 - [ ] A build in a target directory that is already built is left to Cargo and not recorded as a whole, so sources arrived at by editing in one worktree are built again, from the nearest recorded build, by the next worktree that has them. Recording such builds as they are made needs a cheaper record than one that names every input again.
 
-- [ ] Cargo, asking git for a package's files, lists the top directory of the repository and each one on the way to the package. A file git does not track in one of those, in one checkout and not in another, keeps their builds apart although Cargo passes it over. So does a checkout without `.git`, such as an exported copy or a second Jujutsu workspace, beside one that has it.
 
 - [ ] What a compiler writes is still reported by the kernel one call at a time, and rustc writes hundreds of files into the directory of its saved state, which Jato does not record. A check of `olo-system` is down from about 2,600 reported calls to 160; a full build of a crate has many more. The library in watched programs could make those calls unreported for directories Jato names to it, if the filter let more than reads through from its address.
 - [ ] With programs telling of their own reads, whether compilations in a built target still need to go unwatched on a busy machine has to be measured again at a load of 45 and more.
