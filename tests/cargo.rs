@@ -106,6 +106,7 @@ impl Project {
             .env_remove("JATO_MAX_SIZE")
             .env_remove("JATO_KEY_ENV")
             .env_remove("JATO_OBSERVED")
+            .env_remove("JATO_PATH")
             // Tests edit and build within seconds and expect each result to
             // be recorded. The test of editing spells says otherwise.
             .env("JATO_EDIT_WINDOW", "0")
@@ -742,6 +743,67 @@ fn tests_and_programs_start_from_a_recorded_build() {
     assert_eq!(failed.status.code(), Some(101));
     let text = said(&failed);
     assert_eq!(text.matches("cannot find function").count(), 1, "{text}");
+}
+
+#[test]
+fn compilers_are_not_started_through_another_cache_s_stand_ins() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    // A directory first on PATH in which `cc` leads to a compiler cache.
+    // This one keeps a count of its uses, as such tools do, which no
+    // result could be recorded around.
+    let tools = p.temp.path().join("tools");
+    let shims = p.temp.path().join("shims");
+    let counted = p.temp.path().join("uses");
+    write(
+        tools.join("ccache"),
+        &format!(
+            "#!/bin/sh\necho used >> '{}'\nexec /usr/bin/cc \"$@\"\n",
+            counted.display()
+        ),
+    );
+    fs::set_permissions(tools.join("ccache"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(&counted, "");
+    fs::create_dir_all(&shims).unwrap();
+    for name in ["cc", "gcc", "c++"] {
+        symlink(tools.join("ccache"), shims.join(name)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(shims.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let run = || {
+        success(
+            p.command()
+                .env("PATH", &path)
+                .env_remove("JATO_PATH")
+                .args(["run", "-q"]),
+        )
+    };
+    assert_eq!(run().stdout, b"one:none\n");
+    assert_eq!(fs::read(&counted).unwrap(), b"", "the stand-in was used");
+    assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+    p.clean();
+    let (hits, misses) = p.during(|| assert_eq!(run().stdout, b"one:none\n"));
+    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+    // A directory that holds anything else is somebody's own and is kept.
+    write(shims.join("a-tool-of-mine"), "#!/bin/sh\n");
+    p.clean();
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { println!(\"{}!\", leaf::value()); }",
+    );
+    assert_eq!(run().stdout, b"one:none!\n");
+    assert_ne!(
+        fs::read(&counted).unwrap(),
+        b"",
+        "the directory was left out"
+    );
+    assert_eq!(p.count("uncacheable"), 1, "{}", p.stats());
 }
 
 #[test]

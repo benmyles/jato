@@ -76,7 +76,62 @@ Environment
   JATO_DISABLE=1      Run Cargo and the compiler directly
 ";
 
+/// Programs that stand in for a compiler in order to cache or distribute
+/// its work.
+const LAUNCHERS: &[&str] = &[
+    "kache",
+    "ccache",
+    "sccache",
+    "buildcache",
+    "distcc",
+    "icecc",
+];
+
+/// PATH without the directories that hold nothing but links to such a
+/// program under compilers' names. None if there are none.
+///
+/// A compiler started through one of them does its work behind another
+/// cache, where it cannot be watched, so nothing that links could be
+/// recorded. The compilers themselves are further along PATH.
+fn without_launchers(path: &OsStr) -> Option<OsString> {
+    let launcher = |entry: &Path| {
+        entry.is_symlink()
+            && std::fs::canonicalize(entry).is_ok_and(|real| {
+                real.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| LAUNCHERS.contains(&name))
+            })
+    };
+    let stand_ins = |dir: &Path| {
+        // Looked at closely only if one of the usual names is such a link.
+        ["cc", "gcc", "c++", "clang", "rustc", "cargo"]
+            .iter()
+            .any(|name| launcher(&dir.join(name)))
+            && std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().all(|entry| {
+                    entry.file_name().as_encoded_bytes().starts_with(b".")
+                        || launcher(&entry.path())
+                })
+            })
+    };
+    let dirs: Vec<_> = env::split_paths(path).collect();
+    let kept: Vec<_> = dirs.iter().filter(|dir| !stand_ins(dir)).collect();
+    (kept.len() < dirs.len())
+        .then(|| env::join_paths(kept).ok())
+        .flatten()
+}
+
 fn main() {
+    // Once per build: what this process starts inherits the result.
+    if env::var_os("JATO_PATH").is_none() {
+        if let Some(path) = env::var_os("PATH")
+            && let Some(cleaned) = without_launchers(&path)
+        {
+            // Nothing else is running yet in this process.
+            unsafe { env::set_var("PATH", cleaned) };
+        }
+        unsafe { env::set_var("JATO_PATH", "1") };
+    }
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {

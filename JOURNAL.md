@@ -1,5 +1,20 @@
 # Work journal
 
+## 2026-11-21 — observed command results (0.12)
+
+- Studied the Codex and Antigravity sessions. Olo restored 188 of 276 units in 189 s against kache's 3 s. Results were admitted by rule: a crate that used a procedural macro, held assembly nobody had reviewed, or depended on an uncertified producer went back to the compiler, and each new rule cost time without closing the set. Watching links with strace tripled a cold build.
+- Replaced the engine. A result is what a command wrote and printed, reusable when everything the command examined is unchanged. What it examined is reported by the kernel through seccomp user notification, at about 1% more processor time on a cold ripgrep build. Admission rules, native link tracing, reviewed sources, sealed and packed archives, worktree projection and `--keep-build` are gone: 14,100 lines of source and tests became 10,400.
+- Results are relative to the workspace and target directory. rustc is told to write `/proc/self/cwd` for the workspace, which keeps compiled bytes the same in every checkout and still leads a debugger to the sources. Output that names a real location anyway is only reused there.
+- Recorded whole Cargo commands. On a hit the target directory is filled in by cloning and Cargo is not started. Found along the way that Cargo starts compiler wrappers nearly one at a time when they return in milliseconds, which is why restoring 279 units one by one could not go below about two seconds.
+- Found that rustc's incremental state cannot follow a build to another checkout: the working directory and every `--remap-path-prefix` value are checked before any of it is reused. The first edit of a crate in a restored target therefore compiles that crate from scratch, for every cache measured.
+- Measured what observation costs an incremental compilation by alternating watched and unwatched runs. At a load of 22 on 15 processors there was no difference; at 35 to 50 a 1.3 s compilation took 2.1 to 2.4 s, each report waiting for the observer to be scheduled. A crate compiled again within ten minutes is now left to rustc unwatched and unrecorded, and the observer thread asks for a short time slice.
+- Added a limit on running compilers shared by all builds using a cache, kept as file locks so a killed build gives its places back.
+- Fixed while measuring: the umask was read by setting it, from several threads; a restored target lacked Cargo's CACHEDIR.TAG, so compilers started there later were not recognized as writing to it; making a directory that already existed counted as changing it, which kept builds of packages with a plain build script from being recorded; a listing included the target directory when it happened to exist.
+- `jato test`, `bench` and `run` make the build they need on its own when it is not recorded, so it is recorded whole, and stop for good when interrupted during it.
+- Rewrote the comparison harness. RIPGREP
+- OLO
+- Qualified with 19 unit and 38 Cargo-project tests on Rust 1.100 and 1.89, including upstream mold and the pinned nightly's split metadata.
+
 ## 2026-11-21 — macro-generated assembly and producer provenance
 
 - Reproduced Olo's 188 hits on 0.10. Four frequently compiled libraries use private macro-generated register instructions or Rust modules named `asm`. Compared their full active source sets with the crate archives authenticated by Olo’s lockfile.

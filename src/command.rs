@@ -1420,7 +1420,31 @@ pub fn continues(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
     hash.update(recipe);
     hash.update(saved.as_os_str().as_bytes());
     let since = store.since_noted(hash.finalize().as_bytes());
-    since.is_some_and(|seconds| seconds < window) && saved.is_dir()
+    since.is_some_and(|seconds| seconds < window) && has_saved_work(saved, job.name())
+}
+
+/// Whether rustc has finished a session for this crate in the directory it
+/// keeps incremental state in. Cargo makes the directory itself, so its
+/// being there says nothing.
+fn has_saved_work(saved: &Path, name: &str) -> bool {
+    let prefix = format!("{name}-");
+    let Ok(crates) = fs::read_dir(saved) else {
+        return false;
+    };
+    crates
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .any(|entry| {
+            fs::read_dir(entry.path()).is_ok_and(|sessions| {
+                sessions.flatten().any(|session| {
+                    let name = session.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("s-")
+                        && !name.ends_with("-working")
+                        && !name.ends_with(".lock")
+                })
+            })
+        })
 }
 
 /// Record a command that has run, and say what became of it.
