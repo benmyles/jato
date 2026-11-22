@@ -621,37 +621,26 @@ fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
         cmd
     };
     let run = |cmd: &mut Command| String::from_utf8(success(cmd.args(["run", "-q"])).stdout);
-    let state = |root: &Path| {
-        fs::read_dir(root.join("target/debug/incremental"))
-            .map(|crates| crates.flatten().count())
-            .unwrap_or(0)
-    };
     assert_eq!(run(&mut spell()).unwrap(), "one:none\n");
     let stored = p.count("stored");
     assert_eq!((stored, p.count("continued")), (2, 0), "{}", p.stats());
-    // A crate compiled once is compiled without rustc keeping anything
-    // for a next time, which most crates never have.
-    assert_eq!(state(&p.root), 0);
 
-    // Its first edit is compiled the same way, and recorded.
+    // The first edit after a build is compiled under watch and recorded.
     write(p.root.join("leaf/src/text file"), "two");
     assert_eq!(run(&mut spell()).unwrap(), "two:none\n");
     success(spell().args(["build", "-q"]));
     assert_eq!(p.count("stored"), stored + 2, "{}", p.stats());
-    assert_eq!(state(&p.root), 0);
+    assert_eq!(p.count("continued"), 0, "{}", p.stats());
 
-    // A second edit within minutes means the crates are being edited. From
-    // here rustc keeps state, and the compilations are left to it,
-    // unwatched, with nothing put in the cache but that state.
-    for text in ["three", "four", "five"] {
+    // Edits that follow within minutes are compiled by rustc from what it
+    // saved, unwatched, and leave nothing in the cache.
+    for text in ["three", "four"] {
         write(p.root.join("leaf/src/text file"), text);
         assert_eq!(run(&mut spell()).unwrap(), format!("{text}:none\n"));
         success(spell().args(["build", "-q"]));
     }
     assert_eq!(p.count("stored"), stored + 2, "{}", p.stats());
-    assert_eq!(p.count("continued"), 6, "{}", p.stats());
-    assert_eq!(p.count("state_saved"), 2, "{}", p.stats());
-    assert_eq!(state(&p.root), 2);
+    assert_eq!(p.count("continued"), 4, "{}", p.stats());
 
     // The state before them is still known, as a whole build.
     write(p.root.join("leaf/src/text file"), "one");
@@ -659,18 +648,18 @@ fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
     let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "one:none\n"));
     assert_eq!((hits, misses), (0, 0), "{}", p.stats());
     assert_eq!(p.count("build_hit"), known + 1, "{}", p.stats());
-    assert_eq!(p.count("continued"), 6, "{}", p.stats());
+    assert_eq!(p.count("continued"), 4, "{}", p.stats());
 
     // After a pause the next compilation is recorded again, so that a
     // checkout in long use still adds what it builds to the cache.
     std::thread::sleep(std::time::Duration::from_millis(2100));
-    write(p.root.join("leaf/src/text file"), "six");
+    write(p.root.join("leaf/src/text file"), "five");
     let after_pause = run(spell().env("JATO_EDIT_WINDOW", "1")).unwrap();
-    assert_eq!(after_pause, "six:none\n");
+    assert_eq!(after_pause, "five:none\n");
     assert_eq!(p.count("stored"), stored + 4, "{}", p.stats());
-    assert_eq!(p.count("continued"), 6, "{}", p.stats());
+    assert_eq!(p.count("continued"), 4, "{}", p.stats());
     p.clean();
-    let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "six:none\n"));
+    let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "five:none\n"));
     assert_eq!((hits, misses), (2, 0), "{}", p.stats());
 }
 
@@ -890,48 +879,45 @@ fn the_compiler_s_saved_state_is_kept_for_other_checkouts() {
         cmd
     };
     let run = |root: &Path| String::from_utf8(success(command(root).args(["run", "-q"])).stdout);
+    let sessions = |root: &Path| {
+        fs::read_dir(root.join("target/debug/incremental"))
+            .map(|crates| crates.flatten().count())
+            .unwrap_or(0)
+    };
     success(command(&p.root).args(["build"]));
-    // Edited twice, the crates are compiled from saved state from then on,
-    // and the state rustc saved is kept.
-    edit_leaf(&p.root, "first");
-    assert_eq!(run(&p.root).unwrap(), "first\n");
-    assert_eq!(p.count("state_saved"), 0, "{}", p.stats());
-    edit_leaf(&p.root, "second");
-    assert_eq!(run(&p.root).unwrap(), "second\n");
+    // Both crates are the workspace's own, which rustc compiles so that it
+    // can compile them again faster. What it saved for that is kept.
     assert_eq!(p.count("state_saved"), 2, "{}", p.stats());
     assert_eq!(p.count("state_given"), 0, "{}", p.stats());
 
-    // A second checkout starts from a recorded build, with nothing of
-    // rustc's in it.
+    // A second checkout starts from the recorded build. Nothing in it has
+    // been compiled there, so rustc has saved nothing there.
     let copy = p.temp.path().join("second/checkout");
     populate(&copy);
     fs::copy(p.root.join("Cargo.lock"), copy.join("Cargo.lock")).unwrap();
     success(command(&copy).args(["build"]));
     assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
-    assert!(!copy.join("target/debug/incremental").exists());
+    assert_eq!(sessions(&copy), 0);
 
     // Its first edit is compiled from the state saved in the first one.
     edit_leaf(&copy, "edited");
     assert_eq!(run(&copy).unwrap(), "edited\n");
     assert_eq!(p.count("state_given"), 2, "{}", p.stats());
+    assert_eq!(sessions(&copy), 2);
     // From then on that checkout has state of its own.
     edit_leaf(&copy, "edited again");
     assert_eq!(run(&copy).unwrap(), "edited again\n");
     assert_eq!(p.count("state_given"), 2, "{}", p.stats());
     assert_eq!(p.count("state_saved"), 2, "{}", p.stats());
 
-    // The same in the checkout it came from, once its target is gone and
-    // has been built again, which leaves no state of rustc's in it.
+    // The same in the checkout it came from, once its target is gone.
     p.clean();
-    assert_eq!(run(&p.root).unwrap(), "second\n");
-    assert!(!p.root.join("target/debug/incremental/leaf").exists());
     edit_leaf(&p.root, "here");
     assert_eq!(run(&p.root).unwrap(), "here\n");
     assert_eq!(p.count("state_given"), 4, "{}", p.stats());
 
     // Asked not to, Jato leaves rustc to start from nothing.
     p.clean();
-    assert_eq!(run(&p.root).unwrap(), "here\n");
     edit_leaf(&p.root, "from nothing");
     let out = success(
         command(&p.root)
@@ -991,16 +977,11 @@ fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
     };
     sources(&p.root);
     success(command(&p.root).args(["build"]));
-    // Edited twice here, so that rustc saves state and it is kept.
-    for marks in ["()", "**"] {
-        edit(&p.root, marks);
-        success(command(&p.root).args(["build"]));
-    }
-    assert_eq!(p.count("state_saved"), 1, "{}", p.stats());
-    sources(&p.root);
+    assert_eq!(p.count("state_saved"), 2, "{}", p.stats());
 
     let second = checkout("second");
     success(command(&second).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
     edit(&second, "<>");
     let built = success(command(&second).args(["build"]));
     let said = String::from_utf8_lossy(&built.stderr);

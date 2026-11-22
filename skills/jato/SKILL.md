@@ -26,7 +26,7 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 - The first build of a state compiles and records. Later builds of that state, anywhere on the machine that shares the cache, are restored.
 - After editing, Cargo and rustc compile what changed at their usual speed. Undoing an edit returns to a recorded build at once.
-- In a target that was restored, the first edit of a crate is compiled incrementally all the same: Jato hands rustc the state it saved where the build was recorded. `jato stats` counts this as `state_given`.
+- In a target that was restored, the first edit of a crate is compiled incrementally all the same: Jato hands rustc the state it saved where the crate was last compiled under watch. `jato stats` counts this as `state_given`.
 - Builds started at the same time through Jato take turns at the processors. A build that seems to wait is queued behind others; `jato stats` shows `queued`.
 - Jato records on Linux (x86-64 and aarch64, kernel 5.5 or later). Elsewhere its commands run Cargo unchanged.
 

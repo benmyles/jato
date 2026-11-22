@@ -155,7 +155,7 @@ impl Server {
             let name = os(r.bytes()?);
             env.insert(name, os(r.bytes()?));
         }
-        let mut job = Job::unit(
+        let job = Job::unit(
             Request {
                 program,
                 args,
@@ -201,7 +201,7 @@ impl Server {
             return reply(&mut stream, &outcome).map_err(Into::into);
         }
         // Inside a build that is recorded whole, every compilation is.
-        command::choose(&mut job, &mut store, &recipe, true);
+        command::choose(&job, &mut store, &recipe, true);
         let argv = job.argv();
         let mut w = Writer(vec![RUN]);
         w.number(argv.len() as u64);
@@ -233,7 +233,11 @@ impl Server {
             std::time::Duration::from_millis(r.number()?),
         );
         match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
-            Ok(manifest) => self.used(&job, &manifest),
+            Ok(manifest) => {
+                self.used(&job, &manifest);
+                let left = command::Left::Seen(&report.state);
+                command::keep_state(&job, &mut store, &recipe, left);
+            }
             // A failed compilation fails the build. One that worked but
             // cannot be reused leaves nothing to say what it depended on.
             Err(why) if ran.success => self.unusable(&format!("{}: {why}", job.name())),
@@ -665,6 +669,7 @@ fn supervise(
     let config = observe::Config {
         ignore: vec![store.dir.clone()],
         unlisted: Vec::new(),
+        state: None,
     };
     let (mut child, session) = match observe::spawn(&mut cmd, config) {
         Ok(started) => started,

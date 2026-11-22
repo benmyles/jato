@@ -153,11 +153,6 @@ pub struct Job {
     /// Whether the compiler is told to write the roots' aliases in place of
     /// their real locations.
     remap: bool,
-    /// Whether the compiler is left to save state for compiling the crate
-    /// again, where Cargo asked for that. A crate's first compilation in a
-    /// target directory is quicker without, and most crates are never
-    /// compiled there a second time.
-    stateful: bool,
     path: Vec<PathBuf>,
     /// Further facts that tell this command from others like it.
     pub salt: Vec<u8>,
@@ -197,7 +192,6 @@ impl Job {
             roots,
             scope: Scope::Unit,
             remap,
-            stateful: true,
             salt: Vec::new(),
         }
     }
@@ -215,7 +209,6 @@ impl Job {
             roots,
             scope: Scope::Build,
             remap: false,
-            stateful: true,
             salt,
         }
     }
@@ -312,7 +305,7 @@ impl Job {
     fn aliased_out_dir(&self) -> Option<(usize, OsString)> {
         let at = self.facts.out_dir_at?;
         self.facts.incremental.as_ref()?;
-        if !self.remap || !self.stateful {
+        if !self.remap {
             return None;
         }
         let rest = self
@@ -367,17 +360,7 @@ impl Job {
                 .find(|(at, _)| *at == i)
                 .map_or_else(|| args[i].clone(), |(_, new)| new.clone())
         };
-        // Without the option that asks for saved state, and without the
-        // `-C` before it where it stands as a word of its own.
-        let dropped: Vec<usize> = match self.facts.incremental_at {
-            Some(at) if !self.stateful => {
-                let own_word = args[at].as_bytes().starts_with(b"incremental=");
-                if own_word { vec![at - 1, at] } else { vec![at] }
-            }
-            _ => Vec::new(),
-        };
-        let kept = |i: &usize| !dropped.contains(i);
-        argv.extend((0..options).filter(kept).map(arg));
+        argv.extend((0..options).map(arg));
         argv.extend(extra.map(OsString::from));
         if self.remap {
             // Later options win, so the user's own remappings still apply,
@@ -392,7 +375,7 @@ impl Job {
                 }
             }
         }
-        argv.extend((options..args.len()).filter(kept).map(arg));
+        argv.extend((options..args.len()).map(arg));
         argv
     }
 
@@ -477,6 +460,7 @@ impl Job {
             // rustc enumerates every search directory to find crates by
             // name. The files it settles on are opened, and recorded.
             unlisted: self.facts.search.clone(),
+            state: self.facts.incremental.clone(),
         }
     }
 }
@@ -1498,28 +1482,55 @@ fn state_recipe(job: &Job, recipe: &Digest) -> Digest {
     *hash.finalize().as_bytes()
 }
 
+/// Says which of rustc's sessions a compilation that just ended left.
+pub enum Left<'a> {
+    /// The compilation was watched: these are the names it used directly
+    /// inside the directory rustc keeps state in.
+    Seen(&'a std::collections::BTreeSet<OsString>),
+    /// It was not: the session is the one finished since this moment.
+    Since(std::time::SystemTime),
+}
+
 /// Keep what rustc saved for compiling this crate again, for compilations
 /// elsewhere that have nothing to start from: the files of the session it
-/// finished since `since`. Nothing is kept if that session cannot be told
-/// from another's, or is not what this expects.
-fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, since: std::time::SystemTime) {
+/// just finished. Nothing is kept if some is kept already, if that session
+/// cannot be told from another's, or if it is not what this expects.
+pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>) {
     const MOST_FILES: usize = 20_000;
     const MOST_BYTES: u64 = 2 << 30;
+    if job.scope != Scope::Unit || !saved_state_wanted() {
+        return;
+    }
+    let Some(directory) = job.facts.incremental.as_ref() else {
+        return;
+    };
+    let kept = state_recipe(job, recipe);
+    if store.candidates(&kept).is_ok_and(|found| !found.is_empty()) {
+        return;
+    }
     let kept = (|| {
-        let directory = job.facts.incremental.as_ref()?;
-        // The one crate directory of this name with a session that new.
+        // The one crate directory of this name that fits.
         let prefix = format!("{}-", job.name());
-        let mut sessions = fs::read_dir(directory)
-            .ok()?
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-            .filter_map(|entry| finished_session(&entry.path()))
-            .filter(|session| {
-                fs::metadata(session.join("dep-graph.bin"))
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|at| at >= since)
-            });
-        let (session, None) = (sessions.next()?, sessions.next()) else {
+        let named = |name: &OsStr| name.to_string_lossy().starts_with(&prefix);
+        let mut sessions: Vec<PathBuf> = match left {
+            Left::Seen(names) => names
+                .iter()
+                .filter(|name| named(name))
+                .filter_map(|name| finished_session(&directory.join(name)))
+                .collect(),
+            Left::Since(since) => fs::read_dir(directory)
+                .ok()?
+                .flatten()
+                .filter(|entry| named(&entry.file_name()))
+                .filter_map(|entry| finished_session(&entry.path()))
+                .filter(|session| {
+                    fs::metadata(session.join("dep-graph.bin"))
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|at| at >= since)
+                })
+                .collect(),
+        };
+        let (session, None) = (sessions.pop()?, sessions.pop()) else {
             return None;
         };
         let mut files = Vec::new();
@@ -1558,7 +1569,7 @@ fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, since: std::time::S
         let detail = encode_detail(0, b"", b"");
         record.detail = *blake3::hash(&detail).as_bytes();
         store
-            .commit(&state_recipe(job, recipe), &record, &detail, 0, &mut staged)
+            .commit(&kept, &record, &detail, 0, &mut staged)
             .ok()
             .filter(|stored| *stored)
     })();
@@ -1815,91 +1826,58 @@ const EDIT_WINDOW: u64 = 600;
 /// How a compilation that has to run is run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Run {
-    /// Watched and recorded. The compiler keeps state for the next
-    /// compilation if Cargo asked for that.
+    /// Watched and recorded.
     Recorded,
-    /// Watched and recorded, without the compiler keeping state: a crate's
-    /// first compilation in a target directory.
-    Plain,
     /// One of a run of edits, compiled from the state the compiler saved
-    /// here the last time: neither watched nor recorded.
+    /// here or was handed: neither watched nor recorded.
     Continued,
-    /// The second compilation of a crate in a short while, with nothing
-    /// saved to start from and nothing kept from elsewhere to give it.
-    /// Neither watched nor recorded; what the compiler saves is kept.
+    /// One of a run of edits with nothing saved to start from, here or in
+    /// the cache. Neither watched nor recorded; what the compiler saves is
+    /// kept for other checkouts.
     Seeding,
 }
 
-/// Decide how this compilation is run, and prepare it: leave the request
-/// for incremental state out, or put kept state in place.
+/// Decide how this compilation is run, and hand the compiler kept state
+/// if it has none of its own.
 ///
-/// rustc compiling incrementally does more work than rustc compiling a
-/// crate once, and leaves state as large as its output. That pays from
-/// the second compilation of a crate on. So a crate's first compilation
-/// in a target directory is done without, as most crates are compiled
-/// there once; a second within minutes means the crate is being edited,
-/// and from then on rustc keeps state and the compilations are left to it,
-/// unwatched and unrecorded, since each result is replaced by the next.
-/// State saved in one checkout is kept for the others, so that a crate's
-/// second compilation there starts from it instead of from nothing.
+/// A crate compiled again within minutes of its last compilation in the
+/// same target directory is being edited. rustc compiles it from the state
+/// it saved, another edit follows, and what the compilation produces is
+/// replaced before anything else could use it. Watching it would cost a
+/// good part of the time it takes on a busy machine, and keeping its
+/// output would fill the cache with states nobody returns to. The first
+/// compilation after a pause is recorded as usual, which is how a checkout
+/// that is built for months keeps contributing results.
 ///
 /// `building` is set inside a build that is being recorded as a whole,
 /// where nothing is left unwatched.
-pub fn choose(job: &mut Job, store: &mut Store, recipe: &Digest, building: bool) -> Run {
-    let Some(directory) = job.facts.incremental.clone() else {
+pub fn choose(job: &Job, store: &mut Store, recipe: &Digest, building: bool) -> Run {
+    let Some(directory) = job.facts.incremental.as_ref() else {
         return Run::Recorded;
     };
     if job.scope != Scope::Unit {
+        return Run::Recorded;
+    }
+    let own = has_saved_work(directory, job.name());
+    let given = !own && saved_state_wanted() && give_saved_state(job, store, recipe);
+    if building {
         return Run::Recorded;
     }
     let window = env::var("JATO_EDIT_WINDOW")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(EDIT_WINDOW);
-    // With every compilation recorded, or on request, the compiler keeps
-    // state whenever Cargo asks.
-    let as_cargo_asks =
-        window == 0 || env::var_os("JATO_INCREMENTAL").is_some_and(|v| v == "cargo");
-    let own = has_saved_work(&directory, job.name());
-    if building {
-        if !own && !as_cargo_asks {
-            job.stateful = false;
-            return Run::Plain;
-        }
-        return Run::Recorded;
-    }
     let mut hash = blake3::Hasher::new_derive_key("jato compiled here v1");
     hash.update(recipe);
     hash.update(directory.as_os_str().as_bytes());
     let recent = store
         .since_noted(hash.finalize().as_bytes())
         .is_some_and(|seconds| seconds < window);
-    if own {
-        return if recent {
-            Run::Continued
-        } else {
-            Run::Recorded
-        };
+    match (recent, own || given) {
+        (false, _) => Run::Recorded,
+        (true, true) => Run::Continued,
+        (true, false) => Run::Seeding,
     }
-    if saved_state_wanted() && give_saved_state(job, store, recipe) {
-        return if recent {
-            Run::Continued
-        } else {
-            Run::Recorded
-        };
-    }
-    if as_cargo_asks {
-        return Run::Recorded;
-    }
-    if recent {
-        return if saved_state_wanted() {
-            Run::Seeding
-        } else {
-            Run::Continued
-        };
-    }
-    job.stateful = false;
-    Run::Plain
 }
 
 /// Whether rustc has finished a session for this crate in the directory it
@@ -1981,7 +1959,7 @@ pub fn waited(job: &Job, store: &mut Store, time: std::time::Duration) {
 
 /// A compiler command that only this process is watching.
 fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
-    let mut job = Job::unit(Request::current(program, args)?, None);
+    let job = Job::unit(Request::current(program, args)?, None);
     let mut store = match Store::open() {
         Ok(store) => store,
         Err(e) => {
@@ -2010,7 +1988,7 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         (_, Some((outcome, _))) => return print(outcome),
         (lock, None) => lock,
     };
-    let run = choose(&mut job, &mut store, &recipe, false);
+    let run = choose(&job, &mut store, &recipe, false);
     // The compiler will run. With other builds going on, wait for a
     // processor to run it on.
     let place = if job.facts.compiles() {
@@ -2052,12 +2030,12 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
                 .context("starting the compiler")?;
             drop(place);
             if status.success() {
-                keep_state(&job, &mut store, &recipe, since);
+                keep_state(&job, &mut store, &recipe, Left::Since(since));
             }
             drop(lock);
             return Ok(exit_code(status));
         }
-        Run::Recorded | Run::Plain => (),
+        Run::Recorded => (),
     }
     store.count(job.counter("miss"), 1);
     let (ran, report) = match run_piped(&argv, Some((&job, &store))) {
@@ -2072,7 +2050,9 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         }
     };
     drop(place);
-    let _ = finish(&job, &mut store, &recipe, &ran, &report, None);
+    if finish(&job, &mut store, &recipe, &ran, &report, None).is_ok() {
+        keep_state(&job, &mut store, &recipe, Left::Seen(&report.state));
+    }
     drop(lock);
     Ok(ran.code)
 }
