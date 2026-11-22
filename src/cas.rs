@@ -803,6 +803,54 @@ impl Store {
         }))
     }
 
+    /// Put files a compiler saved for its next run where it looks for
+    /// them. All of them or none: false if any could not be had.
+    pub fn place_saved(&mut self, saved: &[crate::manifest::Output], roots: &Roots) -> bool {
+        let how = How {
+            verify: self.verify,
+            clone: self.clone,
+            roots,
+        };
+        let mut written: Vec<PathBuf> = Vec::with_capacity(saved.len());
+        let placed = saved.iter().all(|file| {
+            let Some(dest) = roots.join(file.root, &file.path) else {
+                return false;
+            };
+            let found = File::open(object_path(&self.dir, &file.digest, false))
+                .map(|f| (f, false))
+                .or_else(|_| {
+                    File::open(object_path(&self.dir, &file.digest, true)).map(|f| (f, true))
+                });
+            let Ok((source, packed)) = found else {
+                return false;
+            };
+            let work = Work {
+                output: file,
+                dest: &dest,
+                source,
+                packed,
+            };
+            match place(work, &how) {
+                (Some(staging), Ok(Some(true))) if fs::rename(&staging, &dest).is_ok() => {
+                    written.push(dest);
+                    true
+                }
+                (staging, _) => {
+                    if let Some(staging) = staging {
+                        let _ = fs::remove_file(staging);
+                    }
+                    false
+                }
+            }
+        });
+        if !placed {
+            for path in written {
+                let _ = fs::remove_file(path);
+            }
+        }
+        placed
+    }
+
     /// Whether the file at `dest` already is this output.
     fn holds(&mut self, output: &crate::manifest::Output, dest: &Path, roots: &Roots) -> bool {
         let Ok(meta) = fs::symlink_metadata(dest) else {
@@ -1034,7 +1082,7 @@ impl Store {
         }
         // Outputs that were already stored by another result are shared
         // with it, and must still be there.
-        for output in &record.outputs {
+        for output in record.outputs.iter().chain(&record.saved) {
             let known: bool = tx
                 .prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE digest=?1)")?
                 .query_row([&output.digest], |r| r.get(0))?;
@@ -1043,6 +1091,46 @@ impl Store {
                 .execute(params![entry, output.digest])?;
         }
         add(&tx, "bytes", charge as i64)?;
+        // The compiler's saved state is as large as what it compiled, and
+        // only the latest is any use: earlier results of this command keep
+        // their outputs and give theirs up.
+        if !record.saved.is_empty() {
+            let others: Vec<(i64, Vec<u8>)> = tx
+                .prepare_cached("SELECT id,manifest FROM entries WHERE recipe=?1 AND id<>?2")?
+                .query_map(params![recipe, entry], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, stored) in others {
+                let Ok(mut earlier) = Manifest::decode(&stored) else {
+                    continue;
+                };
+                if earlier.saved.is_empty() {
+                    continue;
+                }
+                let saved = std::mem::take(&mut earlier.saved);
+                tx.prepare_cached("UPDATE entries SET manifest=?1 WHERE id=?2")?
+                    .execute(params![earlier.encode()?, id])?;
+                let mut freed = 0i64;
+                for file in saved {
+                    if earlier.outputs.iter().any(|o| o.digest == file.digest) {
+                        continue;
+                    }
+                    tx.prepare_cached("DELETE FROM outputs WHERE entry=?1 AND object=?2")?
+                        .execute(params![id, file.digest])?;
+                    let gone: Option<(i64, bool)> = tx
+                        .prepare_cached(
+                            "DELETE FROM objects WHERE digest=?1
+                             AND NOT EXISTS(SELECT 1 FROM outputs WHERE object=?1) RETURNING stored,packed",
+                        )?
+                        .query_row([&file.digest], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .optional()?;
+                    if let Some((stored, packed)) = gone {
+                        let _ = fs::remove_file(object_path(&dir, &file.digest, packed));
+                        freed += stored;
+                    }
+                }
+                add(&tx, "bytes", -freed)?;
+            }
+        }
         // Keep a bounded history for each command line.
         let surplus: Vec<i64> = tx
             .prepare_cached(

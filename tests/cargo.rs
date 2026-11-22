@@ -851,6 +851,195 @@ fn a_c_compiler_configured_behind_another_cache_is_named_alone() {
     );
 }
 
+/// Give `leaf` a body that the compiler has to compile anew.
+fn edit_leaf(root: &Path, text: &str) {
+    write(
+        root.join("leaf/src/value.rs"),
+        &format!("pub fn value() -> String {{ String::from({text:?}) }}"),
+    );
+}
+
+#[test]
+fn the_compiler_s_saved_state_follows_a_build_to_another_checkout() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    p.run(&["build"]);
+    // Both crates are the workspace's own, which rustc compiles so that it
+    // can compile them again faster. What it saved for that is kept.
+    assert_eq!(p.count("state_saved"), 2, "{}", p.stats());
+    assert_eq!(p.count("state_given"), 0, "{}", p.stats());
+
+    // A second checkout starts from the recorded build. Nothing in it has
+    // been compiled there, so rustc has saved nothing there.
+    let copy = p.temp.path().join("second/checkout");
+    populate(&copy);
+    fs::copy(p.root.join("Cargo.lock"), copy.join("Cargo.lock")).unwrap();
+    success(p.command_in(&copy).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert!(!copy.join("target/debug/incremental").exists());
+
+    // Its first edit is compiled from the state saved in the first one.
+    edit_leaf(&copy, "edited");
+    let out = success(p.command_in(&copy).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"edited\n");
+    assert_eq!(p.count("state_given"), 2, "{}", p.stats());
+    let sessions = |target: &Path| {
+        fs::read_dir(target.join("debug/incremental"))
+            .unwrap()
+            .flatten()
+            .flat_map(|krate| fs::read_dir(krate.path()).unwrap().flatten())
+            .filter(|entry| entry.path().is_dir())
+            .count()
+    };
+    assert_eq!(sessions(&copy.join("target")), 2);
+    // From then on that checkout has state of its own.
+    edit_leaf(&copy, "edited again");
+    let out = success(p.command_in(&copy).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"edited again\n");
+    assert_eq!(p.count("state_given"), 2, "{}", p.stats());
+
+    // The same in the checkout it came from, once its target is gone.
+    p.clean();
+    edit_leaf(&p.root, "here");
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"here\n");
+    assert_eq!(p.count("state_given"), 4, "{}", p.stats());
+
+    // Asked not to, Jato leaves rustc to start from nothing.
+    p.clean();
+    edit_leaf(&p.root, "from nothing");
+    let out = success(p.command().env("JATO_SAVED_STATE", "0").args(["run", "-q"]));
+    assert_eq!(out.stdout, b"from nothing\n");
+    assert_eq!(p.count("state_given"), 4, "{}", p.stats());
+}
+
+#[test]
+fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
+    let Some(rustc) = std::env::var_os("JATO_TEST_NIGHTLY") else {
+        return;
+    };
+    let cargo = Path::new(&rustc).with_file_name("cargo");
+    let p = Project::whole();
+    // The compiler says when it turns saved state down, and checks every
+    // result it takes from it against one computed afresh.
+    let command = |root: &Path| {
+        let mut cmd = p.command_in(root);
+        cmd.env("CARGO", &cargo)
+            .env("RUSTC", &rustc)
+            .env("RUSTFLAGS", "-Zincremental-info -Zincremental-verify-ich")
+            .env_remove("RUSTUP_TOOLCHAIN");
+        cmd
+    };
+    // Two modules, which rustc compiles to separate object files.
+    let sources = |root: &Path| {
+        write(
+            root.join("src/main.rs"),
+            "mod a; mod b; fn main() { println!(\"{}{}\", a::text(), b::text()); }",
+        );
+        write(
+            root.join("src/a.rs"),
+            "pub fn text() -> String { leaf::value() }",
+        );
+        write(
+            root.join("src/b.rs"),
+            "pub fn text() -> &'static str { \"!\" }",
+        );
+    };
+    let checkout = |name: &str| {
+        let root = p.temp.path().join(name).join("checkout");
+        populate(&root);
+        sources(&root);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        root
+    };
+    sources(&p.root);
+    success(command(&p.root).args(["build"]));
+
+    let second = checkout("second");
+    success(command(&second).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    let edit = |root: &Path| {
+        write(
+            root.join("src/a.rs"),
+            "pub fn text() -> String { format!(\"<{}>\", leaf::value()) }",
+        )
+    };
+    edit(&second);
+    let built = success(command(&second).args(["build"]));
+    let said = String::from_utf8_lossy(&built.stderr);
+    assert_eq!(p.count("state_given"), 1, "{}", p.stats());
+    assert!(said.contains("[incremental]"), "{said}");
+    assert!(!said.contains("ignoring cache"), "{said}");
+    assert_eq!(
+        success(command(&second).args(["run", "-q"])).stdout,
+        b"<one:none>!\n"
+    );
+    // The object file of the module that was not edited is the one the
+    // state came with: it is older than the one compiled just now by the
+    // time rustc took to start and to get to generating code.
+    let objects = |root: &Path| -> Vec<std::time::SystemTime> {
+        let state = root.join("target/debug/incremental");
+        let app = fs::read_dir(state)
+            .unwrap()
+            .flatten()
+            .find(|krate| krate.file_name().to_string_lossy().starts_with("app-"))
+            .unwrap();
+        fs::read_dir(app.path())
+            .unwrap()
+            .flatten()
+            .filter(|session| session.path().is_dir())
+            .flat_map(|session| fs::read_dir(session.path()).unwrap().flatten())
+            .filter(|file| file.path().extension() == Some(OsStr::new("o")))
+            .map(|file| file.metadata().unwrap().modified().unwrap())
+            .collect()
+    };
+    let times = objects(&second);
+    let spread = times
+        .iter()
+        .max()
+        .unwrap()
+        .duration_since(*times.iter().min().unwrap())
+        .unwrap();
+    assert!(times.len() >= 2, "{times:?}");
+    assert!(
+        spread > std::time::Duration::from_millis(15),
+        "every object file was compiled again: {times:?}"
+    );
+
+    // With the state as it was saved, rustc turns it down: it was made
+    // under another workspace's path. This is what the adjustment is for.
+    let third = checkout("third");
+    success(command(&third).args(["build"]));
+    let from = fs::read_dir(p.root.join("target/debug/incremental")).unwrap();
+    for krate in from.flatten() {
+        let to = third
+            .join("target/debug/incremental")
+            .join(krate.file_name());
+        fs::create_dir_all(&to).unwrap();
+        for entry in fs::read_dir(krate.path()).unwrap().flatten() {
+            let dest = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                fs::create_dir_all(&dest).unwrap();
+                for file in fs::read_dir(entry.path()).unwrap().flatten() {
+                    fs::copy(file.path(), dest.join(file.file_name())).unwrap();
+                }
+            } else {
+                fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    // An edit of its own, or the second checkout's result would do.
+    write(
+        third.join("src/a.rs"),
+        "pub fn text() -> String { format!(\"[{}]\", leaf::value()) }",
+    );
+    let built = success(command(&third).args(["build"]));
+    let said = String::from_utf8_lossy(&built.stderr);
+    assert!(said.contains("ignoring cache"), "{said}");
+    assert_eq!(p.count("state_given"), 1, "{}", p.stats());
+}
+
 #[test]
 fn stopping_the_build_ahead_of_a_test_stops_the_command() {
     use std::io::{BufRead, BufReader, Read};

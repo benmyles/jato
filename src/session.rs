@@ -243,6 +243,7 @@ impl Server {
                 .push(store);
             return wire::send(&mut stream, &command(EXEC).0).map_err(Into::into);
         }
+        command::give_saved_state(&job, &mut store, &recipe);
         store.count(job.counter("miss"), 1);
         self.scopes.begin(pid, job.observer(&store));
         let w = command(RUN);
@@ -699,6 +700,7 @@ fn supervise(
     let config = observe::Config {
         ignore: vec![store.dir.clone()],
         unlisted: Vec::new(),
+        state: None,
     };
     let (mut child, session) = match observe::spawn(&mut cmd, config) {
         Ok(started) => started,

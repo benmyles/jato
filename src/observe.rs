@@ -110,6 +110,8 @@ pub struct Report {
     /// A program the command started was still running when it exited.
     pub survivors: bool,
     pub events: u64,
+    /// Names used directly inside the directory `Config::state` names.
+    pub state: std::collections::BTreeSet<OsString>,
 }
 
 #[derive(Default, Clone)]
@@ -118,6 +120,9 @@ pub struct Config {
     pub ignore: Vec<PathBuf>,
     /// Directories whose enumeration is not an input.
     pub unlisted: Vec<PathBuf>,
+    /// One of the ignored directories, for which the names used directly
+    /// inside it are noted all the same.
+    pub state: Option<PathBuf>,
 }
 
 /// Digest of a set of directory entry names.
@@ -547,7 +552,17 @@ mod imp {
         /// dropped; `..` stays, since only the kernel knows where it leads
         /// once symbolic links are involved.
         fn resolve(&mut self, tid: u32, dirfd: i32, name: &[u8]) -> Option<PathBuf> {
-            let base = if name.first() == Some(&b'/') {
+            // A path through the caller's own working directory is a path
+            // relative to that directory, whatever else is under /proc.
+            const OWN: &[u8] = b"/proc/self/cwd";
+            let own = name
+                .strip_prefix(OWN)
+                .filter(|rest| rest.is_empty() || rest[0] == b'/');
+            let (name, dirfd) = match own {
+                Some(rest) => (rest.strip_prefix(b"/").unwrap_or(rest), libc::AT_FDCWD),
+                None => (name, dirfd),
+            };
+            let base = if own.is_none() && name.first() == Some(&b'/') {
                 PathBuf::new()
             } else {
                 let link = if dirfd == libc::AT_FDCWD {
@@ -583,6 +598,13 @@ mod imp {
 
         fn touch(&mut self, path: PathBuf, how: Use) {
             if self.ignored(&path) {
+                if let Some(dir) = &self.config.state
+                    && let Ok(rest) = path.strip_prefix(dir)
+                    && let Some(first) = rest.components().next()
+                    && self.report.state.len() < 64
+                {
+                    self.report.state.insert(first.as_os_str().to_owned());
+                }
                 return;
             }
             let listing = matches!(how, Use::List)

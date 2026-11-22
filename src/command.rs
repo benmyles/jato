@@ -24,7 +24,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v2";
+const EPOCH: &str = "jato command v3";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -296,9 +296,46 @@ impl Job {
         *hash.finalize().as_bytes()
     }
 
+    /// The output directory named through the alias of the directory the
+    /// compiler runs in, when the compiler saves incremental state. That
+    /// state is only of use in another checkout if the compiler was told
+    /// the same things there, and where its output goes is one of them.
+    /// A path relative to that directory would not do: rustc makes it
+    /// absolute before it compares.
+    fn aliased_out_dir(&self) -> Option<(usize, OsString)> {
+        let at = self.facts.out_dir_at?;
+        self.facts.incremental.as_ref()?;
+        if !self.remap {
+            return None;
+        }
+        let rest = self
+            .facts
+            .hint
+            .as_ref()?
+            .strip_prefix(&self.request.cwd)
+            .ok()?;
+        if rest.as_os_str().is_empty() {
+            return None;
+        }
+        let mut arg = OsString::new();
+        if self.request.args[at].as_bytes().starts_with(b"--out-dir=") {
+            arg.push("--out-dir=");
+        }
+        arg.push(Path::new(WORK_ALIAS).join(rest));
+        Some((at, arg))
+    }
+
     /// The command line to run, which for a compilation names aliases for
     /// the roots.
     pub fn argv(&self) -> Vec<OsString> {
+        self.command_line(
+            &self.aliased_out_dir().into_iter().collect::<Vec<_>>(),
+            None,
+        )
+    }
+
+    /// The command line with some arguments replaced and one more option.
+    fn command_line(&self, replaced: &[(usize, OsString)], extra: Option<&str>) -> Vec<OsString> {
         let args = &self.request.args;
         let mut argv = vec![self.request.program.clone()];
         // Another wrapper is given the compiler's path first. Options start
@@ -307,7 +344,14 @@ impl Job {
             .iter()
             .position(|a| a.as_bytes().starts_with(b"-"))
             .unwrap_or(0);
-        argv.extend_from_slice(&args[..options]);
+        let arg = |i: usize| {
+            replaced
+                .iter()
+                .find(|(at, _)| *at == i)
+                .map_or_else(|| args[i].clone(), |(_, new)| new.clone())
+        };
+        argv.extend((0..options).map(arg));
+        argv.extend(extra.map(OsString::from));
         if self.remap {
             // Later options win, so the user's own remappings still apply,
             // and the target directory wins over a workspace containing it.
@@ -321,8 +365,42 @@ impl Job {
                 }
             }
         }
-        argv.extend_from_slice(&args[options..]);
+        argv.extend((options..args.len()).map(arg));
         argv
+    }
+
+    /// This compilation's command line pointed at a crate of one line and
+    /// at directories of its own, to learn what the compiler writes into
+    /// its saved state for these options. `other` adds an option that
+    /// changes nothing but that.
+    fn probe(&self, source: &Path, scratch: &Path, other: bool) -> Option<Vec<OsString>> {
+        let args = &self.request.args;
+        let with = |at: usize, name: &str, path: PathBuf| {
+            let mut arg = OsString::new();
+            let text = args[at].to_string_lossy();
+            if let Some(prefix) = text.find(name).filter(|_| !name.is_empty()) {
+                arg.push(&text[..prefix + name.len()]);
+            }
+            arg.push(path);
+            (at, arg)
+        };
+        let out_dir = self.facts.out_dir_at?;
+        let out_name = if args[out_dir].as_bytes().starts_with(b"--out-dir=") {
+            "--out-dir="
+        } else {
+            ""
+        };
+        let replaced = [
+            (self.facts.source_at?, source.as_os_str().to_owned()),
+            with(out_dir, out_name, scratch.join("out")),
+            with(
+                self.facts.incremental_at?,
+                "incremental=",
+                scratch.join("state"),
+            ),
+        ];
+        let extra = other.then_some("--remap-path-prefix=/nonexistent/jato/probe=/nowhere");
+        Some(self.command_line(&replaced, extra))
     }
 
     /// Files a tool keeps for its own later runs: locks, and what rustc
@@ -368,6 +446,7 @@ impl Job {
             // rustc enumerates every search directory to find crates by
             // name. The files it settles on are opened, and recorded.
             unlisted: self.facts.search.clone(),
+            state: self.facts.incremental.clone(),
         }
     }
 }
@@ -634,13 +713,21 @@ fn env_deps(dep_info: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Paths the compiler reported writing, from its JSON messages.
-fn reported_artifacts(stderr: &[u8]) -> Vec<PathBuf> {
+fn reported_artifacts(stderr: &[u8], cwd: &Path) -> Vec<PathBuf> {
     stderr
         .split(|b| *b == b'\n')
         .filter(|line| memchr::memmem::find(line, b"\"artifact\"").is_some())
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .filter(|message| message["$message_type"] == "artifact")
-        .filter_map(|message| message["artifact"].as_str().map(PathBuf::from))
+        // Named as the output directory was: through the alias of the
+        // directory the compiler ran in.
+        .filter_map(|message| {
+            let path = Path::new(message["artifact"].as_str()?);
+            Some(match path.strip_prefix(WORK_ALIAS) {
+                Ok(rest) => cwd.join(rest),
+                Err(_) => cwd.join(path),
+            })
+        })
         .collect()
 }
 
@@ -874,7 +961,7 @@ pub fn record(
     // do so in the file an earlier build left, or after moving it aside.
     // What that file held does not change what they write.
     let artifacts = if job.facts.compiles() {
-        reported_artifacts(stderr)
+        reported_artifacts(stderr, &job.request.cwd)
     } else {
         Vec::new()
     };
@@ -1315,6 +1402,17 @@ pub fn record(
         });
         staged.push(output);
     }
+    if job.scope == Scope::Unit && saved_state_wanted() {
+        let before = staged.len();
+        match save_state(job, store, report, &mut staged) {
+            Some(saved) if !saved.is_empty() => {
+                manifest.saved = saved;
+                manifest.saved_in = whereabouts(roots);
+                store.count("state_saved", 1);
+            }
+            _ => staged.truncate(before),
+        }
+    }
     let detail = encode_detail(0, &roots.mark(stdout), &roots.mark(stderr));
     manifest.detail = *blake3::hash(&detail).as_bytes();
     manifest.normalize();
@@ -1335,6 +1433,245 @@ pub fn record(
         }
         Ok(false) => Err("it is larger than half the cache".into()),
         Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// Whether the compiler's saved state is kept with results and handed to
+/// compilations that have none.
+fn saved_state_wanted() -> bool {
+    env::var_os("JATO_SAVED_STATE").is_none_or(|v| v != "0")
+}
+
+/// Identifies where a workspace and its target directory really are.
+fn whereabouts(roots: &Roots) -> Digest {
+    let mut hash = blake3::Hasher::new_derive_key("jato workspace and target location v1");
+    for root in [roots::WORK, roots::TARGET] {
+        field(
+            &mut hash,
+            roots
+                .path(root)
+                .map_or(&[][..], |p| p.as_os_str().as_bytes()),
+        );
+    }
+    *hash.finalize().as_bytes()
+}
+
+/// The newest session rustc finished in a crate's state directory.
+fn finished_session(crate_dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(crate_dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("s-") && !name.ends_with("-working") && entry.path().is_dir()
+        })
+        .map(|entry| entry.path())
+        // The names begin with the time, in digits of a fixed width.
+        .max()
+}
+
+/// Stage what rustc saved for compiling this crate again: the files of the
+/// session it just finished. None if there is no such state or it is not
+/// what this expects, in which case nothing is kept.
+fn save_state(
+    job: &Job,
+    store: &mut Store,
+    report: &Report,
+    staged: &mut Vec<Staged>,
+) -> Option<Vec<Output>> {
+    const MOST_FILES: usize = 20_000;
+    const MOST_BYTES: u64 = 2 << 30;
+    let directory = job.facts.incremental.as_ref()?;
+    // The one directory in there this compiler used is this crate's.
+    let prefix = format!("{}-", job.name());
+    let mut used = report
+        .state
+        .iter()
+        .filter(|name| name.to_string_lossy().starts_with(&prefix));
+    let (crate_dir, None) = (directory.join(used.next()?), used.next()) else {
+        return None;
+    };
+    let session = finished_session(&crate_dir)?;
+    let mut files = Vec::new();
+    let mut bytes = 0;
+    for entry in fs::read_dir(&session).ok()? {
+        let entry = entry.ok()?;
+        let meta = entry.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        bytes += meta.len();
+        files.push(entry.path());
+    }
+    if files.is_empty() || files.len() > MOST_FILES || bytes > MOST_BYTES {
+        return None;
+    }
+    files.sort();
+    let mut saved = Vec::with_capacity(files.len());
+    for path in files {
+        // As it is, whatever it holds: no root is looked for in it.
+        let file = store.stage(&path, &Roots::default()).ok()?;
+        let (root, rel) = job.roots.split(&path);
+        saved.push(Output {
+            root,
+            path: rel.to_owned(),
+            digest: file.digest,
+            size: file.size,
+            mode: 0o644,
+            marked: false,
+        });
+        staged.push(file);
+    }
+    Some(saved)
+}
+
+/// The start of a file of rustc's saved state: a mark, a format number
+/// and the compiler's version, then eight bytes that stand for the options
+/// the compiler was given. Returns the two parts.
+fn state_header(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if bytes.len() < 7 || &bytes[..4] != b"RSIC" {
+        return None;
+    }
+    let header = 7 + bytes[6] as usize;
+    Some((bytes.get(..header)?, bytes.get(header..header + 8)?))
+}
+
+/// What the compiler writes for this command's options at the start of its
+/// saved state, learned by having it compile a crate of one line.
+///
+/// rustc refuses saved state made under other options, and the real
+/// location of the workspace is among them, through `--remap-path-prefix`.
+/// Everything else in the state names files by their aliases, so state
+/// from another checkout is good here once it carries this checkout's
+/// eight bytes: the compiler still checks every result in it against the
+/// sources before using it. A second compilation with one more option
+/// that changes nothing else confirms that those bytes are what this
+/// takes them for; if they are not, the state is not used.
+fn options_mark(job: &Job, store: &Store) -> Option<(Vec<u8>, [u8; 8])> {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = store
+        .dir
+        .join("locks")
+        .join(format!("probe-{}-{serial}", std::process::id()));
+    let found = (|| {
+        fs::create_dir_all(&scratch).ok()?;
+        let source = scratch.join("probe.rs");
+        fs::write(
+            &source,
+            "//! Compiled to learn about the compiler.\n#![allow(warnings)]\nfn main() {}\n",
+        )
+        .ok()?;
+        let mut starts = Vec::new();
+        for other in [false, true] {
+            let dir = scratch.join(if other { "other" } else { "same" });
+            fs::create_dir_all(dir.join("out")).ok()?;
+            let argv = job.probe(&source, &dir, other)?;
+            let status = Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(&job.request.cwd)
+                .env_clear()
+                .envs(&job.request.env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok()?;
+            if !status.success() {
+                return None;
+            }
+            let crate_dir = fs::read_dir(dir.join("state"))
+                .ok()?
+                .flatten()
+                .next()?
+                .path();
+            let graph = finished_session(&crate_dir)?.join("dep-graph.bin");
+            let mut start = vec![0u8; 7 + 255 + 8];
+            let n = fs::File::open(graph).ok()?.read(&mut start).ok()?;
+            start.truncate(n);
+            starts.push(start);
+        }
+        let (header, mark) = state_header(&starts[0])?;
+        let (other_header, other_mark) = state_header(&starts[1])?;
+        (header == other_header && mark != other_mark)
+            .then(|| (header.to_vec(), <[u8; 8]>::try_from(mark).unwrap()))
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    found
+}
+
+/// Before a compilation that has no saved state of rustc's to start from:
+/// give it the state kept with the latest recorded result of the same
+/// command, from this checkout or another. The compiler then recompiles
+/// what differs instead of everything.
+pub fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) {
+    let Some(directory) = &job.facts.incremental else {
+        return;
+    };
+    if job.scope != Scope::Unit || !saved_state_wanted() || has_saved_work(directory, job.name()) {
+        return;
+    }
+    let Ok(candidates) = store.candidates(recipe) else {
+        return;
+    };
+    for candidate in &candidates {
+        let Ok(manifest) = Manifest::decode(&candidate.manifest) else {
+            continue;
+        };
+        let Some(first) = manifest.saved.first() else {
+            continue;
+        };
+        let session = job
+            .roots
+            .join(first.root, &first.path)
+            .and_then(|file| file.parent().map(Path::to_owned));
+        let Some(session) =
+            session.filter(|s| s.parent().and_then(Path::parent) == Some(directory))
+        else {
+            continue;
+        };
+        if !store.place_saved(&manifest.saved, &job.roots) {
+            continue;
+        }
+        // rustc takes a session whose lock file it can lock.
+        let name = session.file_name().unwrap_or_default().to_string_lossy();
+        let lock = name
+            .rsplit_once('-')
+            .map(|(stem, _)| session.with_file_name(format!("{stem}.lock")));
+        let ready = (|| {
+            fs::File::create(lock.as_ref()?).ok()?;
+            if manifest.saved_in == whereabouts(&job.roots) {
+                return Some(());
+            }
+            use std::os::unix::fs::FileExt;
+            let (header, mark) = options_mark(job, store)?;
+            let graph = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(session.join("dep-graph.bin"))
+                .ok()?;
+            let mut start = vec![0u8; header.len() + 8];
+            graph.read_exact_at(&mut start, 0).ok()?;
+            if start[..header.len()] != header[..] {
+                // Saved by another version of the compiler.
+                return None;
+            }
+            graph.write_all_at(&mark, header.len() as u64).ok()
+        })();
+        if ready.is_none() {
+            let _ = fs::remove_dir_all(&session);
+            if let Some(lock) = lock {
+                let _ = fs::remove_file(lock);
+            }
+            continue;
+        }
+        store.count("state_given", 1);
+        log(
+            job.name(),
+            "given the compiler's saved state from an earlier compilation",
+        );
+        return;
     }
 }
 
@@ -1558,6 +1895,7 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         }
         return passthrough(cmd);
     }
+    give_saved_state(&job, &mut store, &recipe);
     store.count(job.counter("miss"), 1);
     let (ran, report) = match run_piped(&job.argv(), Some((&job, &store))) {
         Ok(ran) => ran,

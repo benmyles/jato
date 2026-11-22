@@ -27,6 +27,12 @@ pub struct Facts {
     /// colour setting is.
     pub skipped: Vec<usize>,
     pub json_at: Option<usize>,
+    /// Where the source file, the output directory and the directory for
+    /// incremental state stand among the arguments: the argument that
+    /// holds each path, which for the last two may follow `name=`.
+    pub source_at: Option<usize>,
+    pub out_dir_at: Option<usize>,
+    pub incremental_at: Option<usize>,
 }
 
 const TAKES_VALUE: &[&str] = &[
@@ -99,6 +105,7 @@ impl Facts {
                     facts.links = true;
                 } else if !arg.starts_with('-') && arg.ends_with(".rs") && facts.source.is_none() {
                     facts.source = Some(cwd.join(arg));
+                    facts.source_at = Some(at);
                 }
                 continue;
             };
@@ -112,7 +119,10 @@ impl Facts {
                         facts.externs.push(cwd.join(path));
                     }
                 }
-                "--out-dir" => facts.hint = Some(cwd.join(value)),
+                "--out-dir" => {
+                    facts.hint = Some(cwd.join(value));
+                    facts.out_dir_at = tokens.last().copied();
+                }
                 "-o" if facts.hint.is_none() => {
                     facts.hint = cwd.join(value).parent().map(Path::to_owned)
                 }
@@ -123,6 +133,7 @@ impl Facts {
                 "-C" | "--codegen" => {
                     if let Some(dir) = value.strip_prefix("incremental=") {
                         facts.incremental = Some(cwd.join(dir));
+                        facts.incremental_at = tokens.last().copied();
                         facts.skipped.extend(tokens);
                     } else if value == "target-cpu=native" {
                         facts.native_cpu = true;

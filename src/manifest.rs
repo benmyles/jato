@@ -57,6 +57,13 @@ pub struct Manifest {
     pub removed: Vec<Place>,
     /// Digest of what the command printed and its exit status.
     pub detail: Digest,
+    /// What the compiler saved for compiling this crate again after a
+    /// change. It is no part of the result: a later compilation that finds
+    /// no such state of its own is given this to start from.
+    pub saved: Vec<Output>,
+    /// Identifies the workspace and target directory the state was saved
+    /// in, where the compiler accepts it as it is.
+    pub saved_in: Digest,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -172,6 +179,13 @@ impl Manifest {
             w.path(*root, path);
         }
         w.0.extend_from_slice(&self.detail);
+        w.number(self.saved.len() as u64);
+        for file in &self.saved {
+            w.path(file.root, &file.path);
+            w.0.extend_from_slice(&file.digest);
+            w.number(file.size);
+        }
+        w.0.extend_from_slice(&self.saved_in);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -239,6 +253,18 @@ impl Manifest {
             m.removed.push(r.path()?);
         }
         m.detail = r.digest()?;
+        for _ in 0..r.count()? {
+            let (root, path) = r.path()?;
+            m.saved.push(Output {
+                root,
+                path,
+                digest: r.digest()?,
+                size: r.number()?,
+                mode: 0o644,
+                marked: false,
+            });
+        }
+        m.saved_in = r.digest()?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -536,6 +562,15 @@ mod tests {
             }],
             removed: vec![(2, "debug/old".into())],
             detail: [5; 32],
+            saved: vec![Output {
+                root: 2,
+                path: "debug/incremental/a-1x/s-1-2-3/dep-graph.bin".into(),
+                digest: [4; 32],
+                size: 77,
+                mode: 0o644,
+                marked: false,
+            }],
+            saved_in: [6; 32],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
@@ -544,6 +579,7 @@ mod tests {
         assert_ne!(key, m.key(&[2; 32]));
         let mut other = m.clone();
         other.outputs.clear();
+        other.saved.clear();
         assert_eq!(other.key(&[1; 32]), key);
         other.inputs[0].state = State::Absent;
         assert_ne!(other.key(&[1; 32]), key);
