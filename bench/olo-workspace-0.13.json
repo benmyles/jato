@@ -1,0 +1,309 @@
+{
+  "project": "olo",
+  "command": "check",
+  "c_compilers": "own",
+  "packages": [],
+  "cargo_args": [
+    "--workspace"
+  ],
+  "edit": "crates/system/src/lib.rs",
+  "versions": {
+    "cargo": "cargo 1.102.0-nightly (ede6cefea 2026-11-11)",
+    "rustc": "rustc 1.102.0-nightly (5f4effd57 2026-11-13)",
+    "jato": "jato 0.13.0",
+    "kache": "kache 2.3.0"
+  },
+  "runs": 1,
+  "jobs": null,
+  "processors": 16,
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "filesystem": "btrfs",
+  "median": {
+    "jato": {
+      "cold": {
+        "seconds": 508.46,
+        "cpu": 2449.39
+      },
+      "fresh": {
+        "seconds": 0.661,
+        "cpu": 0.57
+      },
+      "restore": {
+        "seconds": 2.217,
+        "cpu": 1.8
+      },
+      "new_target": {
+        "seconds": 2.13,
+        "cpu": 1.55
+      },
+      "copy": {
+        "seconds": 2.632,
+        "cpu": 2.02
+      },
+      "copy_edit": {
+        "seconds": 10.458,
+        "cpu": 35.66
+      },
+      "edit_first": {
+        "seconds": 18.145,
+        "cpu": 33.56
+      },
+      "edit": {
+        "seconds": 8.976,
+        "cpu": 24.44
+      },
+      "undo": {
+        "seconds": 0.879,
+        "cpu": 0.71
+      }
+    },
+    "kache": {
+      "cold": {
+        "seconds": 546.851,
+        "cpu": 2608.95
+      },
+      "fresh": {
+        "seconds": 0.635,
+        "cpu": 0.6
+      },
+      "restore": {
+        "seconds": 11.801,
+        "cpu": 53.19
+      },
+      "new_target": {
+        "seconds": 21.131,
+        "cpu": 118.46
+      },
+      "copy": {
+        "seconds": 12.699,
+        "cpu": 61.86
+      },
+      "copy_edit": {
+        "seconds": 11.334,
+        "cpu": 87.19
+      },
+      "edit_first": {
+        "seconds": 7.008,
+        "cpu": 33.88
+      },
+      "edit": {
+        "seconds": 5.182,
+        "cpu": 23.92
+      },
+      "undo": {
+        "seconds": 5.588,
+        "cpu": 24.5
+      }
+    }
+  },
+  "samples": {
+    "jato": {
+      "cold": [
+        {
+          "seconds": 508.46,
+          "cpu": 2449.39,
+          "load": 18.2,
+          "compiled": 323
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.661,
+          "cpu": 0.57,
+          "load": 30.1,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 2.217,
+          "cpu": 1.8,
+          "load": 30.1,
+          "compiled": 0
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 2.13,
+          "cpu": 1.55,
+          "load": 29.4,
+          "compiled": 0
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 2.632,
+          "cpu": 2.02,
+          "load": 29.4,
+          "compiled": 0
+        }
+      ],
+      "copy_edit": [
+        {
+          "seconds": 10.458,
+          "cpu": 35.66,
+          "load": 28.1,
+          "compiled": 2
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 18.145,
+          "cpu": 33.56,
+          "load": 26.8,
+          "compiled": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 8.976,
+          "cpu": 24.44,
+          "load": 33.7,
+          "compiled": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.879,
+          "cpu": 0.71,
+          "load": 33.3,
+          "compiled": 0
+        }
+      ]
+    },
+    "kache": {
+      "cold": [
+        {
+          "seconds": 546.851,
+          "cpu": 2608.95,
+          "load": 33.6,
+          "compiled": 319
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.635,
+          "cpu": 0.6,
+          "load": 30.1,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 11.801,
+          "cpu": 53.19,
+          "load": 30.1,
+          "compiled": 322
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 21.131,
+          "cpu": 118.46,
+          "load": 26.7,
+          "compiled": 8
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 12.699,
+          "cpu": 61.86,
+          "load": 29.0,
+          "compiled": 9
+        }
+      ],
+      "copy_edit": [
+        {
+          "seconds": 11.334,
+          "cpu": 87.19,
+          "load": 28.6,
+          "compiled": 0
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 7.008,
+          "cpu": 33.88,
+          "load": 27.8,
+          "compiled": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 5.182,
+          "cpu": 23.92,
+          "load": 28.1,
+          "compiled": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 5.588,
+          "cpu": 24.5,
+          "load": 27.3,
+          "compiled": 0
+        }
+      ]
+    }
+  },
+  "details": {
+    "jato": [
+      {
+        "store_bytes": 3249500253,
+        "store_extents": {
+          "total": 3252625408,
+          "exclusive": 48537600,
+          "shared": 3039551488
+        },
+        "target_bytes": 3218597241,
+        "target_extents": {
+          "total": 3221442560,
+          "exclusive": 16572416,
+          "shared": 3039694848
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 3285732674,
+        "counters": {
+          "build_hit": 5,
+          "build_left_to_cargo": 5,
+          "build_miss": 1,
+          "build_stored": 1,
+          "continued": 165,
+          "hashed_bytes": 10512692160,
+          "hit": 17,
+          "miss": 1612,
+          "pinned": 98,
+          "query_hit": 2,
+          "query_miss": 17,
+          "query_stored": 17,
+          "restored_bytes": 4949730151,
+          "saved_ms": 2508619,
+          "state_given": 98,
+          "state_saved": 171,
+          "stored": 1612,
+          "tool_hit": 16,
+          "tool_miss": 1137,
+          "tool_stored": 1131
+        }
+      }
+    ],
+    "kache": [
+      {
+        "store_bytes": 1697339256,
+        "store_extents": {
+          "total": 1697316864,
+          "exclusive": 67670016,
+          "shared": 1480900608
+        },
+        "target_bytes": 1677685125,
+        "target_extents": {
+          "total": 1680314368,
+          "exclusive": 19034112,
+          "shared": 1505800192
+        },
+        "daemon_rss_kib": 84108,
+        "store_bytes_end": 1701387049
+      }
+    ]
+  }
+}

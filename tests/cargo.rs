@@ -110,6 +110,9 @@ impl Project {
             // Tests edit and build within seconds and expect each result to
             // be recorded. The test of editing spells says otherwise.
             .env("JATO_EDIT_WINDOW", "0")
+            // What is recorded must not depend on what else this machine
+            // is doing. The test of a busy machine says otherwise.
+            .env("JATO_BUSY", "0")
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("RUSTC_BOOTSTRAP")
@@ -818,6 +821,45 @@ fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
     p.clean();
     let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "five:none\n"));
     assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+}
+
+#[test]
+fn on_a_busy_machine_compilations_in_a_built_target_are_not_watched() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // A build made from nothing is recorded however busy the machine is.
+    let busy = || {
+        let mut cmd = p.command();
+        cmd.env_remove("JATO_EDIT_WINDOW").env("JATO_BUSY", "0.001");
+        cmd
+    };
+    success(busy().args(["build"]));
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    assert_eq!(p.count("stored"), 2, "{}", p.stats());
+    // Put back and then edited, with every processor in use: the edited
+    // crate and the one that depends on it are left to rustc, though
+    // neither was compiled here lately.
+    p.clean();
+    success(busy().args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    edit_leaf(&p.root, "in a hurry");
+    let out = success(busy().args(["run", "-q"]));
+    assert_eq!(out.stdout, b"in a hurry\n");
+    assert_eq!(p.count("stored"), 2, "{}", p.stats());
+    assert_eq!(p.count("continued"), 2, "{}", p.stats());
+    // rustc was handed the state it saved in the first build all the same.
+    assert_eq!(p.count("state_given"), 2, "{}", p.stats());
+    // With processors to spare the next crate to be edited is recorded.
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { println!(\"{}!\", leaf::value()); }",
+    );
+    let out = success(busy().env("JATO_BUSY", "0").args(["run", "-q"]));
+    assert_eq!(out.stdout, b"in a hurry!\n");
+    assert_eq!(p.count("stored"), 2, "{}", p.stats());
+    assert_eq!(p.count("continued"), 3, "{}", p.stats());
 }
 
 #[test]

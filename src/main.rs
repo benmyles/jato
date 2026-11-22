@@ -69,6 +69,9 @@ Environment
                       environment
   JATO_EDIT_WINDOW    Seconds within which a crate compiled again counts as
                       being edited and is not recorded; default 600, 0 never
+  JATO_BUSY           Load average from which compilations in a target that
+                      is already built are not watched; default the number
+                      of processors, 0 always watches
   JATO_WHOLE_BUILDS=0 Reuse single compilations only
   JATO_TOOLS=0        Leave the C compilers and assemblers that build scripts
                       start to themselves

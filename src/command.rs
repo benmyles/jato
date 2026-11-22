@@ -2344,11 +2344,39 @@ pub fn choose(job: &Job, store: &mut Store, recipe: &Digest, building: bool) -> 
     let recent = store
         .since_noted(hash.finalize().as_bytes())
         .is_some_and(|seconds| seconds < window);
-    match (recent, own || given) {
+    // Watching a compiler costs it a turn at the processor for every file
+    // it asks about. With processors to spare that is nothing. With every
+    // one in use it can double the time of a short compilation, and
+    // whoever edited is waiting. Asked to record every compilation, Jato
+    // does.
+    let dear = window > 0 && !recent && busy();
+    if dear {
+        log(job.name(), "every processor is in use");
+    } else if recent {
+        log(
+            job.name(),
+            "compiled here a moment ago: one of a run of edits",
+        );
+    }
+    match (recent || dear, own || given) {
         (false, _) => Run::Recorded,
         (true, true) => Run::Continued,
         (true, false) => Run::Seeding,
     }
+}
+
+/// Whether the machine's processors have all been in use over the last
+/// minute. `JATO_BUSY` sets the load from which that is so; 0 means never.
+fn busy() -> bool {
+    let limit = env::var("JATO_BUSY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(0.0, |n| n.get() as f64));
+    limit > 0.0
+        && fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+            .is_some_and(|load| load >= limit)
 }
 
 /// Whether rustc has finished a session for this crate in the directory it
@@ -2481,10 +2509,7 @@ fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
     let argv = job.argv();
     match run {
         Run::Continued => {
-            log(
-                job.name(),
-                "one of a run of edits: left to rustc, unrecorded",
-            );
+            log(job.name(), "left to rustc, unwatched and unrecorded");
             store.count("continued", 1);
             drop(lock);
             drop(store);
@@ -2505,7 +2530,7 @@ fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
         Run::Seeding => {
             log(
                 job.name(),
-                "being edited: compiled with saved state from now on, unrecorded",
+                "left to rustc, unwatched and unrecorded; the state it saves is kept",
             );
             store.count("continued", 1);
             store.flush();

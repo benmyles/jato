@@ -96,6 +96,8 @@ The files of a build that is put back all get one time, taken from the filesyste
 
 A crate compiled again within ten minutes of its last compilation in the same target directory is being edited. rustc compiles it incrementally from the state it saved, Jato looks for a recorded result (which is how undoing an edit is instant) and otherwise leaves the compiler unwatched and its output unrecorded, because the next edit replaces it. The first compilation after a pause is recorded again. `JATO_EDIT_WINDOW` sets the pause in seconds; `0` records every compilation.
 
+Watching a compiler is free while processors are free. On a machine where every one is in use, each file the compiler asks about costs it a turn at the processor, and a short compilation can take several times as long: checking `olo-system` and its 54 dependents after an edit took 17 to 25 s watched and 7 to 14 s unwatched at a load of 45 to 55 on 15 processors. So in a target directory that is already built, compilations are left unwatched while the load average is at or above the number of processors, and recorded when it is below. A build made from nothing is always recorded. `JATO_BUSY` sets the load; `0` always watches.
+
 A target directory that was restored holds none of the state rustc saves for compiling a crate again, so the first edit of a crate there would compile the whole crate. Jato keeps that state in the cache, once for each crate and replaced by newer state when it is more than an hour old, and hands it to a compilation that has none of its own: the first edit in a new checkout is compiled incrementally, from state saved where the crate was last compiled under watch. On Olo that took the first edit of the top crate in a new checkout from about 110 processor-seconds to 53.
 
 What rustc makes of the state depends on the crate. For a library it reuses its analysis and the code it generated for every module that was not edited. For a program or a test in another target directory it reuses the analysis and generates all code again: rustc ties the code of anything it links to the real locations of the libraries linked in, whatever names they are given by. In the target directory the state was saved in, after a clean, a program's code is reused too.
@@ -161,6 +163,7 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_KEY_ENV=A,B` | Variables a procedural macro reads from the environment. |
 | `JATO_JOBS=8` | Compilers running at once across the builds sharing this cache. |
 | `JATO_EDIT_WINDOW=0` | Record every compilation, including each edit. |
+| `JATO_BUSY=8` | The load average from which compilations in a built target are left unwatched. Defaults to the number of processors; `0` always watches. |
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
 | `JATO_TOOLS=0` | Leave the C compilers and assemblers that build scripts start to themselves. |
 | `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state in the cache or hand it to other checkouts. |
