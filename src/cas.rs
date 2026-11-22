@@ -8,6 +8,7 @@
 //!
 //! Object files are renamed into place and unlinked only while this process
 //! holds SQLite's writer lock, so the index and the directory agree.
+use crate::manifest::Manifest;
 use crate::observe::Stamp;
 use crate::roots::Roots;
 use crate::scan::{self, Digest};
@@ -35,9 +36,8 @@ CREATE TABLE entries(
 CREATE INDEX entries_by_recipe ON entries(recipe, used DESC);
 CREATE INDEX entries_by_use ON entries(used);
 CREATE TABLE outputs(
-    entry INTEGER NOT NULL REFERENCES entries ON DELETE CASCADE, root INTEGER NOT NULL,
-    path BLOB NOT NULL, object BLOB NOT NULL, mode INTEGER NOT NULL, marked INTEGER NOT NULL,
-    PRIMARY KEY(entry, root, path)
+    entry INTEGER NOT NULL REFERENCES entries ON DELETE CASCADE, object BLOB NOT NULL,
+    PRIMARY KEY(entry, object)
 ) WITHOUT ROWID;
 CREATE INDEX outputs_by_object ON outputs(object);
 CREATE TABLE objects(
@@ -167,13 +167,12 @@ pub struct Stats {
 pub struct Candidate {
     pub key: Digest,
     pub manifest: Vec<u8>,
+    used: i64,
 }
 
 /// One output of a command, copied into the cache directory but not yet
 /// part of the cache.
 pub struct Staged {
-    pub root: u8,
-    pub path: PathBuf,
     pub digest: Digest,
     pub size: u64,
     pub mode: u32,
@@ -213,6 +212,30 @@ pub struct Store {
     counts: BTreeMap<String, i64>,
     used: Vec<Digest>,
     serial: u32,
+}
+
+/// Whether an error says the index file itself cannot be trusted.
+pub fn damaged_index(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    })
+}
+
+/// Move a damaged index out of the way. Its objects stay, to be collected
+/// by `jato gc` or adopted again as the same outputs are stored.
+pub fn set_aside(dir: &Path) {
+    let stamp = now();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = dir.join(format!("index-v2.sqlite3{suffix}"));
+        let _ = fs::rename(&from, dir.join(format!("damaged-{stamp}{suffix}")));
+    }
 }
 
 fn clone_file(source: &File, dest: &File) -> io::Result<()> {
@@ -257,7 +280,14 @@ impl Store {
             .ok()
             .map(|s| parse_size(&s))
             .transpose()?;
-        let mut store = Self::at(cache_dir()?)?;
+        let dir = cache_dir()?;
+        let mut store = match Self::at(dir.clone()) {
+            Err(e) if damaged_index(&e) => {
+                set_aside(&dir);
+                Self::at(dir)?
+            }
+            other => other?,
+        };
         store.env_limit = env_limit;
         match env::var("JATO_STORAGE").as_deref() {
             Ok("packed") => store.clone = false,
@@ -284,10 +314,13 @@ impl Store {
         )?;
         conn.set_prepared_statement_cache_capacity(48);
         conn.busy_handler(Some(wait_for_writer))?;
+        // Nothing is forced to disk: after a power failure the index may be
+        // damaged, and a damaged index is set aside. A short log keeps the
+        // cost of opening the index low for each compiler command.
         conn.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA mmap_size=268435456;
-             PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=2048;
-             PRAGMA journal_size_limit=16777216;",
+             PRAGMA synchronous=OFF; PRAGMA wal_autocheckpoint=128;
+             PRAGMA journal_size_limit=1048576;",
         )?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
@@ -428,15 +461,26 @@ impl Store {
 
     // ---- lookups ----------------------------------------------------------
 
+    /// Read from one consistent state of the index until `end_read`,
+    /// without taking and dropping a lock for every question.
+    pub fn begin_read(&self) {
+        let _ = self.conn.execute_batch("BEGIN");
+    }
+
+    pub fn end_read(&self) {
+        let _ = self.conn.execute_batch("COMMIT");
+    }
+
     /// Earlier results for a command line, most recently used first.
     pub fn candidates(&self, recipe: &Digest) -> Result<Vec<Candidate>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT key,manifest FROM entries WHERE recipe=?1 ORDER BY used DESC LIMIT ?2",
+            "SELECT key,manifest,used FROM entries WHERE recipe=?1 ORDER BY used DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![recipe, VARIANTS as i64], |r| {
             Ok(Candidate {
                 key: r.get(0)?,
                 manifest: r.get(1)?,
+                used: r.get(2)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -449,79 +493,64 @@ impl Store {
             .unwrap_or(0)
     }
 
-    /// Write an entry's files where they belong here. None if the entry or
-    /// one of its objects is gone, damaged, or names a root this command
-    /// lacks; nothing is left behind in that case.
-    pub fn restore(&mut self, key: &Digest, roots: &Roots) -> Result<Option<Restored>> {
-        let entry = self
-            .conn
-            .prepare_cached("SELECT id,detail,cost_ms FROM entries WHERE key=?1")?
-            .query_row([key], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, u64>(2)?,
-                ))
-            })
-            .optional()?;
-        let Some((id, detail, cost_ms)) = entry else {
-            return Ok(None);
-        };
-        struct Row {
-            dest: Option<PathBuf>,
-            digest: Digest,
-            mode: u32,
-            marked: bool,
-            size: Option<u64>,
-            packed: bool,
+    /// Write a result's files where they belong here and return what the
+    /// command printed. None if an object is gone or damaged, or the result
+    /// names a root this command lacks; nothing is left behind in that case
+    /// and `damaged` says whether the result should be forgotten.
+    pub fn restore(
+        &mut self,
+        candidate: &Candidate,
+        manifest: &Manifest,
+        roots: &Roots,
+        damaged: &mut bool,
+    ) -> Result<Option<Restored>> {
+        let mut dests = Vec::with_capacity(manifest.outputs.len());
+        for output in &manifest.outputs {
+            match roots.join(output.root, &output.path) {
+                Some(dest) => dests.push(dest),
+                None => return Ok(None),
+            }
         }
-        let rows: Vec<Row> = {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT o.root,o.path,o.object,o.mode,o.marked,b.size,b.packed FROM outputs o
-                 LEFT JOIN objects b ON b.digest=o.object WHERE o.entry=?1",
-            )?;
-            let rows = stmt.query_map([id], |r| {
-                let root: u8 = r.get(0)?;
-                let path: Vec<u8> = r.get(1)?;
-                Ok(Row {
-                    dest: roots.join(root, Path::new(std::ffi::OsStr::from_bytes(&path))),
-                    digest: r.get(2)?,
-                    mode: r.get(3)?,
-                    marked: r.get(4)?,
-                    size: r.get(5)?,
-                    packed: r.get::<_, Option<bool>>(6)?.unwrap_or(false),
-                })
-            })?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        if rows.iter().any(|r| r.dest.is_none()) {
-            return Ok(None);
-        }
-        if rows.iter().any(|r| r.size.is_none()) {
-            self.forget(key);
-            return Ok(None);
-        }
-        // Open every object before writing anything, so an entry evicted
+        // Open every object before writing anything, so a result evicted
         // meanwhile leaves the target untouched.
-        let mut sources = Vec::with_capacity(rows.len());
-        for row in &rows {
-            match File::open(object_path(&self.dir, &row.digest, row.packed)) {
-                Ok(f) => sources.push(f),
+        let mut sources = Vec::with_capacity(dests.len());
+        for output in &manifest.outputs {
+            let plain = File::open(object_path(&self.dir, &output.digest, false));
+            let found = match plain {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    self.forget(key);
+                    File::open(object_path(&self.dir, &output.digest, true)).map(|f| (f, true))
+                }
+                other => other.map(|f| (f, false)),
+            };
+            match found {
+                Ok(source) => sources.push(source),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    *damaged = true;
                     return Ok(None);
                 }
                 Err(e) => return Err(e.into()),
             }
         }
+        let detail: Option<(Vec<u8>, u64)> = self
+            .conn
+            .prepare_cached("SELECT detail,cost_ms FROM entries WHERE key=?1")?
+            .query_row([&candidate.key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((detail, cost_ms)) = detail else {
+            return Ok(None);
+        };
+        if blake3::hash(&detail).as_bytes() != &manifest.detail {
+            *damaged = true;
+            return Ok(None);
+        }
         let (verify, clone) = (self.verify, self.clone);
         let mut bytes = 0;
-        let mut staged: Vec<(PathBuf, &Path)> = Vec::with_capacity(rows.len());
-        // Ok(false): the stored bytes are not what the index says.
+        let mut staged: Vec<PathBuf> = Vec::with_capacity(dests.len());
+        // Ok(Some(false)): the stored bytes are not what the result names.
         let result = (|| -> Result<Option<bool>> {
-            for (row, mut source) in rows.iter().zip(sources) {
-                let dest = row.dest.as_deref().unwrap();
-                let size = row.size.unwrap();
+            for ((output, dest), (mut source, packed)) in
+                manifest.outputs.iter().zip(&dests).zip(sources)
+            {
                 let mut name = dest
                     .file_name()
                     .context("output without a file name")?
@@ -534,7 +563,7 @@ impl Store {
                         .write(true)
                         .create(true)
                         .truncate(true)
-                        .mode(row.mode & 0o777)
+                        .mode(output.mode & 0o777)
                         .open(path)
                 };
                 let mut out = match open(&staging) {
@@ -545,19 +574,19 @@ impl Store {
                     }
                     Err(e) => return Err(e.into()),
                 };
-                staged.push((staging, dest));
-                if row.marked {
-                    ensure!(size <= TEXT_LIMIT * 4, "oversized text object");
-                    let mut text = Vec::with_capacity(size as usize);
+                staged.push(staging);
+                if output.marked {
+                    ensure!(output.size <= TEXT_LIMIT * 4, "oversized text object");
+                    let mut text = Vec::with_capacity(output.size as usize);
                     source.read_to_end(&mut text)?;
-                    if blake3::hash(&text).as_bytes() != &row.digest {
+                    if blake3::hash(&text).as_bytes() != &output.digest {
                         return Ok(Some(false));
                     }
                     let Some(text) = roots.unmark(&text) else {
                         return Ok(None);
                     };
                     out.write_all(&text)?;
-                } else if row.packed {
+                } else if packed {
                     let mut hasher = blake3::Hasher::new();
                     let mut decoder = zstd::stream::read::Decoder::new(&mut source)?;
                     let mut buffer = vec![0u8; 256 * 1024];
@@ -571,64 +600,65 @@ impl Store {
                         out.write_all(&buffer[..n])?;
                         written += n as u64;
                     }
-                    if written != size || hasher.finalize().as_bytes() != &row.digest {
+                    if written != output.size || hasher.finalize().as_bytes() != &output.digest {
                         return Ok(Some(false));
                     }
                 } else {
                     // An object's length is part of its identity.
-                    if source.metadata()?.len() != size {
+                    if source.metadata()?.len() != output.size {
                         return Ok(Some(false));
                     }
                     if !clone || clone_file(&source, &out).is_err() {
                         let copied = io::copy(&mut source, &mut out)?;
-                        ensure!(copied == size, "short copy of a cached object");
+                        ensure!(copied == output.size, "short copy of a cached object");
                     }
                     if verify {
                         use std::io::Seek;
                         out.rewind()?;
                         let (digest, length, _) = scan::digest_open(&mut out, &[])?;
-                        if length != size || digest != row.digest {
+                        if length != output.size || digest != output.digest {
                             return Ok(Some(false));
                         }
                     }
                 }
                 // The umask applied at creation. Outputs keep their mode.
-                out.set_permissions(fs::Permissions::from_mode(row.mode & 0o777))?;
-                bytes += size;
+                out.set_permissions(fs::Permissions::from_mode(output.mode & 0o777))?;
+                bytes += output.size;
             }
             Ok(Some(true))
         })();
         if !matches!(result, Ok(Some(true))) {
-            for (staging, _) in &staged {
+            for staging in &staged {
                 let _ = fs::remove_file(staging);
             }
-            if matches!(result, Ok(Some(false))) {
-                self.forget(key);
-                self.count("damaged", 1);
-            }
+            *damaged |= matches!(result, Ok(Some(false)));
             return result.map(|_| None);
         }
         let mut done = 0;
-        let renamed: io::Result<()> = staged.iter().try_for_each(|(staging, dest)| {
+        let renamed: io::Result<()> = staged.iter().zip(&dests).try_for_each(|(staging, dest)| {
             fs::rename(staging, dest)?;
             done += 1;
             Ok(())
         });
         if let Err(e) = renamed {
-            for (staging, _) in &staged[done..] {
+            for staging in &staged[done..] {
                 let _ = fs::remove_file(staging);
             }
             return Err(e.into());
         }
-        for (row, (_, dest)) in rows.iter().zip(&staged) {
+        for (output, dest) in manifest.outputs.iter().zip(&dests) {
             // Later commands read this file. They need not hash it again.
-            if !row.marked
+            if !output.marked
                 && let Ok(meta) = fs::metadata(dest)
             {
-                self.remember(Stamp::of(&meta), row.digest);
+                self.remember(Stamp::of(&meta), output.digest);
             }
         }
-        self.used.push(*key);
+        // Which results were used lately decides what is evicted. An hour
+        // is fine enough, and saves a write for every reuse in a build.
+        if now() - candidate.used > 3_600_000_000 {
+            self.used.push(candidate.key);
+        }
         Ok(Some(Restored {
             detail,
             cost_ms,
@@ -636,7 +666,9 @@ impl Store {
         }))
     }
 
-    fn forget(&mut self, key: &Digest) {
+    /// Drop a result whose objects turned out to be missing or damaged.
+    pub fn forget(&mut self, key: &Digest) {
+        self.count("damaged", 1);
         let dir = self.dir.clone();
         let _ = (|| -> Result<()> {
             let tx = self
@@ -657,7 +689,7 @@ impl Store {
 
     /// Copy one output into the cache directory and learn its digest and
     /// which of `roots`' spellings its bytes name.
-    pub fn stage(&mut self, root: u8, rel: &Path, file: &Path, roots: &Roots) -> Result<Staged> {
+    pub fn stage(&mut self, file: &Path, roots: &Roots) -> Result<Staged> {
         let spellings = roots.spellings();
         let needles: Vec<&[u8]> = spellings.iter().map(|(_, s)| *s).collect();
         let mut source = File::open(file).with_context(|| format!("opening {}", file.display()))?;
@@ -671,8 +703,6 @@ impl Store {
                 .join("objects")
                 .join(format!("tmp-{}-{}", std::process::id(), self.serial));
         let mut staged = Staged {
-            root,
-            path: rel.to_owned(),
             digest: [0; 32],
             size: before.size,
             mode,
@@ -831,17 +861,8 @@ impl Store {
                 )?;
                 charge += output.stored;
             }
-            tx.execute(
-                "INSERT INTO outputs VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    entry,
-                    output.root,
-                    output.path.as_os_str().as_bytes(),
-                    output.digest,
-                    output.mode,
-                    output.marked
-                ],
-            )?;
+            tx.prepare_cached("INSERT OR IGNORE INTO outputs VALUES(?1,?2)")?
+                .execute(params![entry, output.digest])?;
         }
         add(&tx, "bytes", charge as i64)?;
         // Keep a bounded history for each command line.
@@ -953,9 +974,7 @@ impl Store {
             directory: self.dir.clone(),
             limit_bytes: self.budget()?,
             stored_bytes: counters.remove("bytes").unwrap_or(0),
-            artifact_bytes: one(
-                "SELECT sum(b.size) FROM outputs o JOIN objects b ON b.digest=o.object",
-            )?,
+            artifact_bytes: one("SELECT sum(size) FROM objects")?,
             database_bytes,
             entries: one("SELECT count(*) FROM entries")?,
             objects: one("SELECT count(*) FROM objects")?,

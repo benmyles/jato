@@ -46,7 +46,8 @@ fn original(program: &OsStr, args: &[OsString]) -> Command {
     cmd
 }
 
-/// Explanations go to stderr, or are appended to the file JATO_LOG names.
+/// Explanations go to stderr, or are appended to the file JATO_LOG names,
+/// there with the time of day and how long this process has been running.
 fn log(name: &str, message: impl std::fmt::Display) {
     let Some(setting) = env::var_os("JATO_LOG") else {
         return;
@@ -59,8 +60,22 @@ fn log(name: &str, message: impl std::fmt::Display) {
             .append(true)
             .open(&setting)
     {
-        let _ = file.write_all(format!("[{name}] {message}\n").as_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let line = format!(
+            "{}.{:03} +{:.1}ms [{name}] {message}\n",
+            now.as_secs(),
+            now.subsec_millis(),
+            started().elapsed().as_secs_f64() * 1000.0
+        );
+        let _ = file.write_all(line.as_bytes());
     }
+}
+
+fn started() -> Instant {
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(Instant::now)
 }
 
 /// What the arguments say about a rustc command. None of it decides whether
@@ -391,6 +406,22 @@ impl Job<'_> {
         cmd
     }
 
+    /// Files a tool keeps for its own later runs: locks, and what rustc
+    /// saves to compile incrementally. They are neither inputs nor outputs.
+    fn state(&self, path: &Path) -> bool {
+        const LOCKS: &[&str] = &[".cargo-lock", ".package-cache", ".package-cache-mutate"];
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        if LOCKS.contains(&name) || name.starts_with(".global-cache") {
+            return true;
+        }
+        let (root, rest) = self.roots.split(path);
+        root == roots::TARGET
+            && rest
+                .components()
+                .take(3)
+                .any(|c| c.as_os_str() == "incremental")
+    }
+
     /// Compilations are counted apart from the questions Cargo and build
     /// scripts ask the compiler, which take no time worth saving.
     fn counter(&self, event: &'static str) -> &'static str {
@@ -446,6 +477,27 @@ fn decode_detail(detail: &[u8]) -> Option<(i32, &[u8], &[u8])> {
 
 /// Look for a recorded result that holds here and put its files in place.
 fn reuse(job: &Job<'_>, store: &mut Store, recipe: &Digest) -> Result<Option<i32>> {
+    store.begin_read();
+    let mut forget = Vec::new();
+    let found = search(job, store, recipe, &mut forget);
+    store.end_read();
+    for key in forget {
+        store.forget(&key);
+    }
+    if let Err(e) = &found
+        && crate::cas::damaged_index(e)
+    {
+        crate::cas::set_aside(&store.dir);
+    }
+    found
+}
+
+fn search(
+    job: &Job<'_>,
+    store: &mut Store,
+    recipe: &Digest,
+    forget: &mut Vec<Digest>,
+) -> Result<Option<i32>> {
     let candidates = store.candidates(recipe)?;
     if candidates.is_empty() {
         log(&job.facts.name, "miss: this command has not been recorded");
@@ -455,9 +507,12 @@ fn reuse(job: &Job<'_>, store: &mut Store, recipe: &Digest) -> Result<Option<i32
     let mut nearest = None;
     for candidate in &candidates {
         let manifest = match Manifest::decode(&candidate.manifest) {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                nearest.get_or_insert(format!("unreadable record: {e}"));
+            // The index said this result belongs to this command. Only a
+            // record that says so itself is believed.
+            Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
+            _ => {
+                nearest.get_or_insert("its record is unreadable".to_owned());
+                forget.push(candidate.key);
                 continue;
             }
         };
@@ -465,7 +520,11 @@ fn reuse(job: &Job<'_>, store: &mut Store, recipe: &Digest) -> Result<Option<i32
             nearest.get_or_insert(why);
             continue;
         }
-        let Some(restored) = store.restore(&candidate.key, &job.roots)? else {
+        let mut damaged = false;
+        let Some(restored) = store.restore(candidate, &manifest, &job.roots, &mut damaged)? else {
+            if damaged {
+                forget.push(candidate.key);
+            }
             nearest.get_or_insert("its files are no longer in the cache".into());
             continue;
         };
@@ -625,6 +684,9 @@ fn record(job: &Job<'_>, store: &mut Store, recipe: &Digest, ran: &Ran) -> Resul
     let mut paths: Vec<_> = report.paths.iter().collect();
     paths.sort_by_key(|(path, _)| *path);
     for (path, access) in paths {
+        if job.state(path) {
+            continue;
+        }
         let (root, rel) = roots.split(path);
         let now = fs::symlink_metadata(path);
         if access.written {
@@ -661,6 +723,9 @@ fn record(job: &Job<'_>, store: &mut Store, recipe: &Digest, ran: &Ran) -> Resul
         }
         let state = match access.kind {
             Kind::Absent => State::Absent,
+            // The compiler was told to search this directory. What it took
+            // from there is recorded; that the directory exists adds nothing.
+            Kind::Dir if access.listing.is_none() && job.facts.search.contains(path) => continue,
             Kind::Dir => State::Dir(access.listing),
             Kind::File => {
                 // The dynamic loader's index of installed libraries. The
@@ -792,22 +857,28 @@ fn record(job: &Job<'_>, store: &mut Store, recipe: &Digest, ran: &Ran) -> Resul
     let mut staged: Vec<Staged> = Vec::with_capacity(outputs.len());
     let spellings: Vec<u8> = roots.spellings().iter().map(|(id, _)| *id).collect();
     for (root, rel, path) in &outputs {
-        let output = store
-            .stage(*root, rel, path, roots)
-            .map_err(|e| format!("{e:#}"))?;
+        let output = store.stage(path, roots).map_err(|e| format!("{e:#}"))?;
         for (id, named) in spellings.iter().zip(&output.names) {
             let pin = (*id, roots.path(*id).unwrap().to_owned());
             if *named && !manifest.pins.contains(&pin) {
                 manifest.pins.push(pin);
             }
         }
-        manifest.outputs.push((*root, rel.clone()));
+        manifest.outputs.push(crate::manifest::Output {
+            root: *root,
+            path: rel.clone(),
+            digest: output.digest,
+            size: output.size,
+            mode: output.mode,
+            marked: output.marked,
+        });
         staged.push(output);
     }
+    let detail = encode_detail(0, &roots.mark(stdout), &roots.mark(stderr));
+    manifest.detail = *blake3::hash(&detail).as_bytes();
     manifest.normalize();
     let key = manifest.key(recipe);
     let encoded = manifest.encode().map_err(|e| format!("{e:#}"))?;
-    let detail = encode_detail(0, &roots.mark(stdout), &roots.mark(stderr));
     match store.commit(recipe, &key, &encoded, &detail, ran.millis, &mut staged) {
         Ok(true) => {
             if !manifest.pins.is_empty() {
@@ -855,6 +926,7 @@ fn queue(store: &Store, recipe: &Digest, source: Option<Digest>) -> Option<(fs::
 }
 
 pub fn wrap(program: &OsStr, args: &[OsString]) -> Result<i32> {
+    started();
     if env::var_os("JATO_DISABLE").is_some_and(|v| v == "1") {
         return passthrough(original(program, args));
     }

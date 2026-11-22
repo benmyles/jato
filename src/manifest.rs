@@ -51,9 +51,23 @@ pub struct Manifest {
     pub ansi: Option<bool>,
     /// Files the command wrote. They do not count as entries of the
     /// directories it listed.
-    pub outputs: Vec<(u8, PathBuf)>,
+    pub outputs: Vec<Output>,
     /// Files from before the command that it removed.
-    pub removed: Vec<(u8, PathBuf)>,
+    pub removed: Vec<Place>,
+    /// Digest of what the command printed and its exit status.
+    pub detail: Digest,
+}
+
+/// A file a command wrote, and the object that holds its bytes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Output {
+    pub root: u8,
+    pub path: PathBuf,
+    pub digest: Digest,
+    pub size: u64,
+    pub mode: u32,
+    /// The object is text in which marks stand for the roots.
+    pub marked: bool,
 }
 
 const MAX_MANIFEST: usize = 64 << 20;
@@ -222,16 +236,28 @@ impl Manifest {
         *hash.finalize().as_bytes()
     }
 
+    /// The stored form. It carries a checksum, and everything needed to
+    /// restore the result, so a damaged index can hide a result but cannot
+    /// make one stand in for another.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut w = Writer(self.conditions());
-        for list in [&self.outputs, &self.removed] {
-            w.number(list.len() as u64);
-            for (root, path) in list {
-                w.path(*root, path);
-            }
+        w.number(self.outputs.len() as u64);
+        for output in &self.outputs {
+            w.path(output.root, &output.path);
+            w.0.extend_from_slice(&output.digest);
+            w.number(output.size);
+            w.number(output.mode.into());
+            w.0.push(output.marked.into());
         }
+        w.number(self.removed.len() as u64);
+        for (root, path) in &self.removed {
+            w.path(*root, path);
+        }
+        w.0.extend_from_slice(&self.detail);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
-        Ok(zstd::bulk::compress(&w.0, 1)?)
+        let mut packer = zstd::bulk::Compressor::new(1)?;
+        packer.include_checksum(true)?;
+        Ok(packer.compress(&w.0)?)
     }
 
     pub fn decode(stored: &[u8]) -> Result<Self> {
@@ -280,11 +306,21 @@ impl Manifest {
             1 => Some(false),
             _ => Some(true),
         };
-        for list in [&mut m.outputs, &mut m.removed] {
-            for _ in 0..r.count()? {
-                list.push(r.path()?);
-            }
+        for _ in 0..r.count()? {
+            let (root, path) = r.path()?;
+            m.outputs.push(Output {
+                root,
+                path,
+                digest: r.digest()?,
+                size: r.number()?,
+                mode: u32::try_from(r.number()?)?,
+                marked: r.byte()? != 0,
+            });
         }
+        for _ in 0..r.count()? {
+            m.removed.push(r.path()?);
+        }
+        m.detail = r.digest()?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -467,10 +503,11 @@ impl Manifest {
                     let own: Vec<&OsStr> = self
                         .outputs
                         .iter()
-                        .filter(|(root, out)| {
-                            *root == input.root && out.parent() == Some(input.path.as_path())
+                        .filter(|out| {
+                            out.root == input.root
+                                && out.path.parent() == Some(input.path.as_path())
                         })
-                        .filter_map(|(_, out)| out.file_name())
+                        .filter_map(|out| out.path.file_name())
                         .collect();
                     match list(&path, &own) {
                         Ok(names) if names == *recorded => (),
@@ -536,8 +573,16 @@ mod tests {
             pins: vec![(1, "/home/a/ws".into())],
             width: Some(Some(120)),
             ansi: Some(true),
-            outputs: vec![(2, "debug/a.rlib".into())],
-            removed: vec![],
+            outputs: vec![Output {
+                root: 2,
+                path: "debug/a.rlib".into(),
+                digest: [3; 32],
+                size: 1 << 33,
+                mode: 0o755,
+                marked: true,
+            }],
+            removed: vec![(2, "debug/old".into())],
+            detail: [5; 32],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
