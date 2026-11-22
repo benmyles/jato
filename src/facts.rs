@@ -18,6 +18,11 @@ pub struct Facts {
     pub json: bool,
     pub native_cpu: bool,
     pub keeps_real_paths: bool,
+    /// The crates named on the command line.
+    pub externs: Vec<PathBuf>,
+    /// The command produces something other than a Rust library: a
+    /// program, a test, or a library with other crates' code in it.
+    pub links: bool,
     /// Arguments left out of the command's identity, and the one whose
     /// colour setting is.
     pub skipped: Vec<usize>,
@@ -90,6 +95,8 @@ impl Facts {
             } else {
                 if arg == "-" {
                     facts.reads_stdin = true;
+                } else if arg == "--test" {
+                    facts.links = true;
                 } else if !arg.starts_with('-') && arg.ends_with(".rs") && facts.source.is_none() {
                     facts.source = Some(cwd.join(arg));
                 }
@@ -99,6 +106,12 @@ impl Facts {
             let tokens = if wide { vec![at, at + 1] } else { vec![at] };
             match flag {
                 "--crate-name" => facts.name = value.to_owned(),
+                "--crate-type" => facts.links |= !matches!(value, "lib" | "rlib"),
+                "--extern" => {
+                    if let Some((_, path)) = value.split_once('=') {
+                        facts.externs.push(cwd.join(path));
+                    }
+                }
                 "--out-dir" => facts.hint = Some(cwd.join(value)),
                 "-o" if facts.hint.is_none() => {
                     facts.hint = cwd.join(value).parent().map(Path::to_owned)
@@ -265,6 +278,23 @@ mod tests {
             facts.incremental.as_deref(),
             Some(Path::new("/t/debug/incremental"))
         );
+        assert!(!facts.links && facts.externs.is_empty());
+        let facts = Facts::parse(
+            &args(&[
+                "--crate-type",
+                "lib",
+                "--crate-type=cdylib",
+                "--extern",
+                "a=/t/liba.rmeta",
+                "--extern",
+                "proc_macro",
+                "x.rs",
+            ]),
+            Path::new("/w"),
+        );
+        assert!(facts.links);
+        assert_eq!(facts.externs, [PathBuf::from("/t/liba.rmeta")]);
+        assert!(Facts::parse(&args(&["--test", "x.rs"]), Path::new("/w")).links);
     }
 
     #[test]

@@ -828,6 +828,51 @@ fn the_same_compilation_started_twice_runs_once() {
 }
 
 #[test]
+fn compilations_finishing_together_in_one_build_are_all_stored() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    let mut manifest =
+        String::from("[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\n");
+    let mut main = String::from("fn main() { let mut n = 0;\n");
+    for i in 0..12 {
+        manifest.push_str(&format!("part{i}={{path='part{i}'}}\n"));
+        main.push_str(&format!("n += part{i}::value();\n"));
+        write(
+            p.root.join(format!("part{i}/Cargo.toml")),
+            &format!("[package]\nname='part{i}'\nversion='0.1.0'\nedition='2021'\n"),
+        );
+        write(
+            p.root.join(format!("part{i}/src/lib.rs")),
+            &format!("pub fn value() -> u32 {{ {i} }}"),
+        );
+    }
+    main.push_str("println!(\"{n}\"); }");
+    write(p.root.join("Cargo.toml"), &manifest);
+    write(p.root.join("src/main.rs"), &main);
+    p.run(&["build", "-j", "12"]);
+    let stats = p.stats();
+    assert_eq!(stats["counters"]["stored"], 13, "{stats}");
+    assert_eq!(
+        stats["counters"]["uncacheable"].as_u64().unwrap_or(0),
+        0,
+        "{stats}"
+    );
+    assert_eq!(stats["counters"]["build_stored"], 1, "{stats}");
+    p.clean();
+    let (hits, misses) = p.during(|| {
+        let out = success(
+            p.command()
+                .env("JATO_WHOLE_BUILDS", "0")
+                .args(["run", "-q", "-j", "12"]),
+        );
+        assert_eq!(out.stdout, b"66\n");
+    });
+    assert_eq!((hits, misses), (13, 0), "{}", p.stats());
+}
+
+#[test]
 fn a_damaged_or_missing_object_is_compiled_again() {
     if !observes() {
         return;

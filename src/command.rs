@@ -831,10 +831,26 @@ pub fn record(
     // this command's own outputs are taken out before they are recorded.
     let mut listings: HashMap<Place, Vec<OsString>> = HashMap::new();
     let mut watched: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let siblings = job.scope == Scope::Unit && job.facts.compiles() && !job.facts.links;
     let mut paths: Vec<_> = report.paths.iter().collect();
     paths.sort_by_key(|(path, _)| *path);
     for (path, access) in paths {
         if job.state(path) {
+            continue;
+        }
+        // For a Rust library the compiler takes only metadata from other
+        // crates. Those named on its command line are recorded. Any other
+        // it loads through them it checks against the hash they carry, so
+        // it cannot have used a different one; and whether a sibling's
+        // library file was there yet depends on how far the sibling's own
+        // compilation had got.
+        if siblings
+            && !access.written
+            && path
+                .parent()
+                .is_some_and(|dir| job.facts.search.iter().any(|d| d == dir))
+            && !job.facts.externs.contains(path)
+        {
             continue;
         }
         let (root, rel) = roots.split(path);

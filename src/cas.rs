@@ -211,7 +211,6 @@ pub struct Store {
     learned: Vec<(Stamp, Digest)>,
     counts: BTreeMap<String, i64>,
     used: Vec<Digest>,
-    serial: u32,
 }
 
 /// Whether an error says the index file itself cannot be trusted.
@@ -468,7 +467,6 @@ impl Store {
             learned: Vec::new(),
             counts: BTreeMap::new(),
             used: Vec::new(),
-            serial: 0,
         })
     }
 
@@ -840,11 +838,13 @@ impl Store {
         ensure!(meta.is_file(), "{} is not a regular file", file.display());
         let before = Stamp::of(&meta);
         let mode = meta.permissions().mode() & 0o777;
-        self.serial += 1;
-        let temp =
-            self.dir
-                .join("objects")
-                .join(format!("tmp-{}-{}", std::process::id(), self.serial));
+        // One process can hold several stores, each staging at once.
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = self
+            .dir
+            .join("objects")
+            .join(format!("tmp-{}-{serial}", std::process::id()));
         let mut staged = Staged {
             digest: [0; 32],
             size: before.size,
