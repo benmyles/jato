@@ -1,7 +1,10 @@
 //! Record which files a command reads, lists, runs and writes.
 //!
-//! The command runs under a seccomp filter that reports path-taking system
-//! calls to a thread in this process. Every call is allowed to continue;
+//! The command runs under a seccomp filter that reports system calls that
+//! open, examine, list, run, create or remove a path to a thread in this
+//! process. Reading where a symbolic link points is not reported: programs
+//! do that for every part of every path they tidy, and the links that
+//! matter are found again from the paths that were used. Every call is allowed to continue;
 //! nothing is denied or emulated. A cache entry is only as sound as its list
 //! of inputs, and this is where that list comes from. It includes what proc
 //! macros, linkers, assemblers and build scripts open, which rustc's dep-info
@@ -159,7 +162,6 @@ mod imp {
         pub const LINK: u32 = 86;
         pub const UNLINK: u32 = 87;
         pub const SYMLINK: u32 = 88;
-        pub const READLINK: u32 = 89;
         pub const PIVOT_ROOT: u32 = 155;
         pub const CHROOT: u32 = 161;
         pub const MOUNT: u32 = 165;
@@ -171,7 +173,6 @@ mod imp {
         pub const RENAMEAT: u32 = 264;
         pub const LINKAT: u32 = 265;
         pub const SYMLINKAT: u32 = 266;
-        pub const READLINKAT: u32 = 267;
         pub const FACCESSAT: u32 = 269;
         pub const UNSHARE: u32 = 272;
         pub const NAME_TO_HANDLE_AT: u32 = 303;
@@ -187,8 +188,7 @@ mod imp {
         pub const ARCH: u32 = 0xc000_003e;
         /// Calls that only this architecture's table has.
         pub const LEGACY: &[u32] = &[
-            OPEN, STAT, LSTAT, ACCESS, GETDENTS, RENAME, MKDIR, RMDIR, CREAT, LINK, UNLINK,
-            SYMLINK, READLINK,
+            OPEN, STAT, LSTAT, ACCESS, GETDENTS, RENAME, MKDIR, RMDIR, CREAT, LINK, UNLINK, SYMLINK,
         ];
     }
     #[cfg(target_arch = "aarch64")]
@@ -206,7 +206,6 @@ mod imp {
         pub const LINK: u32 = u32::MAX - 9;
         pub const UNLINK: u32 = u32::MAX - 10;
         pub const SYMLINK: u32 = u32::MAX - 11;
-        pub const READLINK: u32 = u32::MAX - 12;
         pub const MKDIRAT: u32 = 34;
         pub const UNLINKAT: u32 = 35;
         pub const SYMLINKAT: u32 = 36;
@@ -219,7 +218,6 @@ mod imp {
         pub const CHROOT: u32 = 51;
         pub const OPENAT: u32 = 56;
         pub const GETDENTS64: u32 = 61;
-        pub const READLINKAT: u32 = 78;
         pub const NEWFSTATAT: u32 = 79;
         pub const UNSHARE: u32 = 97;
         pub const CONNECT: u32 = 203;
@@ -302,7 +300,6 @@ mod imp {
         nr::OPENAT2,
         nr::EXECVE,
         nr::EXECVEAT,
-        nr::READLINKAT,
         nr::FACCESSAT,
         nr::FACCESSAT2,
         nr::GETDENTS64,
@@ -747,10 +744,8 @@ mod imp {
                     };
                     self.open(tid, a[0] as i32, a[1], flags)
                 }
-                nr::STAT | nr::LSTAT | nr::ACCESS | nr::READLINK => {
-                    self.at(tid, CWD, a[0], Use::Probe)
-                }
-                nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT | nr::FACCESSAT2 | nr::READLINKAT => {
+                nr::STAT | nr::LSTAT | nr::ACCESS => self.at(tid, CWD, a[0], Use::Probe),
+                nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT | nr::FACCESSAT2 => {
                     self.at(tid, a[0] as i32, a[1], Use::Probe)
                 }
                 nr::EXECVE => self.at(tid, CWD, a[0], Use::Execute),

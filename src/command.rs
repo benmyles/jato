@@ -76,7 +76,30 @@ pub fn log(name: &str, message: impl std::fmt::Display) {
 
 pub fn started() -> Instant {
     static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *STARTED.get_or_init(Instant::now)
+    *STARTED.get_or_init(|| {
+        umask();
+        Instant::now()
+    })
+}
+
+/// This process's file mode creation mask. It can only be read by setting
+/// it, which other threads would see, so that is done once and before any
+/// are started.
+pub fn umask() -> u32 {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let listed = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let line = status.lines().find_map(|l| l.strip_prefix("Umask:"))?;
+                u32::from_str_radix(line.trim(), 8).ok()
+            });
+        listed.unwrap_or_else(|| unsafe {
+            let mask = libc::umask(0o077);
+            libc::umask(mask);
+            mask as u32
+        })
+    })
 }
 
 pub fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
@@ -247,12 +270,7 @@ impl Job {
             }
         }
         // Output files get their permissions from the mask.
-        let mask = unsafe {
-            let mask = libc::umask(0o077);
-            libc::umask(mask);
-            mask
-        };
-        field(&mut hash, &mask.to_le_bytes());
+        field(&mut hash, &umask().to_le_bytes());
         field(
             &mut hash,
             if self.remap {
@@ -473,6 +491,33 @@ fn search(
         ),
     );
     Ok(None)
+}
+
+/// Whether the target already holds most of what this command last
+/// produced. Cargo will then find most of it up to date, and watching all
+/// of Cargo's own work would cost more than recording it could give back.
+pub fn mostly_built(job: &Job, store: &Store, recipe: &Digest) -> bool {
+    let Ok(candidates) = store.candidates(recipe) else {
+        return false;
+    };
+    let Some(manifest) = candidates
+        .first()
+        .and_then(|c| Manifest::decode(&c.manifest).ok())
+    else {
+        return false;
+    };
+    // A sample is enough to tell a populated target from an empty one.
+    let step = (manifest.outputs.len() / 64).max(1);
+    let sample: Vec<_> = manifest.outputs.iter().step_by(step).collect();
+    let present = sample
+        .iter()
+        .filter(|output| {
+            job.roots
+                .join(output.root, &output.path)
+                .is_some_and(|path| path.exists())
+        })
+        .count();
+    !sample.is_empty() && present * 2 > sample.len()
 }
 
 /// Copy a stream through while keeping what passed, up to a limit.
@@ -972,6 +1017,45 @@ pub fn record(
                 .as_ref()
                 .map(|target| roots.mark_os(target.as_os_str()).into_owned()),
             state,
+        });
+    }
+    // A path leads where the links along it point. Each directory on the
+    // way to an input that is a link is an input too.
+    let mut walked: HashSet<PathBuf> = HashSet::new();
+    let mut links = Vec::new();
+    for input in &manifest.inputs {
+        let Some(path) = roots.join(input.root, &input.path) else {
+            continue;
+        };
+        for dir in path.ancestors().skip(1) {
+            if dir.parent().is_none() || !walked.insert(dir.to_owned()) {
+                break;
+            }
+            if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
+                && let Ok(target) = fs::read_link(dir)
+            {
+                links.push((dir.to_owned(), target));
+            }
+        }
+    }
+    for (dir, target) in links {
+        let (root, rel) = roots.split(&dir);
+        if manifest
+            .inputs
+            .iter()
+            .any(|i| i.root == root && i.path == rel)
+        {
+            continue;
+        }
+        manifest.inputs.push(Input {
+            root,
+            path: rel.to_owned(),
+            link: Some(roots.mark_os(target.as_os_str()).into_owned()),
+            state: if dir.is_dir() {
+                State::Dir(None)
+            } else {
+                State::Absent
+            },
         });
     }
     // The kernel loads these itself, so no call of the command named them.

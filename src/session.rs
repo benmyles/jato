@@ -488,6 +488,19 @@ pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
         Ok(None) => (),
         Err(e) => log(name, format_args!("lookup failed: {e:#}")),
     }
+    // An edit in a target that is already built: Cargo will compile a few
+    // crates and find the rest up to date. Each compiler it starts is
+    // watched on its own. Watching Cargo check everything else as well
+    // would add more to this build than its record could save later.
+    if command::mostly_built(&job, &store, &recipe) {
+        log(
+            name,
+            "the target is already built: leaving this build to Cargo",
+        );
+        store.count("build_left_to_cargo", 1);
+        drop(store);
+        return command::passthrough(cmd);
+    }
     let terminal_out = io::stderr().is_terminal();
     store.count(job.counter("miss"), 1);
 
@@ -585,6 +598,10 @@ pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
         millis: begun.elapsed().as_millis() as u64,
     };
     let parts = server.parts.lock().unwrap_or_else(|e| e.into_inner());
+    log(
+        name,
+        format_args!("ran, with {} file accesses of its own", report.paths.len()),
+    );
     let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
     store.flush();
     Ok(ran.code)

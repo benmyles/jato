@@ -477,7 +477,14 @@ fn a_recorded_build_gives_way_to_anything_that_changed() {
     }
     let p = Project::new();
     p.run(&["build"]);
-    let builds = || (p.count("build_hit"), p.count("build_miss"));
+    // Builds restored whole, and builds that Cargo had to carry out: under
+    // watch from an empty target, or on its own in one already built.
+    let builds = || {
+        (
+            p.count("build_hit"),
+            p.count("build_miss") + p.count("build_left_to_cargo"),
+        )
+    };
     assert_eq!(builds(), (0, 1));
     p.run(&["build"]);
     assert_eq!(builds(), (1, 1));

@@ -411,7 +411,13 @@ impl Manifest {
                 ));
             }
         }
-        for input in &self.inputs {
+        // What is in the workspace changes most often, and what is outside
+        // both roots least. Looking in that order finds a change soonest.
+        let by_root = |root: u8| self.inputs.iter().filter(move |input| input.root == root);
+        let ordered = by_root(crate::roots::WORK)
+            .chain(by_root(crate::roots::TARGET))
+            .chain(by_root(crate::roots::ABSOLUTE));
+        for input in ordered {
             let Some(path) = here.roots.join(input.root, &input.path) else {
                 return Err("it was recorded with a target directory this command lacks".into());
             };
