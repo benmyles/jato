@@ -43,12 +43,14 @@ fn address(name: &OsStr) -> io::Result<SocketAddr> {
 
 /// Hand a compiler command to the build's supervisor. None if there is no
 /// supervisor to ask, in which case the caller handles the command alone.
-pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString]) -> Result<Option<i32>> {
+pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> Result<Option<i32>> {
     let Ok(mut stream) = address(session).and_then(|addr| UnixStream::connect_addr(&addr)) else {
         return Ok(None);
     };
     let mut w = Writer(Vec::new());
     w.number(std::process::id().into());
+    w.0.push(tool.into());
+    w.0.push(command::descriptor_spare().into());
     w.bytes(std::env::current_dir()?.as_os_str().as_bytes());
     w.bytes(program.as_bytes());
     w.number(args.len() as u64);
@@ -81,9 +83,16 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString]) -> Result<Option
                 argv.push(os(r.bytes()?));
             }
             let place = place(r.byte()? != 0);
+            let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
             let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
             // The supervisor is already watching this process's children.
-            let (ran, _) = command::run_piped(&argv, None)?;
+            let ran = match command::run_piped(&argv, None, held.as_deref()) {
+                Ok((ran, _)) => ran,
+                // That command line needs the directory it could not be
+                // started with. Cargo's own does not.
+                Err(_) if held.is_some() => return Ok(None),
+                Err(e) => return Err(e),
+            };
             drop(place);
             let mut w = Writer(Vec::new());
             w.number(ran.code as u32 as u64);
@@ -147,6 +156,8 @@ impl Server {
         let message = wire::receive(&mut stream)?;
         let mut r = Reader(&message);
         let pid = r.number()? as u32;
+        let tool = r.byte()? != 0;
+        let spare = r.byte()? != 0;
         let cwd = PathBuf::from(os(r.bytes()?));
         let program = os(r.bytes()?);
         let mut args = Vec::new();
@@ -158,15 +169,23 @@ impl Server {
             let name = os(r.bytes()?);
             env.insert(name, os(r.bytes()?));
         }
-        let job = Job::unit(
-            Request {
-                program,
-                args,
-                cwd,
-                env,
-            },
-            self.roots.path(crate::roots::TARGET),
-        );
+        // What a compiler starts is part of that compiler's work, and is
+        // already being recorded as such.
+        if tool && self.scopes.inside(pid) {
+            return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
+        }
+        let request = Request {
+            program,
+            args,
+            cwd,
+            env,
+            spare: spare && !tool,
+        };
+        let job = if tool {
+            Job::tool(request, self.roots.path(crate::roots::TARGET))
+        } else {
+            Job::unit(request, self.roots.path(crate::roots::TARGET))
+        };
         let mut store = match self.store() {
             Ok(store) => store,
             Err(e) => {
@@ -212,7 +231,9 @@ impl Server {
             w.bytes(arg.as_bytes());
         }
         // Whether to wait for a processor before running it.
-        w.0.push(job.facts.compiles().into());
+        w.0.push((job.tool || job.facts.compiles()).into());
+        // And the directory to start it with on a descriptor, if any.
+        w.optional(job.held().map(|dir| dir.as_os_str().as_bytes()));
         store.count(job.counter("miss"), 1);
         self.scopes.begin(pid, job.observer(&store));
         let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
@@ -238,22 +259,31 @@ impl Server {
         let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
             Ok(manifest) => {
                 self.used(&job, &manifest);
-                true
+                Some(report)
             }
-            // A failed compilation fails the build. One that worked but
-            // cannot be reused leaves nothing to say what it depended on.
-            Err(why) if ran.success => {
+            // A build goes on after a command that failed where the
+            // failure was an answer: a build script asking whether
+            // something compiles. And a build script's compiler whose
+            // result cannot be kept did what it did all the same. Either
+            // way it was the build's doing, as it would have been without
+            // a record of its own.
+            Err(_) if job.tool || !ran.success => {
+                self.scopes.absorb(report);
+                None
+            }
+            // A Rust compilation that worked but cannot be reused leaves
+            // nothing to say what it depended on.
+            Err(why) => {
                 self.unusable(&format!("{}: {why}", job.name()));
-                false
+                None
             }
-            Err(_) => false,
         };
         drop(lock);
         store.flush();
         let _ = wire::send(&mut stream, &[0]);
         // Cargo has its answer and goes on. What the compiler saved for a
         // next time is kept meanwhile.
-        if recorded {
+        if let Some(report) = recorded {
             let left = command::Left::Seen(&report.state);
             command::keep_state(&job, &mut store, &recipe, left);
             store.flush();
@@ -264,26 +294,6 @@ impl Server {
             .push(store);
         Ok(())
     }
-}
-
-/// The nearest directory at or above `from` whose manifest declares a
-/// workspace, or failing that the nearest with a manifest at all.
-fn workspace_root(from: &Path) -> Option<PathBuf> {
-    let mut nearest = None;
-    for dir in from.ancestors() {
-        let manifest = dir.join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
-            continue;
-        };
-        if text
-            .lines()
-            .any(|line| line.trim_start().starts_with("[workspace"))
-        {
-            return Some(dir.to_owned());
-        }
-        nearest.get_or_insert_with(|| dir.to_owned());
-    }
-    nearest
 }
 
 /// Where this Cargo command works: the workspace, and the target directory
@@ -315,7 +325,7 @@ fn locate(request: &Request) -> (Roots, Vec<usize>) {
         Some((path, _)) => request.cwd.join(path).parent().map(Path::to_owned),
         None => Some(request.cwd.clone()),
     };
-    let work = start.as_deref().and_then(workspace_root);
+    let work = start.as_deref().and_then(crate::roots::workspace_above);
     let target = match target {
         // Where the target directory is does not change what is built.
         Some((path, at)) => {
@@ -509,6 +519,7 @@ fn prepare(cmd: &Command, name: &str) -> Result<Option<Prepared>> {
         args: cmd.get_args().map(OsStr::to_owned).collect(),
         cwd: std::env::current_dir()?,
         env,
+        spare: false,
     };
     let (roots, skipped) = locate(&request);
     // Diagnostics are laid out for the terminal they are shown on.
@@ -848,6 +859,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (OsString::from(k), OsString::from(v)))
                 .collect(),
+            spare: false,
         };
         let (roots, skipped) = locate(&request(&["build"], &[]));
         assert_eq!(roots.path(crate::roots::WORK), Some(root.as_path()));

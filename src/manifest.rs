@@ -6,7 +6,7 @@
 //! result is tied to. A result is reused only when all of it holds again.
 use crate::cas::Store;
 use crate::observe::{Kind, Stamp, kind_of, listing_digest};
-use crate::roots::Roots;
+use crate::roots::{Roots, Surroundings, WORK};
 use crate::scan::Digest;
 use crate::wire::{Reader, Writer};
 use anyhow::{Result, bail, ensure};
@@ -37,9 +37,26 @@ pub struct Input {
 /// A root and a path beneath it.
 pub type Place = (u8, PathBuf);
 
+/// A name the command looked for in the directories above its workspace,
+/// one after another: the way Cargo looks for its settings and for a
+/// repository, and rustup for the toolchain to use. From another workspace
+/// the same search passes through other directories. What it finds has to
+/// be the same files.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Walk {
+    /// The name, as a path from each of those directories.
+    pub name: PathBuf,
+    /// The last directory it was looked for in.
+    pub top: PathBuf,
+    /// Where something of that name was, nearest first, leaving out what
+    /// the environment names in full and is reached by that name.
+    pub found: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     pub inputs: Vec<Input>,
+    pub walks: Vec<Walk>,
     /// Environment variables the result depends on, with roots marked.
     pub env: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     /// Program names looked up on PATH, and where each was found.
@@ -99,6 +116,8 @@ impl Manifest {
         self.which.sort();
         self.which.dedup_by(|a, b| a.0 == b.0);
         self.pins.sort();
+        self.walks.sort();
+        self.walks.dedup();
         self.outputs.sort();
         self.outputs.dedup();
         self.removed.sort();
@@ -157,6 +176,15 @@ impl Manifest {
             Some(false) => 1,
             Some(true) => 2,
         });
+        w.number(self.walks.len() as u64);
+        for walk in &self.walks {
+            w.bytes(walk.name.as_os_str().as_bytes());
+            w.bytes(walk.top.as_os_str().as_bytes());
+            w.number(walk.found.len() as u64);
+            for found in &walk.found {
+                w.bytes(found.as_os_str().as_bytes());
+            }
+        }
         w.0
     }
 
@@ -255,6 +283,18 @@ impl Manifest {
             _ => Some(true),
         };
         for _ in 0..r.count()? {
+            let path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
+            let mut walk = Walk {
+                name: path(r.bytes()?),
+                top: path(r.bytes()?),
+                found: Vec::new(),
+            };
+            for _ in 0..r.count()? {
+                walk.found.push(path(r.bytes()?));
+            }
+            m.walks.push(walk);
+        }
+        for _ in 0..r.count()? {
             let (root, path) = r.path()?;
             m.outputs.push(Output {
                 root,
@@ -302,10 +342,15 @@ pub fn which(name: &OsStr, dirs: &[PathBuf]) -> Option<PathBuf> {
 /// A command's environment.
 pub type Env = std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>;
 
+/// The directories a command with this environment finds programs in.
+/// The one in which compilers' names lead back to Jato is left out: what
+/// is found there is whatever the rest of PATH finds.
 pub fn path_dirs(cwd: &Path, env: &Env) -> Vec<PathBuf> {
+    let stand_ins = env.get(OsStr::new(crate::tools::DIRECTORY));
     env.get(OsStr::new("PATH"))
         .map(|path| {
             std::env::split_paths(path)
+                .filter(|dir| Some(dir.as_os_str()) != stand_ins.map(|own| own.as_os_str()))
                 .map(|dir| cwd.join(dir))
                 .collect()
         })
@@ -435,6 +480,39 @@ pub fn list(dir: &Path, own: &[OsString]) -> io::Result<Digest> {
 }
 
 impl Manifest {
+    /// Whether a search upward from `work` finds what each recorded one
+    /// found. `named` says what has a name of its own in this environment.
+    fn walks_hold(&self, work: &Path, named: impl Fn(&Path) -> bool) -> Result<(), String> {
+        for walk in &self.walks {
+            let mut found = Vec::new();
+            let mut reached = false;
+            for dir in work.ancestors().skip(1) {
+                let here = dir.join(&walk.name);
+                if !named(&here) && fs::symlink_metadata(&here).is_ok() {
+                    found.push(here);
+                }
+                if dir == walk.top {
+                    reached = true;
+                    break;
+                }
+            }
+            if !reached {
+                return Err(format!(
+                    "this workspace is not below {}, as far up as {} was looked for",
+                    walk.top.display(),
+                    walk.name.display()
+                ));
+            }
+            if let Some(extra) = found.iter().find(|here| !walk.found.contains(here)) {
+                return Err(format!("{} is above this workspace", extra.display()));
+            }
+            if let Some(missing) = walk.found.iter().find(|there| !found.contains(there)) {
+                return Err(format!("{} is not above this workspace", missing.display()));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether everything this manifest records holds here. An error says
     /// what does not.
     pub fn holds(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
@@ -445,6 +523,12 @@ impl Manifest {
                     recorded.display()
                 ));
             }
+        }
+        if let Some(work) = here.roots.path(WORK)
+            && !self.walks.is_empty()
+        {
+            let around = Surroundings::of(work, here.env);
+            self.walks_hold(work, |path| around.named(path))?;
         }
         if let Some(width) = self.width
             && width != here.width
@@ -474,9 +558,20 @@ impl Manifest {
                 .as_ref()
                 .map(|(root, path)| (*root, path.as_path()));
             if found != recorded {
+                let at = |place: Option<(u8, &Path)>| match place {
+                    Some((root, path)) => here
+                        .roots
+                        .join(root, path)
+                        .unwrap_or_else(|| path.to_owned())
+                        .display()
+                        .to_string(),
+                    None => "nowhere".to_owned(),
+                };
                 return Err(format!(
-                    "PATH now finds a different {}",
-                    name.to_string_lossy()
+                    "PATH now finds a different {}: at {}, where it was at {}",
+                    name.to_string_lossy(),
+                    at(found),
+                    at(recorded)
                 ));
             }
         }
@@ -521,7 +616,7 @@ impl Manifest {
                         Some(digest) => digest,
                         None => {
                             let digest = store
-                                .digest_known(&path, seen.stamp.unwrap())
+                                .digest_seen(&path, seen.stamp.unwrap())
                                 .map_err(|e| format!("{}: {e}", path.display()))?;
                             if let Some(seen) = here.seen.get_mut(&path) {
                                 seen.digest = Some(digest);
@@ -543,6 +638,52 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_above_the_workspace_has_to_find_the_same_from_another() {
+        let temp = tempfile::tempdir().unwrap();
+        let top = temp.path();
+        let settings = Path::new(".cargo/config.toml");
+        // As recorded in `first/ws`: Cargo looked for settings in every
+        // directory up to `top`, and found those of `top` itself.
+        let there = top.join(settings);
+        fs::create_dir_all(there.parent().unwrap()).unwrap();
+        fs::write(&there, "").unwrap();
+        let m = Manifest {
+            walks: vec![Walk {
+                name: settings.to_owned(),
+                top: top.to_owned(),
+                found: vec![there.clone()],
+            }],
+            ..Manifest::default()
+        };
+        let nothing = |_: &Path| false;
+        let work = |name: &str| {
+            let dir = top.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        // The same from a workspace beside it, and from one further down.
+        assert_eq!(m.walks_hold(&work("second/ws"), nothing), Ok(()));
+        let deeper = work("third/further/down/ws");
+        assert_eq!(m.walks_hold(&deeper, nothing), Ok(()));
+        // Settings nearer to that workspace than those recorded.
+        let nearer = top.join("third/further").join(settings);
+        fs::create_dir_all(nearer.parent().unwrap()).unwrap();
+        fs::write(&nearer, "").unwrap();
+        let why = m.walks_hold(&deeper, nothing).unwrap_err();
+        assert!(why.ends_with("is above this workspace"), "{why}");
+        // Unless they have a name of their own, as Cargo's home has.
+        assert_eq!(m.walks_hold(&deeper, |path| path == nearer), Ok(()));
+        // A workspace that is not below the directory searched up to.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let why = m.walks_hold(elsewhere.path(), nothing).unwrap_err();
+        assert!(why.contains("is not below"), "{why}");
+        // What was found is gone.
+        fs::remove_file(&there).unwrap();
+        let why = m.walks_hold(&work("second/ws"), nothing).unwrap_err();
+        assert!(why.ends_with("is not above this workspace"), "{why}");
+    }
 
     #[test]
     fn a_manifest_survives_storage_and_its_key_ignores_what_it_wrote() {
@@ -570,6 +711,11 @@ mod tests {
             env: vec![(b"B".to_vec(), None), (b"A".to_vec(), Some(b"1".to_vec()))],
             which: vec![(b"cc".to_vec(), Some((0, "/usr/bin/cc".into())))],
             pins: vec![(1, "/home/a/ws".into())],
+            walks: vec![Walk {
+                name: ".cargo/config.toml".into(),
+                top: "/".into(),
+                found: vec!["/home/.cargo/config.toml".into()],
+            }],
             width: Some(Some(120)),
             ansi: Some(true),
             outputs: vec![Output {

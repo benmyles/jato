@@ -5,7 +5,7 @@
 //! one checkout or target directory is found from another. Whether a result
 //! can really be used elsewhere is decided separately, from its bytes.
 use std::borrow::Cow;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +73,135 @@ fn target_above(hint: &Path) -> Option<&Path> {
         .find(|dir| dir.join("CACHEDIR.TAG").is_file())
 }
 
+/// The nearest directory at or above `from` whose manifest declares a
+/// workspace, or failing that the nearest with a manifest at all.
+pub fn workspace_above(from: &Path) -> Option<PathBuf> {
+    let mut nearest = None;
+    for dir in from.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        if text
+            .lines()
+            .any(|line| line.trim_start().starts_with("[workspace"))
+        {
+            return Some(dir.to_owned());
+        }
+        nearest.get_or_insert_with(|| dir.to_owned());
+    }
+    nearest
+}
+
+/// How many directories deep a path is.
+fn depth(path: &Path) -> usize {
+    path.components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+}
+
+/// What lies around a workspace: the directories a path written with `..`
+/// from inside it would lead to.
+///
+/// A command reaches such a place by going up from the workspace: Cargo
+/// for a package named by `path = "../shared"`, a compiler for a file
+/// included from beside the crate, Cargo and rustup for the settings they
+/// look for in every directory above. In another checkout the same steps
+/// lead somewhere else. What a command examined there is therefore
+/// recorded a second time, by the way from the workspace, and a result is
+/// reused only where both places are as they were.
+pub struct Surroundings {
+    work: PathBuf,
+    /// The directory, some way above the workspace, below which anything
+    /// may have been reached from it.
+    reach: Option<PathBuf>,
+    /// Directories the environment names in full. What is in them was
+    /// reached by that name, wherever the workspace is.
+    named: Vec<PathBuf>,
+}
+
+impl Surroundings {
+    pub fn of(work: &Path, env: &std::collections::BTreeMap<OsString, OsString>) -> Self {
+        // What moves with the workspace: the repository it is part of.
+        let moved = work
+            .ancestors()
+            .take(8)
+            .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+            .unwrap_or(work);
+        // Two directories further up, but not as far as the top two
+        // levels of the filesystem, which hold everybody's files.
+        let above: Vec<&Path> = moved.ancestors().skip(1).take(2).collect();
+        let reach = above
+            .iter()
+            .rev()
+            .find(|dir| depth(dir) >= 3)
+            .or_else(|| above.first().filter(|dir| depth(dir) >= 2))
+            .map(|dir| dir.to_path_buf())
+            .or_else(|| (moved != work).then(|| moved.to_owned()));
+        let mut named = Vec::new();
+        let mut name = |dir: PathBuf| {
+            if dir.is_absolute() && depth(&dir) > 0 && !work.starts_with(&dir) {
+                named.push(dir);
+            }
+        };
+        for (variable, value) in env {
+            // Where a shell is and was says nothing about the build.
+            if variable == "PWD" || variable == "OLDPWD" {
+                continue;
+            }
+            std::env::split_paths(value).for_each(&mut name);
+        }
+        // Where Cargo and rustup keep their own files when nothing says.
+        if let Some(home) = env.get(OsStr::new("HOME")) {
+            for (variable, dir) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+                if !env.contains_key(OsStr::new(variable)) {
+                    name(Path::new(home).join(dir));
+                }
+            }
+        }
+        Self {
+            work: work.to_owned(),
+            reach,
+            named,
+        }
+    }
+
+    /// Whether `path` was reached by a name of its own.
+    pub fn named(&self, path: &Path) -> bool {
+        self.named.iter().any(|dir| path.starts_with(dir))
+    }
+
+    /// Whether `path`, which is outside the workspace, is close enough
+    /// that anything may have led there from it.
+    pub fn beside(&self, path: &Path) -> bool {
+        self.reach
+            .as_ref()
+            .is_some_and(|reach| path.starts_with(reach))
+    }
+
+    /// How far above the workspace the directory is that `path` and the
+    /// workspace are both in, and the way down from there.
+    pub fn above<'a>(&self, path: &'a Path) -> (usize, &'a Path) {
+        let shared = self
+            .work
+            .ancestors()
+            .skip(1)
+            .enumerate()
+            .find_map(|(up, dir)| Some((up + 1, path.strip_prefix(dir).ok()?)));
+        shared.unwrap_or((depth(&self.work), path))
+    }
+
+    /// `rest` in the directory `up` levels above a workspace, written from
+    /// the workspace.
+    pub fn from_inside(up: usize, rest: &Path) -> PathBuf {
+        let mut way: PathBuf = std::iter::repeat_n("..", up).collect();
+        if !rest.as_os_str().is_empty() {
+            way.push(rest);
+        }
+        way
+    }
+}
+
 impl Roots {
     /// `hint` is any path inside the target directory, such as the
     /// compiler's output directory. `known` is the target directory if
@@ -91,6 +220,28 @@ impl Roots {
         // claim every path on the machine.
         let work = Root::new(cwd).filter(|_| cwd.components().count() > 2);
         Self { work, target }
+    }
+
+    /// The roots for a program that a build script started in `cwd`, the
+    /// directory of the package `manifest_dir`: the workspace the package
+    /// belongs to where the program runs inside it, and otherwise the
+    /// directory it runs in, as for a compiler there. `out_dir` is the
+    /// build script's own directory, and `known` the target directory if
+    /// whoever started the build knows it.
+    pub fn of_script(
+        cwd: &Path,
+        manifest_dir: Option<&Path>,
+        out_dir: Option<&Path>,
+        known: Option<&Path>,
+    ) -> Self {
+        let found = Self::detect(cwd, out_dir, known);
+        let workspace = workspace_above(manifest_dir.unwrap_or(cwd))
+            .and_then(|dir| Root::new(&dir))
+            .filter(|work| work.path.components().count() > 2 && work.strip(cwd).is_some());
+        Self {
+            work: workspace.or(found.work),
+            target: found.target,
+        }
     }
 
     fn root(&self, id: u8) -> Option<&Root> {
@@ -226,6 +377,83 @@ fn replace_path(text: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
     }
     out.extend_from_slice(&text[copied..]);
     Some(out)
+}
+
+#[cfg(test)]
+mod surroundings {
+    use super::*;
+
+    fn around(work: &str, env: &[(&str, &str)]) -> Surroundings {
+        let env = env
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect();
+        Surroundings::of(Path::new(work), &env)
+    }
+
+    #[test]
+    fn what_is_beside_a_workspace_is_told_from_what_has_a_name_of_its_own() {
+        let here = around(
+            "/nowhere/ben/src/olo",
+            &[
+                ("HOME", "/nowhere/ben"),
+                (
+                    "PATH",
+                    "/usr/bin:/nowhere/ben/bin:/nowhere/ben/src/tools/bin",
+                ),
+                ("PWD", "/nowhere/ben/src/olo"),
+                ("OLDPWD", "/nowhere/ben/src/other"),
+            ],
+        );
+        // A crate next to the checkout, and the directory both are in.
+        assert!(here.beside(Path::new("/nowhere/ben/src/shared/Cargo.toml")));
+        assert!(here.beside(Path::new("/nowhere/ben/src/.cargo/config.toml")));
+        assert!(!here.named(Path::new("/nowhere/ben/src/other/lib.rs")));
+        // The person's other files and the system's are further away.
+        assert!(!here.beside(Path::new("/nowhere/ben/notes.txt")));
+        assert!(!here.beside(Path::new("/usr/lib64/libc.so.6")));
+        // Cargo's home, and a directory PATH names, are reached by name.
+        assert!(here.named(Path::new("/nowhere/ben/.cargo/registry/index")));
+        assert!(here.named(Path::new("/nowhere/ben/src/tools/bin/protoc")));
+        assert!(here.named(Path::new("/usr/bin/cc")));
+        // A home directory the workspace is in names nothing in particular.
+        assert!(!here.named(Path::new("/nowhere/ben/notes.txt")));
+
+        // Directly in a home directory, everything else there is beside it.
+        let low = around("/nowhere/ben/olo", &[("HOME", "/nowhere/ben")]);
+        assert!(low.beside(Path::new("/nowhere/ben/shared/lib.rs")));
+        assert!(!low.beside(Path::new("/nowhere/other/file")));
+        // At the top of the filesystem nothing is.
+        assert!(!around("/olo", &[]).beside(Path::new("/shared/lib.rs")));
+    }
+
+    #[test]
+    fn a_place_above_a_workspace_is_written_from_inside_it() {
+        let here = around("/nowhere/ben/src/olo", &[]);
+        for (path, up, rest) in [
+            ("/nowhere/ben/src/shared/lib.rs", 1, "shared/lib.rs"),
+            ("/nowhere/ben/src", 1, ""),
+            ("/nowhere/.cargo/config.toml", 3, ".cargo/config.toml"),
+            ("/.cargo/config.toml", 4, ".cargo/config.toml"),
+            ("/usr/lib/libc.so", 4, "usr/lib/libc.so"),
+        ] {
+            assert_eq!(here.above(Path::new(path)), (up, Path::new(rest)), "{path}");
+            let way = Surroundings::from_inside(up, Path::new(rest));
+            // Followed from the workspace, the way leads back.
+            let mut back = PathBuf::from("/nowhere/ben/src/olo");
+            for part in way.components() {
+                match part {
+                    std::path::Component::ParentDir => drop(back.pop()),
+                    part => back.push(part),
+                }
+            }
+            assert_eq!(back, Path::new(path));
+        }
+        assert_eq!(
+            Surroundings::from_inside(2, Path::new("")),
+            Path::new("../..")
+        );
+    }
 }
 
 #[cfg(test)]

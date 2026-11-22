@@ -6,9 +6,9 @@
 //! was. What it looked at is observed, not inferred from its arguments.
 use crate::cas::{Staged, Store};
 use crate::facts::{Facts, keyed};
-use crate::manifest::{Env, Here, Input, Manifest, Output, Place, State, path_dirs, which};
+use crate::manifest::{Env, Here, Input, Manifest, Output, Place, State, Walk, path_dirs, which};
 use crate::observe::{self, Kind, Report, Stamp};
-use crate::roots::{self, Roots};
+use crate::roots::{self, Roots, Surroundings};
 use crate::scan::Digest;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -24,11 +24,20 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v4";
+const EPOCH: &str = "jato command v5";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
 const TARGET_ALIAS: &str = "/proc/self/cwd/target";
+/// The descriptor a compiler is given its target directory on when that
+/// directory is not inside the one it runs in, and the directory by that
+/// name.
+pub const HELD_FD: i32 = 219;
+const HELD_ALIAS: &str = "/proc/self/fd/219";
+/// The option by which gcc and clang write one directory's name for
+/// another's: in debugging information, and where the source names its
+/// own file.
+const C_MAP: &str = "-ffile-prefix-map=";
 const CAPTURE_LIMIT: usize = 4 << 20;
 /// The file Cargo puts in a target directory it creates.
 const TARGET_TAG: &str = "CACHEDIR.TAG";
@@ -115,6 +124,14 @@ pub struct Request {
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
     pub env: Env,
+    /// Whether the descriptor a target directory can be held on is unused
+    /// in the process that will start the compiler.
+    pub spare: bool,
+}
+
+/// Whether descriptor `HELD_FD` is unused in this process.
+pub fn descriptor_spare() -> bool {
+    unsafe { libc::fcntl(HELD_FD, libc::F_GETFD) == -1 }
 }
 
 impl Request {
@@ -124,8 +141,163 @@ impl Request {
             args: args.to_vec(),
             cwd: env::current_dir()?,
             env: env::vars_os().collect(),
+            spare: descriptor_spare(),
         })
     }
+}
+
+/// Something found out about a program by trying it, remembered with the
+/// cache for as long as the program's file stays as it is. An answer of no
+/// is asked for again after a day: something passing may have been the
+/// reason. `more` is whatever else decides the answer, and `attempt` is
+/// given a directory of its own to try in.
+fn learned(
+    question: &str,
+    programs: &[&OsStr],
+    more: &[u8],
+    attempt: impl FnOnce(&Path) -> Option<bool>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    const AGAIN_AFTER: u64 = 86_400;
+    let Ok(cache) = crate::cas::cache_dir() else {
+        return false;
+    };
+    let mut hash = blake3::Hasher::new_derive_key("jato learned about a program v1");
+    field(&mut hash, question.as_bytes());
+    for program in programs {
+        field(&mut hash, program.as_bytes());
+        if let Ok(meta) = fs::metadata(program) {
+            for number in [meta.dev(), meta.ino(), meta.size()] {
+                hash.update(&number.to_le_bytes());
+            }
+            hash.update(&meta.mtime().to_le_bytes());
+            hash.update(&meta.mtime_nsec().to_le_bytes());
+        }
+    }
+    field(&mut hash, more);
+    let name: String = hash.finalize().as_bytes()[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let locks = cache.join("locks");
+    let known = locks.join(format!("{question}-{name}"));
+    let answer = || match fs::read(&known).as_deref() {
+        Ok(b"yes") => Some(true),
+        Ok(_) => fs::metadata(&known)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < AGAIN_AFTER)
+            .then_some(false),
+        Err(_) => None,
+    };
+    if let Some(found) = answer() {
+        return found;
+    }
+    // Of the compilers a build starts together, one finds out and the
+    // rest wait for what it learns.
+    let _ = fs::create_dir_all(&locks);
+    let turn = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(locks.join(format!("turn-{question}-{name}")))
+        .ok();
+    if let Some(turn) = &turn
+        && turn.lock().is_ok()
+        && let Some(found) = answer()
+    {
+        return found;
+    }
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = locks.join(format!("probe-{}-{question}-{serial}", std::process::id()));
+    let found = fs::create_dir_all(&scratch)
+        .ok()
+        .and_then(|()| attempt(&scratch))
+        .unwrap_or(false);
+    let _ = fs::remove_dir_all(&scratch);
+    let _ = fs::write(&known, if found { "yes" } else { "no" });
+    found
+}
+
+/// Whether the compiler this request starts still has a directory it was
+/// started with on a descriptor when it comes to write: learned by having
+/// it compile an empty crate into one. A program between Jato and the
+/// compiler may close what it inherits, or hand the work to a process that
+/// never had it.
+fn keeps_descriptor(request: &Request) -> bool {
+    // The compiler, after any wrappers of its own that Cargo named.
+    let options = request
+        .args
+        .iter()
+        .position(|a| a.as_bytes().starts_with(b"-"))
+        .unwrap_or(0);
+    let programs: Vec<&OsStr> = std::iter::once(&request.program)
+        .chain(&request.args[..options])
+        .map(OsString::as_os_str)
+        .collect();
+    // A proxy takes the compiler it starts from here.
+    let toolchain = request.env.get(OsStr::new("RUSTUP_TOOLCHAIN"));
+    let toolchain = toolchain.map_or(&b""[..], |t| t.as_bytes());
+    learned("held", &programs, toolchain, |scratch| {
+        let mut cmd = Command::new(&request.program);
+        cmd.args(&request.args[..options])
+            .args(["-", "--crate-name", "jato_held", "--crate-type", "lib"])
+            .args(["--emit=metadata", "--out-dir", HELD_ALIAS])
+            .env_clear()
+            .envs(&request.env)
+            .current_dir(&request.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hold(&mut cmd, scratch).ok()?;
+        let done = cmd.status().ok()?;
+        let kept = done.success() && scratch.join("libjato_held.rmeta").is_file();
+        log(
+            "rustc",
+            format_args!(
+                "the compiler {} a directory it is started with",
+                if kept { "keeps" } else { "does not keep" }
+            ),
+        );
+        Some(kept)
+    })
+}
+
+/// Whether a C compiler takes the option that has it write another name
+/// for a directory into what it compiles.
+fn maps_prefixes(request: &Request) -> bool {
+    learned("maps", &[request.program.as_os_str()], b"", |_| {
+        let done = Command::new(&request.program)
+            .arg(format!("{C_MAP}/jato/probe=/nowhere"))
+            .args(["-E", "-x", "c", "/dev/null", "-o", "/dev/null"])
+            .env_clear()
+            .envs(&request.env)
+            .current_dir(&request.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        Some(done.success())
+    })
+}
+
+/// Have `cmd` start with the directory `dir` open on descriptor `HELD_FD`.
+pub fn hold(cmd: &mut Command, dir: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = fs::File::open(dir)?;
+    unsafe {
+        cmd.pre_exec(move || {
+            // The copy stays open in the program that is started.
+            if libc::dup2(dir.as_raw_fd(), HELD_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 /// What a command printed and how it ended.
@@ -153,6 +325,12 @@ pub struct Job {
     /// Whether the compiler is told to write the roots' aliases in place of
     /// their real locations.
     remap: bool,
+    /// Whether the compiler can be given its target directory on a
+    /// descriptor: the descriptor is free, and the program has been seen to
+    /// keep one.
+    descriptor: bool,
+    /// A compiler other than rustc, started by a build script.
+    pub tool: bool,
     path: Vec<PathBuf>,
     /// Further facts that tell this command from others like it.
     pub salt: Vec<u8>,
@@ -185,13 +363,76 @@ impl Job {
             && cfg!(target_os = "linux")
             && env::var_os("JATO_REMAP").is_none_or(|v| v != "0")
             && (roots.work.is_some() || roots.target.is_some());
-        Self {
+        let mut job = Self {
             path: path_dirs(&request.cwd, &request.env),
             request,
             facts,
             roots,
             scope: Scope::Unit,
             remap,
+            descriptor: true,
+            tool: false,
+            salt: Vec::new(),
+        };
+        // Asked only of a compilation that would be given one.
+        job.descriptor = job.held().is_some()
+            && job.request.spare
+            && saved_state_wanted()
+            && keeps_descriptor(&job.request);
+        job
+    }
+
+    /// A C or C++ compiler or an assembler that a build script started.
+    /// `target` is the target directory when whoever started the build
+    /// knows it. Nothing is taken from the program's arguments: what it
+    /// examines and writes is seen as it runs.
+    pub fn tool(request: Request, target: Option<&Path>) -> Self {
+        let program = Path::new(&request.program)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // For whoever reads the log: the file it is given, if it says.
+        let source = request.args.iter().find_map(|arg| {
+            let arg = Path::new(arg);
+            let kind = arg.extension()?.to_str()?;
+            let known = ["c", "cc", "cpp", "cxx", "m", "mm", "s", "S", "asm", "o"];
+            (!arg.as_os_str().as_bytes().starts_with(b"-") && known.contains(&kind))
+                .then(|| arg.file_name())
+                .flatten()
+        });
+        let name = match source {
+            Some(source) => format!("{program} {}", source.to_string_lossy()),
+            None => program.clone(),
+        };
+        let named = |variable: &str| request.env.get(OsStr::new(variable)).map(PathBuf::from);
+        let roots = Roots::of_script(
+            &request.cwd,
+            named("CARGO_MANIFEST_DIR").as_deref(),
+            named("OUT_DIR").as_deref(),
+            target,
+        );
+        // The compiler proper, started by name, takes other options.
+        let front_end = request
+            .args
+            .first()
+            .is_some_and(|arg| arg.as_bytes().starts_with(b"-cc1"));
+        let remap = crate::tools::c_family(&program)
+            && !front_end
+            && env::var_os("JATO_REMAP").is_none_or(|v| v != "0")
+            && (roots.work.is_some() || roots.target.is_some())
+            && maps_prefixes(&request);
+        Self {
+            path: path_dirs(&request.cwd, &request.env),
+            facts: Facts {
+                name,
+                ..Facts::default()
+            },
+            request,
+            roots,
+            scope: Scope::Unit,
+            remap,
+            descriptor: false,
+            tool: true,
             salt: Vec::new(),
         }
     }
@@ -209,6 +450,8 @@ impl Job {
             roots,
             scope: Scope::Build,
             remap: false,
+            descriptor: false,
+            tool: false,
             salt,
         }
     }
@@ -296,24 +539,35 @@ impl Job {
         *hash.finalize().as_bytes()
     }
 
-    /// The output directory named through the alias of the directory the
-    /// compiler runs in, when the compiler saves incremental state. That
-    /// state is only of use in another checkout if the compiler was told
-    /// the same things there, and where its output goes is one of them.
-    /// A path relative to that directory would not do: rustc makes it
-    /// absolute before it compares.
-    fn aliased_out_dir(&self) -> Option<(usize, OsString)> {
+    /// The output directory under a name that reads the same in every
+    /// checkout, when the compiler saves incremental state. That state is
+    /// only of use elsewhere if the compiler was told the same things
+    /// there, and where its output goes is one of them. A path relative
+    /// to where it runs would not do: rustc makes it absolute before it
+    /// compares.
+    ///
+    /// Inside the directory the compiler runs in, the name goes through
+    /// `/proc/self/cwd`. A target directory anywhere else is held open on
+    /// a descriptor and named through that, for crates rustc writes
+    /// itself: a linker would have to be trusted to keep the descriptor.
+    /// Returns the argument to replace, and the directory to hold open.
+    fn aliased_out_dir(&self) -> Option<(usize, OsString, Option<&Path>)> {
         let at = self.facts.out_dir_at?;
         self.facts.incremental.as_ref()?;
         if !self.remap {
             return None;
         }
-        let rest = self
-            .facts
-            .hint
-            .as_ref()?
-            .strip_prefix(&self.request.cwd)
-            .ok()?;
+        let out = self.facts.hint.as_ref()?;
+        let (alias, rest, held) = match out.strip_prefix(&self.request.cwd) {
+            Ok(rest) => (WORK_ALIAS, rest, None),
+            Err(_) => {
+                let target = self.roots.path(roots::TARGET)?;
+                if self.facts.links || !self.descriptor {
+                    return None;
+                }
+                (HELD_ALIAS, out.strip_prefix(target).ok()?, Some(target))
+            }
+        };
         if rest.as_os_str().is_empty() {
             return None;
         }
@@ -321,14 +575,25 @@ impl Job {
         if self.request.args[at].as_bytes().starts_with(b"--out-dir=") {
             arg.push("--out-dir=");
         }
-        arg.push(Path::new(WORK_ALIAS).join(rest));
-        Some((at, arg))
+        arg.push(Path::new(alias).join(rest));
+        Some((at, arg, held))
+    }
+
+    /// The directory the compiler has to be started with on descriptor
+    /// `HELD_FD`, if its output directory is named through it.
+    pub fn held(&self) -> Option<&Path> {
+        self.aliased_out_dir()?.2
+    }
+
+    /// Whether what the compiler saves here is of use anywhere else.
+    fn state_travels(&self) -> bool {
+        self.aliased_out_dir().is_some()
     }
 
     /// Identifies the output directory as the compiler is given it.
     fn out_dir_given(&self) -> Digest {
         let given = match (self.aliased_out_dir(), self.facts.out_dir_at) {
-            (Some((_, arg)), _) => arg,
+            (Some((_, arg, _)), _) => arg,
             (None, Some(at)) => self.request.args[at].clone(),
             (None, None) => OsString::new(),
         };
@@ -339,7 +604,11 @@ impl Job {
     /// the roots.
     pub fn argv(&self) -> Vec<OsString> {
         self.command_line(
-            &self.aliased_out_dir().into_iter().collect::<Vec<_>>(),
+            &self
+                .aliased_out_dir()
+                .map(|(at, arg, _)| (at, arg))
+                .into_iter()
+                .collect::<Vec<_>>(),
             None,
         )
     }
@@ -365,14 +634,24 @@ impl Job {
         if self.remap {
             // Later options win, so the user's own remappings still apply,
             // and the target directory wins over a workspace containing it.
+            let option = if self.tool {
+                C_MAP
+            } else {
+                "--remap-path-prefix="
+            };
             for (root, alias) in [(roots::WORK, WORK_ALIAS), (roots::TARGET, TARGET_ALIAS)] {
                 if let Some(path) = self.roots.path(root) {
-                    let mut arg = OsString::from("--remap-path-prefix=");
+                    let mut arg = OsString::from(option);
                     arg.push(path);
                     arg.push("=");
                     arg.push(alias);
                     argv.push(arg);
                 }
+            }
+            // Whatever the compiler writes of where its output went reads
+            // as it would have under the directory's own name.
+            if self.held().is_some() {
+                argv.push(format!("--remap-path-prefix={HELD_ALIAS}={TARGET_ALIAS}").into());
             }
         }
         argv.extend((options..args.len()).map(arg));
@@ -439,6 +718,14 @@ impl Job {
     /// scripts ask the compiler, which take no time worth saving, and from
     /// whole builds.
     pub fn counter(&self, event: &'static str) -> &'static str {
+        if self.tool {
+            return match event {
+                "hit" => "tool_hit",
+                "miss" => "tool_miss",
+                "stored" => "tool_stored",
+                _ => "tool_uncacheable",
+            };
+        }
         match (self.scope, self.facts.compiles(), event) {
             (Scope::Unit, true, _) => event,
             (Scope::Unit, false, "hit") => "query_hit",
@@ -528,6 +815,22 @@ fn search(
     let candidates = store.candidates(recipe)?;
     if candidates.is_empty() {
         log(job.name(), "miss: this command has not been recorded");
+        if job.tool && env::var_os("JATO_LOG").is_some() {
+            // Which command, with the roots as the record would have them:
+            // what still names a place is what keeps it from being found.
+            let line: Vec<u8> = job
+                .request
+                .args
+                .iter()
+                .flat_map(|arg| [b" ", job.roots.mark_os(arg).as_ref()].concat())
+                .map(|byte| if byte == 0 { b'|' } else { byte })
+                .take(600)
+                .collect();
+            log(
+                job.name(),
+                format_args!("  as:{}", String::from_utf8_lossy(&line)),
+            );
+        }
         return Ok(None);
     }
     let mut here = Here::new(
@@ -661,13 +964,20 @@ pub struct Ran {
 }
 
 /// Start `argv`, pass its output through and keep it.
-pub fn run_piped(argv: &[OsString], observed: Option<(&Job, &Store)>) -> Result<(Ran, Report)> {
+pub fn run_piped(
+    argv: &[OsString],
+    observed: Option<(&Job, &Store)>,
+    held: Option<&Path>,
+) -> Result<(Ran, Report)> {
     let begun = Instant::now();
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .env(crate::jobs::HELD, "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(dir) = held {
+        hold(&mut cmd, dir)?;
+    }
     let (mut child, session) = match observed {
         Some((job, store)) => {
             let (child, session) = observe::spawn(&mut cmd, job.observer(store))?;
@@ -726,17 +1036,29 @@ fn env_deps(dep_info: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// How to refer to the program with this command line when saying why a
+/// result was not kept.
+fn named(program: Option<&str>) -> String {
+    match program {
+        Some(line) if !line.is_empty() => format!("`{line}`"),
+        _ => "it".to_owned(),
+    }
+}
+
 /// Paths the compiler reported writing, from its JSON messages.
-fn reported_artifacts(stderr: &[u8], cwd: &Path) -> Vec<PathBuf> {
+fn reported_artifacts(stderr: &[u8], cwd: &Path, target: Option<&Path>) -> Vec<PathBuf> {
     stderr
         .split(|b| *b == b'\n')
         .filter(|line| memchr::memmem::find(line, b"\"artifact\"").is_some())
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .filter(|message| message["$message_type"] == "artifact")
         // Named as the output directory was: through the alias of the
-        // directory the compiler ran in.
+        // directory the compiler ran in, or of the one held open for it.
         .filter_map(|message| {
             let path = Path::new(message["artifact"].as_str()?);
+            if let (Ok(rest), Some(target)) = (path.strip_prefix(HELD_ALIAS), target) {
+                return Some(target.join(rest));
+            }
             Some(match path.strip_prefix(WORK_ALIAS) {
                 Ok(rest) => cwd.join(rest),
                 Err(_) => cwd.join(path),
@@ -961,8 +1283,12 @@ pub fn record(
     if report.network {
         return Err("it used the network".into());
     }
-    if let Some(socket) = report.sockets.iter().find(|s| !harmless_socket(s)) {
-        return Err(format!("it talked to a service at {}", socket.display()));
+    if let Some((socket, caller)) = report.sockets.iter().find(|(s, _)| !harmless_socket(s)) {
+        return Err(format!(
+            "{} talked to a service at {}",
+            named(Some(caller)),
+            socket.display()
+        ));
     }
     let (Some(stdout), Some(stderr)) = (&ran.stdout, &ran.stderr) else {
         return Err("it printed more than can be kept".into());
@@ -975,7 +1301,7 @@ pub fn record(
     // do so in the file an earlier build left, or after moving it aside.
     // What that file held does not change what they write.
     let artifacts = if job.facts.compiles() {
-        reported_artifacts(stderr, &job.request.cwd)
+        reported_artifacts(stderr, &job.request.cwd, roots.path(roots::TARGET))
     } else {
         Vec::new()
     };
@@ -1017,11 +1343,18 @@ pub fn record(
             // and rewrites. What was there does not change what it writes.
             let stale = artifacts.contains(access.origin.as_ref().unwrap_or(path))
                 || (job.scope == Scope::Build && root == roots::TARGET);
+            let writer = named(access.writer.as_deref());
             if access.read && !stale {
-                return Err(format!("it changed {}, which it had read", path.display()));
+                return Err(format!(
+                    "{writer} changed {}, which had been read",
+                    path.display()
+                ));
             }
             if access.updated && !stale && now.as_ref().is_ok_and(|m| !m.is_dir()) {
-                return Err(format!("it wrote into {} as it found it", path.display()));
+                return Err(format!(
+                    "{writer} wrote into {} as it found it",
+                    path.display()
+                ));
             }
             made.insert((root, rel.to_owned()));
             match &now {
@@ -1118,9 +1451,14 @@ pub fn record(
                 if stamp != first && !renamed {
                     return Err(format!("{} changed while it ran", path.display()));
                 }
-                let digest = store
-                    .digest_known(path, stamp)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                // A program that was run did something whether or not
+                // it may be read, and only its contents say what.
+                let digest = if access.executed {
+                    store.digest_known(path, stamp)
+                } else {
+                    store.digest_seen(path, stamp)
+                }
+                .map_err(|e| format!("{}: {e}", path.display()))?;
                 if access.executed {
                     executed.push(path.clone());
                 }
@@ -1312,13 +1650,110 @@ pub fn record(
                 manifest.env.push((name.clone(), ours));
             }
         }
-        for (name, found) in &parts.which {
+        // A part may have looked along a PATH of its own: rustc puts its
+        // own tools first for the linker it starts. What it found is among
+        // the inputs. What this command's PATH finds for the name is what
+        // must not change.
+        for name in parts.which.keys() {
             if !manifest.which.iter().any(|(n, _)| n == name) {
-                manifest.which.push((name.clone(), found.clone()));
+                let found = which(OsStr::from_bytes(name), &job.path).map(|path| {
+                    let (root, rel) = roots.split(&path);
+                    (root, rel.to_owned())
+                });
+                manifest.which.push((name.clone(), found));
             }
         }
         manifest.pins.extend(parts.pins.iter().cloned());
         manifest.removed.extend(parts.removed.iter().cloned());
+    }
+    if let Some(work) = roots.path(roots::WORK) {
+        let around = Surroundings::of(work, &job.request.env);
+        let (walks, again) = {
+            let outside: Vec<(&Input, usize, &Path)> = manifest
+                .inputs
+                .iter()
+                .filter(|input| input.root == roots::ABSOLUTE)
+                .map(|input| {
+                    let (up, rest) = around.above(&input.path);
+                    (input, up, rest)
+                })
+                .collect();
+            // A name looked for in one directory above the workspace
+            // after another, or in the workspace and above it, was looked
+            // for from the workspace.
+            let inside: HashSet<&Path> = manifest
+                .inputs
+                .iter()
+                .filter(|input| input.root == roots::WORK)
+                .map(|input| input.path.as_path())
+                .collect();
+            let mut levels: BTreeMap<&Path, BTreeMap<usize, &Input>> = BTreeMap::new();
+            for (input, up, rest) in &outside {
+                if !rest.as_os_str().is_empty() {
+                    levels.entry(rest).or_default().insert(*up, input);
+                }
+            }
+            let walks: Vec<Walk> = levels
+                .iter()
+                .filter(|(name, at)| at.len() + usize::from(inside.contains(*name)) > 1)
+                .filter_map(|(name, at)| {
+                    let last = *at.keys().next_back()?;
+                    Some(Walk {
+                        name: name.to_path_buf(),
+                        top: work.ancestors().nth(last)?.to_owned(),
+                        found: at
+                            .values()
+                            .filter(|input| {
+                                input.state != State::Absent && !around.named(&input.path)
+                            })
+                            .map(|input| input.path.clone())
+                            .collect(),
+                    })
+                })
+                .collect();
+            // Anything else near the workspace may have been reached from
+            // it, as a crate named by `../shared` is, or by a name of its
+            // own. It is recorded a second time by the way from the
+            // workspace, and has to be as it was both ways.
+            let walked = |rest: &Path, path: &Path| {
+                walks.iter().any(|walk| {
+                    walk.name == rest || walk.found.iter().any(|found| path.starts_with(found))
+                })
+            };
+            let again: Vec<Input> = outside
+                .iter()
+                .filter(|(input, _, rest)| {
+                    around.beside(&input.path)
+                        && !around.named(&input.path)
+                        && !walked(rest, &input.path)
+                })
+                .map(|(input, up, rest)| Input {
+                    root: roots::WORK,
+                    path: Surroundings::from_inside(*up, rest),
+                    link: input.link.clone(),
+                    state: input.state.clone(),
+                })
+                .collect();
+            (walks, again)
+        };
+        manifest.walks = walks;
+        manifest.inputs.extend(again);
+        // What was written there was written beside this workspace, and
+        // would be again nowhere else.
+        let pin = (roots::WORK, work.to_owned());
+        if let Some((_, _, path)) = outputs.iter().find(|(root, _, path)| {
+            *root == roots::ABSOLUTE && around.beside(path) && !around.named(path)
+        }) && !manifest.pins.contains(&pin)
+        {
+            log(
+                job.name(),
+                format_args!(
+                    "it wrote {} beside the workspace, so this result is only reused there",
+                    path.display()
+                ),
+            );
+            manifest.pins.push(pin);
+        }
     }
     if job.scope == Scope::Build {
         // Cargo marks a target directory when it creates one, and this
@@ -1403,6 +1838,14 @@ pub fn record(
         for (id, named) in spellings.iter().zip(&output.names) {
             let pin = (*id, roots.path(*id).unwrap().to_owned());
             if *named && !manifest.pins.contains(&pin) {
+                log(
+                    job.name(),
+                    format_args!(
+                        "{} names {}, so this result is only reused there",
+                        path.display(),
+                        pin.1.display()
+                    ),
+                );
                 manifest.pins.push(pin);
             }
         }
@@ -1422,15 +1865,8 @@ pub fn record(
     let stored = store.commit(recipe, &manifest, &detail, ran.millis, &mut staged);
     match stored {
         Ok(true) => {
-            if let Some((_, path)) = manifest.pins.first() {
+            if !manifest.pins.is_empty() {
                 store.count("pinned", 1);
-                log(
-                    job.name(),
-                    format_args!(
-                        "its output names {}, so it is only reused there",
-                        path.display()
-                    ),
-                );
             }
             Ok(manifest)
         }
@@ -1501,7 +1937,9 @@ pub enum Left<'a> {
 pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>) {
     const MOST_FILES: usize = 20_000;
     const MOST_BYTES: u64 = 2 << 30;
-    if job.scope != Scope::Unit || !saved_state_wanted() {
+    // State made for an output directory named as it is only suits that
+    // one place, which has its own.
+    if job.scope != Scope::Unit || !saved_state_wanted() || !job.state_travels() {
         return;
     }
     let Some(directory) = job.facts.incremental.as_ref() else {
@@ -1703,6 +2141,9 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
     let Some(directory) = &job.facts.incremental else {
         return false;
     };
+    if !job.state_travels() {
+        return false;
+    }
     let kept = state_recipe(job, recipe);
     let Ok(candidates) = store.candidates(&kept) else {
         return false;
@@ -1989,7 +2430,15 @@ pub fn waited(job: &Job, store: &mut Store, time: std::time::Duration) {
 
 /// A compiler command that only this process is watching.
 fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
-    let job = Job::unit(Request::current(program, args)?, None);
+    alone(
+        Job::unit(Request::current(program, args)?, None),
+        program,
+        args,
+    )
+}
+
+/// Look up, run and record a command that nothing else is watching.
+fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
     let mut store = match Store::open() {
         Ok(store) => store,
         Err(e) => {
@@ -2021,7 +2470,7 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
     let run = choose(&job, &mut store, &recipe, false);
     // The compiler will run. With other builds going on, wait for a
     // processor to run it on.
-    let place = if job.facts.compiles() {
+    let place = if job.tool || job.facts.compiles() {
         store.flush();
         let place = crate::jobs::take(&store.dir);
         waited(&job, &mut store, place.waited);
@@ -2040,6 +2489,13 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
             drop(lock);
             drop(store);
             let mut cmd = original(&argv[0], &argv[1..]);
+            if let Some(dir) = job.held()
+                && hold(&mut cmd, dir).is_err()
+            {
+                // Without the directory only Cargo's own command line
+                // means anything.
+                cmd = original(program, args);
+            }
             if let Some(place) = place {
                 cmd.env(crate::jobs::HELD, "1");
                 place.keep_through_exec();
@@ -2054,7 +2510,15 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
             store.count("continued", 1);
             store.flush();
             let since = std::time::SystemTime::now();
-            let status = original(&argv[0], &argv[1..])
+            let mut cmd = original(&argv[0], &argv[1..]);
+            if let Some(dir) = job.held()
+                && hold(&mut cmd, dir).is_err()
+            {
+                drop(lock);
+                drop(store);
+                return passthrough(original(program, args));
+            }
+            let status = cmd
                 .env(crate::jobs::HELD, "1")
                 .status()
                 .context("starting the compiler")?;
@@ -2068,7 +2532,7 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         Run::Recorded => (),
     }
     store.count(job.counter("miss"), 1);
-    let (ran, report) = match run_piped(&argv, Some((&job, &store))) {
+    let (ran, report) = match run_piped(&argv, Some((&job, &store)), job.held()) {
         Ok(ran) => ran,
         Err(e) => {
             // The command may not have started at all. Run it plainly so
@@ -2100,11 +2564,53 @@ pub fn wrap(program: &OsStr, args: &[OsString]) -> Result<i32> {
         return passthrough(original(program, args));
     }
     if let Some(session) = env::var_os("JATO_SESSION")
-        && let Some(code) = crate::session::ask(&session, program, args)?
+        && let Some(code) = crate::session::ask(&session, program, args, false)?
     {
         return Ok(code);
     }
     wrap_alone(program, args)
+}
+
+/// Run the compiler or assembler `program`, found for the name this
+/// process was started under, or put back what it made before. That is
+/// for build scripts: inside a build Jato supervises the supervisor is
+/// asked, and in any other this process watches the program itself.
+/// Started by anything else, such as a program or a test Cargo runs, or
+/// where it may be sent something to read, the program is simply run.
+pub fn stand_in(program: &Path, args: &[OsString]) -> Result<i32> {
+    started();
+    let reads_nothing =
+        fs::read_link("/proc/self/fd/0").ok().as_deref() == Some(Path::new("/dev/null"));
+    let program = program.as_os_str();
+    // What Cargo tells a build script and nothing else it starts.
+    let script = ["OUT_DIR", "TARGET", "HOST", "OPT_LEVEL", "NUM_JOBS"]
+        .iter()
+        .all(|name| env::var_os(name).is_some());
+    // rustc links through the C compiler, naming a directory of its own
+    // that is new every time. That run is rustc's work, never the same
+    // command twice.
+    let parent = fs::read_to_string(format!(
+        "/proc/{}/comm",
+        std::os::unix::process::parent_id()
+    ));
+    let linking = parent.is_ok_and(|name| name.trim_end() == "rustc");
+    if !script || linking || !reads_nothing || env::var_os("JATO_DISABLE").is_some_and(|v| v == "1")
+    {
+        return passthrough(original(program, args));
+    }
+    if let Some(session) = env::var_os("JATO_SESSION")
+        && let Some(code) = crate::session::ask(&session, program, args, true)?
+    {
+        return Ok(code);
+    }
+    // Nothing supervises this build: Cargo is carrying out a few steps in
+    // a target that is already built, or the build as a whole is not
+    // being recorded.
+    alone(
+        Job::tool(Request::current(program, args)?, None),
+        program,
+        args,
+    )
 }
 
 #[cfg(test)]

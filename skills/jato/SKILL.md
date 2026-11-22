@@ -27,6 +27,8 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 - The first build of a state compiles and records. Later builds of that state, anywhere on the machine that shares the cache, are restored.
 - After editing, Cargo and rustc compile what changed at their usual speed. Undoing an edit returns to a recorded build at once.
 - In a target that was restored, the first edit of a crate is compiled incrementally all the same: Jato hands rustc the state it saved where the crate was last compiled under watch. `jato stats` counts this as `state_given`.
+- C, C++ and assembly that build scripts compile are remembered like Rust, through the names `cc`, `gcc`, `clang`, `nasm` and their relatives at the head of `PATH` for the Cargo commands Jato runs. `jato stats` counts them as `tool_hit` and `tool_miss`. `JATO_TOOLS=0` turns this off.
+- A checkout with a different crate beside it (`path = "../shared"`), or with Cargo settings in a directory above it, gets a build of its own.
 - Builds started at the same time through Jato take turns at the processors. A build that seems to wait is queued behind others; `jato stats` shows `queued`.
 - Jato records on Linux (x86-64 and aarch64, kernel 5.5 or later). Elsewhere its commands run Cargo unchanged.
 
@@ -37,7 +39,7 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 ## Explain cache behavior
 
-Compare `jato stats --json` before and after a command: `build_hit` counts builds put back whole, `hit` single compilations reused, `miss` compilations run and recorded, `continued` compilations left to rustc during a run of edits, `uncacheable` those that could not be stored. `JATO_LOG=debug jato build` says for each command whether it was reused and, if not, which file, variable or setting had changed. Give `JATO_LOG` an absolute path to collect this in a file.
+Compare `jato stats --json` before and after a command: `build_hit` counts builds put back whole, `hit` single compilations reused, `miss` compilations run and recorded, `continued` compilations left to rustc during a run of edits, `uncacheable` those that could not be stored. `JATO_LOG=debug jato build` says for each command whether it was reused and, if not, which file, variable or setting had changed, and for a build that was not recorded which program did what. Give `JATO_LOG` an absolute path to collect this in a file.
 
 A procedural macro that reads an environment variable needs it named: `JATO_KEY_ENV=NAME,OTHER`. Files and directories a macro or build script reads are seen without help. A compilation that uses the network is never stored.
 

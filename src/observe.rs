@@ -104,6 +104,80 @@ pub struct Access {
     /// Where those earlier contents were when the command started, if the
     /// command moved them here.
     pub origin: Option<PathBuf>,
+    /// The command line of the program that wrote over what was there.
+    pub writer: Option<Box<str>>,
+    /// When the command first used the path and when it made the file its
+    /// own, counted in the system calls reported until then. Zero for a
+    /// file it never made.
+    pub first: u64,
+    pub made: u64,
+}
+
+impl Access {
+    /// Take in what a part of the command did with the same path under a
+    /// record of its own, as if the command had done it all itself.
+    ///
+    /// Where the order of two things cannot be told from the two records,
+    /// the one that keeps more of what was there from outside is assumed.
+    pub fn absorb(&mut self, part: Access) {
+        // Whichever looked first saw what was there before the command.
+        let (mut whole, later) = if part.first < self.first {
+            (part, self.clone())
+        } else {
+            (self.clone(), part)
+        };
+        // What the later one found was the command's own work only if the
+        // file had been made by then.
+        let own = whole.created && whole.made <= later.first;
+        if !own {
+            whole.read |= later.read;
+            whole.probed |= later.probed;
+            whole.appeared |= later.appeared;
+            whole.updated |= later.updated;
+            if whole.listing.is_none() {
+                whole.listing = later.listing;
+            }
+            if later.created && !whole.created {
+                whole.created = true;
+                whole.made = later.made;
+            }
+        }
+        whole.executed |= later.executed;
+        whole.written |= later.written;
+        // Whether it is there now says which of the two acted last.
+        whole.removed |= later.removed;
+        if whole.origin.is_none() {
+            whole.origin = later.origin;
+        }
+        if whole.writer.is_none() {
+            whole.writer = later.writer;
+        }
+        *self = whole;
+    }
+}
+
+impl Report {
+    /// Take in the record of a part of the command that was kept apart.
+    pub fn absorb(&mut self, part: Report) {
+        for (path, access) in part.paths {
+            match self.paths.get_mut(&path) {
+                Some(known) => {
+                    known.absorb(access);
+                    if known.removed && fs::symlink_metadata(&path).is_ok() {
+                        known.removed = false;
+                    }
+                }
+                None => drop(self.paths.insert(path, access)),
+            }
+        }
+        self.network |= part.network;
+        self.sockets.extend(part.sockets);
+        self.sockets.truncate(64);
+        if self.incomplete.is_none() {
+            self.incomplete = part.incomplete;
+        }
+        self.survivors |= part.survivors;
+    }
 }
 
 #[derive(Default, Debug)]
@@ -111,8 +185,9 @@ pub struct Report {
     pub paths: HashMap<PathBuf, Access>,
     /// The command opened a network connection.
     pub network: bool,
-    /// Unix sockets the command connected to.
-    pub sockets: Vec<PathBuf>,
+    /// Unix sockets the command connected to, and the command line of the
+    /// program that did.
+    pub sockets: Vec<(PathBuf, String)>,
     /// Why the record cannot be trusted to be complete, if it cannot.
     pub incomplete: Option<String>,
     /// A program the command started was still running when it exited.
@@ -504,6 +579,22 @@ mod imp {
         report: Report,
         config: Config,
         buffer: Vec<u8>,
+        /// The thread whose system call is being looked at, and how many
+        /// calls the whole command has reported so far.
+        caller: u32,
+        now: u64,
+    }
+
+    /// The command line of the program a thread belongs to, for telling
+    /// someone which program it was.
+    fn command_line(tid: u32) -> String {
+        let Ok(line) = fs::read(format!("/proc/{tid}/cmdline")) else {
+            return String::new();
+        };
+        let line = &line[..line.len().min(160)];
+        String::from_utf8_lossy(line)
+            .trim_end_matches('\0')
+            .replace('\0', " ")
     }
 
     impl Tracker {
@@ -563,11 +654,28 @@ mod imp {
             // A path through the caller's own working directory is a path
             // relative to that directory, whatever else is under /proc.
             const OWN: &[u8] = b"/proc/self/cwd";
-            let own = name
+            const OPEN: &[u8] = b"/proc/self/fd/";
+            let whole = |rest: &&[u8]| rest.is_empty() || rest[0] == b'/';
+            let mut own = name
                 .strip_prefix(OWN)
-                .filter(|rest| rest.is_empty() || rest[0] == b'/');
+                .filter(whole)
+                .map(|rest| (rest, libc::AT_FDCWD));
+            // And one through a directory the caller holds open is a path
+            // relative to that directory.
+            if own.is_none()
+                && let Some(rest) = name.strip_prefix(OPEN)
+            {
+                let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+                let number = std::str::from_utf8(&rest[..digits])
+                    .ok()
+                    .and_then(|n| n.parse::<i32>().ok());
+                own = number
+                    .map(|fd| (&rest[digits..], fd))
+                    .filter(|(rest, _)| whole(rest));
+            }
+            let own = own.map(|(rest, fd)| (rest.strip_prefix(b"/").unwrap_or(rest), fd));
             let (name, dirfd) = match own {
-                Some(rest) => (rest.strip_prefix(b"/").unwrap_or(rest), libc::AT_FDCWD),
+                Some((rest, fd)) => (rest, fd),
                 None => (name, dirfd),
             };
             let base = if own.is_none() && name.first() == Some(&b'/') {
@@ -658,6 +766,9 @@ mod imp {
                         removed: false,
                         appeared: false,
                         origin: None,
+                        writer: None,
+                        first: self.now,
+                        made: 0,
                     },
                 );
             }
@@ -687,12 +798,18 @@ mod imp {
                     if !access.created {
                         if replace || fs::symlink_metadata(&path).is_err() {
                             access.created = true;
+                            access.made = self.now;
                         } else {
                             access.updated = true;
                             access.read |= read;
                         }
                     }
                     access.removed = false;
+                    // A result may be turned down for this, and which
+                    // program it was is the first thing anyone asks.
+                    if (access.read || access.updated) && access.writer.is_none() {
+                        access.writer = Some(command_line(self.caller).into());
+                    }
                 }
                 Use::Remove => access.removed = true,
             }
@@ -752,6 +869,7 @@ mod imp {
         }
 
         fn handle(&mut self, data: &Data, tid: u32) {
+            self.caller = tid;
             let a = &data.args;
             let call = data.nr as u32;
             if data.arch != nr::ARCH || (cfg!(target_arch = "x86_64") && call >= 0x4000_0000) {
@@ -832,9 +950,13 @@ mod imp {
                             } else {
                                 memchr::memchr(0, name).unwrap_or(name.len())
                             };
-                            self.report
-                                .sockets
-                                .push(PathBuf::from(OsString::from_vec(name[..end].to_vec())));
+                            let caller = command_line(tid);
+                            if self.report.sockets.len() < 64 {
+                                self.report.sockets.push((
+                                    PathBuf::from(OsString::from_vec(name[..end].to_vec())),
+                                    caller,
+                                ));
+                            }
                         }
                         libc::AF_UNSPEC => (),
                         _ => self.report.network = true,
@@ -912,6 +1034,7 @@ mod imp {
             );
             if !ours && let Some(access) = self.report.paths.get_mut(&dest) {
                 access.created = false;
+                access.made = 0;
                 access.updated = true;
                 access.origin = origin;
             }
@@ -1047,10 +1170,12 @@ mod imp {
             state.events += 1;
             let (data, tid) = (notif.data, notif.pid);
             let state = &mut *state;
+            let now = state.events;
             let tracker = match state.scope_of(tid) {
                 Some(scope) => state.scopes.get_mut(&scope).unwrap(),
                 None => &mut state.whole,
             };
+            tracker.now = now;
             // Recording must never keep the command from continuing.
             let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tracker.handle(&data, tid)
@@ -1084,8 +1209,23 @@ mod imp {
                     report: Report::default(),
                     config,
                     buffer: Vec::new(),
+                    caller: 0,
+                    now: 0,
                 },
             );
+        }
+
+        /// Whether `process` is the root of a scope or runs inside one.
+        pub fn inside(&self, process: u32) -> bool {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.scopes.contains_key(&process) || state.scope_of(process).is_some()
+        }
+
+        /// Count what a scope recorded as the doing of the command as a
+        /// whole after all, as it would have been without the scope.
+        pub fn absorb(&self, report: Report) {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.whole.report.absorb(report);
         }
 
         /// The record for `root`'s descendants, which have all exited.
@@ -1151,6 +1291,8 @@ mod imp {
                 report: Report::default(),
                 config,
                 buffer: Vec::new(),
+                caller: 0,
+                now: 0,
             },
             scopes: HashMap::new(),
             owner: HashMap::new(),
@@ -1320,6 +1462,10 @@ mod imp {
     pub struct Scopes;
     impl Scopes {
         pub fn begin(&self, _: u32, _: Config) {}
+        pub fn inside(&self, _: u32) -> bool {
+            false
+        }
+        pub fn absorb(&self, _: Report) {}
         pub fn end(&self, _: u32) -> Option<Report> {
             None
         }
@@ -1344,3 +1490,110 @@ mod imp {
 }
 
 pub use imp::{Scopes, Session, answer, available, spawn};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path first used at `first`, found as a file or not there.
+    fn seen(first: u64, there: bool) -> Access {
+        Access {
+            kind: if there { Kind::File } else { Kind::Absent },
+            stamp: None,
+            links: 1,
+            link: None,
+            read: false,
+            probed: false,
+            listing: None,
+            executed: false,
+            written: false,
+            created: false,
+            updated: false,
+            removed: false,
+            appeared: false,
+            origin: None,
+            writer: None,
+            first,
+            made: 0,
+        }
+    }
+
+    fn made(first: u64, there: bool, at: u64) -> Access {
+        Access {
+            written: true,
+            created: true,
+            made: at,
+            ..seen(first, there)
+        }
+    }
+
+    fn read(first: u64) -> Access {
+        Access {
+            read: true,
+            ..seen(first, true)
+        }
+    }
+
+    #[test]
+    fn a_part_s_record_is_taken_in_as_the_command_s_own_doing() {
+        // The command made a file and a part of it read that file: the
+        // command read its own work.
+        let mut whole = made(3, false, 3);
+        whole.absorb(read(7));
+        assert!(whole.created && whole.written && !whole.read);
+        assert_eq!(whole.kind, Kind::Absent);
+
+        // The part made it and the command read it afterwards: the same.
+        let mut whole = read(9);
+        whole.absorb(made(4, false, 4));
+        assert!(whole.created && whole.written && !whole.read);
+        assert_eq!(whole.kind, Kind::Absent);
+
+        // The command read what was there and the part wrote over it.
+        let mut whole = read(2);
+        whole.absorb(made(6, true, 6));
+        assert!(whole.read && whole.created && whole.written);
+
+        // The command only looked, the part read what was there, and the
+        // command wrote over it later still: what the part read came from
+        // outside.
+        let mut whole = Access {
+            probed: true,
+            ..made(1, true, 9)
+        };
+        whole.absorb(read(5));
+        assert!(whole.read && whole.created);
+
+        // Both read it. It is what it was when the first of them looked.
+        let mut whole = read(8);
+        let mut part = read(2);
+        part.links = 2;
+        whole.absorb(part);
+        assert!(whole.read && !whole.written);
+        assert_eq!((whole.first, whole.links), (2, 2));
+    }
+
+    #[test]
+    fn a_part_s_report_joins_the_command_s() {
+        let mut whole = Report::default();
+        whole.paths.insert("/nowhere/shared".into(), read(1));
+        let mut part = Report {
+            network: true,
+            ..Report::default()
+        };
+        part.paths.insert("/nowhere/only-the-part".into(), read(4));
+        part.paths.insert(
+            "/nowhere/shared".into(),
+            Access {
+                removed: true,
+                ..seen(5, true)
+            },
+        );
+        whole.absorb(part);
+        assert!(whole.network);
+        assert!(whole.paths["/nowhere/only-the-part".as_ref() as &Path].read);
+        // Nothing is there now, so the removal was the last word.
+        let shared = &whole.paths["/nowhere/shared".as_ref() as &Path];
+        assert!(shared.removed && shared.read);
+    }
+}

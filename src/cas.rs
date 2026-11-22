@@ -100,6 +100,36 @@ fn now() -> i64 {
         .as_micros() as i64
 }
 
+/// The latest time that anything written to this filesystem from now on is
+/// certain to be newer than, as the filesystem itself tells time.
+///
+/// A file gets the time of the kernel's last clock tick when it is
+/// written, which can be a millisecond behind the clock a program reads,
+/// or the time of a server. Files given the time by this program's clock
+/// could be newer than a source edited right afterwards, and Cargo would
+/// take them for up to date.
+fn just_before_now(beside: &Path) -> Option<libc::timespec> {
+    use std::os::unix::fs::MetadataExt;
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = beside
+        .parent()?
+        .join(format!(".jato-time-{}-{serial}", std::process::id()));
+    let written = File::create(&probe).and_then(|file| file.metadata());
+    let _ = fs::remove_file(&probe);
+    let written = written.ok()?;
+    // One edited within the same tick gets this very time, so step back.
+    let (mut sec, mut nsec) = (written.mtime(), written.mtime_nsec() - 1);
+    if nsec < 0 {
+        sec -= 1;
+        nsec = 999_999_999;
+    }
+    Some(libc::timespec {
+        tv_sec: sec as _,
+        tv_nsec: nsec as _,
+    })
+}
+
 fn wait_for_writer(attempt: i32) -> bool {
     if attempt >= 400 {
         return false;
@@ -569,6 +599,21 @@ impl Store {
         Ok(digest)
     }
 
+    /// What a command that examined this file can have learned about what
+    /// is in it: its contents, or for a file that may not be read, which
+    /// the command could not read either, what can be seen from outside.
+    pub fn digest_seen(&mut self, path: &Path, stamp: Stamp) -> io::Result<Digest> {
+        match self.digest_known(path, stamp) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let mut hash = blake3::Hasher::new_derive_key("jato file that may not be read v1");
+                hash.update(&stamp.size.to_le_bytes());
+                hash.update(&stamp.mtime.to_le_bytes());
+                Ok(*hash.finalize().as_bytes())
+            }
+            digest => digest,
+        }
+    }
+
     // ---- lookups ----------------------------------------------------------
 
     /// Read from one consistent state of the index until `end_read`,
@@ -757,21 +802,29 @@ impl Store {
             }
             return Err(e.into());
         }
-        if tree && !todo.is_empty() {
-            // Now, to the microsecond: no source file can be newer.
-            let stamp = now();
+        if tree
+            && !todo.is_empty()
+            && let Some(stamp) = dests.first().and_then(|dest| just_before_now(dest))
+        {
+            // Every file of the build gets one time, as if the build had
+            // just ended: no source is newer, and one edited from here on
+            // will be.
             let times = [
                 libc::timespec {
                     tv_sec: 0,
                     tv_nsec: libc::UTIME_OMIT,
                 },
-                libc::timespec {
-                    tv_sec: (stamp / 1_000_000) as _,
-                    tv_nsec: ((stamp % 1_000_000) * 1000) as _,
-                },
+                stamp,
             ];
-            for dest in &dests {
-                if let Ok(name) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+            for (i, dest) in dests.iter().enumerate() {
+                // A file outside the target directory that already held
+                // what it should is one of the sources as far as Cargo
+                // can tell, a lock file the recorded build wrote for one.
+                // When it last changed is part of what Cargo remembers of
+                // the package, and it did not change now.
+                let source = manifest.outputs[i].root != crate::roots::TARGET
+                    && todo.binary_search(&i).is_err();
+                if !source && let Ok(name) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
                     unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) };
                 }
             }

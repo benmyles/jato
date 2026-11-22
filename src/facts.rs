@@ -205,6 +205,12 @@ pub fn keyed(name: &[u8]) -> bool {
         b"SDKROOT",
         b"AR",
         b"ARFLAGS",
+        // What a C compiler or an assembler takes from its environment.
+        b"OBJC_INCLUDE_PATH",
+        b"OBJCPLUS_INCLUDE_PATH",
+        b"DEPENDENCIES_OUTPUT",
+        b"SUNPRO_DEPENDENCIES",
+        b"NASMENV",
     ];
     const PREFIXES: &[&[u8]] = &[
         b"CARGO_",
@@ -224,10 +230,15 @@ pub fn keyed(name: &[u8]) -> bool {
         b"PKG_CONFIG",
         b"MOLD_",
         b"LLD_",
+        b"GCC_",
+        b"CCC_",
     ];
     // Set by Cargo or the user for Cargo itself. They reach the compiler as
-    // arguments, or say how this particular build is being run.
+    // arguments, say how this particular build is being run, or name a
+    // program that Cargo and build scripts start and a compiler does not.
     const NOT: &[&[u8]] = &[
+        b"RUSTDOC",
+        b"CARGO_BUILD_RUSTDOC",
         b"CARGO_MAKEFLAGS",
         b"CARGO_PRIMARY_PACKAGE",
         b"CARGO_TARGET_DIR",
@@ -347,9 +358,16 @@ mod tests {
             "CC",
             "HOME",
             "LC_ALL",
+            "RUSTDOCFLAGS",
+            "GCC_COLORS",
+            "CCC_OVERRIDE_OPTIONS",
+            "NASMENV",
         ] {
             assert!(keyed(name.as_bytes()), "{name}");
         }
+        // Where rustdoc is says nothing about what rustc makes of a crate,
+        // and Jato sets it for a build whose configuration names another
+        // cache's stand-in.
         for name in [
             "CARGO_MAKEFLAGS",
             "PATH",
@@ -357,6 +375,8 @@ mod tests {
             "RUSTC_WRAPPER",
             "CARGO_TARGET_DIR",
             "PWD",
+            "RUSTDOC",
+            "CARGO_BUILD_RUSTDOC",
         ] {
             assert!(!keyed(name.as_bytes()), "{name}");
         }

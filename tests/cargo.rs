@@ -428,6 +428,163 @@ fn a_path_cargo_must_escape_keeps_its_results_where_they_were_made() {
     assert_eq!(p.run(&["run", "-q"]).stdout, b"two:none\n");
 }
 
+/// A project in `dir/ws` that takes a crate from beside itself, `dir/shared`,
+/// which says `said`.
+fn beside(dir: &Path, said: &str) -> PathBuf {
+    let root = dir.join("ws");
+    write(
+        root.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nshared={path='../shared'}\n",
+    );
+    write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", shared::said()); }",
+    );
+    write(
+        dir.join("shared/Cargo.toml"),
+        "[package]\nname='shared'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        dir.join("shared/src/lib.rs"),
+        &format!("pub fn said() -> &'static str {{ {said:?} }}"),
+    );
+    root
+}
+
+#[test]
+fn a_crate_beside_a_checkout_is_looked_at_beside_each_checkout() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    let binary = |root: &Path| {
+        let out = Command::new(root.join("target/debug/app"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let first = beside(&p.temp.path().join("first"), "one");
+    success(p.command_in(&first).args(["build"]));
+    assert_eq!(binary(&first), "one\n");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    let lock = fs::read(first.join("Cargo.lock")).unwrap();
+    let copy = |name: &str, said: &str| {
+        let root = beside(&p.temp.path().join(name), said);
+        fs::write(root.join("Cargo.lock"), &lock).unwrap();
+        root
+    };
+    // A checkout with the same crate beside it is the same build.
+    let same = copy("same", "one");
+    success(p.command_in(&same).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(binary(&same), "one\n");
+    // One with another crate beside it is not, though the first
+    // checkout's neighbour is still as it was.
+    let other = copy("other", "two");
+    success(p.command_in(&other).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(binary(&other), "two\n");
+}
+
+#[test]
+fn a_file_included_from_beside_a_checkout_is_looked_at_beside_each_checkout() {
+    let p = Project::named("first/checkout");
+    // A crate that takes a file from outside its workspace.
+    let outside = |root: &Path, motto: &str| {
+        write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"{} {}\", leaf::value(), include_str!(\"../../motto.txt\")); }",
+        );
+        write(root.parent().unwrap().join("motto.txt"), motto);
+    };
+    outside(&p.root, "onward");
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none onward\n");
+    let copy = |name: &str, motto: &str| {
+        let root = p.temp.path().join(name).join("checkout");
+        populate(&root);
+        outside(&root, motto);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        root
+    };
+    // Where the file says something else the crate is compiled, though
+    // the file beside the first checkout is as it was.
+    let second = copy("second", "sideways");
+    let (hits, misses) = p.during(|| {
+        let out = success(p.command_in(&second).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"one:none sideways\n");
+    });
+    assert_eq!((hits, misses), (1, 1), "{}", p.stats());
+    // Where it says the same, the result is the same.
+    let third = copy("third", "onward");
+    let (hits, misses) = p.during(|| {
+        let out = success(p.command_in(&third).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"one:none onward\n");
+    });
+    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+}
+
+#[test]
+fn settings_above_a_checkout_are_looked_for_above_each_checkout() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    let copy = |root: &Path| {
+        populate(root);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+    };
+    // A checkout further down, with nothing new above it, is given the
+    // build.
+    let plain = p.temp.path().join("plain/further/down/checkout");
+    copy(&plain);
+    success(p.command_in(&plain).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // One below a directory with settings for Cargo is another build.
+    let set = p.temp.path().join("set/further/checkout");
+    copy(&set);
+    write(
+        p.temp.path().join("set/.cargo/config.toml"),
+        "[env]\nLEAF_ENV = \"from above\"\n",
+    );
+    assert_eq!(
+        success(p.command_in(&set).args(["run", "-q"])).stdout,
+        b"one:from above\n"
+    );
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
+fn an_edit_right_after_a_build_is_put_back_is_compiled() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    p.run(&["build"]);
+    // A file written in the same instant as the files of a build that was
+    // put back must still look newer to Cargo than they do. The kernel
+    // gives a written file the time of its last clock tick, which is a
+    // little behind the clock a program reads.
+    for round in 0..12 {
+        p.clean();
+        p.run(&["build"]);
+        assert_eq!(p.count("build_hit"), round + 1, "{}", p.stats());
+        let text = format!("round {round}");
+        edit_leaf(&p.root, &text);
+        let out = success(
+            p.command()
+                .env_remove("JATO_EDIT_WINDOW")
+                .args(["run", "-q"]),
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{text}\n"));
+        // Back to the build that is recorded.
+        write(
+            p.root.join("leaf/src/value.rs"),
+            "pub fn value() -> String { format!(\"{}:{}\", include_str!(\"text file\"), option_env!(\"LEAF_ENV\").unwrap_or(\"none\")) }",
+        );
+    }
+}
+
 #[test]
 fn a_build_recorded_once_is_filled_in_without_running_cargo() {
     if !observes() {
@@ -834,6 +991,12 @@ fn a_c_compiler_configured_behind_another_cache_is_named_alone() {
         p.root.join("src/main.rs"),
         r#"fn main() { println!("{}", include_str!(concat!(env!("OUT_DIR"), "/found.txt"))); }"#,
     );
+    // Further away, where Cargo only looks for what the project leaves
+    // unsaid.
+    write(
+        p.temp.path().join("cargo/config.toml"),
+        "[env]\nHOST_CXX = \"ccache c++\"\n",
+    );
     // Whatever the environment these tests run in says about compilers.
     let command = || {
         let mut cmd = p.command();
@@ -856,6 +1019,412 @@ fn a_c_compiler_configured_behind_another_cache_is_named_alone() {
         found(command().env("JATO_DISABLE", "1")).unwrap(),
         "ccache cc|g++\n"
     );
+}
+
+#[test]
+fn a_file_that_may_not_be_read_is_known_by_what_can_be_seen_of_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // Somewhere on the machine a build script looks around in, as one
+    // that searches for a library does, is a file kept from this user.
+    let kept = p.temp.path().join("elsewhere/kept");
+    let keep = |text: &str| {
+        if kept.exists() {
+            fs::set_permissions(&kept, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        write(&kept, text);
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o000)).unwrap();
+    };
+    keep("nobody's business");
+    write(
+        p.root.join("build.rs"),
+        &format!(
+            r#"fn main() {{
+                let path = {kept:?};
+                let size = std::fs::metadata(path).unwrap().len();
+                let _ = std::fs::read(path);
+                let to = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("size.txt");
+                std::fs::write(to, size.to_string()).unwrap();
+            }}"#
+        ),
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() { println!("{}", include_str!(concat!(env!("OUT_DIR"), "/size.txt"))); }"#,
+    );
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"17\n");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"17\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // What the build script could see of it has changed.
+    keep("nobody's business at all");
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"24\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Give the project in `root` a build script that compiles C from the
+/// workspace with debugging information, the way the `cc` crate does it,
+/// after asking the compiler whether a header is there.
+fn compile_c(root: &Path) {
+    write(root.join("native/answer.h"), "#define ANSWER 42\n");
+    write(
+        root.join("native/answer.c"),
+        "#include \"answer.h\"\nint answer(void) { return ANSWER; }\n",
+    );
+    write(
+        root.join("native/probe.c"),
+        "#include <jato_extra.h>\nint probe(void) { return EXTRA; }\n",
+    );
+    write(
+        root.join("build.rs"),
+        r#"use std::process::Command;
+        fn main() {
+            let out = std::env::var("OUT_DIR").unwrap();
+            let cc = |args: &[&str]| {
+                Command::new("cc").args(args).status().unwrap().success()
+            };
+            // Whether the header is installed, as build scripts ask.
+            let probe = format!("{out}/probe.o");
+            if cc(&["-Iextra", "-c", "native/probe.c", "-o", &probe]) {
+                println!("cargo:rustc-cfg=extra");
+            }
+            let object = format!("{out}/answer.o");
+            assert!(cc(&["-g", "-O1", "-c", "native/answer.c", "-o", &object]));
+            let library = format!("{out}/libanswer.a");
+            let _ = std::fs::remove_file(&library);
+            assert!(Command::new("ar").args(["crs", &library, &object]).status().unwrap().success());
+            println!("cargo:rustc-link-search=native={out}");
+            println!("cargo:rustc-link-lib=static=answer");
+            println!("cargo:rerun-if-changed=native");
+            println!("cargo:rustc-check-cfg=cfg(extra)");
+        }"#,
+    );
+    write(
+        root.join("src/main.rs"),
+        r#"unsafe extern "C" { fn answer() -> i32; }
+        fn main() {
+            let extra = if cfg!(extra) { " and more" } else { "" };
+            println!("{}{extra}", unsafe { answer() });
+        }"#,
+    );
+}
+
+/// The files a build script's C compiler left in `target`, by name.
+fn compiled_c(target: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![target.join("debug/build")];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                dirs.push(entry.path());
+            } else if entry.file_name() == name {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn c_that_a_build_script_compiles_is_remembered_like_rust() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    compile_c(&p.root);
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"42\n");
+    // The compilation that worked is kept. The one that failed was an
+    // answer to the build script, and is asked again another time.
+    assert_eq!(p.count("tool_miss"), 2, "{}", p.stats());
+    assert_eq!(p.count("tool_stored"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // The compiler was told other names for the workspace, so what it
+    // wrote for a debugger does not say where this checkout is.
+    let objects = compiled_c(&p.root.join("target"), "answer.o");
+    assert_eq!(objects.len(), 1, "{objects:?}");
+    let object = fs::read(&objects[0]).unwrap();
+    let names = |bytes: &[u8], needle: &Path| {
+        let needle = needle.as_os_str().as_encoded_bytes();
+        bytes.windows(needle.len()).any(|window| window == needle)
+    };
+    assert!(!names(&object, &p.root), "the object names its checkout");
+    assert!(names(&object, Path::new("/proc/self/cwd")));
+
+    // So another checkout is given the whole build.
+    let copy = |name: &str| {
+        let root = p.temp.path().join(name).join("checkout");
+        populate(&root);
+        compile_c(&root);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        root
+    };
+    let second = copy("second");
+    assert_eq!(
+        success(p.command_in(&second).args(["run", "-q"])).stdout,
+        b"42\n"
+    );
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_miss"), 2, "{}", p.stats());
+
+    // In a checkout whose Rust differs, Cargo carries the build out and
+    // runs the build script, whose compiler is given what was kept.
+    let third = copy("third");
+    let main = fs::read_to_string(third.join("src/main.rs")).unwrap();
+    write(
+        third.join("src/main.rs"),
+        &main.replace("{}{extra}", "{}{extra}!"),
+    );
+    assert_eq!(
+        success(p.command_in(&third).args(["run", "-q"])).stdout,
+        b"42!\n"
+    );
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_hit"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_miss"), 3, "{}", p.stats());
+    assert_eq!(compiled_c(&third.join("target"), "answer.o").len(), 1);
+
+    // A header is as much a part of the compilation as the file naming it.
+    write(third.join("native/answer.h"), "#define ANSWER 43\n");
+    assert_eq!(
+        success(p.command_in(&third).args(["run", "-q"])).stdout,
+        b"43!\n"
+    );
+    assert_eq!(p.count("tool_hit"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_stored"), 2, "{}", p.stats());
+
+    // What the failed compilation looked for is something the whole build
+    // depends on, though nothing else in the build looks there: once the
+    // header is there, the build is another one.
+    let fourth = copy("fourth");
+    write(fourth.join("extra/jato_extra.h"), "#define EXTRA 1\n");
+    let before = p.count("build_hit");
+    assert_eq!(
+        success(p.command_in(&fourth).args(["run", "-q"])).stdout,
+        b"42 and more\n"
+    );
+    assert_eq!(p.count("build_hit"), before, "{}", p.stats());
+    assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+}
+
+#[test]
+fn a_tool_whose_result_cannot_be_kept_is_part_of_the_build_all_the_same() {
+    use std::os::unix::fs::PermissionsExt;
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // An assembler that says more than is worth keeping, and writes the
+    // file it is given.
+    let tools = p.temp.path().join("tools");
+    write(
+        tools.join("yasm"),
+        "#!/bin/sh\nhead -c 5000000 /dev/zero | tr '\\0' x\necho assembled > \"$1\"\n",
+    );
+    fs::set_permissions(tools.join("yasm"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(tools.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    write(
+        p.root.join("build.rs"),
+        r#"use std::io::Write;
+        use std::process::{Command, Stdio};
+        fn main() {
+            let out = std::env::var("OUT_DIR").unwrap();
+            let said = Command::new("yasm").arg(format!("{out}/made.txt")).output().unwrap();
+            assert!(said.status.success());
+            assert_eq!(said.stdout.len(), 5_000_000);
+            // And a compiler that is sent its source, which nobody saw.
+            let mut cc = Command::new("cc")
+                .args(["-x", "c", "-c", "-", "-o", &format!("{out}/piped.o")])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            cc.stdin.take().unwrap().write_all(b"int piped(void) { return 7; }\n").unwrap();
+            assert!(cc.wait().unwrap().success());
+        }"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() {
+            let object = include_bytes!(concat!(env!("OUT_DIR"), "/piped.o"));
+            print!("{} {}", object.len() > 100, include_str!(concat!(env!("OUT_DIR"), "/made.txt")));
+        }"#,
+    );
+    let run = || success(p.command().env("PATH", &path).args(["run", "-q"]));
+    assert_eq!(run().stdout, b"true assembled\n");
+    // Only the assembler asked for a result, and it could not be kept.
+    assert_eq!(p.count("tool_miss"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_uncacheable"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_stored"), 0, "{}", p.stats());
+    // What both did is the build's own doing, and the build is kept.
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // That build wrote the lock file. Put back, it finds the file as it
+    // should be and leaves it alone: to Cargo the time of the newest file
+    // in a package is the state of a build script that names no inputs,
+    // and it would run this one again.
+    let lock = || {
+        fs::metadata(p.root.join("Cargo.lock"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let written = lock();
+    p.clean();
+    assert_eq!(run().stdout, b"true assembled\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(lock(), written);
+    assert_eq!(p.count("tool_miss"), 1, "{}", p.stats());
+}
+
+#[test]
+fn a_link_by_a_compiler_that_a_build_script_runs_is_that_compiler_s_work() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // A build script that has rustc build a small program, as some do to
+    // find out about the machine. rustc starts the C compiler to link it,
+    // with its own tools put first on PATH and files in a directory that
+    // is named anew each time.
+    write(
+        p.root.join("build.rs"),
+        r#"use std::process::Command;
+        fn main() {
+            let out = std::env::var("OUT_DIR").unwrap();
+            std::fs::write(format!("{out}/probe.rs"), "fn main() { print!(\"probed\"); }").unwrap();
+            let built = Command::new(std::env::var("RUSTC").unwrap())
+                .args(["--crate-name", "probe", "--crate-type", "bin", "--out-dir", &out])
+                .arg(format!("{out}/probe.rs"))
+                .status()
+                .unwrap();
+            assert!(built.success());
+            let said = Command::new(format!("{out}/probe")).output().unwrap();
+            std::fs::write(format!("{out}/said.txt"), said.stdout).unwrap();
+        }"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() { println!("{}", include_str!(concat!(env!("OUT_DIR"), "/said.txt"))); }"#,
+    );
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"probed\n");
+    // No result is kept for the link by itself: it could never be asked
+    // for again. The build as a whole is kept, and found again.
+    assert_eq!(p.count("tool_miss"), 0, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"probed\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
+fn a_tool_given_another_path_by_its_build_script_does_not_hide_the_build() {
+    use std::os::unix::fs::PermissionsExt;
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    compile_c(&p.root);
+    // An assembler of the project's own, in a directory the build script
+    // puts first on PATH for the compiler it starts.
+    let tools = p.root.join("tools");
+    write(tools.join("as"), "#!/bin/sh\nexec /usr/bin/as \"$@\"\n");
+    fs::set_permissions(tools.join("as"), fs::Permissions::from_mode(0o755)).unwrap();
+    let script = fs::read_to_string(p.root.join("build.rs")).unwrap();
+    write(
+        p.root.join("build.rs"),
+        &script.replace(
+            "Command::new(\"cc\").args(args)",
+            "Command::new(\"cc\").env(\"PATH\", format!(\"{}/tools:{}\", std::env::var(\"CARGO_MANIFEST_DIR\").unwrap(), std::env::var(\"PATH\").unwrap())).args(args)",
+        ),
+    );
+    assert_ne!(script, fs::read_to_string(p.root.join("build.rs")).unwrap());
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"42\n");
+    assert_eq!(p.count("tool_stored"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // The compiler looked along a PATH the build never had. What matters
+    // to the build is what its own PATH finds, and that is as it was.
+    p.clean();
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"42\n");
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+}
+
+#[test]
+fn rustdoc_configured_as_another_cache_s_stand_in_is_started_itself() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // As a compiler cache's setup leaves it: Cargo's configuration names a
+    // link to the cache as rustdoc. This one keeps a count of its uses, as
+    // such tools do, which no build could be recorded around.
+    let tools = p.temp.path().join("tools");
+    let counted = p.temp.path().join("uses");
+    write(
+        tools.join("kache"),
+        &format!(
+            "#!/bin/sh\necho used >> '{}'\nexec rustdoc \"$@\"\n",
+            counted.display()
+        ),
+    );
+    fs::set_permissions(tools.join("kache"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(&counted, "");
+    let stand_in = p.temp.path().join("shims/rustdoc");
+    fs::create_dir_all(stand_in.parent().unwrap()).unwrap();
+    symlink(tools.join("kache"), &stand_in).unwrap();
+    write(
+        p.root.join(".cargo/config.toml"),
+        &format!(
+            "[build]\nincremental = true\nrustdoc = \"{}\"\n",
+            stand_in.display()
+        ),
+    );
+    // A build script that asks rustdoc for its version, as those that
+    // describe the build to the program do.
+    write(
+        p.root.join("build.rs"),
+        r#"fn main() {
+            let rustdoc = std::env::var_os("RUSTDOC").unwrap();
+            let out = std::process::Command::new(rustdoc).arg("-V").output().unwrap();
+            assert!(out.status.success());
+            let to = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("doc.txt");
+            std::fs::write(to, out.stdout).unwrap();
+        }"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() { print!("{}", include_str!(concat!(env!("OUT_DIR"), "/doc.txt"))); }"#,
+    );
+    let command = || {
+        let mut cmd = p.command();
+        cmd.env_remove("RUSTDOC").env_remove("CARGO_BUILD_RUSTDOC");
+        cmd
+    };
+    let version = success(command().args(["run", "-q"])).stdout;
+    assert!(version.starts_with(b"rustdoc "), "{version:?}");
+    assert_eq!(fs::read(&counted).unwrap(), b"", "the stand-in was used");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    p.clean();
+    assert_eq!(success(command().args(["run", "-q"])).stdout, version);
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    // What the person names for this command themselves is looked at in
+    // the same way.
+    p.clean();
+    success(command().env("RUSTDOC", &stand_in).args(["build"]));
+    assert_eq!(fs::read(&counted).unwrap(), b"", "the stand-in was used");
+    // Without Jato, Cargo applies its configuration as written.
+    p.clean();
+    success(command().env("JATO_DISABLE", "1").args(["build"]));
+    assert_ne!(fs::read(&counted).unwrap(), b"", "Cargo was told otherwise");
 }
 
 /// Give `leaf` a body that the compiler has to compile anew.
@@ -963,12 +1532,143 @@ fn the_compiler_s_saved_state_is_kept_for_other_checkouts() {
 }
 
 #[test]
+fn saved_state_follows_a_library_into_a_target_directory_elsewhere() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // Each checkout builds into a scratch directory of its own that is not
+    // inside it, as helpers working on one project are often set up.
+    let command = |root: &Path, target: &Path| {
+        let mut cmd = p.command_in(root);
+        cmd.env_remove("JATO_EDIT_WINDOW")
+            .env("CARGO_TARGET_DIR", target);
+        cmd
+    };
+    let first = p.temp.path().join("scratch/first");
+    success(command(&p.root, &first).args(["build"]));
+    // The library's state is kept: rustc writes a library itself, and can
+    // be given its target directory under a name that is the same
+    // anywhere. The program's is not, since a linker writes that.
+    assert_eq!(p.count("state_saved"), 1, "{}", p.stats());
+
+    let copy = p.temp.path().join("second/checkout");
+    populate(&copy);
+    fs::copy(p.root.join("Cargo.lock"), copy.join("Cargo.lock")).unwrap();
+    let second = p.temp.path().join("scratch/second");
+    success(command(&copy, &second).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    edit_leaf(&copy, "edited elsewhere");
+    let out = success(command(&copy, &second).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"edited elsewhere\n");
+    assert_eq!(p.count("state_given"), 1, "{}", p.stats());
+    assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+    // What was compiled this way is a result like any other.
+    fs::remove_dir_all(&second).unwrap();
+    let (hits, misses) = p.during(|| {
+        let out = success(command(&copy, &second).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"edited elsewhere\n");
+    });
+    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+}
+
+#[test]
+fn a_compiler_that_gives_up_what_it_inherits_is_told_its_real_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // The compiler behind a program that closes what it was started with,
+    // as a launcher written in some languages does without being asked.
+    let closing = p.temp.path().join("tools/rustc");
+    write(&closing, "#!/bin/bash\nexec 219<&-\nexec rustc \"$@\"\n");
+    fs::set_permissions(&closing, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = |root: &Path, target: &Path| {
+        let mut cmd = p.command_in(root);
+        cmd.env_remove("JATO_EDIT_WINDOW")
+            .env("CARGO_TARGET_DIR", target)
+            .env("RUSTC", &closing);
+        cmd
+    };
+    let first = p.temp.path().join("scratch/first");
+    let out = success(command(&p.root, &first).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"one:none\n");
+    // Jato found that out before any crate was compiled, and what the
+    // compiler saved for an output directory named as it is stays there.
+    assert_eq!(p.count("state_saved"), 0, "{}", p.stats());
+    let known: Vec<_> = fs::read_dir(p.temp.path().join("cache/locks"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("held-"))
+        .map(|entry| fs::read_to_string(entry.path()).unwrap())
+        .collect();
+    assert_eq!(known, ["no"]);
+
+    let copy = p.temp.path().join("second/checkout");
+    populate(&copy);
+    fs::copy(p.root.join("Cargo.lock"), copy.join("Cargo.lock")).unwrap();
+    let second = p.temp.path().join("scratch/second");
+    success(command(&copy, &second).args(["build"]));
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    edit_leaf(&copy, "edited elsewhere");
+    let out = success(command(&copy, &second).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"edited elsewhere\n");
+    assert_eq!(p.count("state_given"), 0, "{}", p.stats());
+    assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+}
+
+/// The object files rustc keeps for the crate whose name starts with
+/// `krate`, counted on either side of the widest gap between the times
+/// they were written: those there before, and those written after.
+fn object_files(incremental: &Path, krate: &str) -> (usize, usize) {
+    let state = fs::read_dir(incremental)
+        .unwrap()
+        .flatten()
+        .find(|dir| dir.file_name().to_string_lossy().starts_with(krate))
+        .unwrap();
+    let mut times: Vec<std::time::SystemTime> = fs::read_dir(state.path())
+        .unwrap()
+        .flatten()
+        .filter(|session| session.path().is_dir())
+        .flat_map(|session| fs::read_dir(session.path()).unwrap().flatten())
+        .filter(|file| file.path().extension() == Some(OsStr::new("o")))
+        .map(|file| file.metadata().unwrap().modified().unwrap())
+        .collect();
+    times.sort();
+    let gaps = times
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]).unwrap());
+    let widest = gaps.enumerate().max_by_key(|(_, gap)| *gap);
+    match widest {
+        // The compiler pauses for longer than this before it starts.
+        Some((at, gap)) if gap > std::time::Duration::from_millis(100) => {
+            (at + 1, times.len() - at - 1)
+        }
+        _ => (0, times.len()),
+    }
+}
+
+#[test]
 fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
     let Some(rustc) = std::env::var_os("JATO_TEST_NIGHTLY") else {
         return;
     };
     let cargo = Path::new(&rustc).with_file_name("cargo");
     let p = Project::whole();
+    // The compiler behind a pause. An object file that was there before
+    // the compiler started is then much older than one it writes, however
+    // quick or busy the machine is.
+    let slow = p.temp.path().join("slow/rustc");
+    write(
+        &slow,
+        &format!(
+            "#!/bin/sh\nsleep 0.2\nexec '{}' \"$@\"\n",
+            Path::new(&rustc).display()
+        ),
+    );
+    fs::set_permissions(&slow, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let rustc = slow;
     // The compiler says when it turns saved state down, and checks every
     // result it takes from it against one computed afresh.
     let command = |root: &Path| {
@@ -1026,34 +1726,10 @@ fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
         success(command(&second).args(["run", "-q"])).stdout,
         b"<one:none>!\n"
     );
-    // The object file of the module that was not edited is the one the
-    // state came with: it is older than the one compiled just now by the
-    // time rustc took to start and to get to generating code.
-    let state = second.join("target/debug/incremental");
-    let app = fs::read_dir(state)
-        .unwrap()
-        .flatten()
-        .find(|krate| krate.file_name().to_string_lossy().starts_with("app-"))
-        .unwrap();
-    let times: Vec<std::time::SystemTime> = fs::read_dir(app.path())
-        .unwrap()
-        .flatten()
-        .filter(|session| session.path().is_dir())
-        .flat_map(|session| fs::read_dir(session.path()).unwrap().flatten())
-        .filter(|file| file.path().extension() == Some(OsStr::new("o")))
-        .map(|file| file.metadata().unwrap().modified().unwrap())
-        .collect();
-    assert!(times.len() >= 2, "{times:?}");
-    let spread = times
-        .iter()
-        .max()
-        .unwrap()
-        .duration_since(*times.iter().min().unwrap())
-        .unwrap();
-    assert!(
-        spread > std::time::Duration::from_millis(15),
-        "every object file was compiled again: {times:?}"
-    );
+    // For a program rustc takes its analysis from the state and generates
+    // all code again: it ties generated code to the real paths of the
+    // libraries a program is linked with, and those are in another target
+    // directory here.
 
     // With the state as it was saved, rustc turns it down: it was made
     // under another workspace's path. This is what the adjustment is for.
@@ -1082,6 +1758,62 @@ fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
     let said = String::from_utf8_lossy(&built.stderr);
     assert!(said.contains("ignoring cache"), "{said}");
     assert_eq!(p.count("state_given"), 1, "{}", p.stats());
+
+    // The same for a library whose target directory is somewhere else and
+    // reaches the compiler on a descriptor.
+    let outside = |name: &str| p.temp.path().join("scratch").join(name);
+    let leaf_edit = |root: &Path, text: &str| {
+        write(
+            root.join("leaf/src/lib.rs"),
+            "mod value; mod other; pub use value::value; pub use other::other;",
+        );
+        write(
+            root.join("leaf/src/other.rs"),
+            "pub fn other() -> u32 { 7 }",
+        );
+        edit_leaf(root, text);
+    };
+    let fourth = checkout("fourth");
+    leaf_edit(&fourth, "kept");
+    success(
+        command(&fourth)
+            .env("CARGO_TARGET_DIR", outside("fourth"))
+            .args(["build"]),
+    );
+    let fifth = checkout("fifth");
+    leaf_edit(&fifth, "kept");
+    let mut restore = command(&fifth);
+    restore.env("CARGO_TARGET_DIR", outside("fifth"));
+    success(restore.args(["build"]));
+    let given = p.count("state_given");
+    leaf_edit(&fifth, "handed on");
+    let mut build = command(&fifth);
+    build.env("CARGO_TARGET_DIR", outside("fifth"));
+    let built = success(build.args(["build"]));
+    let said = String::from_utf8_lossy(&built.stderr);
+    assert_eq!(p.count("state_given"), given + 1, "{}", p.stats());
+    assert!(!said.contains("ignoring cache"), "{said}");
+    // The object file of the module that was not edited is the one the
+    // state came with, there before the compiler started. The edited
+    // module's was written after.
+    let (kept, compiled) = object_files(&outside("fifth").join("debug/incremental"), "leaf-");
+    assert!(kept > 0 && compiled > 0, "{kept} kept, {compiled} compiled");
+
+    // And for a library whose target directory is inside its checkout.
+    let sixth = checkout("sixth");
+    leaf_edit(&sixth, "kept inside");
+    success(command(&sixth).args(["build"]));
+    let seventh = checkout("seventh");
+    leaf_edit(&seventh, "kept inside");
+    success(command(&seventh).args(["build"]));
+    let given = p.count("state_given");
+    leaf_edit(&seventh, "handed on inside");
+    let built = success(command(&seventh).args(["build"]));
+    let said = String::from_utf8_lossy(&built.stderr);
+    assert!(p.count("state_given") > given, "{}", p.stats());
+    assert!(!said.contains("ignoring cache"), "{said}");
+    let (kept, compiled) = object_files(&seventh.join("target/debug/incremental"), "leaf-");
+    assert!(kept > 0 && compiled > 0, "{kept} kept, {compiled} compiled");
 }
 
 #[test]

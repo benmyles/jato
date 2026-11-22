@@ -14,7 +14,7 @@ mod session {
     //! Whole builds are only recorded where commands can be observed.
     use anyhow::Result;
     use std::ffi::{OsStr, OsString};
-    pub fn ask(_: &OsStr, _: &OsStr, _: &[OsString]) -> Result<Option<i32>> {
+    pub fn ask(_: &OsStr, _: &OsStr, _: &[OsString], _: bool) -> Result<Option<i32>> {
         Ok(None)
     }
     pub fn build(cmd: std::process::Command, _: &str) -> Result<i32> {
@@ -22,6 +22,7 @@ mod session {
     }
     pub fn ready(_: std::process::Command, _: &str) {}
 }
+mod tools;
 mod watch;
 mod wire;
 
@@ -69,6 +70,8 @@ Environment
   JATO_EDIT_WINDOW    Seconds within which a crate compiled again counts as
                       being edited and is not recorded; default 600, 0 never
   JATO_WHOLE_BUILDS=0 Reuse single compilations only
+  JATO_TOOLS=0        Leave the C compilers and assemblers that build scripts
+                      start to themselves
   JATO_SAVED_STATE=0  Leave rustc's incremental state out of the cache
   JATO_COALESCE=0     Let identical concurrent compilations run independently
   JATO_REMAP=0        Leave real workspace and target paths in compiled output
@@ -88,6 +91,26 @@ const LAUNCHERS: &[&str] = &[
     "icecc",
 ];
 
+/// Whether `entry` is a link to such a program under another name.
+fn stands_in(entry: &Path) -> bool {
+    entry.is_symlink()
+        && std::fs::canonicalize(entry).is_ok_and(|real| {
+            real.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| LAUNCHERS.contains(&name))
+        })
+}
+
+/// The tool that a variable names for Cargo, which hands it on to build
+/// scripts: the compiler or rustdoc.
+fn rust_tool(variable: &str) -> Option<(&'static str, &'static str)> {
+    match variable {
+        "RUSTC" | "CARGO_BUILD_RUSTC" => Some(("RUSTC", "rustc")),
+        "RUSTDOC" | "CARGO_BUILD_RUSTDOC" => Some(("RUSTDOC", "rustdoc")),
+        _ => None,
+    }
+}
+
 /// PATH without the directories that hold nothing but links to such a
 /// program under compilers' names. None if there are none.
 ///
@@ -95,23 +118,15 @@ const LAUNCHERS: &[&str] = &[
 /// cache, where it cannot be watched, so nothing that links could be
 /// recorded. The compilers themselves are further along PATH.
 fn without_launchers(path: &OsStr) -> Option<OsString> {
-    let launcher = |entry: &Path| {
-        entry.is_symlink()
-            && std::fs::canonicalize(entry).is_ok_and(|real| {
-                real.file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| LAUNCHERS.contains(&name))
-            })
-    };
     let stand_ins = |dir: &Path| {
         // Looked at closely only if one of the usual names is such a link.
         ["cc", "gcc", "c++", "clang", "rustc", "cargo"]
             .iter()
-            .any(|name| launcher(&dir.join(name)))
+            .any(|name| stands_in(&dir.join(name)))
             && std::fs::read_dir(dir).is_ok_and(|entries| {
                 entries.flatten().all(|entry| {
                     entry.file_name().as_encoded_bytes().starts_with(b".")
-                        || launcher(&entry.path())
+                        || stands_in(&entry.path())
                 })
             })
     };
@@ -143,19 +158,43 @@ fn behind_launcher(value: &str) -> Option<&str> {
     (LAUNCHERS.contains(&program) && !rest.trim().is_empty()).then(|| rest.trim())
 }
 
-/// C compiler settings that would start the compiler through a launcher,
-/// with the compiler alone as the value to use instead. They come from the
-/// environment and from the `[env]` tables of Cargo's configuration, which
-/// Cargo applies to build scripts where the environment says nothing. Only
-/// the plainest form of such a table entry is recognized: `NAME = "value"`.
-fn c_compilers_alone(cwd: &Path) -> Vec<(String, String)> {
+/// Settings that would start a C compiler, the Rust compiler or rustdoc
+/// through a launcher, each with the value to use instead: the tool alone.
+///
+/// A C compiler is named behind its launcher, as in `kache cc`, in the
+/// environment or in an `[env]` table of Cargo's configuration, which Cargo
+/// applies to build scripts where the environment says nothing. rustc and
+/// rustdoc are named by a path that is a link to the launcher, in the
+/// environment or under `[build]`, and Cargo tells build scripts where they
+/// are. Only the plainest form of a configuration entry is recognized:
+/// `name = "value"`.
+fn past_launchers(cwd: &Path) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = Vec::new();
+    // What something nearer has already settled, whatever it said.
+    let mut settled: Vec<String> = Vec::new();
     for (name, value) in env::vars_os() {
-        if let (Some(name), Some(value)) = (name.to_str(), value.to_str())
-            && names_c_compiler(name)
-            && let Some(compiler) = behind_launcher(value)
-        {
-            found.push((name.to_owned(), compiler.to_owned()));
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            continue;
+        };
+        if names_c_compiler(name) {
+            settled.push(name.to_owned());
+            if let Some(compiler) = behind_launcher(value) {
+                found.push((name.to_owned(), compiler.to_owned()));
+            }
+        }
+    }
+    // The short name wins over Cargo's own name for the same setting.
+    for names in [
+        ["RUSTC", "CARGO_BUILD_RUSTC"],
+        ["RUSTDOC", "CARGO_BUILD_RUSTDOC"],
+    ] {
+        let Some(value) = names.iter().find_map(env::var_os) else {
+            continue;
+        };
+        let (variable, tool) = rust_tool(names[0]).expect("named above");
+        settled.push(variable.to_owned());
+        if stands_in(Path::new(&value)) {
+            found.push((variable.to_owned(), tool.to_owned()));
         }
     }
     // Nearest first, as Cargo ranks them; its own home directory last.
@@ -168,9 +207,12 @@ fn c_compilers_alone(cwd: &Path) -> Vec<(String, String)> {
         .or_else(|| env::var_os("HOME").map(|home| Path::new(&home).join(".cargo")));
     files.extend(home.map(|home| home.join("config.toml")));
     for file in files {
-        let Ok(text) = std::fs::read_to_string(file) else {
+        let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
+        // A relative path in a configuration file starts beside the
+        // directory the file is in.
+        let base = file.parent().and_then(Path::parent).unwrap_or(cwd);
         let mut table = "";
         for line in text.lines().map(str::trim) {
             if let Some(header) = line.strip_prefix('[') {
@@ -189,13 +231,23 @@ fn c_compilers_alone(cwd: &Path) -> Vec<(String, String)> {
             else {
                 continue;
             };
-            if table == "env"
-                && names_c_compiler(name)
-                && env::var_os(name).is_none()
-                && !found.iter().any(|(known, _)| known == name)
-                && let Some(compiler) = behind_launcher(value)
-            {
-                found.push((name.to_owned(), compiler.to_owned()));
+            let (variable, instead) = match table {
+                "env" if names_c_compiler(name) => (name, behind_launcher(value)),
+                "build" if matches!(name, "rustc" | "rustdoc") => {
+                    let (variable, tool) = rust_tool(&name.to_uppercase()).expect("one of the two");
+                    // A bare name is looked up along PATH, where the
+                    // launchers' directories have been left out.
+                    let direct = value.contains('/') && stands_in(&base.join(value));
+                    (variable, direct.then_some(tool))
+                }
+                _ => continue,
+            };
+            if settled.iter().any(|known| known == variable) {
+                continue;
+            }
+            settled.push(variable.to_owned());
+            if let Some(instead) = instead {
+                found.push((variable.to_owned(), instead.to_owned()));
             }
         }
     }
@@ -203,6 +255,31 @@ fn c_compilers_alone(cwd: &Path) -> Vec<(String, String)> {
 }
 
 fn main() {
+    // The directory in which compilers' names lead to this program is for
+    // build scripts. Whatever this process looks up or starts finds the
+    // programs themselves.
+    if let (Some(stand_ins), Some(path)) = (env::var_os(tools::DIRECTORY), env::var_os("PATH")) {
+        // Nothing else is running yet in this process.
+        unsafe { env::set_var("PATH", tools::without(&path, &stand_ins)) };
+    }
+    if let Some(name) = env::args_os()
+        .next()
+        .and_then(|own| tools::invoked_as(&own))
+    {
+        let args: Vec<_> = env::args_os().skip(1).collect();
+        let path = env::var_os("PATH").unwrap_or_default();
+        let code = match tools::find(name, &path) {
+            Some(program) => command::stand_in(&program, &args).unwrap_or_else(|e| {
+                eprintln!("jato: {name}: {e:#}");
+                1
+            }),
+            None => {
+                eprintln!("jato: {name}: not found on PATH");
+                127
+            }
+        };
+        std::process::exit(code);
+    }
     // Once per build: what this process starts inherits the result.
     if env::var_os("JATO_PATH").is_none() && env::var_os("JATO_DISABLE").is_none_or(|v| v != "1") {
         if let Some(path) = env::var_os("PATH")
@@ -238,11 +315,17 @@ fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
     if env::var_os("JATO_CACHE_DIR").is_some() {
         cmd.env("JATO_CACHE_DIR", cache_dir()?);
     }
-    // A C compiler started through another cache does its work where it
-    // cannot be watched, and the build could not be recorded.
+    // A tool started through another cache does its work where it cannot
+    // be watched, and the build could not be recorded.
     if env::var_os("JATO_DISABLE").is_none_or(|v| v != "1") {
-        for (name, compiler) in c_compilers_alone(&env::current_dir()?) {
-            cmd.env(name, compiler);
+        for (name, tool) in past_launchers(&env::current_dir()?) {
+            cmd.env(name, tool);
+        }
+        // The C compilers and assemblers that build scripts start ask for
+        // their results too, by way of a directory at the head of PATH in
+        // which their names lead back here.
+        if let Ok(cache) = cache_dir() {
+            tools::offer(&mut cmd, &cache);
         }
     }
     Ok(cmd)
@@ -445,6 +528,14 @@ fn report(stats: &cas::Stats) -> String {
         "Compilers  {hits} results reused, {misses} run ({} of those could not be stored), {edits} run during edits",
         count("uncacheable")
     );
+    let (hits, misses) = (count("tool_hit"), count("tool_miss"));
+    if hits + misses > 0 {
+        let _ = writeln!(
+            out,
+            "           of C compilers and assemblers in build scripts {hits} results reused, {misses} run ({} of those could not be stored)",
+            count("tool_uncacheable")
+        );
+    }
     let _ = writeln!(
         out,
         "Saved      {:.1} s of earlier work not done again",

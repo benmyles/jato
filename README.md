@@ -1,6 +1,6 @@
 # Jato
 
-Jato remembers Rust builds. A build that has been made before, with the same sources, settings and toolchain, is put back in well under a second: after `cargo clean`, in another target directory, or in a checkout that was created a moment ago. Builds that do have to compile go at Cargo's speed, and several of them started together take turns at the processors.
+Jato remembers Rust builds. A build that has been made before, with the same sources, settings and toolchain, is put back in well under a second: after `cargo clean`, in another target directory, or in a checkout that was created a moment ago. Builds that do have to compile go at Cargo's speed, reuse every compilation that still applies, the C that build scripts compile included, and take turns at the processors when several are started together.
 
 On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measured against kache 2.3 and bare Cargo on a 15-processor machine that was busy with other builds:
 
@@ -74,11 +74,23 @@ On a miss Cargo runs under the observer, with each compiler it starts asking Jat
 
 `jato test`, `bench` and `run` first get the build they need: restored if it is recorded, made on its own if not, showing only what is being compiled. Then Cargo runs the command you asked for and finds the build done. A test name filter and a program's arguments are not part of the build.
 
+### C, C++ and assembly in build scripts
+
+A build script that compiles C starts the compiler itself, and Cargo gives nobody a say in that. For the Cargo commands Jato runs, a directory at the head of `PATH` holds the names `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `nasm` and `yasm`, each leading back to Jato, for those of them the rest of `PATH` finds. Started by a build script under one of these names, Jato finds the program itself and treats its run like a run of rustc: looked up, and otherwise run under observation and recorded, with every header it opened or looked for among what the result depends on. gcc and clang are also told the workspace's and the target directory's other names, through `-ffile-prefix-map`, so that debugging information compiled from a file in the workspace does not tie the build to one checkout.
+
+A build script's question to the compiler that is answered by failing, such as whether a header is installed, is asked again every time, and what the compiler looked for is something the build as a whole depends on. A compiler that is sent its source through a pipe is run as it is. Started by anything other than a build script, such as the program `jato run` runs or a test, the names lead straight to the programs. `JATO_TOOLS=0` leaves the directory out.
+
+On the whole Olo workspace this was most of what a second checkout cost. Of 630 processor-seconds for `check --workspace` in a copy of a checkout that had been built, with every Rust compilation restored, 545 went to C, C++ and assembly that 113 build scripts compiled again. With those remembered, the same command in a copy with one crate edited took 65.
+
 ### Other checkouts and target directories
 
 Results are stored relative to the workspace and the target directory, so a second checkout or a new target directory finds them. For that to be true of the compiled bytes, Jato asks rustc to write `/proc/self/cwd` in place of the workspace's location and `/proc/self/cwd/target` in place of the target directory's, through `--remap-path-prefix`. A debugger started in the workspace opens the right sources through those names. Diagnostics, `file!()` and panic messages are unchanged.
 
 Output that still names where it was built, such as a program that embeds `env!("CARGO_MANIFEST_DIR")`, is reused only in that checkout. `JATO_REMAP=0` keeps real paths in everything, and results then stay with the directory they were made in.
+
+A build can also depend on what is around its checkout. A crate named by `path = "../shared"`, or anything else a command reads from near the workspace without the environment naming the place, is recorded twice: where it was, and by the way there from the workspace. A result is reused only where both are as they were, so a checkout with a different neighbour gets a build of its own and one with the same neighbour shares it. Cargo, rustup and git look for settings in every directory above the workspace. What such a search found, apart from Cargo's and rustup's own directories, has to be what a search from the other checkout finds: a directory with a `.cargo/config.toml` above one checkout and not the other keeps their builds apart. A build that writes files beside its workspace is reused only there.
+
+The files of a build that is put back all get one time, taken from the filesystem and set just before the present, so that no source looks newer than the build and any file edited from then on does. A file outside the target directory that already holds what the build wrote, such as `Cargo.lock`, is left as it is.
 
 ### Edits
 
@@ -86,7 +98,9 @@ A crate compiled again within ten minutes of its last compilation in the same ta
 
 A target directory that was restored holds none of the state rustc saves for compiling a crate again, so the first edit of a crate there would compile the whole crate. Jato keeps that state in the cache, once for each crate and replaced by newer state when it is more than an hour old, and hands it to a compilation that has none of its own: the first edit in a new checkout is compiled incrementally, from state saved where the crate was last compiled under watch. On Olo that took the first edit of the top crate in a new checkout from about 110 processor-seconds to 53.
 
-rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. rustc still checks each saved result against the sources before using it, and if the state does not begin the way Jato expects it is left out and the crate is compiled from scratch. State is kept for the output directory it was made with, since rustc generates all code again for any other. A target directory inside the workspace reads the same in every checkout, and so does one target directory shared by all of them; target directories kept elsewhere under different names do not share state. `JATO_SAVED_STATE=0` turns this off.
+What rustc makes of the state depends on the crate. For a library it reuses its analysis and the code it generated for every module that was not edited. For a program or a test in another target directory it reuses the analysis and generates all code again: rustc ties the code of anything it links to the real locations of the libraries linked in, whatever names they are given by. In the target directory the state was saved in, after a clean, a program's code is reused too.
+
+rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. rustc still checks each saved result against the sources before using it, and if the state does not begin the way Jato expects it is left out and the crate is compiled from scratch. State is kept for the output directory it was made with, since rustc generates all code again for any other. A target directory inside the workspace reads the same in every checkout. One kept anywhere else, such as a scratch `CARGO_TARGET_DIR` for each checkout, is held open for the compiler on a descriptor and named through that, `/proc/self/fd/219`, when the crate is a library, which rustc writes itself. Programs, tests and procedural macros there are compiled without state the first time: a linker would have to keep the descriptor. `JATO_SAVED_STATE=0` turns this off.
 
 ### Builds at the same time
 
@@ -116,8 +130,9 @@ A compiler that runs behind kache, ccache or sccache does its work where Jato ca
 - `RUSTC_WRAPPER` is Jato for the Cargo commands Jato runs, whatever Cargo's configuration names.
 - A directory on `PATH` that holds nothing but links to such a tool under compilers' names is left out for everything Jato starts.
 - A C compiler setting of the form `kache cc`, in `CC`, `CXX`, `HOST_CC` and their relatives or in a plain `[env]` entry of Cargo's configuration, is passed to Cargo as `cc`.
+- rustdoc or rustc named by a path that is a link to such a tool, in `RUSTDOC`, `RUSTC` or under `[build]` in Cargo's configuration, is passed to Cargo by its own name. Cargo tells build scripts where both are, and some ask them for their version.
 
-Nothing is changed outside the build Jato runs, and `JATO_DISABLE=1` turns all of it off. If a build still reaches another cache's service, `jato stats` says that the build was not recorded and names the socket.
+Nothing is changed outside the build Jato runs, and `JATO_DISABLE=1` turns all of it off. If a build still reaches another cache, `jato stats` says that the build was not recorded, which program it was, and the socket or file it used.
 
 ## Work on save
 
@@ -141,12 +156,13 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `jato limit 32GiB` | Set the budget for this cache directory. Without one it is a tenth of the filesystem, at least 10 GiB and at most 100 GiB. `jato limit` prints it; `--unset` removes it. |
 | `JATO_MAX_SIZE=4GiB` | Budget for this process when none is stored with `jato limit`. |
 | `jato gc 10GiB` | Evict least-recently-used results down to this size. `jato gc` uses the budget; `jato gc 0` empties the cache. It also removes what earlier versions of Jato left in the directory. |
-| `jato stats [--json]` | Builds put back whole, compilations reused, run, left to rustc during edits or not storable; time waited for other builds; disk use. |
+| `jato stats [--json]` | Builds put back whole; Rust compilations and build scripts' C compilations reused, run, left to rustc during edits or not storable; time waited for other builds; disk use. |
 | `JATO_LOG=debug` | Say for each command whether it was reused and, if not, what had changed. An absolute path appends to that file, with times. |
 | `JATO_KEY_ENV=A,B` | Variables a procedural macro reads from the environment. |
 | `JATO_JOBS=8` | Compilers running at once across the builds sharing this cache. |
 | `JATO_EDIT_WINDOW=0` | Record every compilation, including each edit. |
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
+| `JATO_TOOLS=0` | Leave the C compilers and assemblers that build scripts start to themselves. |
 | `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state in the cache or hand it to other checkouts. |
 | `JATO_STORAGE=packed` | Keep compressed copies even where files can be cloned. |
 | `JATO_VERIFY=1` | Check the digest of restored files on a filesystem that checksums them. |
@@ -168,9 +184,10 @@ There is no daemon, and nothing runs between builds. The cache holds compiled ar
 - A command that used the network, talked to a service through a socket Jato does not know to be harmless, or opened files in a way that cannot be watched.
 - A command that changed something it had read, other than the outputs compilers and linkers rewrite in place.
 - A compilation whose source arrives on standard input.
-- Whatever depends on something that leaves no trace in files or in the variables above: the time of day, a random number, the state of a machine across the network. Such a build is not reproducible by anything.
 
-`jato stats` counts these as not storable, and `JATO_LOG=debug` says why.
+`jato stats` counts these as not storable, and `JATO_LOG=debug` says why, naming the program and the file or socket where there is one.
+
+What leaves no trace in files or in the variables above is not seen at all: the time of day, a random number, the state of a machine across the network. A C file that asks for the time it is compiled at, through `__TIME__` or `__DATE__`, is given back with the time of its first compilation, as a Rust crate whose procedural macro reads the clock is.
 
 ## Design references
 
@@ -182,4 +199,4 @@ There is no daemon, and nothing runs between builds. The cache holds compiled ar
 
 ## Development
 
-Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. The integration suite builds disposable Cargo projects and checks restored bytes, invalidation, other checkouts, procedural macros, build scripts, linkers, damaged caches and concurrent builds. Run `python3 tests/install_skill.py` to check the skill installer. Project conventions, open work and the journal live alongside the code. [AGENTS.md](AGENTS.md) · [TODO.md](TODO.md) · [JOURNAL.md](JOURNAL.md)
+Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. The integration suite builds disposable Cargo projects and checks restored bytes, invalidation, other checkouts and what is beside and above them, procedural macros, build scripts and the C they compile, linkers, damaged caches and concurrent builds. Run `python3 tests/install_skill.py` to check the skill installer. Project conventions, open work and the journal live alongside the code. [AGENTS.md](AGENTS.md) · [TODO.md](TODO.md) · [JOURNAL.md](JOURNAL.md)
