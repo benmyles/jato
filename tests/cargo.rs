@@ -12,6 +12,9 @@ use std::process::{Command, Output};
 struct Project {
     temp: tempfile::TempDir,
     root: PathBuf,
+    /// Whether builds are looked up and recorded as wholes. Most tests
+    /// are about single compilations and say how many they expect.
+    whole: bool,
 }
 
 fn write(path: impl AsRef<Path>, data: &str) {
@@ -66,7 +69,20 @@ impl Project {
         let temp = scratch();
         let root = temp.path().join(directory);
         populate(&root);
-        Self { root, temp }
+        Self {
+            root,
+            temp,
+            whole: false,
+        }
+    }
+
+    /// A project whose builds are recorded and restored as wholes, as
+    /// they are for anyone who has not asked otherwise.
+    fn whole() -> Self {
+        Self {
+            whole: true,
+            ..Self::new()
+        }
     }
 
     fn command(&self) -> Command {
@@ -97,6 +113,9 @@ impl Project {
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("RUSTC_BOOTSTRAP")
             .env_remove("LEAF_ENV");
+        if !self.whole {
+            cmd.env("JATO_WHOLE_BUILDS", "0");
+        }
         // To see why a test went as it did, name a file here.
         if let Some(log) = std::env::var_os("JATO_TEST_LOG") {
             cmd.env("JATO_LOG", log);
@@ -245,7 +264,7 @@ fn a_new_file_the_compiler_would_find_is_not_overlooked() {
 
 #[test]
 fn diagnostics_are_replayed_and_failures_are_never_reused() {
-    let p = Project::new();
+    let p = Project::whole();
     write(
         p.root.join("src/main.rs"),
         "fn main() { let unused_marker = leaf::value(); }",
@@ -413,7 +432,7 @@ fn a_build_recorded_once_is_filled_in_without_running_cargo() {
     if !observes() {
         return;
     }
-    let p = Project::new();
+    let p = Project::whole();
     write(
         p.root.join("src/main.rs"),
         "fn main() { let unused_marker = 1; println!(\"{}\", leaf::value()); }",
@@ -478,7 +497,7 @@ fn a_recorded_build_gives_way_to_anything_that_changed() {
     if !observes() {
         return;
     }
-    let p = Project::new();
+    let p = Project::whole();
     p.run(&["build"]);
     // Builds restored whole, and builds that Cargo had to carry out: under
     // watch from an empty target, or on its own in one already built.
@@ -549,7 +568,7 @@ fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
     if !observes() {
         return;
     }
-    let p = Project::new();
+    let p = Project::whole();
     // As a person would have it: results of edits made minutes apart.
     let spell = || {
         let mut cmd = p.command();
@@ -571,10 +590,12 @@ fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
     assert_eq!(p.count("stored"), stored, "{}", p.stats());
     assert_eq!(p.count("continued"), 4, "{}", p.stats());
 
-    // The state before them is still known.
+    // The state before them is still known, as a whole build.
     write(p.root.join("leaf/src/text file"), "one");
+    let known = p.count("build_hit");
     let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "one:none\n"));
-    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_hit"), known + 1, "{}", p.stats());
     assert_eq!(p.count("continued"), 4, "{}", p.stats());
 
     // After a pause the next compilation is recorded again, so that a
@@ -595,7 +616,7 @@ fn a_target_directory_filled_in_from_a_record_is_marked_as_cargo_marks_it() {
     if !observes() {
         return;
     }
-    let p = Project::new();
+    let p = Project::whole();
     // The build is recorded in a target directory that another command
     // had already made, so Cargo does not write its mark during the build.
     p.run(&["check", "-q"]);
@@ -618,23 +639,65 @@ fn tests_and_programs_start_from_a_recorded_build() {
     if !observes() {
         return;
     }
-    let p = Project::new();
+    let p = Project::whole();
     write(
         p.root.join("leaf/src/lib.rs"),
         "mod value; pub use value::value;\n#[test] fn works() { assert_eq!(value(), \"one:none\"); }",
     );
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { let unused_marker = 1; println!(\"{}\", leaf::value()); }",
+    );
     let passed = |out: &Output| String::from_utf8_lossy(&out.stdout).contains("1 passed");
-    p.run(&["test", "-p", "leaf", "--no-run"]);
-    p.run(&["build"]);
+    let said = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // The first test run makes its build where the build can be recorded
+    // whole, showing what is compiled as it goes. Cargo then finds the
+    // build done and says the rest once, as it would have alone.
+    let first = p.run(&["test", "-p", "leaf", "works", "--", "--test-threads=1"]);
+    assert!(passed(&first));
+    let text = said(&first);
+    assert_eq!(text.matches("Compiling leaf").count(), 1, "{text}");
+    assert_eq!(text.matches("Finished").count(), 1, "{text}");
+    assert_eq!(text.matches("Running").count(), 1, "{text}");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+
+    // The same for a program, whose warnings must not be shown twice.
+    let first = p.run(&["run", "arguments", "--for", "the-program"]);
+    assert_eq!(first.stdout, b"one:none\n");
+    let text = said(&first);
+    assert_eq!(text.matches("Compiling app").count(), 1, "{text}");
+    assert_eq!(text.matches("unused variable").count(), 1, "{text}");
+    assert_eq!(text.matches("Finished").count(), 1, "{text}");
     assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+
     p.clean();
     // Nothing is compiled or fetched one command at a time: the build the
-    // test needs is put back whole, and Cargo then runs the tests.
+    // test needs is put back whole, and Cargo then runs the tests. Which
+    // tests are asked for does not change the build.
     let (hits, misses) = p.during(|| assert!(passed(&p.run(&["test", "-p", "leaf"]))));
     assert_eq!((hits, misses), (0, 0), "{}", p.stats());
     let (hits, misses) = p.during(|| assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n"));
     assert_eq!((hits, misses), (0, 0), "{}", p.stats());
     assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    assert_eq!(p.count("build_miss"), 2, "{}", p.stats());
+    // Asked for by itself, either build is the one already recorded.
+    p.clean();
+    p.run(&["test", "-p", "leaf", "--no-run"]);
+    p.run(&["build"]);
+    assert_eq!(p.count("build_hit"), 4, "{}", p.stats());
+    assert_eq!(p.count("build_miss"), 2, "{}", p.stats());
+
+    // A build that fails ahead of the command is the command's to report.
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { missing_function(); }",
+    );
+    p.clean();
+    let failed = p.command().args(["run"]).output().unwrap();
+    assert_eq!(failed.status.code(), Some(101));
+    let text = said(&failed);
+    assert_eq!(text.matches("cannot find function").count(), 1, "{text}");
 }
 
 /// A procedural macro crate whose macros read things the compiler is never
@@ -906,12 +969,9 @@ fn the_same_compilation_started_twice_runs_once() {
     assert_eq!(stats["counters"]["hit"], 6, "{stats}");
 }
 
-#[test]
-fn compilations_finishing_together_in_one_build_are_all_stored() {
-    if !observes() {
-        return;
-    }
-    let p = Project::new();
+/// Make the project an application over twelve libraries that Cargo can
+/// compile all at once.
+fn twelve_parts(p: &Project) {
     let mut manifest =
         String::from("[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\n");
     let mut main = String::from("fn main() { let mut n = 0;\n");
@@ -930,6 +990,70 @@ fn compilations_finishing_together_in_one_build_are_all_stored() {
     main.push_str("println!(\"{n}\"); }");
     write(p.root.join("Cargo.toml"), &manifest);
     write(p.root.join("src/main.rs"), &main);
+}
+
+#[test]
+fn builds_sharing_a_cache_take_turns_at_the_processors() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    twelve_parts(&p);
+    // One place: Cargo starts twelve compilers and they run one at a time,
+    // whether a build's supervisor hands out the work or each compiler's
+    // wrapper is on its own.
+    success(
+        p.command()
+            .env("JATO_JOBS", "1")
+            .args(["build", "-j", "12"]),
+    );
+    let stats = p.stats();
+    assert_eq!(stats["counters"]["stored"], 13, "{stats}");
+    let queued = stats["counters"]["queued"].as_u64().unwrap_or(0);
+    assert!(queued >= 6, "{stats}");
+    for i in 0..12 {
+        write(
+            p.root.join(format!("part{i}/src/lib.rs")),
+            &format!("pub fn value() -> u32 {{ {i} + 1 }}"),
+        );
+    }
+    let out = success(
+        p.command()
+            .env("JATO_JOBS", "1")
+            .env("JATO_WHOLE_BUILDS", "0")
+            .args(["run", "-q", "-j", "12"]),
+    );
+    assert_eq!(out.stdout, b"78\n");
+    let stats = p.stats();
+    assert_eq!(stats["counters"]["stored"], 26, "{stats}");
+    assert!(
+        stats["counters"]["queued"].as_u64().unwrap_or(0) >= queued + 6,
+        "{stats}"
+    );
+    // Without a limit nothing waits.
+    p.clean();
+    for i in 0..12 {
+        write(
+            p.root.join(format!("part{i}/src/lib.rs")),
+            &format!("pub fn value() -> u32 {{ {i} + 2 }}"),
+        );
+    }
+    let before = p.count("queued");
+    success(
+        p.command()
+            .env("JATO_JOBS", "0")
+            .args(["build", "-j", "12"]),
+    );
+    assert_eq!(p.count("queued"), before, "{}", p.stats());
+}
+
+#[test]
+fn compilations_finishing_together_in_one_build_are_all_stored() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    twelve_parts(&p);
     p.run(&["build", "-j", "12"]);
     let stats = p.stats();
     assert_eq!(stats["counters"]["stored"], 13, "{stats}");

@@ -81,14 +81,18 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString]) -> Result<Option
             for _ in 0..r.count()? {
                 argv.push(os(r.bytes()?));
             }
+            let place = place(r.byte()? != 0);
+            let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
             // The supervisor is already watching this process's children.
             let (ran, _) = command::run_piped(&argv, None)?;
+            drop(place);
             let mut w = Writer(Vec::new());
             w.number(ran.code as u32 as u64);
             w.0.push(ran.success.into());
             w.optional(ran.stdout.as_deref());
             w.optional(ran.stderr.as_deref());
             w.number(ran.millis);
+            w.number(waited);
             // The result is stored before Cargo is told the command is
             // done, so whatever Cargo starts next can find it.
             if wire::send(&mut stream, &w.0).is_ok() {
@@ -102,13 +106,25 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString]) -> Result<Option
             for _ in 0..r.count()? {
                 argv.push(os(r.bytes()?));
             }
+            let place = place(r.byte()? != 0);
             drop(stream);
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]);
+            if let Some(place) = place {
+                cmd.env(crate::jobs::HELD, "1");
+                place.keep_through_exec();
+            }
             command::passthrough(cmd).map(Some)
         }
         _ => Ok(None),
     }
+}
+
+/// A place among the machine's running compilers, for a command that is
+/// one.
+fn place(compiles: bool) -> Option<crate::jobs::Place> {
+    let cache = crate::cas::cache_dir().ok()?;
+    compiles.then(|| crate::jobs::take(&cache))
 }
 
 // ---- the supervisor's side ------------------------------------------------
@@ -208,6 +224,8 @@ impl Server {
             for arg in &argv {
                 w.bytes(arg.as_bytes());
             }
+            // Whether to wait for a processor before running it.
+            w.0.push(job.facts.compiles().into());
             w
         };
         if command::continues(&job, &mut store, &recipe) {
@@ -243,6 +261,11 @@ impl Server {
             stderr: r.optional()?.map(<[u8]>::to_vec),
             millis: r.number()?,
         };
+        command::waited(
+            &job,
+            &mut store,
+            std::time::Duration::from_millis(r.number()?),
+        );
         match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
             Ok(manifest) => self.used(&job, &manifest),
             // A failed compilation fails the build. One that worked but
@@ -365,60 +388,113 @@ fn terminal() -> Option<(OwnedFd, OwnedFd)> {
     }
 }
 
+/// Words Cargo starts a line with to say what it is doing.
+const PROGRESS: &[&str] = &[
+    "Compiling",
+    "Checking",
+    "Building",
+    "Running",
+    "Fresh",
+    "Documenting",
+    "Blocking",
+    "Locking",
+    "Downloading",
+    "Downloaded",
+    "Adding",
+    "Updating",
+    "Dirty",
+];
+
+/// What kind of line Cargo printed.
+#[derive(PartialEq)]
+enum Line {
+    Progress,
+    Finished,
+    Other,
+}
+
+/// What a terminal would show of a line, which is the text after the last
+/// return to the start of the line, and what kind of line it is.
+fn shown(line: &[u8]) -> (&[u8], Line) {
+    let shown = line.rsplit(|b| *b == b'\r').find(|part| part.len() > 1);
+    let shown = shown.unwrap_or(line);
+    let mut plain = Vec::with_capacity(shown.len());
+    let mut bytes = shown.iter().copied().peekable();
+    while let Some(b) = bytes.next() {
+        if b == 0x1b && bytes.peek() == Some(&b'[') {
+            for c in bytes.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(b);
+        }
+    }
+    let text = String::from_utf8_lossy(&plain);
+    let word = text.trim_start().split(' ').next().unwrap_or_default();
+    let kind = if !text.starts_with(' ') {
+        Line::Other
+    } else if PROGRESS.contains(&word) {
+        Line::Progress
+    } else if word == "Finished" {
+        Line::Finished
+    } else {
+        Line::Other
+    };
+    (shown, kind)
+}
+
 /// What Cargo would print for a build in which nothing had to be done,
 /// taken from what it printed when everything was. Lines that report
 /// progress go; diagnostics and the summary stay, with the time it took
 /// this time.
 fn replayed(recorded: &[u8], elapsed: f64, quiet: bool) -> Vec<u8> {
-    const PROGRESS: &[&str] = &[
-        "Compiling",
-        "Checking",
-        "Building",
-        "Running",
-        "Fresh",
-        "Documenting",
-        "Blocking",
-        "Locking",
-        "Downloading",
-        "Downloaded",
-        "Adding",
-        "Updating",
-        "Dirty",
-    ];
     let mut out = Vec::with_capacity(recorded.len());
     for line in recorded.split_inclusive(|b| *b == b'\n') {
-        // What a terminal would show: the text after the last return to
-        // the start of the line, without colour changes.
-        let shown = line.rsplit(|b| *b == b'\r').find(|part| part.len() > 1);
-        let shown = shown.unwrap_or(line);
-        let mut plain = Vec::with_capacity(shown.len());
-        let mut bytes = shown.iter().copied().peekable();
-        while let Some(b) = bytes.next() {
-            if b == 0x1b && bytes.peek() == Some(&b'[') {
-                for c in bytes.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
+        match shown(line) {
+            (_, Line::Progress) => (),
+            (shown, Line::Finished) => {
+                if !quiet && let Some(at) = memchr::memmem::rfind(shown, b" in ") {
+                    out.extend_from_slice(&shown[..at]);
+                    out.extend_from_slice(format!(" in {elapsed:.2}s\n").as_bytes());
                 }
-            } else {
-                plain.push(b);
             }
+            (shown, Line::Other) => out.extend_from_slice(shown),
         }
-        let text = String::from_utf8_lossy(&plain);
-        let word = text.trim_start().split(' ').next().unwrap_or_default();
-        if PROGRESS.contains(&word) && text.starts_with(' ') {
-            continue;
-        }
-        if word == "Finished" && text.starts_with(' ') {
-            if !quiet && let Some(at) = memchr::memmem::rfind(shown, b" in ") {
-                out.extend_from_slice(&shown[..at]);
-                out.extend_from_slice(format!(" in {elapsed:.2}s\n").as_bytes());
-            }
-            continue;
-        }
-        out.extend_from_slice(shown);
     }
     out
+}
+
+/// Passes on the lines in which Cargo says what it is compiling, and
+/// nothing else. For a build made ahead of the command that was asked
+/// for: that command says the rest itself when it finds the build done.
+struct ProgressOnly<W: Write> {
+    to: W,
+    line: Vec<u8>,
+}
+
+impl<W: Write> Write for ProgressOnly<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for part in bytes.split_inclusive(|b| *b == b'\n') {
+            self.line.extend_from_slice(part);
+            if self.line.last() != Some(&b'\n') {
+                break;
+            }
+            let (text, kind) = shown(&self.line);
+            if kind == Line::Progress {
+                // Without what erases a progress bar drawn before it.
+                let text = text.strip_prefix(b"\x1b[K").unwrap_or(text);
+                self.to.write_all(text)?;
+            }
+            self.line.clear();
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.to.flush()
+    }
 }
 
 /// A Cargo command made ready to be looked up.
@@ -487,18 +563,8 @@ fn prepare(cmd: &Command, name: &str) -> Result<Option<Prepared>> {
     Ok(Some(Prepared { job, store, recipe }))
 }
 
-/// Fill in what `cmd` would build if that exact build has been recorded,
-/// without printing anything. Says whether it has.
-pub fn restore(cmd: &Command, name: &str) -> bool {
-    let Ok(Some(mut prepared)) = prepare(cmd, name) else {
-        return false;
-    };
-    let found = command::reuse(&prepared.job, &mut prepared.store, &prepared.recipe, true);
-    matches!(found, Ok(Some(_)))
-}
-
 /// Run a Cargo command that only builds, or fill in what it would build.
-pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
+pub fn build(cmd: Command, name: &str) -> Result<i32> {
     let begun = Instant::now();
     let Some(Prepared {
         job,
@@ -535,6 +601,68 @@ pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
         drop(store);
         return command::passthrough(cmd);
     }
+    let prepared = Prepared { job, store, recipe };
+    match supervise(cmd, prepared, name, begun, true)? {
+        Supervised::Ran(code) => Ok(code),
+        Supervised::Unwatched(cmd) => command::passthrough(cmd),
+    }
+}
+
+/// Get the build done that a command needs before it runs what was built:
+/// `cmd` is that command cut down to its build. A recorded build is filled
+/// in without a word. One that has to be made is made here, where it can be
+/// recorded as a whole, showing only what is being compiled; the command
+/// itself then finds it done and reports on it as it always does.
+pub fn ready(cmd: Command, name: &str) {
+    let begun = Instant::now();
+    let Ok(Some(Prepared {
+        job,
+        mut store,
+        recipe,
+    })) = prepare(&cmd, name)
+    else {
+        return;
+    };
+    match command::reuse(&job, &mut store, &recipe, true) {
+        Ok(Some(_)) => return,
+        Ok(None) => (),
+        Err(e) => log(name, format_args!("lookup failed: {e:#}")),
+    }
+    if command::mostly_built(&job, &store, &recipe) {
+        return;
+    }
+    let prepared = Prepared { job, store, recipe };
+    if let Err(e) = supervise(cmd, prepared, name, begun, false) {
+        log(
+            name,
+            format_args!("the build ahead of the command failed: {e:#}"),
+        );
+    }
+}
+
+/// How a build that was to be watched went.
+enum Supervised {
+    /// To the end, with this exit status.
+    Ran(i32),
+    /// It could not be watched and has not been started.
+    Unwatched(Command),
+}
+
+/// Run Cargo under one observer and record the build as a whole. With
+/// `whole` unset only Cargo's progress is shown, and what it printed is
+/// kept for the record alone.
+fn supervise(
+    mut cmd: Command,
+    prepared: Prepared,
+    name: &str,
+    begun: Instant,
+    whole: bool,
+) -> Result<Supervised> {
+    let Prepared {
+        job,
+        mut store,
+        recipe,
+    } = prepared;
     let terminal_out = io::stderr().is_terminal();
     store.count(job.counter("miss"), 1);
 
@@ -572,7 +700,7 @@ pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
             cmd.env_remove("JATO_SESSION")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
-            return command::passthrough(cmd);
+            return Ok(Supervised::Unwatched(cmd));
         }
     };
     // The command holds the other end of the terminal pair. Keeping a copy
@@ -607,11 +735,26 @@ pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
         libc::kill(pid, libc::SIGTERM);
     });
     let out = child.stdout.take().unwrap();
-    let copy_out = std::thread::spawn(move || command::tee(out, io::stdout()));
-    let (stderr, streamed) = match (master, child_err) {
-        (Some(master), _) => command::tee(std::fs::File::from(master), io::stderr()),
-        (None, Some(err)) => command::tee(err, io::stderr()),
+    let copy_out = std::thread::spawn(move || {
+        if whole {
+            command::tee(out, io::stdout())
+        } else {
+            command::tee(out, io::sink())
+        }
+    });
+    let from: Box<dyn io::Read> = match (master, child_err) {
+        (Some(master), _) => Box::new(std::fs::File::from(master)),
+        (None, Some(err)) => Box::new(err),
         (None, None) => bail!("the command's output could not be read"),
+    };
+    let (stderr, streamed) = if whole {
+        command::tee(from, io::stderr())
+    } else {
+        let progress = ProgressOnly {
+            to: io::stderr(),
+            line: Vec::new(),
+        };
+        command::tee(from, progress)
     };
     let (stdout, streamed_out) = copy_out
         .join()
@@ -638,7 +781,7 @@ pub fn build(mut cmd: Command, name: &str) -> Result<i32> {
     );
     let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
     store.flush();
-    Ok(ran.code)
+    Ok(Supervised::Ran(ran.code))
 }
 
 #[cfg(test)]

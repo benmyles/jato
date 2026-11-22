@@ -572,6 +572,7 @@ pub fn run_piped(argv: &[OsString], observed: Option<(&Job, &Store)>) -> Result<
     let begun = Instant::now();
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
+        .env(crate::jobs::HELD, "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (mut child, session) = match observed {
@@ -1457,6 +1458,20 @@ pub fn finish(
     recorded
 }
 
+/// Note a wait for a place among the running compilers, if there was one
+/// worth the name.
+pub fn waited(job: &Job, store: &mut Store, time: std::time::Duration) {
+    let millis = time.as_millis() as u64;
+    if millis >= 20 {
+        store.count("queued", 1);
+        store.count("queued_ms", millis);
+        log(
+            job.name(),
+            format_args!("waited {millis} ms for other builds' compilers"),
+        );
+    }
+}
+
 /// A compiler command that only this process is watching.
 fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
     let job = Job::unit(Request::current(program, args)?, None);
@@ -1488,7 +1503,18 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         (_, Some((outcome, _))) => return print(outcome),
         (lock, None) => lock,
     };
-    if continues(&job, &mut store, &recipe) {
+    let edit = continues(&job, &mut store, &recipe);
+    // The compiler will run. With other builds going on, wait for a
+    // processor to run it on.
+    let place = if job.facts.compiles() {
+        store.flush();
+        let place = crate::jobs::take(&store.dir);
+        waited(&job, &mut store, place.waited);
+        Some(place)
+    } else {
+        None
+    };
+    if edit {
         log(
             job.name(),
             "one of a run of edits: left to rustc, unrecorded",
@@ -1497,7 +1523,12 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
         drop(lock);
         drop(store);
         let argv = job.argv();
-        return passthrough(original(&argv[0], &argv[1..]));
+        let mut cmd = original(&argv[0], &argv[1..]);
+        if let Some(place) = place {
+            cmd.env(crate::jobs::HELD, "1");
+            place.keep_through_exec();
+        }
+        return passthrough(cmd);
     }
     store.count(job.counter("miss"), 1);
     let (ran, report) = match run_piped(&job.argv(), Some((&job, &store))) {
@@ -1511,6 +1542,7 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
             return passthrough(original(program, args));
         }
     };
+    drop(place);
     let _ = finish(&job, &mut store, &recipe, &ran, &report, None);
     drop(lock);
     Ok(ran.code)

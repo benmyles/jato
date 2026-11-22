@@ -2,6 +2,7 @@ mod cas;
 mod command;
 mod dev;
 mod facts;
+mod jobs;
 mod manifest;
 mod observe;
 mod roots;
@@ -19,6 +20,7 @@ mod session {
     pub fn build(cmd: std::process::Command, _: &str) -> Result<i32> {
         crate::command::passthrough(cmd)
     }
+    pub fn ready(_: std::process::Command, _: &str) {}
 }
 mod watch;
 mod wire;
@@ -108,10 +110,122 @@ fn subcommand(args: &[OsString]) -> Option<(usize, &str)> {
     None
 }
 
+/// Options of Cargo's building commands that are followed by their value.
+const VALUED: &[&str] = &[
+    "-p",
+    "--package",
+    "--exclude",
+    "-j",
+    "--jobs",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "-F",
+    "--features",
+    "--target",
+    "--target-dir",
+    "--artifact-dir",
+    "--profile",
+    "--manifest-path",
+    "--lockfile-path",
+    "--message-format",
+    "--color",
+    "--config",
+    "-Z",
+];
+
+/// Options of the same commands that stand alone.
+const ALONE: &[&str] = &[
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--workspace",
+    "--all",
+    "--all-features",
+    "--no-default-features",
+    "--release",
+    "-r",
+    "--no-run",
+    "--no-fail-fast",
+    "--keep-going",
+    "--ignore-rust-version",
+    "--locked",
+    "--offline",
+    "--frozen",
+    "--future-incompat-report",
+    "--timings",
+    "-v",
+    "-vv",
+    "--verbose",
+    "-q",
+    "--quiet",
+];
+
+/// The build a `test`, `bench` or `run` command makes before it runs
+/// anything, as a command of its own. `at` is where the subcommand stands.
+/// A name to filter tests by and the arguments of the program to run do not
+/// change what is built, so they are left out; a word that might be the
+/// value of an option this does not know is kept. None if the command has
+/// no build that can be asked for alone.
+fn build_only(args: &[OsString], at: usize) -> Option<Vec<OsString>> {
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let run = matches!(args[at].to_str(), Some("run" | "r"));
+    let mut build: Vec<OsString> = args[..at].to_vec();
+    build.push(if run {
+        "build".into()
+    } else {
+        args[at].clone()
+    });
+    let mut unknown = false;
+    let mut named = false;
+    let mut i = at + 1;
+    while i < end {
+        let arg = &args[i];
+        let text = arg.to_str()?;
+        if text == "--doc" {
+            // Documentation tests are compiled as they are run.
+            return None;
+        }
+        if text.starts_with('-') {
+            build.push(arg.clone());
+            if VALUED.contains(&text) {
+                build.push(args.get(i + 1)?.clone());
+                i += 1;
+                unknown = false;
+            } else {
+                unknown = !(ALONE.contains(&text)
+                    || text.contains('=')
+                    || VALUED
+                        .iter()
+                        .any(|flag| flag.len() == 2 && text.starts_with(flag)));
+            }
+        } else if unknown {
+            build.push(arg.clone());
+            unknown = false;
+        } else if run {
+            // The program's arguments start here.
+            break;
+        } else if named {
+            return None;
+        } else {
+            named = true;
+        }
+        i += 1;
+    }
+    if !run {
+        build.push("--no-run".into());
+    }
+    Some(build)
+}
+
 /// Run Cargo with Jato as its compiler wrapper. A command that only builds
 /// is looked up as a whole first, and recorded as a whole if it runs. One
-/// that goes on to run what it built has its build filled in when that is
-/// known, and is otherwise left to Cargo.
+/// that goes on to run what it built has its build filled in or made first,
+/// so that it too is recorded as a whole, and is then left to Cargo.
 fn cargo(args: &[OsString], options: CargoOptions) -> Result<i32> {
     let cmd = cargo_command(args, options)?;
     let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
@@ -119,15 +233,10 @@ fn cargo(args: &[OsString], options: CargoOptions) -> Result<i32> {
     match subcommand(args) {
         Some((_, "build" | "b" | "check" | "c" | "clippy")) => session::build(cmd, "cargo"),
         Some((_, "test" | "t" | "bench")) if flag("--no-run") => session::build(cmd, "cargo"),
-        Some((at, verb @ ("test" | "t" | "bench" | "run" | "r"))) => {
-            // What this command builds before it runs anything.
-            let mut build: Vec<OsString> = args[..end].to_vec();
-            if matches!(verb, "run" | "r") {
-                build[at] = "build".into();
-            } else {
-                build.insert(at + 1, "--no-run".into());
+        Some((at, "test" | "t" | "bench" | "run" | "r")) => {
+            if let Some(build) = build_only(args, at) {
+                session::ready(cargo_command(&build, options)?, "cargo");
             }
-            session::restore(&cargo_command(&build, options)?, "cargo");
             command::passthrough(cmd)
         }
         _ => command::passthrough(cmd),
@@ -267,4 +376,52 @@ fn run() -> Result<i32> {
         _ => bail!("unknown command or arguments. Run jato --help"),
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(text: &str) -> Vec<OsString> {
+        text.split(' ').map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_build_behind_a_test_or_a_program_is_asked_for_alone() {
+        let build = |text: &str| {
+            let args = words(text);
+            let at = subcommand(&args).unwrap().0;
+            build_only(&args, at).map(|b| {
+                b.iter()
+                    .map(|a| a.to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        };
+        let is = |text: &str| Some(text.to_owned());
+        assert_eq!(build("test"), is("test --no-run"));
+        assert_eq!(
+            build("test -p leaf parses_ --release -- --nocapture x"),
+            is("test -p leaf --release --no-run")
+        );
+        assert_eq!(build("+nightly t -j4 name"), is("+nightly t -j4 --no-run"));
+        assert_eq!(
+            build("bench --bench speed"),
+            is("bench --bench speed --no-run")
+        );
+        assert_eq!(
+            build("run --bin app --features=a,b one --two -- three"),
+            is("build --bin app --features=a,b")
+        );
+        assert_eq!(build("r -q"), is("build -q"));
+        // A word after an option this does not know may be its value.
+        assert_eq!(
+            build("test --strange word name"),
+            is("test --strange word --no-run")
+        );
+        // Not one build: documentation tests, and a command Cargo rejects.
+        assert_eq!(build("test --doc"), None);
+        assert_eq!(build("test one two"), None);
+        assert_eq!(build("test -p"), None);
+    }
 }
