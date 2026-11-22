@@ -10,6 +10,7 @@ through the same steps:
   restore     the target directory removed
   new_target  a target directory that has never been used
   copy        the same sources at another path, building into ./target there
+  copy_edit   one source file changed in that copy, where nothing was compiled
   edit_first  one source file changed, in the target that was restored
   edit        the median of further changes to that file
   undo        the file as it was before the changes
@@ -33,7 +34,7 @@ import tempfile
 import time
 
 TOOLS = ["cargo", "jato", "jato-wrapper", "kache", "kache-shim", "sccache"]
-STEPS = ["cold", "fresh", "restore", "new_target", "copy", "edit_first", "edit", "undo"]
+STEPS = ["cold", "fresh", "restore", "new_target", "copy", "copy_edit", "edit_first", "edit", "undo"]
 TICK = os.sysconf("SC_CLK_TCK")
 
 
@@ -247,11 +248,14 @@ def main():
                         copy.parent.mkdir()
                         copy_project(copy)
                         record("copy", step("copy", copy, copy / "target"))
+                        changed = copy / options.edit
+                        changed.write_bytes(changed.read_bytes() + f"\npub fn changed_in_the_copy_{trial}() -> u64 {{ {time.time_ns()} }}\n".encode())
+                        record("copy_edit", step("copy_edit", copy, copy / "target"))
                     edited = project / options.edit
                     original = edited.read_bytes()
                     later = []
                     for n in range(options.edits + 1):
-                        edited.write_bytes(original + f"\n// changed {trial} {n} {time.time_ns()}\n".encode())
+                        edited.write_bytes(original + f"\npub fn changed_{trial}_{n}() -> u64 {{ {time.time_ns()} }}\n".encode())
                         sample = step("edit", project, one)
                         if n == 0:
                             record("edit_first", sample)

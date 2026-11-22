@@ -400,7 +400,11 @@ impl Job {
             ),
         ];
         let extra = other.then_some("--remap-path-prefix=/nonexistent/jato/probe=/nowhere");
-        Some(self.command_line(&replaced, extra))
+        let mut argv = self.command_line(&replaced, extra);
+        // Nothing is wanted from the probe but the state it saves. Which
+        // linker runs is not among the options rustc compares.
+        argv.extend(["-C", "linker=true"].map(OsString::from));
+        Some(argv)
     }
 
     /// Files a tool keeps for its own later runs: locks, and what rustc
@@ -1563,12 +1567,13 @@ fn options_mark(job: &Job, store: &Store) -> Option<(Vec<u8>, [u8; 8])> {
             "//! Compiled to learn about the compiler.\n#![allow(warnings)]\nfn main() {}\n",
         )
         .ok()?;
-        let mut starts = Vec::new();
+        // Both at once: each is a compiler starting up and little more.
+        let mut running = Vec::new();
         for other in [false, true] {
             let dir = scratch.join(if other { "other" } else { "same" });
             fs::create_dir_all(dir.join("out")).ok()?;
             let argv = job.probe(&source, &dir, other)?;
-            let status = Command::new(&argv[0])
+            let child = Command::new(&argv[0])
                 .args(&argv[1..])
                 .current_dir(&job.request.cwd)
                 .env_clear()
@@ -1576,21 +1581,33 @@ fn options_mark(job: &Job, store: &Store) -> Option<(Vec<u8>, [u8; 8])> {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
                 .ok()?;
-            if !status.success() {
-                return None;
+            running.push((child, dir));
+        }
+        let mut starts = Vec::new();
+        let mut failed = false;
+        for (mut child, dir) in running {
+            failed |= !child.wait().is_ok_and(|status| status.success());
+            if failed {
+                continue;
             }
-            let crate_dir = fs::read_dir(dir.join("state"))
-                .ok()?
-                .flatten()
-                .next()?
-                .path();
-            let graph = finished_session(&crate_dir)?.join("dep-graph.bin");
-            let mut start = vec![0u8; 7 + 255 + 8];
-            let n = fs::File::open(graph).ok()?.read(&mut start).ok()?;
-            start.truncate(n);
-            starts.push(start);
+            let read = || {
+                let crate_dir = fs::read_dir(dir.join("state"))
+                    .ok()?
+                    .flatten()
+                    .next()?
+                    .path();
+                let graph = finished_session(&crate_dir)?.join("dep-graph.bin");
+                let mut start = vec![0u8; 7 + 255 + 8];
+                let n = fs::File::open(graph).ok()?.read(&mut start).ok()?;
+                start.truncate(n);
+                Some(start)
+            };
+            starts.push(read()?);
+        }
+        if failed {
+            return None;
         }
         let (header, mark) = state_header(&starts[0])?;
         let (other_header, other_mark) = state_header(&starts[1])?;
