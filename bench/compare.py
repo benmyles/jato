@@ -107,7 +107,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", type=Path, required=True, help="a Cargo project with a Cargo.lock; it is copied, never changed")
     parser.add_argument("--package", action="append", default=[], help="build this workspace package (repeatable)")
-    parser.add_argument("--cargo-args", nargs=argparse.REMAINDER, default=[], help="further arguments for cargo build, last on the line")
+    parser.add_argument("--command", choices=["build", "check"], default="build", help="the Cargo command each contender runs")
+    parser.add_argument("--c-compilers", choices=["alone", "own"], default="alone",
+                        help="alone: build scripts are given the C compilers by their paths, and no contender caches C. "
+                             "own: each contender handles C its own way, kache as `kache cc`, sccache as `sccache cc`, "
+                             "Jato through the names it puts on PATH")
+    parser.add_argument("--cargo-args", nargs=argparse.REMAINDER, default=[], help="further arguments for the Cargo command, last on the line")
     parser.add_argument("--edit", required=True, help="a source file, relative to the project, to append a line to")
     parser.add_argument("--verify", type=shlex.split, metavar="COMMAND",
                         help="a program under the profile directory to run after each step, with its arguments, as one word")
@@ -143,7 +148,7 @@ def main():
     for name, exe in programs.items():
         if exe:
             versions[name] = subprocess.check_output([exe, "--version"], text=True).strip()
-    build = ["build", "--locked", *[a for p in options.package for a in ("-p", p)], *options.cargo_args]
+    build = [options.command, "--locked", *[a for p in options.package for a in ("-p", p)], *options.cargo_args]
     if options.jobs:
         build += ["-j", str(options.jobs)]
     samples = {tool: {step: [] for step in STEPS} for tool in options.tools}
@@ -189,6 +194,16 @@ def main():
                            SCCACHE_SERVER_UDS=str(private / "s.sock"), SCCACHE_CONF=str(empty))
                 kind = tool.split("-")[0]
                 exe = programs.get(kind)
+                if options.c_compilers == "own":
+                    for name in ["CC", "CXX", "HOST_CC", "HOST_CXX"]:
+                        compiler = "c++" if name.endswith("CXX") else "cc"
+                        if kind in ("kache", "sccache"):
+                            # As their setups leave it for build scripts to find.
+                            env[name] = f"{exe} {compiler}"
+                        else:
+                            del env[name]
+                    if kind in ("kache", "sccache"):
+                        env["CC_KNOWN_WRAPPER_CUSTOM"] = kind
                 command = [str(cargo), *build]
                 if tool == "jato":
                     command = [str(exe), *build]
@@ -280,7 +295,8 @@ def main():
     median = {tool: {step: {key: statistics.median(s[key] for s in rows) for key in ("seconds", "cpu")}
                      for step, rows in steps.items() if rows} for tool, steps in samples.items()}
     filesystem = subprocess.run(["findmnt", "-no", "FSTYPE", "-T", options.scratch], capture_output=True, text=True).stdout.strip()
-    print(json.dumps(dict(project=source.name, packages=options.package, cargo_args=options.cargo_args, edit=options.edit,
+    print(json.dumps(dict(project=source.name, command=options.command, c_compilers=options.c_compilers,
+                          packages=options.package, cargo_args=options.cargo_args, edit=options.edit,
                           versions=versions, runs=options.runs, jobs=options.jobs, processors=os.cpu_count(),
                           kernel=platform.release(), filesystem=filesystem, median=median, samples=samples,
                           details=details), indent=2))

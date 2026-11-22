@@ -2594,8 +2594,15 @@ pub fn stand_in(program: &Path, args: &[OsString]) -> Result<i32> {
         std::os::unix::process::parent_id()
     ));
     let linking = parent.is_ok_and(|name| name.trim_end() == "rustc");
-    if !script || linking || !reads_nothing || env::var_os("JATO_DISABLE").is_some_and(|v| v == "1")
-    {
+    // A C compiler is asked many small things: its version, what kind of
+    // compiler it is, whether a file goes through the preprocessor, often
+    // about a file with a name made up for the occasion. Those answers
+    // take no time worth saving. What does is compiling a file.
+    let name = Path::new(program).file_name().and_then(OsStr::to_str);
+    let compiles = !name.is_some_and(crate::tools::c_family)
+        || args.iter().any(|arg| arg == "-c" || arg == "-S");
+    let disabled = env::var_os("JATO_DISABLE").is_some_and(|v| v == "1");
+    if !script || linking || !compiles || !reads_nothing || disabled {
         return passthrough(original(program, args));
     }
     if let Some(session) = env::var_os("JATO_SESSION")
