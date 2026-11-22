@@ -1,6 +1,6 @@
 # Jato
 
-Jato remembers Rust builds. A build that has been made before, with the same sources, settings and toolchain, is put back in well under a second: after `cargo clean`, in another target directory, or in a checkout that was created a moment ago. Builds that do have to compile go at Cargo's speed, reuse every compilation that still applies, the C that build scripts compile included, and take turns at the processors when several are started together.
+Jato remembers Rust builds. A build that has been made before, with the same sources, settings and toolchain, is put back without starting Cargo: after `cargo clean`, in another target directory, in a git worktree created a moment ago. A build of sources that differ a little from ones built before starts from that build, and Cargo compiles what changed. Builds that do have to compile go at Cargo's speed, reuse every compilation that still applies, the C that build scripts compile included, and take turns at the processors when several are started together.
 
 On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measured against kache 2.3 and bare Cargo on a 15-processor machine that was busy with other builds:
 
@@ -14,18 +14,23 @@ On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measu
 | Later edits | 8.0 | 7.8 | 9.9 |
 | The edits undone | 0.12 | 6.3 | 9.0 |
 
-Checking all 121 packages of that workspace, with the 1,100 C, C++ and assembly files its build scripts compile, at a load of 29 to 41:
+Checking all 121 packages of that workspace in a clone of its repository, with the 1,100 C, C++ and assembly files its build scripts compile. Jato 0.15 and kache ran side by side, at a load of 29 to 38:
 
 | Seconds | Jato | kache |
 | --- | ---: | ---: |
-| The same check again | 0.67 | 1.14 |
-| Target directory removed | 1.30 | 13.6 |
-| A target directory never used | 1.04 | 25.6 |
-| The sources copied to another path | 2.22 | 13.1 |
-| A function added to `olo-system` in that copy | 9.7 | 16.5 |
-| The edits undone | 0.36 | 10.3 |
+| The same check again | 0.83 | 1.37 |
+| Target directory removed | 2.2 | 18.0 |
+| A target directory never used | 2.5 | 30.3 |
+| The sources copied to another path | 3.8 | 13.2 |
+| A function added to `olo-system` in that copy | 8.4 | 16.6 |
+| Another copy, the function added before anything is built there | 14.8 | 32.8 |
+| Further edits in a built target, median | 8.5 | 24.5 |
+| The edits undone | 0.92 | 41.8 |
+| Nothing stored, nothing built | 914 | 938 |
 
-A build from nothing takes the processor time it takes with bare Cargo: 769 processor-seconds against 763. On a machine whose processors are all in use it takes longer on the clock, because every compiler is watched: the cold check of the whole workspace took 508 s against kache's 547 s when the machine was moderately busy and 1,490 s against 642 s when it was very busy, for the same processor time. On ripgrep, a small project, the restores took 0.07 to 0.34 s with Jato, 0.38 to 0.70 s with kache and 5 to 8 s with sccache, and a build from nothing 5 to 8% more processor time than bare Cargo's. [All measurements, with conditions and reproduction commands](bench/README.md)
+In a git worktree a first build with nothing changed is put back in 2 s, one with a line changed in one program takes 7 s, and the next worktree with that change 2 s again.
+
+A build from nothing takes the processor time it takes with bare Cargo: 769 processor-seconds against 763 for `olo-system`, 2,319 against kache's 2,297 for the whole workspace. On ripgrep, a small project, the restores took 0.07 to 0.34 s with Jato, 0.38 to 0.70 s with kache and 5 to 8 s with sccache, and a build from nothing 5 to 8% more processor time than bare Cargo's. [All measurements, with conditions and reproduction commands](bench/README.md)
 
 ## Get started
 
