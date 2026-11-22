@@ -11,7 +11,7 @@ use crate::scan::Digest;
 use crate::wire::{Reader, Writer};
 use anyhow::{Result, bail, ensure};
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -353,12 +353,35 @@ impl<'a> Here<'a> {
     }
 }
 
+/// The names in a directory that say nothing about what a command found
+/// there: those its own outputs are beneath, and the one that leads to the
+/// target directory, which is there or not depending on what was built
+/// before. `dir` is the directory as a root and a path beneath it, `path`
+/// the same directory in full.
+pub fn own_names<'a>(
+    dir: (u8, &Path),
+    path: &Path,
+    outputs: impl Iterator<Item = (u8, &'a Path)>,
+    roots: &Roots,
+) -> Vec<OsString> {
+    let first = |rest: &Path| rest.components().next().map(|c| c.as_os_str().to_owned());
+    let mut own: Vec<OsString> = outputs
+        .filter(|(root, _)| *root == dir.0)
+        .filter_map(|(_, output)| first(output.strip_prefix(dir.1).ok()?))
+        .collect();
+    let target = roots.path(crate::roots::TARGET);
+    own.extend(target.and_then(|target| first(target.strip_prefix(path).ok()?)));
+    own.sort();
+    own.dedup();
+    own
+}
+
 /// The names in a directory, without those in `own`.
-pub fn list(dir: &Path, own: &[&OsStr]) -> io::Result<Digest> {
+pub fn list(dir: &Path, own: &[OsString]) -> io::Result<Digest> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         let name = entry?.file_name();
-        if !own.contains(&name.as_os_str()) {
+        if !own.contains(&name) {
             names.push(name);
         }
     }
@@ -434,15 +457,11 @@ impl Manifest {
                 (_, Kind::Absent) => return Err(format!("{} is gone", path.display())),
                 (State::Dir(None), Kind::Dir) => (),
                 (State::Dir(Some(recorded)), Kind::Dir) => {
-                    let own: Vec<&OsStr> = self
+                    let outputs = self
                         .outputs
                         .iter()
-                        .filter(|out| {
-                            out.root == input.root
-                                && out.path.parent() == Some(input.path.as_path())
-                        })
-                        .filter_map(|out| out.path.file_name())
-                        .collect();
+                        .map(|out| (out.root, out.path.as_path()));
+                    let own = own_names((input.root, &input.path), &path, outputs, here.roots);
                     match list(&path, &own) {
                         Ok(names) if names == *recorded => (),
                         Ok(_) => {

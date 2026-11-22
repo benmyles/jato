@@ -780,24 +780,8 @@ mod imp {
                 }
                 nr::SYMLINK => self.at(tid, CWD, a[1], replace),
                 nr::SYMLINKAT => self.at(tid, a[1] as i32, a[2], replace),
-                nr::MKDIR => self.at(
-                    tid,
-                    CWD,
-                    a[0],
-                    Use::Write {
-                        replace: false,
-                        read: false,
-                    },
-                ),
-                nr::MKDIRAT => self.at(
-                    tid,
-                    a[0] as i32,
-                    a[1],
-                    Use::Write {
-                        replace: false,
-                        read: false,
-                    },
-                ),
+                nr::MKDIR => self.make_directory(tid, CWD, a[0]),
+                nr::MKDIRAT => self.make_directory(tid, a[0] as i32, a[1]),
                 nr::TRUNCATE => self.at(tid, CWD, a[0], replace),
                 nr::UNLINK | nr::RMDIR => self.at(tid, CWD, a[0], Use::Remove),
                 nr::UNLINKAT => self.at(tid, a[0] as i32, a[1], Use::Remove),
@@ -841,6 +825,27 @@ mod imp {
                 }
                 _ => (),
             }
+        }
+
+        /// Programs make sure of a directory by trying to create it and
+        /// every directory above it. Where one is already there the call
+        /// fails, having shown only that.
+        fn make_directory(&mut self, tid: u32, dirfd: i32, name: u64) {
+            let Some(name) = self.string(tid, name) else {
+                return;
+            };
+            let Some(path) = self.resolve(tid, dirfd, &name) else {
+                return self.incomplete("a path could not be resolved");
+            };
+            let how = if fs::symlink_metadata(&path).is_ok() {
+                Use::Probe
+            } else {
+                Use::Write {
+                    replace: false,
+                    read: false,
+                }
+            };
+            self.touch(path, how)
         }
 
         fn moved(&mut self, tid: u32, from_dir: i32, from: u64, to_dir: i32, to: u64) {

@@ -1252,14 +1252,15 @@ pub fn record(
     }
     for input in &mut manifest.inputs {
         let place = (input.root, input.path.clone());
-        let written = |name: &OsStr| {
-            outputs.iter().any(|(root, rel, _)| {
-                *root == place.0 && rel.parent() == Some(&place.1) && rel.file_name() == Some(name)
-            })
-        };
         match (&input.state, listings.remove(&place)) {
             (State::Dir(None), Some(mut names)) => {
-                names.retain(|name| !written(name));
+                // The same names are left out when the listing is compared
+                // with the directory later.
+                let own = roots.join(place.0, &place.1).map(|path| {
+                    let written = outputs.iter().map(|(root, rel, _)| (*root, rel.as_path()));
+                    crate::manifest::own_names((place.0, &place.1), &path, written, roots)
+                });
+                names.retain(|name| !own.as_ref().is_some_and(|own| own.contains(name)));
                 input.state = State::Dir(Some(observe::listing_digest(names)));
             }
             // A part listed this directory and left out its own outputs.

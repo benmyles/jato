@@ -564,6 +564,50 @@ fn a_recorded_build_gives_way_to_anything_that_changed() {
 }
 
 #[test]
+fn a_package_cargo_walks_is_recorded_with_its_target_inside_it() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // A build script that names no inputs: Cargo then looks at every file
+    // of the package, by listing the directory the target is made in.
+    write(p.root.join("build.rs"), "fn main() {}");
+    write(p.root.join("notes/idea.txt"), "first");
+    p.run(&["build"]);
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // The target directory now stands in that listing. The build is the
+    // same build with it, without it, and in a checkout that has none yet.
+    p.run(&["build"]);
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    p.clean();
+    p.run(&["build"]);
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    let copy = p.temp.path().join("second/checkout");
+    populate(&copy);
+    for file in ["build.rs", "notes/idea.txt", "Cargo.lock"] {
+        write(
+            copy.join(file),
+            &fs::read_to_string(p.root.join(file)).unwrap(),
+        );
+    }
+    success(p.command_in(&copy).args(["build"]));
+    assert_eq!(p.count("build_hit"), 3, "{}", p.stats());
+    assert_eq!(p.count("build_miss"), 1, "{}", p.stats());
+    assert_eq!(
+        success(p.command_in(&copy).args(["run", "-q"])).stdout,
+        b"one:none\n"
+    );
+    // A file added anywhere in the package is a change to it: Cargo would
+    // run the build script again.
+    for added in ["notes/another.txt", "extra.txt"] {
+        let before = p.count("build_hit");
+        write(p.root.join(added), "more");
+        p.run(&["build"]);
+        assert_eq!(p.count("build_hit"), before, "{added}: {}", p.stats());
+    }
+}
+
+#[test]
 fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
     if !observes() {
         return;
