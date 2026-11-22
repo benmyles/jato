@@ -9,9 +9,9 @@
 //! machine instead of dividing it.
 //!
 //! A place is a lock on a file, which the kernel gives up when its holder
-//! ends in any way. Whoever waits holds a second lock, the turn, while
-//! looking for a free place, so that places go to those who have waited
-//! and not to whoever asked last.
+//! ends in any way. A free place is taken without ceremony. When there is
+//! none, those waiting line up behind a second lock, the turn, and the one
+//! holding it looks for a place every few milliseconds.
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::Path;
@@ -67,34 +67,61 @@ fn take_one_of(cache: &Path, limit: usize) -> Place {
             .open(dir.join(name))
     };
     let begun = Instant::now();
-    let Ok(turn) = fs::create_dir_all(&dir).and_then(|()| open("turn")) else {
+    if fs::create_dir_all(&dir).is_err() {
+        return Place::free();
+    }
+    let mut places: Vec<Option<File>> = (0..limit).map(|_| None).collect();
+    // Compilers started together begin at different places.
+    let first = std::process::id() as usize % limit;
+    let look = |places: &mut Vec<Option<File>>| -> Result<Option<File>, ()> {
+        for at in 0..limit {
+            let i = (first + at) % limit;
+            if places[i].is_none() {
+                places[i] = open(&i.to_string()).ok();
+            }
+            let Some(file) = &places[i] else {
+                return Err(());
+            };
+            match file.try_lock() {
+                Ok(()) => return Ok(places[i].take()),
+                Err(TryLockError::WouldBlock) => (),
+                Err(TryLockError::Error(_)) => return Err(()),
+            }
+        }
+        Ok(None)
+    };
+    // A free place is taken at once, with no lock that many compilers
+    // starting together would have to pass through one by one.
+    match look(&mut places) {
+        Ok(Some(file)) => {
+            return Place {
+                file: Some(file),
+                waited: begun.elapsed(),
+            };
+        }
+        Ok(None) => (),
+        Err(()) => return Place::free(),
+    }
+    // With none free, wait in line. Whoever is first looks every few
+    // milliseconds, which is sooner than a build can start the compiler
+    // that would take a place just given up.
+    let Ok(turn) = open("turn") else {
         return Place::free();
     };
     if lock(&turn).is_err() {
         return Place::free();
     }
-    let mut places: Vec<Option<File>> = (0..limit).map(|_| None).collect();
     loop {
-        for (i, place) in places.iter_mut().enumerate() {
-            if place.is_none() {
-                *place = open(&i.to_string()).ok();
+        match look(&mut places) {
+            Ok(Some(file)) => {
+                return Place {
+                    file: Some(file),
+                    waited: begun.elapsed(),
+                };
             }
-            let Some(file) = place else {
-                return Place::free();
-            };
-            match file.try_lock() {
-                Ok(()) => {
-                    return Place {
-                        file: place.take(),
-                        waited: begun.elapsed(),
-                    };
-                }
-                Err(TryLockError::WouldBlock) => (),
-                Err(TryLockError::Error(_)) => return Place::free(),
-            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+            Err(()) => return Place::free(),
         }
-        // Only the holder of the turn looks, so looking often costs little.
-        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
