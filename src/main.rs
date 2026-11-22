@@ -1,27 +1,19 @@
-mod admission;
-mod archive;
-mod compiler;
-mod content;
+mod cas;
+mod command;
 mod dev;
-mod fingerprint;
-mod flight;
-mod invocation;
 mod keep;
-mod native;
-mod probe;
-mod sealed;
-mod staging;
-mod store;
+mod manifest;
+mod observe;
+mod roots;
+mod scan;
 mod watch;
-#[cfg(target_os = "linux")]
-mod worktree;
 
 use anyhow::{Context, Result, bail};
+use cas::{Store, cache_dir, parse_size};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
-use store::{Store, cache_dir, parse_size};
 
 const HELP: &str = "\
 Jato — a local Rust build cache and workspace edit runner
@@ -31,28 +23,29 @@ Usage
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
   jato dev [ACTION] [ARGS...]       Use the fast development profile (default build)
   jato watch [OPTIONS]             Check on save, with changed packages first
-  jato worktree [--root DIR] ACTION  Reuse builds across independent target directories
-  jato stats [--json]              Show cache contents and compiler counters
-  jato limit [SIZE|--unset]         Read or set this cache directory's shared budget
-  jato gc [SIZE]                   Evict least-recently-used entries to SIZE
+  jato stats [--json]              Show cache contents and counters
+  jato limit [SIZE|--unset]         Read or set this cache directory's budget
+  jato gc [SIZE]                   Evict least-recently-used results to SIZE
   jato --keep-build build [...]    Retain Cargo intermediates when changing target directories
-  jato --system-linker build [...]   Select /usr/bin/cc for x86_64 GNU host links
   jato --version
 
 Examples
   jato check --all-targets
   jato test -p parser -- --nocapture
   jato cargo +stable build --release
-  jato gc 256MiB
+  jato gc 20GiB
+
+To use Jato for every Cargo command, name it in ~/.cargo/config.toml:
+  [build]
+  rustc-wrapper = \"jato\"
 
 Environment
   JATO_CACHE_DIR    Private local cache, default $XDG_CACHE_HOME/jato
-  JATO_MAX_SIZE     Fallback cache budget, default 1GiB
-  JATO_LOG=debug    Explain each cache decision on stderr
-  JATO_LOG=timings  Time compiler runs, input validation, storage and restores
-  JATO_STORAGE=packed  Use compressed chunks for all new artifacts
-  JATO_COALESCE=0   Compile concurrent misses independently
-  JATO_LINK_CACHE=0  Delegate native linking directly to rustc
+  JATO_MAX_SIZE     Cache budget when none is stored with `jato limit`
+  JATO_LOG=debug    Explain each decision on stderr; an absolute path appends to that file
+  JATO_KEY_ENV      Comma-separated variables a proc macro reads from the environment
+  JATO_COALESCE=0   Let identical concurrent compilations run independently
+  JATO_REMAP=0      Leave real workspace and target paths in compiled output
   JATO_DISABLE=1    Run the compiler directly
 ";
 
@@ -68,17 +61,8 @@ fn main() {
 
 #[derive(Clone, Copy, Default)]
 struct CargoOptions {
-    system_linker: bool,
     dev: bool,
     keep_build: bool,
-}
-
-impl CargoOptions {
-    fn set_build_dir(self, cmd: &mut Command) {
-        if self.keep_build {
-            keep::configure(cmd);
-        }
-    }
 }
 
 fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
@@ -89,9 +73,8 @@ fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
         cmd.args(args);
     }
     cmd.env("RUSTC_WRAPPER", env::current_exe()?);
-    options.set_build_dir(&mut cmd);
-    if options.system_linker {
-        set_system_linker(&mut cmd)?;
+    if options.keep_build {
+        keep::configure(&mut cmd);
     }
     if env::var_os("JATO_CACHE_DIR").is_some() {
         cmd.env("JATO_CACHE_DIR", cache_dir()?);
@@ -99,37 +82,16 @@ fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
     Ok(cmd)
 }
 
-fn set_system_linker(cmd: &mut Command) -> Result<()> {
-    anyhow::ensure!(
-        cfg!(all(
-            target_arch = "x86_64",
-            target_os = "linux",
-            target_env = "gnu"
-        )) && Path::new("/usr/bin/cc").is_file(),
-        "--system-linker needs the x86_64 Linux GNU system C driver"
-    );
-    cmd.env(
-        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-        "/usr/bin/cc",
-    );
-    Ok(())
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / 1048576.0)
 }
 
 fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    #[cfg(target_os = "linux")]
-    if args.first().is_some_and(|a| a == "__worktree-launch") {
-        return worktree::enter(&args[1..]);
-    }
-    dispatch(&args)
-}
-
-fn dispatch(args: &[OsString]) -> Result<i32> {
     let mut options = CargoOptions::default();
-    let mut args = args;
+    let mut args = &args[..];
     while let Some(flag) = args.first() {
         match flag.to_str() {
-            Some("--system-linker") => options.system_linker = true,
             Some("--keep-build") => options.keep_build = true,
             Some("dev") => options.dev = true,
             _ => break,
@@ -151,57 +113,64 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
         {
             let mut build = vec![OsString::from("build")];
             build.extend_from_slice(args);
-            return compiler::passthrough(cargo_command(&build, options)?);
+            return command::passthrough(cargo_command(&build, options)?);
         }
     }
     let first = args.first().map(OsString::as_os_str);
-    let verb = first.and_then(OsStr::to_str);
-    match verb {
+    match first.and_then(OsStr::to_str) {
         Some("--version" | "-V") => println!("jato {}", env!("CARGO_PKG_VERSION")),
-        Some("--help" | "-h" | "help") => {
-            print!("{HELP}")
-        }
+        Some("--help" | "-h" | "help") => print!("{HELP}"),
         Some("check" | "build" | "test" | "run" | "clippy") => {
-            return compiler::passthrough(cargo_command(args, options)?);
+            return command::passthrough(cargo_command(args, options)?);
         }
         Some("watch") => return watch::run(&args[1..], options),
-        #[cfg(target_os = "linux")]
-        Some("worktree") => return worktree::run(&args[1..], options),
-        #[cfg(not(target_os = "linux"))]
-        Some("worktree") => bail!("worktree views require Linux and bubblewrap"),
-        Some("cargo") => return compiler::passthrough(cargo_command(&args[1..], options)?),
+        Some("cargo") => return command::passthrough(cargo_command(&args[1..], options)?),
+        // Started by this program to see a command's stragglers out.
+        Some("__answer") if args.len() == 2 => {
+            let fd = args[1].to_str().and_then(|s| s.parse().ok());
+            return Ok(observe::answer(fd.context("bad descriptor")?));
+        }
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
             if args.len() == 2 {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
-            } else {
-                let hits = stats.counters.get("hit").copied().unwrap_or(0);
-                let misses = stats.counters.get("miss").copied().unwrap_or(0);
-                println!("Cache     {}", stats.directory.display());
-                println!("Lookups   {hits} hits, {misses} compiler runs after lookup");
+                return Ok(0);
+            }
+            let count = |name: &str| stats.counters.get(name).copied().unwrap_or(0);
+            let (hits, misses) = (count("hit"), count("miss"));
+            println!("Cache      {}", stats.directory.display());
+            println!(
+                "Commands   {hits} reused, {misses} run ({} of those could not be stored)",
+                count("uncacheable")
+            );
+            if hits + misses > 0 {
                 println!(
-                    "Database  {:.2} MiB across SQLite files",
-                    stats.database_bytes as f64 / 1048576.0
+                    "Reuse      {:.1}% of commands, {:.1} s of compiler time not spent",
+                    100.0 * hits as f64 / (hits + misses) as f64,
+                    count("saved_ms") as f64 / 1000.0
                 );
-                println!(
-                    "Entries   {} ({} unique chunks)",
-                    stats.entries, stats.chunks
-                );
-                println!(
-                    "Storage   {} charged bytes / {} budget",
-                    stats.charged_bytes, stats.limit_bytes
-                );
-                println!(
-                    "Payload   {} packed bytes + {} sealed bytes + {} patch bytes for {} artifact bytes",
-                    stats.compressed_bytes,
-                    stats.sealed_bytes,
-                    stats.patch_bytes,
-                    stats.artifact_bytes
-                );
-                for (name, value) in stats.counters {
-                    if name != "hit" && name != "miss" {
-                        println!("{name:<20} {value}");
-                    }
+            }
+            println!(
+                "Results    {} stored, {} distinct files",
+                stats.entries, stats.objects
+            );
+            println!(
+                "Disk       {} of {} budget, holding {} of outputs",
+                mib(stats.stored_bytes),
+                mib(stats.limit_bytes),
+                mib(stats.artifact_bytes)
+            );
+            println!(
+                "Index      {}, {} file digests remembered",
+                mib(stats.database_bytes),
+                stats.remembered_files
+            );
+            for (name, value) in &stats.counters {
+                if !matches!(
+                    name.as_str(),
+                    "hit" | "miss" | "uncacheable" | "saved_ms" | "stored"
+                ) {
+                    println!("{name:<18} {value}");
                 }
             }
         }
@@ -221,9 +190,14 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
                 .get(1)
                 .map(|a| parse_size(a.to_str().context("size must be UTF-8")?))
                 .transpose()?;
-            println!("Evicted {} entries", Store::open()?.prune(limit)?);
+            let (evicted, earlier) = Store::open()?.prune(limit)?;
+            println!("Evicted {evicted} results");
+            if earlier > 0 {
+                println!("Removed {} left by earlier versions of Jato", mib(earlier));
+            }
         }
-        None if first.is_none() => print!("{HELP}"),
+        None => print!("{HELP}"),
+        // Cargo runs its compiler wrapper as `jato <compiler> <arguments>`.
         _ if first.is_some_and(|driver| {
             Path::new(driver).components().count() > 1
                 || driver == "rustc"
@@ -239,7 +213,7 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
                     }))
         }) =>
         {
-            return compiler::wrap(first.unwrap(), &args[1..]);
+            return command::wrap(first.unwrap(), &args[1..]);
         }
         _ => bail!("unknown command or arguments. Run jato --help"),
     }

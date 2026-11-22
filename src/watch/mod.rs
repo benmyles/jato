@@ -7,7 +7,7 @@ mod events;
 mod tree;
 mod workspace;
 
-use crate::{CargoOptions, cargo_command, compiler};
+use crate::{CargoOptions, cargo_command, command};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
@@ -400,7 +400,7 @@ pub fn run(args: &[OsString], cargo: CargoOptions) -> Result<i32> {
             eprintln!(
                 "jato watch: finished in {:.2}s (exit {})",
                 running.start.elapsed().as_secs_f64(),
-                compiler::exit_code(status)
+                command::exit_code(status)
             );
             job = None;
         }

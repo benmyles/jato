@@ -1,0 +1,554 @@
+//! What a command's result depended on, and whether that still holds.
+//!
+//! A manifest lists every path the command examined with what was there:
+//! a file's digest, a directory, the names in a directory, or nothing. It
+//! also lists the environment variables, program lookups and directories the
+//! result is tied to. A result is reused only when all of it holds again.
+use crate::cas::Store;
+use crate::observe::{Kind, Stamp, kind_of, listing_digest};
+use crate::roots::Roots;
+use crate::scan::Digest;
+use anyhow::{Context as _, Result, bail, ensure};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    Absent,
+    /// A directory, and the digest of its entry names if they were read.
+    Dir(Option<Digest>),
+    File(Digest),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Input {
+    pub root: u8,
+    pub path: PathBuf,
+    /// Where the path led, if it was itself a symbolic link.
+    pub link: Option<Vec<u8>>,
+    pub state: State,
+}
+
+/// A root and a path beneath it.
+pub type Place = (u8, PathBuf);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Manifest {
+    pub inputs: Vec<Input>,
+    /// Environment variables the result depends on, with roots marked.
+    pub env: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Program names looked up on PATH, and where each was found.
+    pub which: Vec<(Vec<u8>, Option<Place>)>,
+    /// Roots whose location the outputs contain.
+    pub pins: Vec<(u8, PathBuf)>,
+    /// The terminal width, if the diagnostics were laid out for one.
+    pub width: Option<Option<u16>>,
+    /// Whether the diagnostics were coloured, if any were rendered.
+    pub ansi: Option<bool>,
+    /// Files the command wrote. They do not count as entries of the
+    /// directories it listed.
+    pub outputs: Vec<(u8, PathBuf)>,
+    /// Files from before the command that it removed.
+    pub removed: Vec<(u8, PathBuf)>,
+}
+
+const MAX_MANIFEST: usize = 64 << 20;
+
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn number(&mut self, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                return self.0.push(byte);
+            }
+            self.0.push(byte | 0x80);
+        }
+    }
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.number(bytes.len() as u64);
+        self.0.extend_from_slice(bytes);
+    }
+    fn path(&mut self, root: u8, path: &Path) {
+        self.0.push(root);
+        self.bytes(path.as_os_str().as_bytes());
+    }
+    fn optional(&mut self, bytes: Option<&[u8]>) {
+        match bytes {
+            Some(bytes) => {
+                self.0.push(1);
+                self.bytes(bytes)
+            }
+            None => self.0.push(0),
+        }
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn byte(&mut self) -> Result<u8> {
+        let (first, rest) = self.0.split_first().context("truncated manifest")?;
+        self.0 = rest;
+        Ok(*first)
+    }
+    fn number(&mut self) -> Result<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = self.byte()?;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        bail!("malformed manifest number")
+    }
+    fn count(&mut self) -> Result<usize> {
+        let n = self.number()? as usize;
+        // Every item takes at least a byte.
+        ensure!(n <= self.0.len(), "malformed manifest count");
+        Ok(n)
+    }
+    fn bytes(&mut self) -> Result<&'a [u8]> {
+        let len = self.number()? as usize;
+        ensure!(len <= self.0.len(), "truncated manifest");
+        let (bytes, rest) = self.0.split_at(len);
+        self.0 = rest;
+        Ok(bytes)
+    }
+    fn path(&mut self) -> Result<(u8, PathBuf)> {
+        let root = self.byte()?;
+        ensure!(root <= crate::roots::TARGET, "unknown manifest root");
+        Ok((root, PathBuf::from(OsStr::from_bytes(self.bytes()?))))
+    }
+    fn optional(&mut self) -> Result<Option<&'a [u8]>> {
+        Ok(match self.byte()? {
+            0 => None,
+            _ => Some(self.bytes()?),
+        })
+    }
+    fn digest(&mut self) -> Result<Digest> {
+        ensure!(self.0.len() >= 32, "truncated manifest");
+        let (digest, rest) = self.0.split_at(32);
+        self.0 = rest;
+        Ok(digest.try_into().unwrap())
+    }
+}
+
+impl Manifest {
+    /// Put the lists in the one order that identifies their contents.
+    pub fn normalize(&mut self) {
+        self.inputs
+            .sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
+        self.inputs
+            .dedup_by(|a, b| (a.root, &a.path) == (b.root, &b.path));
+        self.env.sort();
+        self.env.dedup_by(|a, b| a.0 == b.0);
+        self.which.sort();
+        self.which.dedup_by(|a, b| a.0 == b.0);
+        self.pins.sort();
+        self.outputs.sort();
+        self.outputs.dedup();
+        self.removed.sort();
+        self.removed.dedup();
+    }
+
+    fn conditions(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::with_capacity(self.inputs.len() * 96));
+        w.number(self.inputs.len() as u64);
+        for input in &self.inputs {
+            w.path(input.root, &input.path);
+            w.optional(input.link.as_deref());
+            match &input.state {
+                State::Absent => w.0.push(0),
+                State::Dir(None) => w.0.push(1),
+                State::Dir(Some(names)) => {
+                    w.0.push(2);
+                    w.0.extend_from_slice(names)
+                }
+                State::File(digest) => {
+                    w.0.push(3);
+                    w.0.extend_from_slice(digest)
+                }
+            }
+        }
+        w.number(self.env.len() as u64);
+        for (name, value) in &self.env {
+            w.bytes(name);
+            w.optional(value.as_deref());
+        }
+        w.number(self.which.len() as u64);
+        for (name, found) in &self.which {
+            w.bytes(name);
+            match found {
+                Some((root, path)) => {
+                    w.0.push(1);
+                    w.path(*root, path)
+                }
+                None => w.0.push(0),
+            }
+        }
+        w.number(self.pins.len() as u64);
+        for (root, path) in &self.pins {
+            w.path(*root, path);
+        }
+        match self.width {
+            None => w.0.push(0),
+            Some(None) => w.0.push(1),
+            Some(Some(width)) => {
+                w.0.push(2);
+                w.number(width.into())
+            }
+        }
+        w.0.push(match self.ansi {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        });
+        w.0
+    }
+
+    /// Identifies a command together with everything its result depends on.
+    pub fn key(&self, recipe: &Digest) -> Digest {
+        let mut hash = blake3::Hasher::new_derive_key("jato command result v1");
+        hash.update(recipe);
+        hash.update(&self.conditions());
+        *hash.finalize().as_bytes()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut w = Writer(self.conditions());
+        for list in [&self.outputs, &self.removed] {
+            w.number(list.len() as u64);
+            for (root, path) in list {
+                w.path(*root, path);
+            }
+        }
+        ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
+        Ok(zstd::bulk::compress(&w.0, 1)?)
+    }
+
+    pub fn decode(stored: &[u8]) -> Result<Self> {
+        let raw = zstd::bulk::decompress(stored, MAX_MANIFEST)?;
+        let mut r = Reader(&raw);
+        let mut m = Manifest::default();
+        for _ in 0..r.count()? {
+            let (root, path) = r.path()?;
+            let link = r.optional()?.map(<[u8]>::to_vec);
+            let state = match r.byte()? {
+                0 => State::Absent,
+                1 => State::Dir(None),
+                2 => State::Dir(Some(r.digest()?)),
+                3 => State::File(r.digest()?),
+                _ => bail!("unknown manifest state"),
+            };
+            m.inputs.push(Input {
+                root,
+                path,
+                link,
+                state,
+            });
+        }
+        for _ in 0..r.count()? {
+            let name = r.bytes()?.to_vec();
+            m.env.push((name, r.optional()?.map(<[u8]>::to_vec)));
+        }
+        for _ in 0..r.count()? {
+            let name = r.bytes()?.to_vec();
+            let found = match r.byte()? {
+                0 => None,
+                _ => Some(r.path()?),
+            };
+            m.which.push((name, found));
+        }
+        for _ in 0..r.count()? {
+            m.pins.push(r.path()?);
+        }
+        m.width = match r.byte()? {
+            0 => None,
+            1 => Some(None),
+            _ => Some(Some(u16::try_from(r.number()?)?)),
+        };
+        m.ansi = match r.byte()? {
+            0 => None,
+            1 => Some(false),
+            _ => Some(true),
+        };
+        for list in [&mut m.outputs, &mut m.removed] {
+            for _ in 0..r.count()? {
+                list.push(r.path()?);
+            }
+        }
+        ensure!(r.0.is_empty(), "trailing manifest bytes");
+        Ok(m)
+    }
+}
+
+/// The first program called `name` that the directories of PATH offer.
+pub fn which(name: &OsStr, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter().map(|dir| dir.join(name)).find(|path| {
+        path.is_file()
+            && std::ffi::CString::new(path.as_os_str().as_bytes())
+                .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
+    })
+}
+
+pub fn path_dirs(cwd: &Path) -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| cwd.join(dir))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The situation a manifest is checked against.
+pub struct Here<'a> {
+    pub roots: &'a Roots,
+    pub path: &'a [PathBuf],
+    pub width: Option<u16>,
+    pub ansi: bool,
+    /// What each path was found to be, kept across the candidates of one
+    /// lookup so no file is examined twice.
+    seen: HashMap<PathBuf, Seen>,
+}
+
+#[derive(Clone)]
+struct Seen {
+    link: Option<Vec<u8>>,
+    kind: Kind,
+    stamp: Option<Stamp>,
+    digest: Option<Digest>,
+}
+
+impl<'a> Here<'a> {
+    pub fn new(roots: &'a Roots, path: &'a [PathBuf], width: Option<u16>, ansi: bool) -> Self {
+        Self {
+            roots,
+            path,
+            width,
+            ansi,
+            seen: HashMap::new(),
+        }
+    }
+
+    fn examine(&mut self, path: &Path) -> io::Result<Seen> {
+        if let Some(seen) = self.seen.get(path) {
+            return Ok(seen.clone());
+        }
+        let absent = |e: &io::Error| {
+            matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            )
+        };
+        let seen = match fs::symlink_metadata(path) {
+            Err(e) if absent(&e) => Seen {
+                link: None,
+                kind: Kind::Absent,
+                stamp: None,
+                digest: None,
+            },
+            Err(e) => return Err(e),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = fs::read_link(path)?;
+                let link = Some(self.roots.mark_os(target.as_os_str()).into_owned());
+                match fs::metadata(path) {
+                    Ok(meta) => Seen {
+                        link,
+                        kind: kind_of(&meta),
+                        stamp: Some(Stamp::of(&meta)),
+                        digest: None,
+                    },
+                    Err(e) if absent(&e) => Seen {
+                        link,
+                        kind: Kind::Absent,
+                        stamp: None,
+                        digest: None,
+                    },
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(meta) => Seen {
+                link: None,
+                kind: kind_of(&meta),
+                stamp: Some(Stamp::of(&meta)),
+                digest: None,
+            },
+        };
+        self.seen.insert(path.to_owned(), seen.clone());
+        Ok(seen)
+    }
+}
+
+/// The names in a directory, without those in `own`.
+pub fn list(dir: &Path, own: &[&OsStr]) -> io::Result<Digest> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if !own.contains(&name.as_os_str()) {
+            names.push(name);
+        }
+    }
+    Ok(listing_digest(names))
+}
+
+impl Manifest {
+    /// Whether everything this manifest records holds here. An error says
+    /// what does not.
+    pub fn holds(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
+        for (root, recorded) in &self.pins {
+            if here.roots.path(*root) != Some(recorded.as_path()) {
+                return Err(format!(
+                    "its output names {}, which is not where this build is",
+                    recorded.display()
+                ));
+            }
+        }
+        if let Some(width) = self.width
+            && width != here.width
+        {
+            return Err("its diagnostics were laid out for another terminal width".into());
+        }
+        if let Some(ansi) = self.ansi
+            && ansi != here.ansi
+        {
+            return Err("its diagnostics were rendered with different colour settings".into());
+        }
+        for (name, recorded) in &self.env {
+            let name = OsStr::from_bytes(name);
+            let current = std::env::var_os(name);
+            let current = current.as_ref().map(|v| here.roots.mark_os(v));
+            if current.as_deref() != recorded.as_deref() {
+                return Err(format!(
+                    "the environment variable {} changed",
+                    name.to_string_lossy()
+                ));
+            }
+        }
+        for (name, recorded) in &self.which {
+            let name = OsStr::from_bytes(name);
+            let found = which(name, here.path);
+            let found = found.as_deref().map(|p| here.roots.split(p));
+            let recorded = recorded
+                .as_ref()
+                .map(|(root, path)| (*root, path.as_path()));
+            if found != recorded {
+                return Err(format!(
+                    "PATH now finds a different {}",
+                    name.to_string_lossy()
+                ));
+            }
+        }
+        for input in &self.inputs {
+            let Some(path) = here.roots.join(input.root, &input.path) else {
+                return Err("it was recorded with a target directory this command lacks".into());
+            };
+            let seen = here
+                .examine(&path)
+                .map_err(|e| format!("{} cannot be examined: {e}", path.display()))?;
+            if seen.link != input.link {
+                return Err(format!("{} is a different link", path.display()));
+            }
+            let changed = || Err(format!("{} changed", path.display()));
+            match (&input.state, seen.kind) {
+                (State::Absent, Kind::Absent) => (),
+                (State::Absent, _) => return Err(format!("{} now exists", path.display())),
+                (_, Kind::Absent) => return Err(format!("{} is gone", path.display())),
+                (State::Dir(None), Kind::Dir) => (),
+                (State::Dir(Some(recorded)), Kind::Dir) => {
+                    let own: Vec<&OsStr> = self
+                        .outputs
+                        .iter()
+                        .filter(|(root, out)| {
+                            *root == input.root && out.parent() == Some(input.path.as_path())
+                        })
+                        .filter_map(|(_, out)| out.file_name())
+                        .collect();
+                    match list(&path, &own) {
+                        Ok(names) if names == *recorded => (),
+                        Ok(_) => {
+                            return Err(format!("the entries of {} changed", path.display()));
+                        }
+                        Err(e) => return Err(format!("{}: {e}", path.display())),
+                    }
+                }
+                (State::File(recorded), Kind::File) => {
+                    let digest = match seen.digest {
+                        Some(digest) => digest,
+                        None => {
+                            let digest = store
+                                .digest_known(&path, seen.stamp.unwrap())
+                                .map_err(|e| format!("{}: {e}", path.display()))?;
+                            if let Some(seen) = here.seen.get_mut(&path) {
+                                seen.digest = Some(digest);
+                            }
+                            digest
+                        }
+                    };
+                    if digest != *recorded {
+                        return changed();
+                    }
+                }
+                _ => return changed(),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_manifest_survives_storage_and_its_key_ignores_what_it_wrote() {
+        let mut m = Manifest {
+            inputs: vec![
+                Input {
+                    root: 1,
+                    path: "src/lib.rs".into(),
+                    link: None,
+                    state: State::File([7; 32]),
+                },
+                Input {
+                    root: 0,
+                    path: "/usr/lib/x".into(),
+                    link: Some(b"y".to_vec()),
+                    state: State::Dir(Some([9; 32])),
+                },
+                Input {
+                    root: 2,
+                    path: "debug/missing".into(),
+                    link: None,
+                    state: State::Absent,
+                },
+            ],
+            env: vec![(b"B".to_vec(), None), (b"A".to_vec(), Some(b"1".to_vec()))],
+            which: vec![(b"cc".to_vec(), Some((0, "/usr/bin/cc".into())))],
+            pins: vec![(1, "/home/a/ws".into())],
+            width: Some(Some(120)),
+            ansi: Some(true),
+            outputs: vec![(2, "debug/a.rlib".into())],
+            removed: vec![],
+        };
+        m.normalize();
+        let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
+        assert_eq!(decoded, m);
+        let key = m.key(&[1; 32]);
+        assert_ne!(key, m.key(&[2; 32]));
+        let mut other = m.clone();
+        other.outputs.clear();
+        assert_eq!(other.key(&[1; 32]), key);
+        other.inputs[0].state = State::Absent;
+        assert_ne!(other.key(&[1; 32]), key);
+        assert!(Manifest::decode(b"junk").is_err());
+    }
+}

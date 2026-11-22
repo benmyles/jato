@@ -1,4 +1,4 @@
-use crate::{cargo_command, store};
+use crate::{cargo_command, cas};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -119,7 +119,7 @@ impl Workspace {
         }
         members.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
         excluded.push(meta.target_directory);
-        let cache = store::cache_dir()?;
+        let cache = cas::cache_dir()?;
         if roots.iter().any(|r| r.starts_with(&cache)) {
             for name in [
                 "artifacts-v1.sqlite3",
