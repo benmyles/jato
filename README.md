@@ -2,7 +2,19 @@
 
 Jato remembers Rust builds. A build that has been made before, with the same sources, settings and toolchain, is put back in well under a second: after `cargo clean`, in another target directory, or in a checkout that was created a moment ago. Builds that do have to compile go at Cargo's speed, and several of them started together take turns at the processors.
 
-MEASUREMENTS
+On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measured against kache 2.3 and bare Cargo on a 15-processor machine that was busy with other builds:
+
+| Seconds | Jato | kache | Cargo |
+| --- | ---: | ---: | ---: |
+| Nothing stored, nothing built | 130 | 139 | 142 |
+| The same build again | 0.07 | 0.45 | 0.48 |
+| Target directory removed | 0.17 | 2.4 | as cold |
+| A target directory never used | 0.30 | 1.5 | as cold |
+| The sources copied to another path | 0.22 | 4.3 | as cold |
+| An edit to the top crate | 1.9 | 4.4 | 2.2 |
+| The edit undone | 0.07 | 2.6 | 2.4 |
+
+On ripgrep the same steps took 0.04 to 0.07 s with Jato, 0.18 to 0.41 s with kache and 4 to 16 s with sccache. One thing no cache changes: the first edit of a crate in a restored target compiles that crate from scratch. [All measurements, with conditions and reproduction commands](bench/README.md)
 
 ## Get started
 
@@ -94,6 +106,16 @@ rustc-wrapper = "jato"
 ```
 
 Whole builds are recorded and restored only by Jato's own commands, which is the faster way for anything large. A workspace wrapper such as Clippy's keeps working beneath Jato. Cargo runs build scripts and test programs itself.
+
+### Alongside another compiler cache
+
+A compiler that runs behind kache, ccache or sccache does its work where Jato cannot watch it, so nothing it takes part in could be recorded. Jato therefore starts compilers directly:
+
+- `RUSTC_WRAPPER` is Jato for the Cargo commands Jato runs, whatever Cargo's configuration names.
+- A directory on `PATH` that holds nothing but links to such a tool under compilers' names is left out for everything Jato starts.
+- A C compiler setting of the form `kache cc`, in `CC`, `CXX`, `HOST_CC` and their relatives or in a plain `[env]` entry of Cargo's configuration, is passed to Cargo as `cc`.
+
+Nothing is changed outside the build Jato runs, and `JATO_DISABLE=1` turns all of it off. If a build still reaches another cache's service, `jato stats` says that the build was not recorded and names the socket.
 
 ## Work on save
 

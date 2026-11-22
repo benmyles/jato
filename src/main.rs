@@ -203,7 +203,7 @@ fn c_compilers_alone(cwd: &Path) -> Vec<(String, String)> {
 
 fn main() {
     // Once per build: what this process starts inherits the result.
-    if env::var_os("JATO_PATH").is_none() {
+    if env::var_os("JATO_PATH").is_none() && env::var_os("JATO_DISABLE").is_none_or(|v| v != "1") {
         if let Some(path) = env::var_os("PATH")
             && let Some(cleaned) = without_launchers(&path)
         {

@@ -1,0 +1,176 @@
+{
+  "project": "ripgrep-14.1.1",
+  "packages": [],
+  "builds": 8,
+  "versions": {
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "jato": "jato 0.12.0",
+    "kache": "kache 2.3.0"
+  },
+  "processors": 16,
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "runs": 2,
+  "samples": {
+    "cargo": [
+      {
+        "seconds": 46.67,
+        "each": [
+          46.19,
+          46.47,
+          46.47,
+          46.47,
+          46.47,
+          46.67,
+          46.67,
+          46.67
+        ],
+        "cpu": 223.3,
+        "peak_compilers": 117,
+        "peak_runnable": 4,
+        "peak_rss_mib": 14326,
+        "load_before": 27.4
+      },
+      {
+        "seconds": 116.41,
+        "each": [
+          115.54,
+          115.54,
+          115.54,
+          115.54,
+          115.54,
+          115.54,
+          116.41,
+          116.41
+        ],
+        "cpu": 235.1,
+        "peak_compilers": 112,
+        "peak_runnable": 4,
+        "peak_rss_mib": 13927,
+        "load_before": 96.7
+      }
+    ],
+    "jato": [
+      {
+        "seconds": 74.62,
+        "each": [
+          73.47,
+          73.47,
+          73.47,
+          73.47,
+          74.46,
+          74.62,
+          74.62,
+          74.62
+        ],
+        "cpu": 224.9,
+        "peak_compilers": 15,
+        "peak_runnable": 3,
+        "peak_rss_mib": 4119,
+        "load_before": 76.7,
+        "queued": 293,
+        "queued_seconds": 1708.4
+      },
+      {
+        "seconds": 102.91,
+        "each": [
+          98.11,
+          101.56,
+          101.56,
+          101.56,
+          102.91,
+          102.91,
+          102.91,
+          102.91
+        ],
+        "cpu": 242.3,
+        "peak_compilers": 15,
+        "peak_runnable": 4,
+        "peak_rss_mib": 3884,
+        "load_before": 70.1,
+        "queued": 289,
+        "queued_seconds": 1939.0
+      }
+    ],
+    "jato-unlimited": [
+      {
+        "seconds": 94.95,
+        "each": [
+          87.85,
+          90.77,
+          90.78,
+          90.78,
+          93.72,
+          93.72,
+          94.95,
+          94.95
+        ],
+        "cpu": 243.9,
+        "peak_compilers": 119,
+        "peak_runnable": 30,
+        "peak_rss_mib": 12678,
+        "load_before": 67.5,
+        "queued": 0,
+        "queued_seconds": 0.0
+      },
+      {
+        "seconds": 226.35,
+        "each": [
+          222.31,
+          222.39,
+          224.16,
+          224.16,
+          226.35,
+          226.35,
+          226.35,
+          226.35
+        ],
+        "cpu": 280.9,
+        "peak_compilers": 120,
+        "peak_runnable": 45,
+        "peak_rss_mib": 12857,
+        "load_before": 62.5,
+        "queued": 0,
+        "queued_seconds": 0.0
+      }
+    ],
+    "kache": [
+      {
+        "seconds": 78.12,
+        "each": [
+          77.87,
+          77.87,
+          77.87,
+          77.87,
+          77.87,
+          77.87,
+          78.12,
+          78.12
+        ],
+        "cpu": 224.9,
+        "peak_compilers": 16,
+        "peak_runnable": 32,
+        "peak_rss_mib": 3835,
+        "load_before": 76.5
+      },
+      {
+        "seconds": 389.5,
+        "each": [
+          337.69,
+          379.32,
+          379.32,
+          383.94,
+          383.94,
+          383.94,
+          383.94,
+          389.5
+        ],
+        "cpu": 289.9,
+        "peak_compilers": 16,
+        "peak_runnable": 39,
+        "peak_rss_mib": 3793,
+        "load_before": 74.2
+      }
+    ]
+  }
+}

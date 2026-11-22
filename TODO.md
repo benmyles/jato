@@ -21,3 +21,4 @@
 - [ ] Notice a crate Cargo believes is up to date although a file only the compiler examined has changed, and have it compiled again. Whole builds already see this; a build Cargo carries out itself does not.
 - [ ] Record the builds of `jato test --doc`, and of a target directory set only in a Cargo configuration file, relative to that directory.
 - [ ] Say why a build was not reused in one line without `JATO_LOG`, on request: `jato why`.
+- [ ] C that a build script compiles from the workspace carries the workspace's location in its debug information, which keeps the whole build with that checkout. Pass the compiler the same aliases rustc gets.

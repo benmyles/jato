@@ -11,8 +11,10 @@
 - Added a limit on running compilers shared by all builds using a cache, kept as file locks so a killed build gives its places back.
 - Fixed while measuring: the umask was read by setting it, from several threads; a restored target lacked Cargo's CACHEDIR.TAG, so compilers started there later were not recognized as writing to it; making a directory that already existed counted as changing it, which kept builds of packages with a plain build script from being recorded; a listing included the target directory when it happened to exist.
 - `jato test`, `bench` and `run` make the build they need on its own when it is not recorded, so it is recorded whole, and stop for good when interrupted during it.
-- Rewrote the comparison harness. RIPGREP
-- OLO
+- Rewrote the comparison harness: private stores, daemons, project copies and targets, the built program run after every step. On Olo's `olo-system`, one run at a load of 26 to 36: cold 130 s against kache 2.3's 139 s and Cargo's 142 s; target removed 0.17 s against 2.39 s; new target 0.30 s against 1.54 s; copied checkout 0.22 s against 4.30 s; fresh 0.07 s against 0.45 s; undo 0.07 s against 2.61 s. Both caches compile the edited crate from scratch on the first edit after a restore: 21.6 s and 30.7 s, where Cargo's own target takes 2.3 s.
+- On ripgrep, medians of three: restores 0.05 to 0.07 s against kache's 0.29 to 0.41 s and sccache's 5 to 16 s; cold 8.4 s against 9.2 s, 13.6 s and Cargo's 9.0 s, at 25.4 processor-seconds against Cargo's 25.1.
+- Eight ripgrep builds started together ran 119 compilers and held 12.7 GiB without the limit, 15 compilers and 4.1 GiB with it, and used 8 to 14% less processor time. kache's daemon already limited compilers this way.
+- The machine has kache's stand-ins for `cc` and `cargo` first on PATH and `HOST_CC = "kache cc"` in Cargo's configuration. Every link went through kache's daemon, where it could not be watched. Jato now leaves such directories out of PATH and names the C compiler alone for the builds it runs, and `jato stats` says why the last build was not recorded.
 - Qualified with 19 unit and 38 Cargo-project tests on Rust 1.100 and 1.89, including upstream mold and the pinned nightly's split metadata.
 
 ## 2026-11-21 — macro-generated assembly and producer provenance
