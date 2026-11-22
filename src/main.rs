@@ -285,6 +285,17 @@ fn report(stats: &cas::Stats) -> String {
             count("build_stored")
         );
     }
+    if let Some((ago, why)) = &stats.unrecorded {
+        let ago = match *ago {
+            s if s < 120 => format!("{s} s"),
+            s if s < 7200 => format!("{} min", s / 60),
+            s => format!("{} h", s / 3600),
+        };
+        let _ = writeln!(
+            out,
+            "           the last build made was not recorded ({ago} ago): {why}"
+        );
+    }
     let (hits, misses, edits) = (count("hit"), count("miss"), count("continued"));
     let _ = writeln!(
         out,

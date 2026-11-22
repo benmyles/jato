@@ -1456,6 +1456,9 @@ pub fn finish(
             log(job.name(), format_args!("not stored: {why}"));
         }
     }
+    if job.scope == Scope::Build {
+        store.note_unrecorded(recorded.as_ref().err().map(String::as_str));
+    }
     recorded
 }
 

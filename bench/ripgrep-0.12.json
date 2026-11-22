@@ -1,0 +1,1323 @@
+{
+  "project": "ripgrep-14.1.1",
+  "packages": [],
+  "cargo_args": [],
+  "edit": "crates/core/main.rs",
+  "versions": {
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "jato": "jato 0.12.0",
+    "kache": "kache 2.3.0",
+    "sccache": "sccache 0.19.0"
+  },
+  "runs": 3,
+  "jobs": null,
+  "processors": 16,
+  "kernel": "7.3.4-300.fc45.x86_64",
+  "filesystem": "btrfs",
+  "median": {
+    "cargo": {
+      "cold": {
+        "seconds": 8.986,
+        "cpu": 25.11
+      },
+      "fresh": {
+        "seconds": 0.031,
+        "cpu": 0.03
+      },
+      "restore": {
+        "seconds": 7.083,
+        "cpu": 23.4
+      },
+      "new_target": {
+        "seconds": 8.87,
+        "cpu": 24.77
+      },
+      "copy": {
+        "seconds": 8.409,
+        "cpu": 23.79
+      },
+      "edit_first": {
+        "seconds": 0.542,
+        "cpu": 0.77
+      },
+      "edit": {
+        "seconds": 0.514,
+        "cpu": 0.76
+      },
+      "undo": {
+        "seconds": 0.435,
+        "cpu": 0.76
+      }
+    },
+    "jato": {
+      "cold": {
+        "seconds": 8.379,
+        "cpu": 25.35
+      },
+      "fresh": {
+        "seconds": 0.012,
+        "cpu": 0.01
+      },
+      "restore": {
+        "seconds": 0.062,
+        "cpu": 0.08
+      },
+      "new_target": {
+        "seconds": 0.05,
+        "cpu": 0.07
+      },
+      "copy": {
+        "seconds": 0.075,
+        "cpu": 0.09
+      },
+      "edit_first": {
+        "seconds": 1.748,
+        "cpu": 3.72
+      },
+      "edit": {
+        "seconds": 0.455,
+        "cpu": 0.71
+      },
+      "undo": {
+        "seconds": 0.04,
+        "cpu": 0.04
+      }
+    },
+    "jato-wrapper": {
+      "cold": {
+        "seconds": 11.744,
+        "cpu": 25.04
+      },
+      "fresh": {
+        "seconds": 0.032,
+        "cpu": 0.03
+      },
+      "restore": {
+        "seconds": 0.168,
+        "cpu": 0.33
+      },
+      "new_target": {
+        "seconds": 0.142,
+        "cpu": 0.32
+      },
+      "copy": {
+        "seconds": 0.163,
+        "cpu": 0.34
+      },
+      "edit_first": {
+        "seconds": 3.189,
+        "cpu": 3.86
+      },
+      "edit": {
+        "seconds": 0.629,
+        "cpu": 0.74
+      },
+      "undo": {
+        "seconds": 0.052,
+        "cpu": 0.05
+      }
+    },
+    "kache": {
+      "cold": {
+        "seconds": 9.192,
+        "cpu": 25.18
+      },
+      "fresh": {
+        "seconds": 0.03,
+        "cpu": 0.03
+      },
+      "restore": {
+        "seconds": 0.413,
+        "cpu": 1.11
+      },
+      "new_target": {
+        "seconds": 0.291,
+        "cpu": 0.46
+      },
+      "copy": {
+        "seconds": 0.397,
+        "cpu": 0.64
+      },
+      "edit_first": {
+        "seconds": 3.078,
+        "cpu": 4.28
+      },
+      "edit": {
+        "seconds": 0.686,
+        "cpu": 0.76
+      },
+      "undo": {
+        "seconds": 0.178,
+        "cpu": 0.11
+      }
+    },
+    "sccache": {
+      "cold": {
+        "seconds": 13.626,
+        "cpu": 27.65
+      },
+      "fresh": {
+        "seconds": 0.033,
+        "cpu": 0.03
+      },
+      "restore": {
+        "seconds": 5.224,
+        "cpu": 12.44
+      },
+      "new_target": {
+        "seconds": 15.648,
+        "cpu": 28.34
+      },
+      "copy": {
+        "seconds": 8.23,
+        "cpu": 26.6
+      },
+      "edit_first": {
+        "seconds": 0.628,
+        "cpu": 0.79
+      },
+      "edit": {
+        "seconds": 0.444,
+        "cpu": 0.75
+      },
+      "undo": {
+        "seconds": 0.397,
+        "cpu": 0.73
+      }
+    }
+  },
+  "samples": {
+    "cargo": {
+      "cold": [
+        {
+          "seconds": 10.833,
+          "cpu": 25.44,
+          "load": 33.2,
+          "compiled": 33
+        },
+        {
+          "seconds": 6.89,
+          "cpu": 23.93,
+          "load": 32.6,
+          "compiled": 33
+        },
+        {
+          "seconds": 8.986,
+          "cpu": 25.11,
+          "load": 22.8,
+          "compiled": 33
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.024,
+          "cpu": 0.02,
+          "load": 31.4,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.039,
+          "cpu": 0.03,
+          "load": 31.3,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.031,
+          "cpu": 0.03,
+          "load": 22.0,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 13.809,
+          "cpu": 25.09,
+          "load": 31.4,
+          "compiled": 33
+        },
+        {
+          "seconds": 7.083,
+          "cpu": 23.4,
+          "load": 31.3,
+          "compiled": 33
+        },
+        {
+          "seconds": 6.121,
+          "cpu": 22.58,
+          "load": 22.0,
+          "compiled": 33
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 10.591,
+          "cpu": 26.28,
+          "load": 30.0,
+          "compiled": 33
+        },
+        {
+          "seconds": 8.87,
+          "cpu": 24.77,
+          "load": 30.1,
+          "compiled": 33
+        },
+        {
+          "seconds": 6.296,
+          "cpu": 22.66,
+          "load": 21.3,
+          "compiled": 33
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 9.621,
+          "cpu": 24.49,
+          "load": 28.4,
+          "compiled": 33
+        },
+        {
+          "seconds": 8.409,
+          "cpu": 23.79,
+          "load": 29.2,
+          "compiled": 33
+        },
+        {
+          "seconds": 6.383,
+          "cpu": 22.84,
+          "load": 20.5,
+          "compiled": 33
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 0.542,
+          "cpu": 0.87,
+          "load": 30.8,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.424,
+          "cpu": 0.77,
+          "load": 29.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.633,
+          "cpu": 0.71,
+          "load": 20.5,
+          "compiled": 1
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.514,
+          "cpu": 0.76,
+          "load": 30.8,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.419,
+          "cpu": 0.8,
+          "load": 28.4,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.573,
+          "cpu": 0.69,
+          "load": 20.5,
+          "compiled": 1
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 1.209,
+          "cpu": 0.76,
+          "load": 30.8,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.435,
+          "cpu": 0.78,
+          "load": 28.4,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.405,
+          "cpu": 0.64,
+          "load": 20.5,
+          "compiled": 1
+        }
+      ]
+    },
+    "jato": {
+      "cold": [
+        {
+          "seconds": 9.524,
+          "cpu": 25.95,
+          "load": 31.5,
+          "compiled": 33
+        },
+        {
+          "seconds": 8.379,
+          "cpu": 25.35,
+          "load": 28.5,
+          "compiled": 33
+        },
+        {
+          "seconds": 7.408,
+          "cpu": 25.12,
+          "load": 20.5,
+          "compiled": 33
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.012,
+          "cpu": 0.01,
+          "load": 29.9,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.011,
+          "cpu": 0.01,
+          "load": 27.1,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.02,
+          "cpu": 0.01,
+          "load": 19.6,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 0.063,
+          "cpu": 0.07,
+          "load": 29.9,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.045,
+          "cpu": 0.09,
+          "load": 27.1,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.062,
+          "cpu": 0.08,
+          "load": 19.6,
+          "compiled": 0
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.059,
+          "cpu": 0.08,
+          "load": 29.9,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.05,
+          "cpu": 0.07,
+          "load": 27.1,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.047,
+          "cpu": 0.07,
+          "load": 19.6,
+          "compiled": 0
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 0.073,
+          "cpu": 0.09,
+          "load": 29.9,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.075,
+          "cpu": 0.09,
+          "load": 27.1,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.082,
+          "cpu": 0.08,
+          "load": 19.6,
+          "compiled": 0
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 1.666,
+          "cpu": 3.5,
+          "load": 29.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 1.748,
+          "cpu": 3.72,
+          "load": 27.1,
+          "compiled": 1
+        },
+        {
+          "seconds": 2.512,
+          "cpu": 4.03,
+          "load": 19.6,
+          "compiled": 1
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.437,
+          "cpu": 0.81,
+          "load": 29.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.455,
+          "cpu": 0.71,
+          "load": 28.5,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.536,
+          "cpu": 0.68,
+          "load": 19.3,
+          "compiled": 1
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.039,
+          "cpu": 0.04,
+          "load": 29.9,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.04,
+          "cpu": 0.04,
+          "load": 28.5,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.044,
+          "cpu": 0.04,
+          "load": 19.3,
+          "compiled": 0
+        }
+      ]
+    },
+    "jato-wrapper": {
+      "cold": [
+        {
+          "seconds": 11.949,
+          "cpu": 25.04,
+          "load": 29.9,
+          "compiled": 33
+        },
+        {
+          "seconds": 11.744,
+          "cpu": 28.26,
+          "load": 28.5,
+          "compiled": 33
+        },
+        {
+          "seconds": 7.467,
+          "cpu": 24.74,
+          "load": 28.4,
+          "compiled": 33
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.036,
+          "cpu": 0.03,
+          "load": 28.9,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.032,
+          "cpu": 0.03,
+          "load": 27.0,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.029,
+          "cpu": 0.03,
+          "load": 27.3,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 0.177,
+          "cpu": 0.33,
+          "load": 28.9,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.168,
+          "cpu": 0.34,
+          "load": 27.0,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.148,
+          "cpu": 0.33,
+          "load": 26.4,
+          "compiled": 33
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.182,
+          "cpu": 0.33,
+          "load": 28.9,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.139,
+          "cpu": 0.32,
+          "load": 26.0,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.142,
+          "cpu": 0.32,
+          "load": 26.4,
+          "compiled": 33
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 0.183,
+          "cpu": 0.34,
+          "load": 28.9,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.163,
+          "cpu": 0.38,
+          "load": 26.0,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.138,
+          "cpu": 0.34,
+          "load": 26.4,
+          "compiled": 33
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 4.19,
+          "cpu": 3.86,
+          "load": 28.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 3.189,
+          "cpu": 4.6,
+          "load": 26.0,
+          "compiled": 1
+        },
+        {
+          "seconds": 1.562,
+          "cpu": 3.54,
+          "load": 26.4,
+          "compiled": 1
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.629,
+          "cpu": 0.82,
+          "load": 29.2,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.773,
+          "cpu": 0.69,
+          "load": 26.0,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.453,
+          "cpu": 0.74,
+          "load": 26.4,
+          "compiled": 1
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.052,
+          "cpu": 0.05,
+          "load": 29.8,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.048,
+          "cpu": 0.05,
+          "load": 25.1,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.073,
+          "cpu": 0.04,
+          "load": 26.4,
+          "compiled": 1
+        }
+      ]
+    },
+    "kache": {
+      "cold": [
+        {
+          "seconds": 10.067,
+          "cpu": 25.18,
+          "load": 29.8,
+          "compiled": 33
+        },
+        {
+          "seconds": 9.192,
+          "cpu": 25.9,
+          "load": 25.1,
+          "compiled": 33
+        },
+        {
+          "seconds": 6.721,
+          "cpu": 23.46,
+          "load": 27.2,
+          "compiled": 33
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.03,
+          "cpu": 0.03,
+          "load": 27.1,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.03,
+          "cpu": 0.03,
+          "load": 24.4,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.028,
+          "cpu": 0.03,
+          "load": 26.2,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 0.413,
+          "cpu": 1.11,
+          "load": 27.1,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.433,
+          "cpu": 1.04,
+          "load": 24.4,
+          "compiled": 33
+        },
+        {
+          "seconds": 0.393,
+          "cpu": 1.14,
+          "load": 26.2,
+          "compiled": 33
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 0.279,
+          "cpu": 0.46,
+          "load": 27.1,
+          "compiled": 10
+        },
+        {
+          "seconds": 0.291,
+          "cpu": 0.48,
+          "load": 24.4,
+          "compiled": 10
+        },
+        {
+          "seconds": 0.299,
+          "cpu": 0.44,
+          "load": 26.2,
+          "compiled": 10
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 0.397,
+          "cpu": 0.64,
+          "load": 27.1,
+          "compiled": 10
+        },
+        {
+          "seconds": 0.4,
+          "cpu": 0.65,
+          "load": 24.4,
+          "compiled": 10
+        },
+        {
+          "seconds": 0.31,
+          "cpu": 0.64,
+          "load": 26.2,
+          "compiled": 10
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 3.078,
+          "cpu": 4.23,
+          "load": 27.1,
+          "compiled": 1
+        },
+        {
+          "seconds": 3.008,
+          "cpu": 4.3,
+          "load": 24.4,
+          "compiled": 1
+        },
+        {
+          "seconds": 4.012,
+          "cpu": 4.28,
+          "load": 26.2,
+          "compiled": 1
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.686,
+          "cpu": 0.76,
+          "load": 25.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.452,
+          "cpu": 0.76,
+          "load": 24.1,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.704,
+          "cpu": 0.7,
+          "load": 24.9,
+          "compiled": 1
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.259,
+          "cpu": 0.11,
+          "load": 25.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.082,
+          "cpu": 0.08,
+          "load": 24.1,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.178,
+          "cpu": 0.16,
+          "load": 28.8,
+          "compiled": 1
+        }
+      ]
+    },
+    "sccache": {
+      "cold": [
+        {
+          "seconds": 13.626,
+          "cpu": 27.65,
+          "load": 25.5,
+          "compiled": 33
+        },
+        {
+          "seconds": 14.984,
+          "cpu": 29.01,
+          "load": 24.1,
+          "compiled": 33
+        },
+        {
+          "seconds": 7.291,
+          "cpu": 25.17,
+          "load": 28.8,
+          "compiled": 33
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.03,
+          "cpu": 0.03,
+          "load": 30.4,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.033,
+          "cpu": 0.03,
+          "load": 25.5,
+          "compiled": 0
+        },
+        {
+          "seconds": 0.037,
+          "cpu": 0.03,
+          "load": 26.9,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 5.224,
+          "cpu": 12.44,
+          "load": 29.9,
+          "compiled": 33
+        },
+        {
+          "seconds": 13.998,
+          "cpu": 12.97,
+          "load": 25.5,
+          "compiled": 33
+        },
+        {
+          "seconds": 3.966,
+          "cpu": 11.44,
+          "load": 26.9,
+          "compiled": 33
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 15.674,
+          "cpu": 29.25,
+          "load": 28.8,
+          "compiled": 33
+        },
+        {
+          "seconds": 15.648,
+          "cpu": 28.34,
+          "load": 29.4,
+          "compiled": 33
+        },
+        {
+          "seconds": 5.903,
+          "cpu": 23.7,
+          "load": 25.7,
+          "compiled": 33
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 7.709,
+          "cpu": 26.6,
+          "load": 30.9,
+          "compiled": 33
+        },
+        {
+          "seconds": 13.649,
+          "cpu": 28.82,
+          "load": 32.8,
+          "compiled": 33
+        },
+        {
+          "seconds": 8.23,
+          "cpu": 24.8,
+          "load": 25.8,
+          "compiled": 33
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 0.736,
+          "cpu": 0.79,
+          "load": 28.5,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.628,
+          "cpu": 0.83,
+          "load": 33.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.463,
+          "cpu": 0.76,
+          "load": 24.0,
+          "compiled": 1
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 0.498,
+          "cpu": 0.75,
+          "load": 28.5,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.444,
+          "cpu": 0.82,
+          "load": 33.9,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.374,
+          "cpu": 0.75,
+          "load": 24.0,
+          "compiled": 1
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.45,
+          "cpu": 0.71,
+          "load": 28.5,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.397,
+          "cpu": 0.73,
+          "load": 32.6,
+          "compiled": 1
+        },
+        {
+          "seconds": 0.388,
+          "cpu": 0.81,
+          "load": 22.8,
+          "compiled": 1
+        }
+      ]
+    }
+  },
+  "details": {
+    "cargo": [
+      {
+        "store_bytes": 0,
+        "store_extents": null,
+        "target_bytes": 344145318,
+        "target_extents": {
+          "total": 345772032,
+          "exclusive": 345772032,
+          "shared": 0
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 0
+      },
+      {
+        "store_bytes": 0,
+        "store_extents": null,
+        "target_bytes": 344145317,
+        "target_extents": {
+          "total": 345772032,
+          "exclusive": 345772032,
+          "shared": 0
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 0
+      },
+      {
+        "store_bytes": 0,
+        "store_extents": null,
+        "target_bytes": 344145332,
+        "target_extents": {
+          "total": 345772032,
+          "exclusive": 345772032,
+          "shared": 0
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 0
+      }
+    ],
+    "jato": [
+      {
+        "store_bytes": 225996656,
+        "store_extents": {
+          "total": 226013184,
+          "exclusive": 720896,
+          "shared": 161767424
+        },
+        "target_bytes": 344030415,
+        "target_extents": {
+          "total": 345653248,
+          "exclusive": 120360960,
+          "shared": 161767424
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 226264456,
+        "counters": {
+          "build_hit": 5,
+          "build_left_to_cargo": 4,
+          "build_miss": 1,
+          "build_stored": 1,
+          "continued": 4,
+          "hashed_bytes": 995687705,
+          "miss": 40,
+          "query_hit": 1,
+          "query_miss": 3,
+          "query_stored": 3,
+          "restored_bytes": 832131474,
+          "saved_ms": 45821,
+          "stored": 39
+        }
+      },
+      {
+        "store_bytes": 225996656,
+        "store_extents": {
+          "total": 226013184,
+          "exclusive": 720896,
+          "shared": 200630272
+        },
+        "target_bytes": 344030407,
+        "target_extents": {
+          "total": 345653248,
+          "exclusive": 120360960,
+          "shared": 200630272
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 226272696,
+        "counters": {
+          "build_hit": 5,
+          "build_left_to_cargo": 4,
+          "build_miss": 1,
+          "build_stored": 1,
+          "continued": 4,
+          "hashed_bytes": 951452852,
+          "miss": 40,
+          "query_hit": 1,
+          "query_miss": 3,
+          "query_stored": 3,
+          "restored_bytes": 832131474,
+          "saved_ms": 40349,
+          "stored": 39
+        }
+      },
+      {
+        "store_bytes": 226000752,
+        "store_extents": {
+          "total": 226017280,
+          "exclusive": 724992,
+          "shared": 159559680
+        },
+        "target_bytes": 344030422,
+        "target_extents": {
+          "total": 345653248,
+          "exclusive": 120360960,
+          "shared": 159559680
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 226268552,
+        "counters": {
+          "build_hit": 5,
+          "build_left_to_cargo": 4,
+          "build_miss": 1,
+          "build_stored": 1,
+          "continued": 4,
+          "hashed_bytes": 1040296101,
+          "miss": 40,
+          "query_hit": 1,
+          "query_miss": 3,
+          "query_stored": 3,
+          "restored_bytes": 832131474,
+          "saved_ms": 35723,
+          "stored": 39
+        }
+      }
+    ],
+    "jato-wrapper": [
+      {
+        "store_bytes": 226328277,
+        "store_extents": {
+          "total": 226377728,
+          "exclusive": 1085440,
+          "shared": 160923648
+        },
+        "target_bytes": 344032023,
+        "target_extents": {
+          "total": 345653248,
+          "exclusive": 120360960,
+          "shared": 160923648
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 226451445,
+        "counters": {
+          "continued": 4,
+          "hashed_bytes": 559228014,
+          "hit": 118,
+          "miss": 43,
+          "query_hit": 13,
+          "query_miss": 3,
+          "query_stored": 3,
+          "restored_bytes": 728291935,
+          "saved_ms": 90847,
+          "stored": 39
+        }
+      },
+      {
+        "store_bytes": 226352973,
+        "store_extents": {
+          "total": 226418688,
+          "exclusive": 1110016,
+          "shared": 201195520
+        },
+        "target_bytes": 344031999,
+        "target_extents": {
+          "total": 345669632,
+          "exclusive": 120360960,
+          "shared": 201195520
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 226665757,
+        "counters": {
+          "continued": 4,
+          "hashed_bytes": 640428304,
+          "hit": 118,
+          "miss": 43,
+          "query_hit": 13,
+          "query_miss": 3,
+          "query_stored": 3,
+          "restored_bytes": 728291935,
+          "saved_ms": 99095,
+          "stored": 39
+        }
+      },
+      {
+        "store_bytes": 226348781,
+        "store_extents": {
+          "total": 226398208,
+          "exclusive": 1105920,
+          "shared": 146526208
+        },
+        "target_bytes": 344032039,
+        "target_extents": {
+          "total": 345653248,
+          "exclusive": 120360960,
+          "shared": 146526208
+        },
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 226414317,
+        "counters": {
+          "continued": 4,
+          "hashed_bytes": 655489357,
+          "hit": 118,
+          "miss": 43,
+          "query_hit": 13,
+          "query_miss": 3,
+          "query_stored": 3,
+          "restored_bytes": 728291935,
+          "saved_ms": 67660,
+          "stored": 39
+        }
+      }
+    ],
+    "kache": [
+      {
+        "store_bytes": 217360461,
+        "store_extents": {
+          "total": 217288704,
+          "exclusive": 4677632,
+          "shared": 186933248
+        },
+        "target_bytes": 244594945,
+        "target_extents": {
+          "total": 244604928,
+          "exclusive": 360448,
+          "shared": 211931136
+        },
+        "daemon_rss_kib": 21540,
+        "store_bytes_end": 217565775
+      },
+      {
+        "store_bytes": 217360439,
+        "store_extents": {
+          "total": 217288704,
+          "exclusive": 4677632,
+          "shared": 165478400
+        },
+        "target_bytes": 244594945,
+        "target_extents": {
+          "total": 244604928,
+          "exclusive": 360448,
+          "shared": 190447616
+        },
+        "daemon_rss_kib": 21428,
+        "store_bytes_end": 217549249
+      },
+      {
+        "store_bytes": 217364556,
+        "store_extents": {
+          "total": 217292800,
+          "exclusive": 4681728,
+          "shared": 183209984
+        },
+        "target_bytes": 244594945,
+        "target_extents": {
+          "total": 244604928,
+          "exclusive": 360448,
+          "shared": 208207872
+        },
+        "daemon_rss_kib": 21108,
+        "store_bytes_end": 217528694
+      }
+    ],
+    "sccache": [
+      {
+        "store_bytes": 28411661,
+        "store_extents": {
+          "total": 28471296,
+          "exclusive": 28471296,
+          "shared": 0
+        },
+        "target_bytes": 344149112,
+        "target_extents": {
+          "total": 345772032,
+          "exclusive": 345772032,
+          "shared": 0
+        },
+        "daemon_rss_kib": 16036,
+        "store_bytes_end": 85235189
+      },
+      {
+        "store_bytes": 28411672,
+        "store_extents": {
+          "total": 28471296,
+          "exclusive": 28471296,
+          "shared": 0
+        },
+        "target_bytes": 344149134,
+        "target_extents": {
+          "total": 345772032,
+          "exclusive": 345772032,
+          "shared": 0
+        },
+        "daemon_rss_kib": 13792,
+        "store_bytes_end": 85235216
+      },
+      {
+        "store_bytes": 28411678,
+        "store_extents": {
+          "total": 28471296,
+          "exclusive": 28471296,
+          "shared": 0
+        },
+        "target_bytes": 344149102,
+        "target_extents": {
+          "total": 345772032,
+          "exclusive": 345772032,
+          "shared": 0
+        },
+        "daemon_rss_kib": 20324,
+        "store_bytes_end": 85235226
+      }
+    ]
+  }
+}

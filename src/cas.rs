@@ -163,6 +163,9 @@ pub struct Stats {
     pub objects: u64,
     pub remembered_files: u64,
     pub counters: BTreeMap<String, u64>,
+    /// Why the latest build that ran under watch was not recorded as a
+    /// whole, and how many seconds ago that was.
+    pub unrecorded: Option<(u64, String)>,
 }
 
 pub struct Candidate {
@@ -1178,7 +1181,35 @@ impl Store {
             objects: one("SELECT count(*) FROM objects")?,
             remembered_files: one("SELECT count(*) FROM stamps")?,
             counters,
+            unrecorded: self
+                .conn
+                .query_row(
+                    "SELECT value FROM settings WHERE name='unrecorded'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .unwrap_or(None)
+                .and_then(|noted| {
+                    let (at, why) = noted.split_once('\t')?;
+                    let ago = (now() / 1_000_000 - at.parse::<i64>().ok()?).max(0);
+                    Some((ago as u64, why.to_owned()))
+                }),
         })
+    }
+
+    /// Keep why a build could not be recorded as a whole, or forget the
+    /// last such reason once one has been.
+    pub fn note_unrecorded(&mut self, why: Option<&str>) {
+        let _ = match why {
+            Some(why) => self.conn.execute(
+                "INSERT INTO settings VALUES('unrecorded',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                [format!("{}\t{why}", now() / 1_000_000)],
+            ),
+            None => self
+                .conn
+                .execute("DELETE FROM settings WHERE name='unrecorded'", []),
+        };
     }
 }
 
