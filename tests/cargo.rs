@@ -807,6 +807,51 @@ fn compilers_are_not_started_through_another_cache_s_stand_ins() {
 }
 
 #[test]
+fn a_c_compiler_configured_behind_another_cache_is_named_alone() {
+    let p = Project::new();
+    // As a compiler cache's setup leaves it for build scripts to find.
+    write(
+        p.root.join(".cargo/config.toml"),
+        "[build]\nincremental = true\n\n[env]\nHOST_CC = \"ccache cc\" # theirs\nHOST_CXX = \"g++\"\n",
+    );
+    write(
+        p.root.join("build.rs"),
+        r#"fn main() {
+            let read = |name| std::env::var(name).unwrap_or_default();
+            let found = format!("{}|{}", read("HOST_CC"), read("HOST_CXX"));
+            std::fs::write(std::path::Path::new(&read("OUT_DIR")).join("found.txt"), found).unwrap();
+            println!("cargo:rerun-if-env-changed=HOST_CC");
+        }"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() { println!("{}", include_str!(concat!(env!("OUT_DIR"), "/found.txt"))); }"#,
+    );
+    // Whatever the environment these tests run in says about compilers.
+    let command = || {
+        let mut cmd = p.command();
+        cmd.env_remove("HOST_CC").env_remove("HOST_CXX");
+        cmd
+    };
+    let found = |cmd: &mut Command| String::from_utf8(success(cmd.args(["run", "-q"])).stdout);
+    assert_eq!(found(&mut command()).unwrap(), "cc|g++\n");
+    // What the person set for this command themselves is theirs to set.
+    assert_eq!(
+        found(command().env("HOST_CC", "clang")).unwrap(),
+        "clang|g++\n"
+    );
+    assert_eq!(
+        found(command().env("HOST_CC", "sccache clang")).unwrap(),
+        "clang|g++\n"
+    );
+    // Without Jato, Cargo applies its configuration as written.
+    assert_eq!(
+        found(command().env("JATO_DISABLE", "1")).unwrap(),
+        "ccache cc|g++\n"
+    );
+}
+
+#[test]
 fn stopping_the_build_ahead_of_a_test_stops_the_command() {
     use std::io::{BufRead, BufReader, Read};
     if !observes() {

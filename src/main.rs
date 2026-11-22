@@ -121,6 +121,86 @@ fn without_launchers(path: &OsStr) -> Option<OsString> {
         .flatten()
 }
 
+/// Whether `name` is one of the variables build scripts take a C or C++
+/// compiler from: CC, CXX, and those with HOST_ or TARGET_ before or a
+/// target after.
+fn names_c_compiler(name: &str) -> bool {
+    let name = name
+        .strip_prefix("HOST_")
+        .or_else(|| name.strip_prefix("TARGET_"))
+        .unwrap_or(name);
+    ["CC", "CXX"].iter().any(|base| {
+        name.strip_prefix(base)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    })
+}
+
+/// The compiler in a setting like `kache cc`: what follows the launcher.
+fn behind_launcher(value: &str) -> Option<&str> {
+    let (first, rest) = value.trim().split_once(char::is_whitespace)?;
+    let program = Path::new(first).file_name()?.to_str()?;
+    (LAUNCHERS.contains(&program) && !rest.trim().is_empty()).then(|| rest.trim())
+}
+
+/// C compiler settings that would start the compiler through a launcher,
+/// with the compiler alone as the value to use instead. They come from the
+/// environment and from the `[env]` tables of Cargo's configuration, which
+/// Cargo applies to build scripts where the environment says nothing. Only
+/// the plainest form of such a table entry is recognized: `NAME = "value"`.
+fn c_compilers_alone(cwd: &Path) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for (name, value) in env::vars_os() {
+        if let (Some(name), Some(value)) = (name.to_str(), value.to_str())
+            && names_c_compiler(name)
+            && let Some(compiler) = behind_launcher(value)
+        {
+            found.push((name.to_owned(), compiler.to_owned()));
+        }
+    }
+    // Nearest first, as Cargo ranks them; its own home directory last.
+    let mut files: Vec<_> = cwd
+        .ancestors()
+        .map(|dir| dir.join(".cargo/config.toml"))
+        .collect();
+    let home = env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| Path::new(&home).join(".cargo")));
+    files.extend(home.map(|home| home.join("config.toml")));
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let mut table = "";
+        for line in text.lines().map(str::trim) {
+            if let Some(header) = line.strip_prefix('[') {
+                table = header.split(']').next().unwrap_or_default().trim();
+                continue;
+            }
+            let Some((name, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim());
+            let value = value.split_once(" #").map_or(value, |(v, _)| v.trim());
+            let Some(value) = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .filter(|v| !v.contains(['"', '\\']))
+            else {
+                continue;
+            };
+            if table == "env"
+                && names_c_compiler(name)
+                && env::var_os(name).is_none()
+                && !found.iter().any(|(known, _)| known == name)
+                && let Some(compiler) = behind_launcher(value)
+            {
+                found.push((name.to_owned(), compiler.to_owned()));
+            }
+        }
+    }
+    found
+}
+
 fn main() {
     // Once per build: what this process starts inherits the result.
     if env::var_os("JATO_PATH").is_none() {
@@ -156,6 +236,13 @@ fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
     cmd.env("RUSTC_WRAPPER", env::current_exe()?);
     if env::var_os("JATO_CACHE_DIR").is_some() {
         cmd.env("JATO_CACHE_DIR", cache_dir()?);
+    }
+    // A C compiler started through another cache does its work where it
+    // cannot be watched, and the build could not be recorded.
+    if env::var_os("JATO_DISABLE").is_none_or(|v| v != "1") {
+        for (name, compiler) in c_compilers_alone(&env::current_dir()?) {
+            cmd.env(name, compiler);
+        }
     }
     Ok(cmd)
 }
@@ -510,6 +597,30 @@ fn run() -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compiler_named_behind_a_launcher_is_named_alone() {
+        assert_eq!(behind_launcher("kache cc"), Some("cc"));
+        assert_eq!(
+            behind_launcher("/usr/bin/ccache  gcc -m64"),
+            Some("gcc -m64")
+        );
+        assert_eq!(behind_launcher("cc"), None);
+        assert_eq!(behind_launcher("kache"), None);
+        assert_eq!(behind_launcher("clang --target=x"), None);
+        for name in [
+            "CC",
+            "CXX",
+            "HOST_CC",
+            "TARGET_CXX",
+            "CC_x86_64-unknown-linux-gnu",
+        ] {
+            assert!(names_c_compiler(name), "{name}");
+        }
+        for name in ["CCACHE_DIR", "CXXFLAGS", "RUSTC", "HOST_CCX", "ACC"] {
+            assert!(!names_c_compiler(name), "{name}");
+        }
+    }
 
     fn words(text: &str) -> Vec<OsString> {
         text.split(' ').map(OsString::from).collect()
