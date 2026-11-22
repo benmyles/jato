@@ -6,15 +6,15 @@ On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measu
 
 | Seconds | Jato | kache | Cargo |
 | --- | ---: | ---: | ---: |
-| Nothing stored, nothing built | 130 | 139 | 142 |
-| The same build again | 0.07 | 0.45 | 0.48 |
-| Target directory removed | 0.17 | 2.4 | as cold |
-| A target directory never used | 0.30 | 1.5 | as cold |
-| The sources copied to another path | 0.22 | 4.3 | as cold |
-| An edit to the top crate | 1.9 | 4.4 | 2.2 |
-| The edit undone | 0.07 | 2.6 | 2.4 |
+| The same build again | 0.09 | 0.60 | 0.55 |
+| Target directory removed | 0.20 | 2.6 | as cold |
+| A target directory never used | 0.21 | 3.1 | as cold |
+| The sources copied to another path | 0.33 | 6.8 | as cold |
+| First edit of the top crate in that copy | 13 | 25 | |
+| Later edits | 8.0 | 7.8 | 9.9 |
+| The edits undone | 0.12 | 6.3 | 9.0 |
 
-On ripgrep the same steps took 0.04 to 0.07 s with Jato, 0.18 to 0.41 s with kache and 4 to 16 s with sccache. One thing no cache changes: the first edit of a crate in a restored target compiles that crate from scratch. [All measurements, with conditions and reproduction commands](bench/README.md)
+A build from nothing takes what it takes with bare Cargo: 769 processor-seconds against 763. On ripgrep, a small project, the restores took 0.07 to 0.34 s with Jato, 0.38 to 0.70 s with kache and 5 to 8 s with sccache, and a build from nothing 5 to 8% more processor time than bare Cargo's. [All measurements, with conditions and reproduction commands](bench/README.md)
 
 ## Get started
 
@@ -84,9 +84,9 @@ Output that still names where it was built, such as a program that embeds `env!(
 
 A crate compiled again within ten minutes of its last compilation in the same target directory is being edited. rustc compiles it incrementally from the state it saved, Jato looks for a recorded result (which is how undoing an edit is instant) and otherwise leaves the compiler unwatched and its output unrecorded, because the next edit replaces it. The first compilation after a pause is recorded again. `JATO_EDIT_WINDOW` sets the pause in seconds; `0` records every compilation.
 
-A target directory that was restored holds none of the state rustc saves for compiling a crate again, so the first edit of a crate there would compile the whole crate. Jato keeps that state in the cache, once for each crate, and hands it to a compilation that has none of its own: the first edit in a new checkout is compiled incrementally, from state saved where the crate was last compiled under watch. FIRST-EDIT
+A target directory that was restored holds none of the state rustc saves for compiling a crate again, so the first edit of a crate there would compile the whole crate. Jato keeps that state in the cache, once for each crate, and hands it to a compilation that has none of its own: the first edit in a new checkout is compiled incrementally, from state saved where the crate was last compiled under watch. On Olo that took the first edit of the top crate in a new checkout from about 110 processor-seconds to 53.
 
-rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. rustc still checks each saved result against the sources before using it, and if the state does not begin the way Jato expects it is left out and the crate is compiled from scratch. The target directory has to lie inside the workspace for state to move between checkouts. `JATO_SAVED_STATE=0` turns this off.
+rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. rustc still checks each saved result against the sources before using it, and if the state does not begin the way Jato expects it is left out and the crate is compiled from scratch. State is kept for the output directory it was made with, since rustc generates all code again for any other. A target directory inside the workspace reads the same in every checkout, and so does one target directory shared by all of them; target directories kept elsewhere under different names do not share state. `JATO_SAVED_STATE=0` turns this off.
 
 ### Builds at the same time
 
@@ -157,6 +157,8 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 The cache directory holds an SQLite index and the files commands wrote, each stored once under the BLAKE3 digest of its contents. On a filesystem that can clone files, such as Btrfs or XFS, a stored file is a clone of the compiler's output and a restored file is a clone of that: the bytes exist once on disk however many target directories hold them, and each copy can still be written without affecting the others. On other filesystems objects are compressed with Zstandard and restores are copies.
 
 A result becomes visible in one transaction, after its files are in place. Each record says itself which command it belongs to and which files it needs; the index only finds records and counts references. A restored file's digest is checked unless the filesystem checksums data itself. A record that cannot be read or whose files are gone is dropped and the command runs.
+
+Next to results the cache keeps the state rustc saved for each crate of a workspace, which is about as large as the crate's compiled output. It is stored once however many checkouts are handed it.
 
 There is no daemon, and nothing runs between builds. The cache holds compiled artifacts and diagnostics, which may include values embedded by `env!`.
 

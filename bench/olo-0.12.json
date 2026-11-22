@@ -19,92 +19,100 @@
   "median": {
     "jato": {
       "cold": {
-        "seconds": 129.696,
-        "cpu": 746.1
+        "seconds": 145.972,
+        "cpu": 768.83
       },
       "fresh": {
-        "seconds": 0.065,
-        "cpu": 0.06
+        "seconds": 0.092,
+        "cpu": 0.09
       },
       "restore": {
-        "seconds": 0.167,
-        "cpu": 0.41
+        "seconds": 0.198,
+        "cpu": 0.43
       },
       "new_target": {
-        "seconds": 0.305,
-        "cpu": 0.32
+        "seconds": 0.21,
+        "cpu": 0.41
       },
       "copy": {
-        "seconds": 0.218,
+        "seconds": 0.329,
         "cpu": 0.4
       },
+      "copy_edit": {
+        "seconds": 13.258,
+        "cpu": 52.85
+      },
       "edit_first": {
-        "seconds": 21.64,
-        "cpu": 110.71
+        "seconds": 8.926,
+        "cpu": 20.96
       },
       "edit": {
-        "seconds": 1.873,
-        "cpu": 3.2
+        "seconds": 7.958,
+        "cpu": 11.22
       },
       "undo": {
-        "seconds": 0.074,
-        "cpu": 0.07
+        "seconds": 0.115,
+        "cpu": 0.11
       }
     },
     "kache": {
       "cold": {
-        "seconds": 139.059,
-        "cpu": 766.48
+        "seconds": 113.598,
+        "cpu": 758.46
       },
       "fresh": {
-        "seconds": 0.45,
-        "cpu": 0.43
+        "seconds": 0.602,
+        "cpu": 0.64
       },
       "restore": {
-        "seconds": 2.391,
-        "cpu": 10.81
+        "seconds": 2.628,
+        "cpu": 11.49
       },
       "new_target": {
-        "seconds": 1.541,
-        "cpu": 1.97
+        "seconds": 3.072,
+        "cpu": 4.09
       },
       "copy": {
-        "seconds": 4.299,
-        "cpu": 10.28
+        "seconds": 6.771,
+        "cpu": 14.63
+      },
+      "copy_edit": {
+        "seconds": 24.709,
+        "cpu": 125.01
       },
       "edit_first": {
-        "seconds": 30.733,
-        "cpu": 126.57
+        "seconds": 16.26,
+        "cpu": 47.09
       },
       "edit": {
-        "seconds": 4.374,
-        "cpu": 3.93
+        "seconds": 7.841,
+        "cpu": 12.85
       },
       "undo": {
-        "seconds": 2.611,
-        "cpu": 3.62
+        "seconds": 6.345,
+        "cpu": 18.69
       }
     },
     "cargo": {
       "cold": {
-        "seconds": 141.758,
-        "cpu": 762.25
+        "seconds": 128.902,
+        "cpu": 762.56
       },
       "fresh": {
-        "seconds": 0.484,
-        "cpu": 0.44
+        "seconds": 0.546,
+        "cpu": 0.54
       },
       "edit_first": {
-        "seconds": 2.246,
-        "cpu": 3.15
+        "seconds": 6.873,
+        "cpu": 18.87
       },
       "edit": {
-        "seconds": 2.167,
-        "cpu": 3.3
+        "seconds": 9.922,
+        "cpu": 11.89
       },
       "undo": {
-        "seconds": 2.444,
-        "cpu": 3.38
+        "seconds": 9.005,
+        "cpu": 20.68
       }
     }
   },
@@ -112,65 +120,73 @@
     "jato": {
       "cold": [
         {
-          "seconds": 129.696,
-          "cpu": 746.1,
-          "load": 36.1,
+          "seconds": 145.972,
+          "cpu": 768.83,
+          "load": 50.2,
           "compiled": 232
         }
       ],
       "fresh": [
         {
-          "seconds": 0.065,
-          "cpu": 0.06,
-          "load": 28.8,
+          "seconds": 0.092,
+          "cpu": 0.09,
+          "load": 29.6,
           "compiled": 0
         }
       ],
       "restore": [
         {
-          "seconds": 0.167,
-          "cpu": 0.41,
-          "load": 28.8,
+          "seconds": 0.198,
+          "cpu": 0.43,
+          "load": 29.6,
           "compiled": 0
         }
       ],
       "new_target": [
         {
-          "seconds": 0.305,
-          "cpu": 0.32,
-          "load": 28.8,
+          "seconds": 0.21,
+          "cpu": 0.41,
+          "load": 29.6,
           "compiled": 0
         }
       ],
       "copy": [
         {
-          "seconds": 0.218,
+          "seconds": 0.329,
           "cpu": 0.4,
-          "load": 28.8,
+          "load": 29.6,
           "compiled": 0
+        }
+      ],
+      "copy_edit": [
+        {
+          "seconds": 13.258,
+          "cpu": 52.85,
+          "load": 29.5,
+          "compiled": 1
         }
       ],
       "edit_first": [
         {
-          "seconds": 21.64,
-          "cpu": 110.71,
-          "load": 28.8,
+          "seconds": 8.926,
+          "cpu": 20.96,
+          "load": 29.4,
           "compiled": 1
         }
       ],
       "edit": [
         {
-          "seconds": 1.873,
-          "cpu": 3.2,
+          "seconds": 7.958,
+          "cpu": 11.22,
           "load": 27.0,
           "compiled": 1
         }
       ],
       "undo": [
         {
-          "seconds": 0.074,
-          "cpu": 0.07,
-          "load": 27.0,
+          "seconds": 0.115,
+          "cpu": 0.11,
+          "load": 27.5,
           "compiled": 0
         }
       ]
@@ -178,65 +194,73 @@
     "kache": {
       "cold": [
         {
-          "seconds": 139.059,
-          "cpu": 766.48,
-          "load": 25.7,
+          "seconds": 113.598,
+          "cpu": 758.46,
+          "load": 27.5,
           "compiled": 232
         }
       ],
       "fresh": [
         {
-          "seconds": 0.45,
-          "cpu": 0.43,
-          "load": 33.0,
+          "seconds": 0.602,
+          "cpu": 0.64,
+          "load": 26.6,
           "compiled": 0
         }
       ],
       "restore": [
         {
-          "seconds": 2.391,
-          "cpu": 10.81,
-          "load": 32.3,
+          "seconds": 2.628,
+          "cpu": 11.49,
+          "load": 26.6,
           "compiled": 232
         }
       ],
       "new_target": [
         {
-          "seconds": 1.541,
-          "cpu": 1.97,
-          "load": 32.3,
+          "seconds": 3.072,
+          "cpu": 4.09,
+          "load": 26.6,
           "compiled": 11
         }
       ],
       "copy": [
         {
-          "seconds": 4.299,
-          "cpu": 10.28,
-          "load": 30.5,
+          "seconds": 6.771,
+          "cpu": 14.63,
+          "load": 25.2,
           "compiled": 11
+        }
+      ],
+      "copy_edit": [
+        {
+          "seconds": 24.709,
+          "cpu": 125.01,
+          "load": 24.4,
+          "compiled": 1
         }
       ],
       "edit_first": [
         {
-          "seconds": 30.733,
-          "cpu": 126.57,
-          "load": 30.5,
+          "seconds": 16.26,
+          "cpu": 47.09,
+          "load": 23.8,
           "compiled": 1
         }
       ],
       "edit": [
         {
-          "seconds": 4.374,
-          "cpu": 3.93,
-          "load": 29.4,
+          "seconds": 7.841,
+          "cpu": 12.85,
+          "load": 24.4,
           "compiled": 1
         }
       ],
       "undo": [
         {
-          "seconds": 2.611,
-          "cpu": 3.62,
-          "load": 29.1,
+          "seconds": 6.345,
+          "cpu": 18.69,
+          "load": 21.4,
           "compiled": 1
         }
       ]
@@ -244,44 +268,45 @@
     "cargo": {
       "cold": [
         {
-          "seconds": 141.758,
-          "cpu": 762.25,
-          "load": 28.5,
+          "seconds": 128.902,
+          "cpu": 762.56,
+          "load": 21.2,
           "compiled": 232
         }
       ],
       "fresh": [
         {
-          "seconds": 0.484,
-          "cpu": 0.44,
-          "load": 34.7,
+          "seconds": 0.546,
+          "cpu": 0.54,
+          "load": 28.5,
           "compiled": 0
         }
       ],
       "restore": [],
       "new_target": [],
       "copy": [],
+      "copy_edit": [],
       "edit_first": [
         {
-          "seconds": 2.246,
-          "cpu": 3.15,
-          "load": 32.9,
+          "seconds": 6.873,
+          "cpu": 18.87,
+          "load": 28.5,
           "compiled": 1
         }
       ],
       "edit": [
         {
-          "seconds": 2.167,
-          "cpu": 3.3,
-          "load": 31.3,
+          "seconds": 9.922,
+          "cpu": 11.89,
+          "load": 27.2,
           "compiled": 1
         }
       ],
       "undo": [
         {
-          "seconds": 2.444,
-          "cpu": 3.38,
-          "load": 31.3,
+          "seconds": 9.005,
+          "cpu": 20.68,
+          "load": 24.7,
           "compiled": 1
         }
       ]
@@ -290,63 +315,65 @@
   "details": {
     "jato": [
       {
-        "store_bytes": 646021921,
+        "store_bytes": 1271422960,
         "store_extents": {
-          "total": 646475776,
-          "exclusive": 5505024,
-          "shared": 603754496
+          "total": 1275744256,
+          "exclusive": 12595200,
+          "shared": 1239674880
         },
-        "target_bytes": 1267569405,
+        "target_bytes": 1267570978,
         "target_extents": {
-          "total": 1271820288,
-          "exclusive": 630849536,
-          "shared": 603754496
+          "total": 1271836672,
+          "exclusive": 8687616,
+          "shared": 1239674880
         },
         "daemon_rss_kib": 0,
-        "store_bytes_end": 647230033,
+        "store_bytes_end": 1737018871,
         "counters": {
           "build_hit": 5,
-          "build_left_to_cargo": 4,
+          "build_left_to_cargo": 5,
           "build_miss": 1,
           "build_stored": 1,
-          "continued": 24,
-          "hashed_bytes": 2052108249,
-          "miss": 279,
+          "continued": 18,
+          "hashed_bytes": 1861981214,
+          "miss": 291,
           "query_hit": 1,
           "query_miss": 8,
           "query_stored": 8,
-          "restored_bytes": 2878838038,
-          "saved_ms": 643156,
-          "stored": 279
+          "restored_bytes": 2878868722,
+          "saved_ms": 723864,
+          "state_given": 12,
+          "state_saved": 15,
+          "stored": 291
         }
       }
     ],
     "kache": [
       {
-        "store_bytes": 655246509,
+        "store_bytes": 655641352,
         "store_extents": {
-          "total": 655245312,
-          "exclusive": 11247616,
-          "shared": 626806784
+          "total": 655638528,
+          "exclusive": 11640832,
+          "shared": 609984512
         },
-        "target_bytes": 677532373,
+        "target_bytes": 677535704,
         "target_extents": {
           "total": 678051840,
           "exclusive": 2420736,
-          "shared": 651804672
+          "shared": 634982400
         },
-        "daemon_rss_kib": 21832,
-        "store_bytes_end": 656910376
+        "daemon_rss_kib": 21112,
+        "store_bytes_end": 657391165
       }
     ],
     "cargo": [
       {
         "store_bytes": 0,
         "store_extents": null,
-        "target_bytes": 1267861990,
+        "target_bytes": 1267874255,
         "target_extents": {
-          "total": 1272139776,
-          "exclusive": 1272139776,
+          "total": 1272147968,
+          "exclusive": 1272147968,
           "shared": 0
         },
         "daemon_rss_kib": 0,

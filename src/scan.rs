@@ -95,7 +95,7 @@ pub fn digest_file(path: &Path, needles: &[&[u8]]) -> io::Result<(Digest, Stamp,
     }
     let (digest, length, found) = digest_open(&mut file, needles)?;
     let stamp = Stamp::of(&file.metadata()?);
-    if stamp != Stamp::of(&before) || length != stamp.size {
+    if !Stamp::of(&before).same_contents(&stamp) || length != stamp.size {
         return Err(io::Error::other("file changed while it was read"));
     }
     Ok((digest, stamp, found))

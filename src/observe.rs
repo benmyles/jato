@@ -45,6 +45,14 @@ impl Stamp {
             ctime: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
         }
     }
+
+    /// Whether two looks at a file a moment apart saw the same contents.
+    /// The change time alone moves when the file is given another name,
+    /// as rustc does with a metadata file while other compilers read it.
+    pub fn same_contents(&self, later: &Self) -> bool {
+        (self.dev, self.ino, self.size, self.mtime)
+            == (later.dev, later.ino, later.size, later.mtime)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

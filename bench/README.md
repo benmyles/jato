@@ -6,39 +6,45 @@ Each contender had its own empty store, its own daemon where it has one, its own
 
 ## Olo
 
-`cargo build -p olo-system` at Olo commit `645cce1e3aea`: 279 compilations on the pinned `nightly-2026-11-14` with `-Zthreads=8`, upstream mold 3.0.0, the project's dev profile and workspace feature unification. One run; load average 26 to 36.
+`cargo build -p olo-system` at Olo commit `645cce1e3aea`: 279 compilations on the pinned `nightly-2026-11-14` with `-Zthreads=8`, upstream mold 3.0.0, the project's dev profile and workspace feature unification. Each contender built in its checkout's own `target`. One run; load average 21 to 29, except during Jato's cold build, when it was 50.
 
 | Seconds | Jato 0.12.0 | kache 2.3.0 | Bare Cargo |
 | --- | ---: | ---: | ---: |
-| Nothing stored, nothing built | 129.70 | 139.06 | 141.76 |
-| The same build again | 0.07 | 0.45 | 0.48 |
-| Target directory removed | 0.17 | 2.39 | a cold build |
-| A target directory never used | 0.30 | 1.54 | a cold build |
-| The sources copied to another path | 0.22 | 4.30 | a cold build |
-| First edit of `olo-system` in the restored target | 21.64 | 30.73 | 2.25 |
-| Further edits, median of three | 1.87 | 4.37 | 2.17 |
-| The edits undone | 0.07 | 2.61 | 2.44 |
+| Nothing stored, nothing built | 145.97 | 113.60 | 128.90 |
+| The same build again | 0.09 | 0.60 | 0.55 |
+| Target directory removed | 0.20 | 2.63 | a cold build |
+| A target directory never used | 0.21 | 3.07 | a cold build |
+| The sources copied to another path | 0.33 | 6.77 | a cold build |
+| A function added to `olo-system` in that copy | 13.26 | 24.71 | |
+| A function added in the restored target | 8.93 | 16.26 | 6.87 |
+| Further such edits, median of three | 7.96 | 7.84 | 9.92 |
+| The edits undone | 0.12 | 6.34 | 9.01 |
 
-The cold builds used 746, 766 and 762 processor-seconds: watching every compiler cost nothing that shows next to the difference between runs. In Jato's restores Cargo does not start; kache answers 279 compiler invocations one after another. Both caches compile the edited crate from scratch the first time, because a restored target has none of rustc's saved state; Cargo, whose target was built in place, has it. For a target directory it has not seen, kache fills in what it can before Cargo looks, and Cargo then asked it for 11 compilations.
+The cold builds used 769, 758 and 763 processor-seconds: watching every compiler and keeping what it wrote cost under 1% more than bare Cargo. Their wall-clock times follow the machine's load, not the contender: over five sittings Jato's cold build took 130 to 146 s and once 662 s, kache's 114 to 339 s, Cargo's 118 to 285 s.
 
-After the cold build Jato's store held 616 MiB of files, of which 5 MiB were not shared with the target directory they were cloned from; kache's held 625 MiB with 11 MiB of its own. The target directory was 1,209 MiB under Jato and bare Cargo, 602 MiB of that rustc's incremental state and other files nothing else shares, and 646 MiB under kache, which built without incremental compilation. A target Jato restores has no incremental state until something in it is compiled. kache's daemon held 21 MiB of memory between builds; Jato has no daemon. [Samples, processor time and disk accounting](olo-0.12.json)
+In Jato's restores Cargo does not start; kache answers 279 compiler invocations one after another, and for a target directory it has not seen it fills in what it can before Cargo looks. The first edit in a checkout where nothing has been compiled used 53 processor-seconds with Jato, which handed rustc the state it had saved in the first checkout, and 125 with kache, where rustc compiled the crate from nothing. In the restored target the same took 21 against 47 processor-seconds; Cargo's own target, built in place, still had rustc's state and took 19. Before Jato handed saved state on, both of these edits cost it 108 to 127 processor-seconds.
+
+After the cold build Jato's store held 1,212 MiB: the build's outputs (616 MiB) and the state rustc saved for the workspace's 15 crates. 12 MiB of that was not shared with the target directory it was cloned from. kache's store held 625 MiB with 11 MiB of its own; kache builds without incremental state. The target directory was 1,209 MiB under Jato and bare Cargo and 646 MiB under kache. A target Jato restores takes 1.3 MiB of its own until something in it is compiled. kache's daemon held 21 MiB of memory between builds; Jato has no daemon. [Samples, processor time and disk accounting](olo-0.12.json)
 
 ## ripgrep
 
-ripgrep 14.1.1 on Rust 1.100, default dev profile, median of three rotating runs; load average 20 to 32. `jato` is `jato build`; `jato wrapper` is plain Cargo with Jato as `RUSTC_WRAPPER`, which reuses single compilations only.
+ripgrep 14.1.1 on Rust 1.100, default dev profile, median of three rotating runs; load average 21 to 30. `jato` is `jato build`; `jato wrapper` is plain Cargo with Jato as `RUSTC_WRAPPER`, which reuses single compilations only.
 
 | Seconds | `jato` | `jato` wrapper | kache 2.3.0 | sccache 0.19.0 | Bare Cargo |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Nothing stored, nothing built | 8.38 | 11.74 | 9.19 | 13.63 | 8.99 |
-| The same build again | 0.01 | 0.03 | 0.03 | 0.03 | 0.03 |
-| Target directory removed | 0.06 | 0.17 | 0.41 | 5.22 | 7.08 |
-| A target directory never used | 0.05 | 0.14 | 0.29 | 15.65 | 8.87 |
-| The sources copied to another path | 0.07 | 0.16 | 0.40 | 8.23 | 8.41 |
-| First edit in the restored target | 1.75 | 3.19 | 3.08 | 0.63 | 0.54 |
-| Further edits, median of three | 0.46 | 0.63 | 0.69 | 0.44 | 0.51 |
-| The edits undone | 0.04 | 0.05 | 0.18 | 0.40 | 0.43 |
+| Nothing stored, nothing built | 10.93 | 16.77 | 7.33 | 8.53 | 7.83 |
+| The same build again | 0.01 | 0.04 | 0.03 | 0.03 | 0.03 |
+| Target directory removed | 0.07 | 0.18 | 0.38 | 4.86 | 9.53 |
+| A target directory never used | 0.34 | 0.17 | 0.61 | 8.09 | 9.12 |
+| The sources copied to another path | 0.08 | 0.19 | 0.70 | 7.54 | 11.32 |
+| A function added in that copy | 2.13 | 3.23 | 2.94 | 0.50 | 0.68 |
+| A function added in the restored target | 1.06 | 0.91 | 2.07 | 0.47 | 0.77 |
+| Further such edits, median of three | 0.52 | 0.51 | 0.53 | 0.47 | 0.50 |
+| The edits undone | 0.05 | 0.05 | 0.16 | 0.51 | 0.69 |
 
-Cold builds used 25.4, 25.0, 25.2, 27.7 and 25.1 processor-seconds in that order. The cold wall-clock times of a single contender ranged over 7 to 15 s between runs, more than the contenders differ from each other. sccache does not cache the incrementally compiled workspace crates, so its target keeps rustc's state and its first edit is Cargo's. [Samples and disk accounting](ripgrep-0.12.json)
+The cold builds used 25.8 to 27.7 processor-seconds with `jato`, 25.6 to 28.3 as a wrapper, 23.2 to 23.6 with kache, 26.7 to 28.4 with sccache and 24.4 to 25.6 with bare Cargo: on a project this small, watching the compilers and keeping rustc's state for nine crates costs 5 to 8%. The cold wall-clock samples of one contender spread from 8 to 22 s as the machine's load moved; a build of the same kind alone at a load of 15 took 5.7 s. In those runs each wrapper kept rustc's state before telling Cargo it was done; under `jato build` that now happens after.
+
+For sccache and bare Cargo the copy is a cold build, which leaves rustc's own state behind for the edit that follows; sccache does not cache the workspace's incrementally compiled crates at all. For a crate this small the state Jato hands on is worth little over compiling from nothing: 2.1 s against kache's 2.9 s in the copy. [Samples and disk accounting](ripgrep-0.12.json)
 
 ## Builds started together
 

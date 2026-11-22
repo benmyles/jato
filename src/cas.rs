@@ -560,10 +560,11 @@ impl Store {
             return Ok(digest);
         }
         let (digest, read, _) = scan::digest_file(path, &[])?;
-        if read != stamp {
+        if !stamp.same_contents(&read) {
             return Err(io::Error::other("file changed while it was read"));
         }
-        self.remember(stamp, digest);
+        // As the file is now, which is what the next look will find.
+        self.remember(read, digest);
         self.count("hashed_bytes", stamp.size);
         Ok(digest)
     }

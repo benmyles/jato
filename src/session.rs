@@ -118,6 +118,9 @@ struct Server {
     parts: Mutex<Parts>,
     stores: Mutex<Vec<Store>>,
     stop: AtomicBool,
+    /// Requests still being served, some past the point where their
+    /// compiler was told it is done.
+    busy: std::sync::atomic::AtomicUsize,
 }
 
 impl Server {
@@ -232,24 +235,33 @@ impl Server {
             &mut store,
             std::time::Duration::from_millis(r.number()?),
         );
-        match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
+        let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
             Ok(manifest) => {
                 self.used(&job, &manifest);
-                let left = command::Left::Seen(&report.state);
-                command::keep_state(&job, &mut store, &recipe, left);
+                true
             }
             // A failed compilation fails the build. One that worked but
             // cannot be reused leaves nothing to say what it depended on.
-            Err(why) if ran.success => self.unusable(&format!("{}: {why}", job.name())),
-            Err(_) => (),
-        }
+            Err(why) if ran.success => {
+                self.unusable(&format!("{}: {why}", job.name()));
+                false
+            }
+            Err(_) => false,
+        };
         drop(lock);
         store.flush();
+        let _ = wire::send(&mut stream, &[0]);
+        // Cargo has its answer and goes on. What the compiler saved for a
+        // next time is kept meanwhile.
+        if recorded {
+            let left = command::Left::Seen(&report.state);
+            command::keep_state(&job, &mut store, &recipe, left);
+            store.flush();
+        }
         self.stores
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(store);
-        let _ = wire::send(&mut stream, &[0]);
         Ok(())
     }
 }
@@ -691,6 +703,7 @@ fn supervise(
         parts: Mutex::new(Parts::default()),
         stores: Mutex::new(Vec::new()),
         stop: AtomicBool::new(false),
+        busy: std::sync::atomic::AtomicUsize::new(0),
     });
     let accepting = server.clone();
     let accept = std::thread::spawn(move || {
@@ -699,10 +712,12 @@ fn supervise(
                 break;
             }
             let server = accepting.clone();
+            server.busy.fetch_add(1, Ordering::AcqRel);
             std::thread::spawn(move || {
                 if let Err(e) = server.serve(stream) {
                     server.unusable(&format!("a compiler's request failed: {e:#}"));
                 }
+                server.busy.fetch_sub(1, Ordering::AcqRel);
             });
         }
     });
@@ -745,6 +760,12 @@ fn supervise(
     server.stop.store(true, Ordering::Release);
     let _ = UnixStream::connect_addr(&address(OsStr::new(&socket))?);
     let _ = accept.join();
+    // Cargo has gone, and so have the compilers. Whatever is still being
+    // kept for them is given a moment to finish.
+    let patience = Instant::now();
+    while server.busy.load(Ordering::Acquire) > 0 && patience.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let report = session.finish();
     let ran = Ran {
         code: command::exit_code(status),
