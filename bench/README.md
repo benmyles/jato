@@ -1,6 +1,6 @@
 # Jato measurements
 
-The whole Olo workspace was measured with Jato 0.13.0, everything else with 0.12.0.
+The whole Olo workspace was measured with Jato 0.13.0 and again with 0.14.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
 
 Benchmarks ran on an Intel Core Ultra 7 356H (16 logical processors, 15 available to the session, 62 GiB) with Fedora 45, Linux 7.3.4 and Btrfs with zstd compression. The machine was shared with other people's builds throughout: its load average is given with each set of numbers, and wall-clock times moved with it. Comparisons within one table were taken in one sitting, rotating the order of contenders where there was more than one run.
 
@@ -49,6 +49,8 @@ Putting a build back is one command's result for Jato and 2,600 for kache, of wh
 The check from nothing is where Jato pays for watching. The processor time is the same as kache's within what two runs differ by: 2,449 against 2,609 in a run the day's first, with Jato first, and 2,613 against 2,439 in this one. The time on the clock follows the machine: 508 s against kache's 547 s in the first run, where the load average was 18 when Jato started, and 1,490 s against 642 s here. With every processor in use, each file a watched compiler asks about costs it a turn at the processor. The checklist describes watching from inside the compiler's own process, which would end that.
 
 In the first run compilations in a built target were still watched whatever the load, and the edits went the other way: 18.14 s for the first edit after the restore against kache's 7.01 s, and 8.98 s against 5.18 s for the later ones, for the same processor time. `olo-system` has 54 dependents in the workspace, and a check of each is one short compilation. They are now left unwatched while the load average is at or above the number of processors, which gave the numbers above. kache's times for the same steps moved between the runs by more than that. [Samples and disk accounting](olo-workspace-0.13.json) · [the first run](olo-workspace-0.13-watched.json)
+
+With 0.14.0, in which programs tell of their own reads, the same cold check took 703 s at a load of 30 to 46 and 2,350 processor-seconds; 2.4 million file calls were told of by the programs and 0.54 million reported by the kernel. A copied checkout was put back in 1.7 to 3.8 s, and `check --workspace` in a copy with one low-level crate edited took 24.8 s and 76 processor-seconds: 2,616 results reused, the edited crate and its dependents compiled.
 
 After the cold check Jato's store held 3,099 MiB and kache's 1,609 MiB, the target directories 3,069 and 1,600 MiB: rustc's incremental state again, which kache builds without. kache's daemon held 62 to 82 MiB between builds.
 
