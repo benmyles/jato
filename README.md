@@ -136,7 +136,7 @@ Cargo asks git which files a package has when the package's build script names n
 
 On its way to a package's files Cargo lists the top of the repository and every directory of the package. It goes by the names in a directory only where it looks for a package's programs, tests, examples and benchmarks, and where a workspace finds its packages by a pattern such as `crates/*`. What it lists elsewhere is not counted: a file git does not track, an editor's leftovers, or the `target` directory of an earlier build beside a build made into another, keep no build from being put back. A directory that a build script or a compiler lists counts in full.
 
-The files of a build that is put back all get one time, taken from the filesystem and set just before the present, so that no source looks newer than the build and any file edited from then on does. A file outside the target directory that already holds what the build wrote, such as `Cargo.lock`, is left as it is.
+The files of a build that is put back all get one time, taken just before Jato looks at the sources, so that no source looks newer than the build and any file edited from then on does, one saved while the files are still being written included. A file outside the target directory that already holds what the build wrote, such as `Cargo.lock`, is left as it is.
 
 ### Edits
 
@@ -207,7 +207,7 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_MAX_SIZE=4GiB` | Budget for this process when none is stored with `jato limit`. |
 | `jato gc 10GiB` | Evict least-recently-used results down to this size. `jato gc` uses the budget; `jato gc 0` empties the cache. It also removes what earlier versions of Jato left in the directory. |
 | `jato stats [--json]` | Builds put back whole; Rust compilations and build scripts' C compilations reused, run, left to rustc during edits or not storable; time waited for other builds; disk use. |
-| `JATO_LOG=debug` | Say for each command whether it was reused and, if not, what had changed. An absolute path appends to that file, with times. |
+| `JATO_LOG=debug` | Say for each command whether it was reused and, if not, what had changed, and for a build put back how long each step took. An absolute path appends to that file, with times. |
 | `JATO_RECIPES=/dir` | Write what each command is known by into a file of its own in this directory, a line for each thing, with the workspace and the target directory as marks. Two runs' directories compared show why a command of one was not found for the other. |
 | `JATO_KEY_ENV=A,B` | Variables a procedural macro reads from the environment. |
 | `JATO_JOBS=8` | Compilers running at once across the builds sharing this cache. |

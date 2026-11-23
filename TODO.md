@@ -57,10 +57,12 @@
 - [x] `JATO_RECIPES` writes what every command is known by where two runs can be compared.
 - [x] Start a build from one made in another checkout whose output names that checkout. The record says which compilers wrote such output, and they are run again. Olo's `build --workspace` in a new worktree: 47 s to 12 s.
 - [x] Read a file before compressing it, and do not compress what the cache holds; read a file that has two names once. Recording a dev build of all of Olo on ext4: 20 s to 2.5 s.
+- [x] Put a build back with a thread for each processor, each taking the next largest file, give files their time as they are written, and move them into place on several threads. A dev build of all of Olo, 21,600 files and 21 GB on ext4: 4.3 to 5.1 s, now 2.8 to 4.1.
+- [x] Take the time for a build's files before its sources are looked at. A source saved while the files were being written looked older than the build to Cargo.
 
 ## Open
 
-- [ ] Putting a dev build of all of Olo back on ext4 takes 5.3 s, 14 processor-seconds of it decompressing 13 GB. On a filesystem that clones files none of it is copied.
+- [ ] Putting a dev build of all of Olo back on ext4 takes 3 to 4 s, two or more of them writing 21 GB through memory at the rate memory takes it. On a filesystem that clones files none of it is copied.
 - [ ] The `cc` crate names an object file after a hash of the directory its source is in. Source that a build script generates in its output directory is in another directory in every checkout, so 41 of Olo's C compilations are made again in each, 2.4 s for the longest. The result could be kept by what was compiled and given the name asked for.
 - [ ] A build script that writes something else every time it runs has everything above it compiled again wherever Cargo runs the script: `grammers-tl-types` generates its source in an order that changes, 3.7 s for the crate and seven more after it. Putting a build script's run back, as recorded, would do away with that and with the scripts' own time.
 
@@ -83,7 +85,7 @@
 - [ ] A crate from beside the workspace gets a different name from Cargo in every checkout, so its compilations and those of its dependents are not shared between checkouts, only whole builds are.
 - [ ] rustc's incremental state doubles the size of a build made from scratch, in the target directory and in the cache. Leaving it out of such builds would need another source for the state handed on at the first edit: on Olo, compiling a crate without it was no cheaper than compiling it incrementally from nothing (116 to 127 against about 110 processor-seconds), so nothing is gained by leaving it out of first edits.
 - [ ] Reuse test results: a test program whose own file and everything it read are unchanged could report what it reported before. It needs a rule for the environment, which a program reads unseen, and for tests that depend on time or chance.
-- [ ] Putting back the 13,000 files of a check of all of Olo takes 1.4 to 2.5 s, and finding that nothing needs putting back 0.3 s. Each file costs about ten system calls, and each of the 82,000 inputs is asked about one at a time.
+- [ ] Finding that nothing of a check of all of Olo needs putting back takes 0.2 s, most of it asking about each of the 69,000 inputs one at a time.
 - [ ] Evict by what a result costs to rebuild and how much room it takes, not only by when it was last used. A linked program is large and quick to make again; a library is the reverse.
 - [ ] One jobserver for all builds on the machine. The limit on running compilers bounds processes, not the threads each compiler starts with tokens from its own build.
 - [ ] Recording on macOS and Windows. Commands there run as they would without Jato.

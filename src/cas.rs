@@ -108,7 +108,7 @@ fn now() -> i64 {
 /// or the time of a server. Files given the time by this program's clock
 /// could be newer than a source edited right afterwards, and Cargo would
 /// take them for up to date.
-fn just_before_now(beside: &Path) -> Option<libc::timespec> {
+pub fn just_before_now(beside: &Path) -> Option<libc::timespec> {
     use std::os::unix::fs::MetadataExt;
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -234,6 +234,11 @@ pub struct Restored {
     pub detail: Vec<u8>,
     pub cost_ms: u64,
     pub bytes: u64,
+    /// How many files had to be written, and how long it took to see
+    /// which, to write them beside where they belong, and to move them
+    /// there and give them their time.
+    pub files: usize,
+    pub took: [std::time::Duration; 3],
 }
 
 pub struct Store {
@@ -311,8 +316,22 @@ fn object_path(dir: &Path, digest: &Digest, packed: bool) -> PathBuf {
     path
 }
 
+/// How a result's files are to be put in place.
+#[derive(Clone, Copy, Default)]
+pub struct Placing<'a> {
+    /// A whole build's: files that already hold the right bytes are left,
+    /// and the others are written on several threads.
+    pub tree: bool,
+    /// Outputs to leave out, and to remove where they are.
+    pub leave: Option<&'a [bool]>,
+    /// The time to give every file of a whole build.
+    pub time: Option<libc::timespec>,
+}
+
 /// One output to put in place.
 struct Work<'a> {
+    /// Its place among the outputs.
+    at: usize,
     output: &'a crate::manifest::Output,
     dest: &'a PathBuf,
     /// Where the object is kept, and whether compressed.
@@ -324,6 +343,8 @@ struct How<'a> {
     verify: bool,
     clone: bool,
     roots: &'a Roots,
+    /// The time to give each file, if all of a build's get one.
+    time: Option<libc::timespec>,
 }
 
 /// Write one output to a staging file beside its destination. Returns the
@@ -336,6 +357,7 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
         dest,
         source,
         packed,
+        ..
     } = work;
     let Some(file_name) = dest.file_name() else {
         return (None, Err(anyhow::anyhow!("output without a file name")));
@@ -420,6 +442,18 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
         }
         // The umask applied at creation. Outputs keep their mode.
         out.set_permissions(fs::Permissions::from_mode(output.mode & 0o777))?;
+        if let Some(time) = how.time {
+            let times = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                time,
+            ];
+            if unsafe { libc::futimens(out.as_raw_fd(), times.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
         Ok(Some(true))
     })();
     (Some(staging), written)
@@ -733,11 +767,12 @@ impl Store {
         candidate: &Candidate,
         manifest: &Manifest,
         roots: &Roots,
-        tree: bool,
-        leave: Option<&[bool]>,
+        how: Placing<'_>,
         damaged: &mut bool,
     ) -> Result<Option<Restored>> {
+        let Placing { tree, leave, time } = how;
         let left = |i: usize| leave.is_some_and(|leave| leave[i]);
+        let begun = std::time::Instant::now();
         let mut dests = Vec::with_capacity(manifest.outputs.len());
         for output in &manifest.outputs {
             match roots.join(output.root, &output.path) {
@@ -768,6 +803,7 @@ impl Store {
             };
             match found {
                 Ok((source, packed)) => sources.push(Work {
+                    at: i,
                     output: &manifest.outputs[i],
                     dest: &dests[i],
                     source,
@@ -792,43 +828,79 @@ impl Store {
             *damaged = true;
             return Ok(None);
         }
+        // For the test of a source edited while a build is put back:
+        // say that the sources have been looked at, and wait to be told
+        // to go on.
+        if tree && let Some(hold) = env::var_os("JATO_TEST_HOLD") {
+            let hold = PathBuf::from(hold);
+            let _ = fs::write(hold.with_extension("waiting"), "");
+            for _ in 0..4000 {
+                if hold.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Every file of a whole build gets one time, as if the build had
+        // just ended before anyone looked at its sources: no source is
+        // newer, and one edited from then on will be.
+        let time = if tree { time } else { None };
         let how = How {
             verify: self.verify,
             clone: self.clone,
             roots,
+            time,
         };
         let bytes: u64 = sources.iter().map(|w| w.output.size).sum();
-        // Each piece of work leaves a staged file beside its destination.
+        // Each piece of work leaves a staged file beside its destination,
+        // made by as many threads as there are processors: each of them
+        // mostly unpacks or copies.
+        let most = std::thread::available_parallelism().map_or(8, |n| n.get());
         let threads = if tree {
-            8.min(sources.len() / 16 + 1)
+            most.clamp(1, 64).min(sources.len() / 16 + 1)
         } else {
             1
         };
-        let mut lanes: Vec<Vec<Work<'_>>> = (0..threads).map(|_| Vec::new()).collect();
-        for (i, work) in sources.into_iter().enumerate() {
-            lanes[i % threads].push(work);
-        }
-        // A lane's staged files with where each belongs, and how it went.
-        type Lane<'a> = (Vec<(PathBuf, &'a PathBuf)>, Result<Option<bool>>);
-        fn run<'a>(lane: Vec<Work<'a>>, how: &How<'_>) -> Lane<'a> {
-            let mut staged = Vec::with_capacity(lane.len());
-            for work in lane {
-                let dest = work.dest;
+        let looked = begun.elapsed();
+        // The largest first, each thread taking the next when it is done
+        // with one: a build has a few files of hundreds of megabytes and
+        // thousands of a few kilobytes.
+        sources.sort_by_key(|work| std::cmp::Reverse(work.output.size));
+        let queue = std::sync::Mutex::new(sources.into_iter());
+        // A thread's staged files with which outputs they are, and how it
+        // went.
+        type Lane = (Vec<(PathBuf, usize)>, Result<Option<bool>>);
+        fn run(
+            queue: &std::sync::Mutex<std::vec::IntoIter<Work<'_>>>,
+            failed: &std::sync::atomic::AtomicBool,
+            how: &How<'_>,
+        ) -> Lane {
+            use std::sync::atomic::Ordering;
+            let mut staged = Vec::new();
+            loop {
+                if failed.load(Ordering::Relaxed) {
+                    return (staged, Ok(Some(true)));
+                }
+                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                let Some(work) = next else {
+                    return (staged, Ok(Some(true)));
+                };
+                let at = work.at;
                 let (staging, placed) = place(work, how);
-                staged.extend(staging.map(|s| (s, dest)));
+                staged.extend(staging.map(|s| (s, at)));
                 if !matches!(placed, Ok(Some(true))) {
+                    failed.store(true, Ordering::Relaxed);
                     return (staged, placed);
                 }
             }
-            (staged, Ok(Some(true)))
         }
-        let results: Vec<Lane<'_>> = if threads == 1 {
-            lanes.into_iter().map(|lane| run(lane, &how)).collect()
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let results: Vec<Lane> = if threads == 1 {
+            vec![run(&queue, &failed, &how)]
         } else {
             std::thread::scope(|scope| {
-                let handles: Vec<_> = lanes
-                    .into_iter()
-                    .map(|lane| scope.spawn(|| run(lane, &how)))
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| scope.spawn(|| run(&queue, &failed, &how)))
                     .collect();
                 handles
                     .into_iter()
@@ -840,7 +912,8 @@ impl Store {
                     .collect()
             })
         };
-        let mut staged: Vec<(PathBuf, &PathBuf)> = Vec::new();
+        let written = begun.elapsed();
+        let mut staged: Vec<(PathBuf, usize)> = Vec::new();
         let mut verdict = Ok(Some(true));
         for (files, result) in results {
             staged.extend(files);
@@ -848,10 +921,13 @@ impl Store {
                 verdict = result;
             }
         }
-        if !matches!(verdict, Ok(Some(true))) {
-            for (staging, _) in &staged {
+        let give_up = |staged: &[(PathBuf, usize)]| {
+            for (staging, _) in staged {
                 let _ = fs::remove_file(staging);
             }
+        };
+        if !matches!(verdict, Ok(Some(true))) {
+            give_up(&staged);
             *damaged |= matches!(verdict, Ok(Some(false)));
             return verdict.map(|_| None);
         }
@@ -860,63 +936,99 @@ impl Store {
                 && let Err(e) = fs::remove_file(dest)
                 && e.kind() != io::ErrorKind::NotFound
             {
-                for (staging, _) in &staged {
-                    let _ = fs::remove_file(staging);
-                }
+                give_up(&staged);
                 return Err(e.into());
             }
         }
-        let mut done = 0;
-        let renamed: io::Result<()> = staged.iter().try_for_each(|(staging, dest)| {
-            fs::rename(staging, dest)?;
-            done += 1;
-            Ok(())
-        });
-        if let Err(e) = renamed {
-            for (staging, _) in &staged[done..] {
-                let _ = fs::remove_file(staging);
+        // Each staged file goes to its place, and is known from then on
+        // by what the filesystem says of it there.
+        type Known = Vec<(usize, Option<Stamp>)>;
+        let moved = |part: &[(PathBuf, usize)]| -> io::Result<Known> {
+            let mut known = Vec::with_capacity(part.len());
+            for (staging, at) in part {
+                fs::rename(staging, &dests[*at])?;
+                let stamp = fs::metadata(&dests[*at]).ok().map(|meta| Stamp::of(&meta));
+                known.push((*at, stamp));
             }
+            Ok(known)
+        };
+        let threads = most.clamp(1, 16).min(staged.len() / 256 + 1);
+        let moves: Vec<io::Result<Known>> = if threads == 1 {
+            vec![moved(&staged)]
+        } else {
+            let each = staged.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = staged
+                    .chunks(each)
+                    .map(|part| scope.spawn(|| moved(part)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(io::Error::other("a restore failed")))
+                    })
+                    .collect()
+            })
+        };
+        let mut known: Known = Vec::with_capacity(staged.len());
+        let mut failure = None;
+        for part in moves {
+            match part {
+                Ok(part) => known.extend(part),
+                Err(e) => failure = Some(e),
+            }
+        }
+        if let Some(e) = failure {
+            // Whatever was not moved is still beside its place.
+            give_up(&staged);
             return Err(e.into());
         }
-        if tree && let Some(stamp) = todo.first().and_then(|&i| just_before_now(&dests[i])) {
-            // Every file of the build gets one time, as if the build had
-            // just ended: no source is newer, and one edited from here on
-            // will be.
-            let times = [
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_OMIT,
-                },
-                stamp,
-            ];
+        if tree && !todo.is_empty() {
+            // Without a time taken before the sources were looked at, the
+            // files get the one the filesystem has now.
+            let late = match time {
+                Some(_) => None,
+                None => just_before_now(&dests[todo[0]]),
+            };
             for (i, dest) in dests.iter().enumerate() {
+                // What was written just now has the time already.
+                let written = todo.binary_search(&i).is_ok();
+                let Some(stamp) = late.or(time.filter(|_| !written)) else {
+                    continue;
+                };
                 // A file outside the target directory that already held
                 // what it should is one of the sources as far as Cargo
                 // can tell, a lock file the recorded build wrote for one.
                 // When it last changed is part of what Cargo remembers of
                 // the package, and it did not change now.
-                let source = manifest.outputs[i].root != crate::roots::TARGET
-                    && todo.binary_search(&i).is_err();
+                let source = manifest.outputs[i].root != crate::roots::TARGET && !written;
                 if !source
                     && !left(i)
                     && let Ok(name) = std::ffi::CString::new(dest.as_os_str().as_bytes())
                 {
+                    let times = [
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: libc::UTIME_OMIT,
+                        },
+                        stamp,
+                    ];
                     unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) };
+                    // Later commands read this file. They need not hash
+                    // it again.
+                    if let Ok(meta) = fs::metadata(dest) {
+                        self.remember(Stamp::of(&meta), manifest.outputs[i].digest);
+                    }
                 }
             }
+            if late.is_some() {
+                known.clear();
+            }
         }
-        if !todo.is_empty() {
-            let touched: Box<dyn Iterator<Item = usize>> = if tree {
-                Box::new(0..dests.len())
-            } else {
-                Box::new(todo.iter().copied())
-            };
-            for i in touched {
-                // Later commands read this file. They need not hash it again.
-                let output = &manifest.outputs[i];
-                if let Ok(meta) = fs::metadata(&dests[i]) {
-                    self.remember(Stamp::of(&meta), output.digest);
-                }
+        for (at, stamp) in known {
+            if let Some(stamp) = stamp {
+                self.remember(stamp, manifest.outputs[at].digest);
             }
         }
         // Which results were used lately decides what is evicted. An hour
@@ -928,6 +1040,8 @@ impl Store {
             detail,
             cost_ms,
             bytes,
+            files: todo.len(),
+            took: [looked, written - looked, begun.elapsed() - written],
         }))
     }
 
@@ -938,6 +1052,7 @@ impl Store {
             verify: self.verify,
             clone: self.clone,
             roots,
+            time: None,
         };
         let mut written: Vec<PathBuf> = Vec::with_capacity(saved.len());
         let placed = saved.iter().all(|file| {
@@ -950,6 +1065,7 @@ impl Store {
                 Err(_) => (object_path(&self.dir, &file.digest, true), true),
             };
             let work = Work {
+                at: 0,
                 output: file,
                 dest: &dest,
                 source,

@@ -1632,6 +1632,48 @@ fn a_build_is_the_same_build_on_any_terminal_and_on_none() {
     assert_eq!(p.count("build_hit"), 5, "{}", p.stats());
 }
 
+/// A build is right for the sources as they were when Jato looked at
+/// them. One edited after that, while the files are still being written,
+/// has to look newer to Cargo than the build does.
+#[test]
+fn an_edit_made_while_a_build_is_put_back_is_newer_than_the_build() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    p.run(&["build"]);
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    for target in [true, false] {
+        // Once into a target directory that is there, and once where
+        // there is none.
+        fs::remove_dir_all(p.root.join("target")).unwrap();
+        if target {
+            fs::create_dir(p.root.join("target")).unwrap();
+        }
+        let hold = p.temp.path().join(format!("go-{target}"));
+        let mut build = p
+            .command()
+            .env("JATO_TEST_HOLD", &hold)
+            .args(["build"])
+            .spawn()
+            .unwrap();
+        let waiting = hold.with_extension("waiting");
+        for _ in 0..4000 {
+            if waiting.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(waiting.exists(), "the build never looked at its sources");
+        // Saved again as it was: the time is what Cargo goes by.
+        write(p.root.join("leaf/src/text file"), "one");
+        write(&hold, "");
+        assert!(build.wait().unwrap().success());
+        assert_eq!(p.stale_for_cargo(&p.root, &p.root.join("target")), 2);
+    }
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+}
+
 #[test]
 fn an_edit_right_after_a_build_is_put_back_is_compiled() {
     if !observes() {

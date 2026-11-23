@@ -925,6 +925,9 @@ fn search(
         job.facts.ansi,
     );
     let mut nearest = None;
+    // Taken before anything is looked at: a source edited while a build
+    // is being put back is newer than the build.
+    let time = if tree { time_before(&job.roots) } else { None };
     for candidate in &candidates {
         let stored = store.record(candidate).unwrap_or_default();
         let manifest = match Manifest::decode(&stored) {
@@ -937,12 +940,19 @@ fn search(
                 continue;
             }
         };
+        let asked = Instant::now();
         if let Err(why) = manifest.holds(&mut here, store) {
             nearest.get_or_insert(why);
             continue;
         }
+        let held = asked.elapsed();
         let mut damaged = false;
-        let restored = store.restore(candidate, &manifest, &job.roots, tree, None, &mut damaged)?;
+        let how = crate::cas::Placing {
+            tree,
+            leave: None,
+            time,
+        };
+        let restored = store.restore(candidate, &manifest, &job.roots, how, &mut damaged)?;
         let Some(restored) = restored else {
             if damaged {
                 forget.push(candidate.key);
@@ -967,8 +977,21 @@ fn search(
         store.count("restored_bytes", restored.bytes);
         if tree {
             note_build(&job.roots, recipe, &candidate.key);
+            let [looked, written, placed] = restored.took.map(|took| took.as_millis());
+            log(
+                job.name(),
+                format_args!(
+                    "hit: {} inputs as they were, seen in {} ms; {} of {} files to put back, {} MB, seen in {looked} ms, written in {written} ms, in place in {placed} ms",
+                    manifest.inputs.len(),
+                    held.as_millis(),
+                    restored.files,
+                    manifest.outputs.len(),
+                    restored.bytes >> 20,
+                ),
+            );
+        } else {
+            log(job.name(), "hit");
         }
-        log(job.name(), "hit");
         let outcome = Outcome {
             code,
             stdout: stdout.into_owned(),
@@ -1492,6 +1515,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     }
     let mut best: Option<Near> = None;
     let mut why = None;
+    let time = time_before(&job.roots);
     for (at, candidate) in candidates.iter().enumerate().take(NEAR) {
         let stored = store.record(candidate).unwrap_or_default();
         let manifest = match Manifest::decode(&stored) {
@@ -1597,14 +1621,12 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         }
     }
     let mut damaged = false;
-    let restored = store.restore(
-        candidate,
-        &manifest,
-        &job.roots,
-        true,
-        Some(&leave),
-        &mut damaged,
-    );
+    let how = crate::cas::Placing {
+        tree: true,
+        leave: Some(&leave),
+        time,
+    };
+    let restored = store.restore(candidate, &manifest, &job.roots, how, &mut damaged);
     store.end_read();
     let restored = match restored {
         Ok(Some(restored)) => restored,
@@ -1666,6 +1688,34 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         now,
         cost_ms: restored.cost_ms,
     })
+}
+
+/// The time to give the files of a build that is put back: the latest
+/// that anything written from now on is certain to be newer than. It is
+/// taken before the sources are looked at, so that one edited while the
+/// files are being written is newer than they are, and Cargo compiles it.
+///
+/// In a target directory that exists the filesystem is asked, by writing
+/// there. Where there is none yet nothing is written beside the
+/// workspace to ask: files get the time of the kernel's last clock tick,
+/// and that clock can be read.
+fn time_before(roots: &Roots) -> Option<libc::timespec> {
+    let target = roots.path(roots::TARGET)?;
+    if target.is_dir() {
+        return crate::cas::just_before_now(&target.join("time"));
+    }
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &raw mut now) } != 0 {
+        return None;
+    }
+    // One edited within the same tick gets this very time, so step back.
+    if now.tv_nsec == 0 {
+        now.tv_sec -= 1;
+        now.tv_nsec = 999_999_999;
+    } else {
+        now.tv_nsec -= 1;
+    }
+    Some(now)
 }
 
 /// The name of the file in a target directory in which Jato notes the
