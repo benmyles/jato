@@ -488,6 +488,39 @@ fn a_build_whose_program_names_its_checkout_is_started_from_in_another() {
     success(p.command_in(&third).args(["build"]));
     assert_eq!(p.count("build_near"), 2, "{}", p.stats());
     assert_eq!(program(&third), format!("{} two:none\n", third.display()));
+    // A check first, and the build after it in the same target directory:
+    // recorded as resting on the check, with the check's files in it.
+    // Most of them are the check's, as they are in a workspace whose
+    // build scripts write a great deal.
+    let q = Project::whole();
+    let script = r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    for n in 0..60 {
+        std::fs::write(format!("{out}/made-{n}.txt"), n.to_string()).unwrap();
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"#;
+    write(q.root.join("build.rs"), script);
+    write(q.root.join("src/main.rs"), main);
+    q.run(&["check"]);
+    q.run(&["build"]);
+    assert_eq!(q.count("build_stored"), 2, "{}", q.stats());
+    // Where only the check has been put back, the programs have not been
+    // built: the build starts from the recorded one, and is not left to
+    // Cargo as one in a target directory that is built already.
+    let fourth = q.temp.path().join("fourth");
+    populate(&fourth);
+    write(fourth.join("build.rs"), script);
+    write(fourth.join("src/main.rs"), main);
+    fs::copy(q.root.join("Cargo.lock"), fourth.join("Cargo.lock")).unwrap();
+    success(q.command_in(&fourth).args(["check"]));
+    assert_eq!(q.count("build_hit"), 1, "{}", q.stats());
+    success(q.command_in(&fourth).args(["build"]));
+    assert_eq!(q.count("build_left_to_cargo"), 0, "{}", q.stats());
+    assert_eq!(q.count("build_near"), 1, "{}", q.stats());
+    assert_eq!(q.count("build_stored"), 3, "{}", q.stats());
+    assert_eq!(program(&fourth), says(&fourth));
 }
 
 #[test]

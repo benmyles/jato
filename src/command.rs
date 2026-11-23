@@ -1024,9 +1024,25 @@ pub fn mostly_built(job: &Job, store: &Store, recipe: &Digest) -> bool {
     else {
         return false;
     };
+    // What this command's own compilers wrote is what tells. A build
+    // rests on what a check left in the target directory, and its record
+    // has the check's files in it: a target directory with only those is
+    // not one in which the programs have been built.
+    let theirs = |part: usize| manifest.theirs.binary_search(&(part as u32)).is_ok();
+    let mut own: Vec<&Output> = manifest
+        .parts
+        .iter()
+        .enumerate()
+        .filter(|(part, _)| !theirs(*part))
+        .flat_map(|(_, part)| &part.outputs)
+        .map(|output| &manifest.outputs[*output as usize])
+        .collect();
+    if own.is_empty() {
+        own = manifest.outputs.iter().collect();
+    }
     // A sample is enough to tell a populated target from an empty one.
-    let step = (manifest.outputs.len() / 64).max(1);
-    let sample: Vec<_> = manifest.outputs.iter().step_by(step).collect();
+    let step = (own.len() / 64).max(1);
+    let sample: Vec<_> = own.iter().step_by(step).collect();
     let present = sample
         .iter()
         .filter(|output| {

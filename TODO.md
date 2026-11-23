@@ -59,6 +59,7 @@
 - [x] Read a file before compressing it, and do not compress what the cache holds; read a file that has two names once. Recording a dev build of all of Olo on ext4: 20 s to 2.5 s.
 - [x] Put a build back with a thread for each processor up to sixteen, each taking the next largest file, give files their time as they are written, and move them into place on several threads. A dev build of all of Olo, 21,600 files and 21 GB on ext4: 4.3 to 5.1 s, now 2.7 to 4.
 - [x] Say in `jato stats` whether the cache's filesystem clones files, and how large a build was that the budget turned away.
+- [x] Tell a target directory that is already built by what this command's own compilers wrote. A build's record has the files of the check it rested on in it, most of the record on Olo, so a worktree where only the check had been put back was taken for built, the build left to Cargo and never recorded there.
 - [x] Read a build's files into the cache on several threads when it is recorded. A dev build of all of Olo: 2.5 s to 1.1 s on ext4, 4.7 s to 2.3 s on Btrfs.
 - [x] Take the time for a build's files before its sources are looked at. A source saved while the files were being written looked older than the build to Cargo.
 
