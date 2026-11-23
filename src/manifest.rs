@@ -37,6 +37,10 @@ pub struct Input {
 /// A root and a path beneath it.
 pub type Place = (u8, PathBuf);
 
+/// The variable that lists the directories the loader looks through for
+/// a program's libraries before any others.
+pub const LIBRARY_PATH: &[u8] = b"LD_LIBRARY_PATH";
+
 /// A name the command looked for in the directories above its workspace,
 /// one after another: the way Cargo looks for its settings and for a
 /// repository, and rustup for the toolchain to use. From another workspace
@@ -703,14 +707,19 @@ impl Manifest {
             return Err("its diagnostics were rendered with different colour settings".into());
         }
         for (name, recorded) in &self.env {
-            let name = OsStr::from_bytes(name);
-            let current = here.env.get(name).map(|v| here.roots.mark_os(v));
-            if current.as_deref() != recorded.as_deref() {
-                return Err(format!(
-                    "the environment variable {} changed",
-                    name.to_string_lossy()
-                ));
+            let variable = OsStr::from_bytes(name);
+            let current = here.env.get(variable).map(|v| here.roots.mark_os(v));
+            if current.as_deref() == recorded.as_deref() {
+                continue;
             }
+            if name == LIBRARY_PATH {
+                self.libraries_found_alike(recorded.as_deref(), here)?;
+                continue;
+            }
+            return Err(format!(
+                "the environment variable {} changed",
+                variable.to_string_lossy()
+            ));
         }
         for (name, recorded) in &self.which {
             let name = OsStr::from_bytes(name);
@@ -735,6 +744,91 @@ impl Manifest {
                     at(found),
                     at(recorded)
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the loader, going through the directories its variable
+    /// names now, finds every library where it found it when the command
+    /// was recorded with another list.
+    ///
+    /// Cargo puts a directory more in the list for what a build script
+    /// starts in a build than in a check, and the compilers a build
+    /// script starts are the same commands in both. The loader takes the
+    /// first directory that has the name it wants. So the directories in
+    /// both lists have to follow one another as they did, nothing may
+    /// have been found in a directory no longer listed, and a directory
+    /// listed only now may hold none of the names: those of the shared
+    /// objects among the inputs, wherever each was found, and of anything
+    /// examined in a directory of the recorded list.
+    fn libraries_found_alike(
+        &self,
+        recorded: Option<&[u8]>,
+        here: &Here<'_>,
+    ) -> Result<(), String> {
+        let changed = |how: String| format!("the libraries' search path changed: {how}");
+        // An entry that is no full path is a place that moves with
+        // whatever looks there.
+        let dirs = |list: &[u8]| -> Option<Vec<PathBuf>> {
+            list.split(|byte| *byte == b':')
+                .map(|dir| {
+                    dir.starts_with(b"/")
+                        .then(|| PathBuf::from(OsStr::from_bytes(dir)))
+                })
+                .collect()
+        };
+        let was = match recorded {
+            None => Some(Vec::new()),
+            Some(list) => here.roots.unmark(list).and_then(|list| dirs(&list)),
+        };
+        let now = match here.env.get(OsStr::from_bytes(LIBRARY_PATH)) {
+            None => Some(Vec::new()),
+            Some(list) => dirs(list.as_bytes()),
+        };
+        let (Some(was), Some(now)) = (was, now) else {
+            return Err(changed("it names a place that is not a full path".into()));
+        };
+        let kept = |from: &[PathBuf], other: &[PathBuf]| -> Vec<PathBuf> {
+            from.iter()
+                .filter(|dir| other.contains(dir))
+                .cloned()
+                .collect()
+        };
+        if kept(&was, &now) != kept(&now, &was) {
+            return Err(changed("its directories are in another order".into()));
+        }
+        let added: Vec<&PathBuf> = now.iter().filter(|dir| !was.contains(dir)).collect();
+        let mut names: Vec<&OsStr> = Vec::new();
+        for input in &self.inputs {
+            let (Some(parent), Some(name)) = (input.path.parent(), input.path.file_name()) else {
+                continue;
+            };
+            let Some(parent) = here.roots.join(input.root, parent) else {
+                continue;
+            };
+            let listed = was.contains(&parent);
+            if listed && input.state != State::Absent && !now.contains(&parent) {
+                return Err(changed(format!(
+                    "{} was found in a directory that is no longer in it",
+                    parent.join(name).display()
+                )));
+            }
+            if listed || memchr::memmem::find(name.as_bytes(), b".so").is_some() {
+                names.push(name);
+            }
+        }
+        for dir in added {
+            // The loader also looks in directories of this name for
+            // libraries made for the processor at hand.
+            let found = std::iter::once(OsStr::new("glibc-hwcaps"))
+                .chain(names.iter().copied())
+                .find(|name| fs::symlink_metadata(dir.join(name)).is_ok());
+            if let Some(name) = found {
+                return Err(changed(format!(
+                    "{} would be found first now",
+                    dir.join(name).display()
+                )));
             }
         }
         Ok(())
@@ -863,6 +957,133 @@ mod tests {
         fs::remove_file(&there).unwrap();
         let why = m.walks_hold(&work("second/ws"), nothing).unwrap_err();
         assert!(why.ends_with("is not above this workspace"), "{why}");
+    }
+
+    #[test]
+    fn a_library_path_is_known_by_what_the_loader_finds_along_it() {
+        use crate::roots::{ABSOLUTE, Root, TARGET};
+        let temp = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let dir = temp.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let (tools, system, target) = (dir("toolchain/lib"), dir("usr/lib"), dir("ws/target"));
+        fs::create_dir_all(target.join("debug")).unwrap();
+        for file in [
+            tools.join("libdriver.so"),
+            tools.join("libstd.rlib"),
+            system.join("libc.so.6"),
+        ] {
+            fs::write(file, "").unwrap();
+        }
+        let roots = Roots {
+            work: Some(Root::at(temp.path().join("ws"))),
+            target: Some(Root::at(target.clone())),
+        };
+        let file = |path: PathBuf, state: State| Input {
+            root: ABSOLUTE,
+            path,
+            link: None,
+            state,
+        };
+        // As recorded by a compiler that a build script started in a
+        // check: its own libraries, one of the system's, and a name it
+        // looked for among its own in vain.
+        let found = State::File([0; 32]);
+        let m = Manifest {
+            inputs: vec![
+                file(tools.join("libdriver.so"), found.clone()),
+                file(tools.join("libstd.rlib"), found.clone()),
+                file(tools.join("libextra.so"), State::Absent),
+                file(system.join("libc.so.6"), found.clone()),
+                file(temp.path().join("ws/src/lib.rs"), found),
+            ],
+            ..Manifest::default()
+        };
+        let recorded = tools.as_os_str().as_bytes().to_vec();
+        let alike = |now: Option<String>| {
+            let mut env = Env::new();
+            if let Some(now) = now {
+                env.insert(OsStr::from_bytes(LIBRARY_PATH).to_owned(), now.into());
+            }
+            let here = Here::new(&roots, &env, &[], None, false);
+            m.libraries_found_alike(Some(&recorded), &here)
+        };
+        let (tools_s, debug) = (tools.display(), target.join("debug"));
+        // The same list, and the one a build has, with a directory before
+        // it that holds none of the names.
+        assert_eq!(alike(Some(format!("{tools_s}"))), Ok(()));
+        assert_eq!(
+            alike(Some(format!("{}:{tools_s}", debug.display()))),
+            Ok(())
+        );
+        assert_eq!(
+            alike(Some(format!("{tools_s}:{}", debug.display()))),
+            Ok(())
+        );
+        // A file of another name there changes nothing.
+        fs::write(debug.join("app"), "").unwrap();
+        fs::write(debug.join("lib.rs"), "").unwrap();
+        assert_eq!(
+            alike(Some(format!("{}:{tools_s}", debug.display()))),
+            Ok(())
+        );
+        // One of a name that was looked up does: found among the
+        // compiler's own, looked for there in vain, or found elsewhere.
+        for name in ["libstd.rlib", "libextra.so", "libc.so.6", "glibc-hwcaps"] {
+            fs::write(debug.join(name), "").unwrap();
+            let why = alike(Some(format!("{}:{tools_s}", debug.display()))).unwrap_err();
+            assert!(why.ends_with("would be found first now"), "{name}: {why}");
+            fs::remove_file(debug.join(name)).unwrap();
+        }
+        // The directory things were found in is no longer looked through.
+        let why = alike(None).unwrap_err();
+        assert!(why.contains("no longer in it"), "{why}");
+        let why = alike(Some(format!("{}", system.display()))).unwrap_err();
+        assert!(why.contains("no longer in it"), "{why}");
+        // A place that moves with whoever looks.
+        let why = alike(Some(format!("{tools_s}:"))).unwrap_err();
+        assert!(why.contains("not a full path"), "{why}");
+        // Two directories the other way round.
+        let both = format!("{tools_s}:{}", system.display());
+        let m2 = Manifest {
+            inputs: m.inputs.clone(),
+            ..Manifest::default()
+        };
+        let here_env: Env = [(
+            OsStr::from_bytes(LIBRARY_PATH).to_owned(),
+            format!("{}:{tools_s}", system.display()).into(),
+        )]
+        .into_iter()
+        .collect();
+        let here = Here::new(&roots, &here_env, &[], None, false);
+        let why = m2
+            .libraries_found_alike(Some(both.as_bytes()), &here)
+            .unwrap_err();
+        assert!(why.contains("another order"), "{why}");
+        // A list recorded with the target directory in it, read where
+        // the target directory is another.
+        let marked = roots
+            .mark(format!("{}:{tools_s}", debug.display()).as_bytes())
+            .into_owned();
+        assert!(memchr::memchr(0, &marked).is_some());
+        let elsewhere = Roots {
+            work: roots.work.clone(),
+            target: Some(Root::at(dir("other/target"))),
+        };
+        let env: Env = [(
+            OsStr::from_bytes(LIBRARY_PATH).to_owned(),
+            format!(
+                "{}:{tools_s}",
+                elsewhere.path(TARGET).unwrap().join("debug").display()
+            )
+            .into(),
+        )]
+        .into_iter()
+        .collect();
+        let here = Here::new(&elsewhere, &env, &[], None, false);
+        assert_eq!(m.libraries_found_alike(Some(&marked), &here), Ok(()));
     }
 
     #[test]

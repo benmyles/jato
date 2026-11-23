@@ -26,7 +26,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v6";
+const EPOCH: &str = "jato command v7";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -495,6 +495,7 @@ impl Job {
             Scope::Unit => keyed(name),
             // Cargo reads its configuration from variables that never reach
             // the compiler except as arguments.
+            // And Cargo makes the compilers' library path out of its own.
             Scope::Build => {
                 !matches!(
                     name,
@@ -508,14 +509,39 @@ impl Job {
                     || matches!(
                         name,
                         b"TERM" | b"NO_COLOR" | b"CLICOLOR" | b"CLICOLOR_FORCE"
-                    ))
+                    )
+                    || name == crate::manifest::LIBRARY_PATH)
             }
         }
     }
 
     pub fn recipe(&self) -> Digest {
+        self.recipe_and(None)
+    }
+
+    /// Everything the recipe is made of, a line for each thing, with the
+    /// roots as their marks: for a person comparing two commands that
+    /// should have been one.
+    pub fn recipe_said(&self) -> Vec<u8> {
+        let mut said = Vec::new();
+        self.recipe_and(Some(&mut said));
+        said
+    }
+
+    fn recipe_and(&self, mut said: Option<&mut Vec<u8>>) -> Digest {
         let mut hash = blake3::Hasher::new_derive_key(EPOCH);
         let roots = &self.roots;
+        let mut field = |hash: &mut blake3::Hasher, bytes: &[u8]| {
+            field(hash, bytes);
+            if let Some(said) = said.as_deref_mut() {
+                said.extend(bytes.iter().map(|byte| match byte {
+                    0 => b'|',
+                    b'\n' => b' ',
+                    byte => *byte,
+                }));
+                said.push(b'\n');
+            }
+        };
         field(&mut hash, &roots.mark_os(&self.request.program));
         field(&mut hash, &roots.mark_os(self.request.cwd.as_os_str()));
         for (i, arg) in self.request.args.iter().enumerate() {
@@ -772,6 +798,14 @@ impl Job {
     pub fn observer(&self, store: &Store) -> observe::Config {
         let mut ignore = vec![store.dir.clone()];
         ignore.extend(self.facts.incremental.clone());
+        // The tokens a build shares among its compilers, where they are
+        // in a pipe with a name.
+        ignore.extend(
+            crate::jobs::TOLD_IN
+                .iter()
+                .filter_map(|name| self.request.env.get(OsStr::new(name)))
+                .filter_map(|said| crate::jobs::named_pipe(said)),
+        );
         observe::Config {
             fast: observe::fast_library(&store.dir),
             ignore,
@@ -844,6 +878,25 @@ fn search(
     forget: &mut Vec<Digest>,
 ) -> Result<Option<(Outcome, Manifest)>> {
     let candidates = store.candidates(recipe)?;
+    // For someone finding out why two commands were not the same one:
+    // each as it is known, in a file named for it.
+    if let Some(dir) = env::var_os("JATO_RECIPES") {
+        let name: String = job
+            .name()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .take(60)
+            .collect();
+        let hex = blake3::Hash::from(*recipe).to_hex();
+        let file = Path::new(&dir).join(format!("{name}.{}", &hex.as_str()[..16]));
+        let _ = fs::write(file, job.recipe_said());
+    }
     if candidates.is_empty() {
         log(job.name(), "miss: this command has not been recorded");
         if job.tool && env::var_os("JATO_LOG").is_some() {
@@ -2230,6 +2283,16 @@ pub fn record(
                 }
             }
         }
+        // Where the loader looked for the libraries of the compiler and
+        // of what it started. That is no part of which command this is:
+        // what was found there is among the inputs. The directories are
+        // kept, to tell at another time whether the same would be found.
+        let name = crate::manifest::LIBRARY_PATH;
+        if !manifest.env.iter().any(|(known, _)| known == name) {
+            let value = job.request.env.get(OsStr::from_bytes(name));
+            let value = value.map(|v| roots.mark_os(v).into_owned());
+            manifest.env.push((name.to_vec(), value));
+        }
         let rendered = if job.facts.json {
             memchr::memmem::find(stderr, b"\"rendered\":\"").is_some()
         } else {
@@ -2489,7 +2552,10 @@ pub fn record(
             let again: Vec<Input> = outside
                 .iter()
                 .filter(|input| {
-                    around.beside(&input.path) && !around.named(&input.path) && !walked(&input.path)
+                    around.beside(&input.path)
+                        && !around.named(&input.path)
+                        && !around.kept(&input.path)
+                        && !walked(&input.path)
                 })
                 .map(|input| {
                     let (up, rest) = around.above(&input.path);
@@ -2510,7 +2576,10 @@ pub fn record(
         // would be again nowhere else.
         let pin = (roots::WORK, work.to_owned());
         if let Some((_, _, path)) = outputs.iter().find(|(root, _, path)| {
-            *root == roots::ABSOLUTE && around.beside(path) && !around.named(path)
+            *root == roots::ABSOLUTE
+                && around.beside(path)
+                && !around.named(path)
+                && !around.kept(path)
         }) && !manifest.pins.contains(&pin)
         {
             log(

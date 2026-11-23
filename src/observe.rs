@@ -1332,16 +1332,44 @@ mod imp {
         program: HashMap<u32, (bool, u64)>,
     }
 
-    /// The process a thread belongs to and that process's parent.
+    /// The process a thread belongs to and that process's parent. Both
+    /// stand near the top of the thread's status, after a name the kernel
+    /// keeps to one line, so one read of its beginning has them: the
+    /// kernel makes the whole of it anew for every read, and this is asked
+    /// for every thread a build starts.
     fn ids(tid: u32) -> Option<(u32, u32)> {
-        let status = fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
-        let field = |name: &str| {
+        use std::io::Read;
+        let mut status = [0u8; 384];
+        let mut file = fs::File::open(format!("/proc/{tid}/status")).ok()?;
+        let n = file.read(&mut status).ok()?;
+        ids_in(&status[..n])
+    }
+
+    /// The same, from the beginning of a status.
+    fn ids_in(status: &[u8]) -> Option<(u32, u32)> {
+        let field = |name: &[u8]| {
             status
-                .lines()
+                .split(|byte| *byte == b'\n')
                 .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| std::str::from_utf8(value).ok())
                 .and_then(|value| value.trim().parse::<u32>().ok())
         };
-        Some((field("Tgid:")?, field("PPid:")?))
+        Some((field(b"Tgid:")?, field(b"PPid:")?))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn a_thread_s_process_and_its_parent_stand_at_the_top_of_its_status() {
+        let status = b"Name:\tPPid:\\n7 Tgid:\nUmask:\t0022\nState:\tS (sleeping)\n\
+            Tgid:\t4100\nNgid:\t0\nPid:\t4107\nPPid:\t38\nTracerPid:\t0\nUid:\t1000";
+        assert_eq!(ids_in(status), Some((4100, 38)));
+        assert_eq!(ids_in(&status[..60]), None);
+        let me = std::process::id();
+        assert_eq!(
+            ids(me),
+            Some((me, std::os::unix::process::parent_id())),
+            "this process's own status"
+        );
     }
 
     impl State {
@@ -1397,8 +1425,10 @@ mod imp {
             self.events += 1;
             let now = self.events;
             // The program may be gone by now. What it belonged to is known
-            // from its first report, which came before any note.
+            // from its first report, which came before any note. Where
+            // nothing has a record of its own there is nothing to ask.
             let scope = match self.owner.get(&process) {
+                _ if self.scopes.is_empty() => Some(None),
                 Some((scope, _)) => Some(*scope),
                 None if ids(process).is_some() => Some(self.scope_of(process)),
                 None => None,

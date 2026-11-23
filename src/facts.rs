@@ -193,7 +193,6 @@ pub fn keyed(name: &[u8]) -> bool {
         b"SOURCE_DATE_EPOCH",
         b"ZERO_AR_DATE",
         b"LIBRARY_PATH",
-        b"LD_LIBRARY_PATH",
         b"LD_PRELOAD",
         b"LD_RUN_PATH",
         b"COMPILER_PATH",

@@ -315,7 +315,8 @@ fn object_path(dir: &Path, digest: &Digest, packed: bool) -> PathBuf {
 struct Work<'a> {
     output: &'a crate::manifest::Output,
     dest: &'a PathBuf,
-    source: File,
+    /// Where the object is kept, and whether compressed.
+    source: PathBuf,
     packed: bool,
 }
 
@@ -333,11 +334,19 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
     let Work {
         output,
         dest,
-        mut source,
+        source,
         packed,
     } = work;
     let Some(file_name) = dest.file_name() else {
         return (None, Err(anyhow::anyhow!("output without a file name")));
+    };
+    // Opened only now: a build has more files than a process may hold
+    // open. One evicted since it was looked for is a result that is not
+    // all there, like one that was never whole.
+    let mut source = match File::open(&source) {
+        Ok(source) => source,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (None, Ok(Some(false))),
+        Err(e) => return (None, Err(e.into())),
     };
     let mut name = file_name.to_owned();
     name.push(format!(".jato-{}", std::process::id()));
@@ -742,17 +751,20 @@ impl Store {
                 todo.push(i);
             }
         }
-        // Open every object before writing anything, so a result evicted
-        // meanwhile leaves the target untouched.
+        // Find every object before writing anything: a result that is not
+        // all there is found out before any of it is copied. Nothing is in
+        // the target until all of it is staged, so one evicted meanwhile
+        // leaves the target untouched too.
         let mut sources = Vec::with_capacity(todo.len());
         for &i in &todo {
             let digest = &manifest.outputs[i].digest;
-            let plain = File::open(object_path(&self.dir, digest, false));
-            let found = match plain {
+            let plain = object_path(&self.dir, digest, false);
+            let found = match fs::symlink_metadata(&plain) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    File::open(object_path(&self.dir, digest, true)).map(|f| (f, true))
+                    let packed = object_path(&self.dir, digest, true);
+                    fs::symlink_metadata(&packed).map(|_| (packed, true))
                 }
-                other => other.map(|f| (f, false)),
+                other => other.map(|_| (plain, false)),
             };
             match found {
                 Ok((source, packed)) => sources.push(Work {
@@ -932,13 +944,10 @@ impl Store {
             let Some(dest) = roots.join(file.root, &file.path) else {
                 return false;
             };
-            let found = File::open(object_path(&self.dir, &file.digest, false))
-                .map(|f| (f, false))
-                .or_else(|_| {
-                    File::open(object_path(&self.dir, &file.digest, true)).map(|f| (f, true))
-                });
-            let Ok((source, packed)) = found else {
-                return false;
+            let plain = object_path(&self.dir, &file.digest, false);
+            let (source, packed) = match fs::symlink_metadata(&plain) {
+                Ok(_) => (plain, false),
+                Err(_) => (object_path(&self.dir, &file.digest, true), true),
             };
             let work = Work {
                 output: file,

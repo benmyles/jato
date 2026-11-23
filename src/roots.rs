@@ -118,6 +118,8 @@ pub struct Surroundings {
     /// Directories the environment names in full. What is in them was
     /// reached by that name, wherever the workspace is.
     named: Vec<PathBuf>,
+    /// The home directory, if the workspace is somewhere in it.
+    home: Option<PathBuf>,
 }
 
 impl Surroundings {
@@ -159,16 +161,45 @@ impl Surroundings {
                 }
             }
         }
+        let home = env
+            .get(OsStr::new("HOME"))
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute() && depth(home) > 0 && work.starts_with(home));
         Self {
             work: work.to_owned(),
             reach,
             named,
+            home,
         }
     }
 
     /// Whether `path` was reached by a name of its own.
     pub fn named(&self, path: &Path) -> bool {
         self.named.iter().any(|dir| path.starts_with(dir))
+    }
+
+    /// Whether `path` is one of the places in the home directory where
+    /// programs keep a person's settings and their own files: a name
+    /// there that begins with a dot, as git's `.gitconfig` is and
+    /// `.config` and `.cache`. A program finds such a place by the home
+    /// directory's name, wherever the workspace is. One that looks for a
+    /// name in every directory above the workspace comes by there too,
+    /// and that is a search, recorded as one.
+    pub fn kept(&self, path: &Path) -> bool {
+        let Some(home) = &self.home else {
+            return false;
+        };
+        let first = path
+            .strip_prefix(home)
+            .ok()
+            .and_then(|rest| rest.components().next());
+        match first {
+            Some(std::path::Component::Normal(first)) => {
+                first.as_encoded_bytes().starts_with(b".")
+                    && !self.work.starts_with(home.join(first))
+            }
+            _ => false,
+        }
     }
 
     /// Whether `path`, which is outside the workspace, is close enough
@@ -199,6 +230,14 @@ impl Surroundings {
             way.push(rest);
         }
         way
+    }
+}
+
+impl Root {
+    /// A root at `path`, which is what it is called everywhere.
+    #[cfg(test)]
+    pub fn at(path: PathBuf) -> Self {
+        Self { path, real: None }
     }
 }
 
@@ -423,6 +462,22 @@ mod surroundings {
         let low = around("/nowhere/ben/olo", &[("HOME", "/nowhere/ben")]);
         assert!(low.beside(Path::new("/nowhere/ben/shared/lib.rs")));
         assert!(!low.beside(Path::new("/nowhere/other/file")));
+        // All but what programs keep there for the person, under names
+        // that begin with a dot: those they find by the home directory.
+        assert!(low.beside(Path::new("/nowhere/ben/.gitconfig")));
+        assert!(low.kept(Path::new("/nowhere/ben/.gitconfig")));
+        assert!(low.kept(Path::new("/nowhere/ben/.config/git/config")));
+        assert!(!low.kept(Path::new("/nowhere/ben/shared/.gitconfig")));
+        assert!(!low.kept(Path::new("/nowhere/ben/shared/lib.rs")));
+        assert!(!low.kept(Path::new("/nowhere/ben")));
+        assert!(!low.kept(Path::new("/nowhere/other/.gitconfig")));
+        // Not a workspace that is itself in such a place, nor one that is
+        // not in the home directory at all.
+        let hidden = around("/nowhere/ben/.work/olo", &[("HOME", "/nowhere/ben")]);
+        assert!(!hidden.kept(Path::new("/nowhere/ben/.work/shared/lib.rs")));
+        assert!(hidden.kept(Path::new("/nowhere/ben/.gitconfig")));
+        let away = around("/elsewhere/src/olo", &[("HOME", "/nowhere/ben")]);
+        assert!(!away.kept(Path::new("/nowhere/ben/.gitconfig")));
         // At the top of the filesystem nothing is.
         assert!(!around("/olo", &[]).beside(Path::new("/shared/lib.rs")));
     }

@@ -793,16 +793,28 @@ fn supervise(
             None
         }
     };
+    let mut ignore = vec![store.dir.clone()];
+    // Tokens that whoever started this build shares with it.
+    ignore.extend(
+        crate::jobs::TOLD_IN
+            .iter()
+            .filter_map(std::env::var_os)
+            .filter_map(|said| crate::jobs::named_pipe(&said)),
+    );
     let config = observe::Config {
         fast: observe::fast_library(&store.dir),
-        ignore: vec![store.dir.clone()],
+        ignore,
         unlisted: Vec::new(),
         state: None,
     };
+    // And the tokens for this build's own compilers, kept in the cache
+    // directory until Cargo has gone.
+    let tokens = crate::jobs::offer(&mut cmd, &store.dir);
     let (mut child, session) = match observe::spawn(&mut cmd, config) {
         Ok(started) => started,
         Err(e) => {
             log(name, format_args!("not observed: {e:#}"));
+            crate::jobs::withdraw(&mut cmd, tokens);
             cmd.env_remove("JATO_SESSION")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
@@ -874,6 +886,7 @@ fn supervise(
         let _ = child.kill();
     }
     let status = child.wait().context("waiting for Cargo")?;
+    drop(tokens);
     server.stop.store(true, Ordering::Release);
     let _ = UnixStream::connect_addr(&address(OsStr::new(&socket))?);
     let _ = accept.join();

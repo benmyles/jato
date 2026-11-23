@@ -557,6 +557,81 @@ fn settings_above_a_checkout_are_looked_for_above_each_checkout() {
     assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
 }
 
+/// A program finds what it keeps for the person in the home directory by
+/// the home directory's name: git its `.gitconfig`, a tool the settings
+/// it reads. From a checkout further down, the same steps up would lead
+/// somewhere else, and nothing took them.
+#[test]
+fn settings_kept_in_the_home_directory_are_found_there_from_any_checkout() {
+    if !observes() {
+        return;
+    }
+    let p = Project {
+        whole: true,
+        ..Project::named("home/app")
+    };
+    let home = p.temp.path().join("home");
+    let at_home = |root: &Path| {
+        let mut cmd = p.command_in(root);
+        cmd.env("HOME", &home);
+        // The toolchains stay where they are.
+        if std::env::var_os("RUSTUP_HOME").is_none()
+            && let Some(real) = std::env::var_os("HOME")
+        {
+            cmd.env("RUSTUP_HOME", Path::new(&real).join(".rustup"));
+        }
+        cmd
+    };
+    let script = |root: &Path| {
+        write(
+            root.join("leaf/build.rs"),
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let home = std::env::var("HOME").unwrap();
+    let kept = std::fs::read_to_string(format!("{home}/.leafrc")).unwrap_or_default();
+    println!("cargo:rustc-env=LEAF_ENV={}", kept.trim());
+}
+"#,
+        );
+    };
+    script(&p.root);
+    write(home.join(".leafrc"), "kept\n");
+    assert_eq!(
+        success(at_home(&p.root).args(["run", "-q"])).stdout,
+        b"one:kept\n"
+    );
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    let copy = |root: &Path| {
+        populate(root);
+        script(root);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+    };
+    // Further down in the home directory, and outside it.
+    let down = home.join("work/further/down/app");
+    copy(&down);
+    assert_eq!(
+        success(at_home(&down).args(["run", "-q"])).stdout,
+        b"one:kept\n"
+    );
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    let outside = p.temp.path().join("elsewhere/app");
+    copy(&outside);
+    assert_eq!(
+        success(at_home(&outside).args(["run", "-q"])).stdout,
+        b"one:kept\n"
+    );
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    // What is kept there is still what the build read.
+    write(home.join(".leafrc"), "new\n");
+    let other = home.join("other/app");
+    copy(&other);
+    assert_eq!(
+        success(at_home(&other).args(["run", "-q"])).stdout,
+        b"one:new\n"
+    );
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+}
+
 #[test]
 fn a_directory_named_like_one_at_the_top_of_the_filesystem_was_not_searched_for() {
     if !observes() {
@@ -1581,6 +1656,173 @@ fn a_build_recorded_once_is_filled_in_without_running_cargo() {
     );
 }
 
+/// A pipe with a name, holding so many tokens, and its name.
+fn tokens(dir: &Path, count: usize) -> (fs::File, PathBuf) {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("tokens");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut pipe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .unwrap();
+    pipe.write_all(&vec![b'|'; count]).unwrap();
+    (pipe, path)
+}
+
+/// A library of several modules, which the compiler turns into machine
+/// code on as many threads as it gets tokens for.
+fn several_modules(root: &Path) {
+    let mut lib = String::from("mod value; pub use value::value;\n");
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        lib.push_str(&format!("pub mod {name};\n"));
+        write(
+            root.join(format!("leaf/src/{name}.rs")),
+            &format!(
+                "pub fn {name}(n: u64) -> String {{ (0..n).map(|i| format!(\"{name}{{i}}\")).collect() }}\n"
+            ),
+        );
+    }
+    write(root.join("leaf/src/lib.rs"), &lib);
+}
+
+/// Whoever starts a build may share its tokens with it, make for one, in
+/// a pipe that has a name. Every compiler opens that file, takes tokens
+/// out of it and puts them back.
+#[test]
+fn tokens_in_a_pipe_with_a_name_are_no_input_of_a_compiler() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    several_modules(&p.root);
+    let (_pipe, path) = tokens(&p.temp.path().join("shared"), 3);
+    let told = format!("-j4 --jobserver-auth=fifo:{}", path.display());
+    let build = || {
+        success(
+            p.command()
+                .env("CARGO_MAKEFLAGS", &told)
+                .args(["build", "--release"]),
+        )
+    };
+    let (hits, misses) = p.during(|| drop(build()));
+    assert_eq!((hits, misses), (0, 2), "{}", p.stats());
+    assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+    p.clean();
+    let (hits, misses) = p.during(|| drop(build()));
+    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+}
+
+/// Cargo makes a pipe for its tokens unless it is given one, and to hand
+/// on a pipe without a name it starts every compiler as a copy of itself.
+/// Jato gives it one with a name, and only where nothing says how many
+/// compilers to run.
+#[test]
+fn cargo_is_given_its_tokens_by_name_unless_something_says_how_many() {
+    if !observes() || std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+        return;
+    }
+    let p = Project::whole();
+    several_modules(&p.root);
+    write(
+        p.root.join("leaf/build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let told = std::env::var("CARGO_MAKEFLAGS").unwrap_or_default();
+    let how = if told.contains("--jobserver-auth=fifo:") { "by name" } else { "handed down" };
+    println!("cargo:rustc-env=LEAF_ENV={how}");
+}
+"#,
+    );
+    let program = |target: &Path| {
+        let out = Command::new(target.join("debug/app")).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let build = |target: &Path, more: &[&str]| {
+        success(
+            p.command()
+                .env("JATO_JOBSERVER", "1")
+                .env("CARGO_TARGET_DIR", target)
+                .arg("build")
+                .args(more),
+        )
+    };
+    let first = p.root.join("target");
+    build(&first, &[]);
+    assert_eq!(program(&first), "one:by name\n");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // The pipe went with the build.
+    let left: Vec<_> = fs::read_dir(p.temp.path().join("cache/locks/jobs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("tokens-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    // A build told how many is Cargo's to arrange, on the command line
+    // or in its settings.
+    let second = p.temp.path().join("second");
+    build(&second, &["-j2"]);
+    assert_eq!(program(&second), "one:handed down\n");
+    write(p.root.join(".cargo/config.toml"), "[build]\njobs = 2\n");
+    let third = p.temp.path().join("third");
+    build(&third, &[]);
+    assert_eq!(program(&third), "one:handed down\n");
+}
+
+/// A build has more files than a process may hold open at once.
+#[test]
+fn a_build_of_more_files_than_may_be_open_at_once_is_put_back() {
+    use std::os::unix::process::CommandExt;
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        write(
+            p.root.join(format!("src/bin/{name}.rs")),
+            "fn main() { println!(\"{}\", leaf::value()); }",
+        );
+    }
+    p.run(&["build"]);
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    fn files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .map(|entry| match entry.file_type().unwrap().is_dir() {
+                true => files(&entry.path()),
+                false => 1,
+            })
+            .sum()
+    }
+    p.clean();
+    let mut cmd = p.command();
+    cmd.args(["build"]);
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = 40;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    success(&mut cmd);
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    let back = files(&p.root.join("target"));
+    assert!(back > 64, "only {back} files were put back");
+    assert_eq!(p.stale_for_cargo(&p.root, &p.root.join("target")), 0);
+}
+
 #[test]
 fn a_recorded_build_gives_way_to_anything_that_changed() {
     if !observes() {
@@ -2223,6 +2465,37 @@ fn c_that_a_build_script_compiles_is_remembered_like_rust() {
     );
     assert_eq!(p.count("build_hit"), before, "{}", p.stats());
     assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+}
+
+/// What a build script has compiled is the same work whichever command
+/// the build is for. Cargo lists a directory more for the loader when it
+/// runs a build script in a build than in a check.
+#[test]
+fn what_a_build_script_compiled_for_a_check_is_there_for_a_build() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    compile_c(&p.root);
+    p.run(&["check"]);
+    assert_eq!(p.count("tool_stored"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_hit"), 0, "{}", p.stats());
+    let built = p.temp.path().join("built");
+    success(p.command().env("CARGO_TARGET_DIR", &built).args(["build"]));
+    assert_eq!(p.count("tool_hit"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_stored"), 1, "{}", p.stats());
+    let out = Command::new(built.join("debug/app")).output().unwrap();
+    assert_eq!(out.stdout, b"42\n");
+    // And the other way round.
+    let q = Project::new();
+    compile_c(&q.root);
+    q.run(&["build"]);
+    success(
+        q.command()
+            .env("CARGO_TARGET_DIR", q.temp.path().join("checked"))
+            .args(["check"]),
+    );
+    assert_eq!(q.count("tool_hit"), 1, "{}", q.stats());
 }
 
 #[test]

@@ -46,7 +46,22 @@
 - [x] Take the terminal out of what tells one build from another. A person at a terminal was never given a build an agent had made, nor one made in a window of another width, and a crate with a warning was compiled again for each width. Colours are left out where a build is put back without a terminal, as Cargo leaves them out.
 - [x] Count the names in a directory Cargo lists only where Cargo goes by them. In a git checkout Cargo lists the top of the repository, and a file git does not track there, or a `target` directory beside a build made elsewhere, kept builds from being put back.
 
+## 0.16
+
+- [x] Give Cargo its tokens in a pipe with a name. With its own, Cargo starts every compiler as a copy of itself: 29 of the 60 processor-seconds of a check of all of Olo in which every compilation but 49 was answered, one compiler at a time. That check went from 15 s to 11 s. Left alone wherever something says how many compilers to run, and where a make older than 4.4 would be found.
+- [x] Take the loader's list of directories out of what tells one compiler command from another, and compare it by what would be found. Cargo lists one directory more for what a build script starts in a build than in a check, so the 1,113 commands that Olo's build scripts start, most of its C and assembly, were made again by the first build after a check.
+- [x] Put a build back with no more files open than the threads doing it. Every file to copy was opened first, and a check of all of Olo has 13,000 of them: under the usual limit of 1,024 nothing was put back and nothing said so but the log.
+- [x] Find what programs keep in the home directory by its name. In a checkout directly in the home directory, git's `.gitconfig` was one step up from the workspace, and every worktree further down looked for it one step up from itself.
+- [x] Leave a pipe of tokens that has a name out of what a compiler examined. A build started by make with such a pipe was never recorded.
+- [x] Learn which process a thread belongs to with one read of the top of its status. It was read whole, in 15,000 pieces, half of all the system calls of a build in which every compiler was answered.
+- [x] `JATO_RECIPES` writes what every command is known by where two runs can be compared.
+
 ## Open
+
+- [ ] A build whose output names its checkout, a program that embeds `env!("CARGO_MANIFEST_DIR")` for one, is only put back there, and nothing can start from it elsewhere. One such program among Olo's 56 has every new worktree's first `build --workspace` answered one compiler at a time: 47 s where putting it back would take a few. The record could say which compilers wrote such output, and a build elsewhere could start from it with those to make again.
+- [ ] On a filesystem that cannot clone files, recording a dev build of all of Olo takes 20 s after Cargo is done, for 13,900 files and 13 GB, whether 50 compilers ran or all of them. On Btrfs it takes under a second.
+- [ ] The `cc` crate names an object file after a hash of the directory its source is in. Source that a build script generates in its output directory is in another directory in every checkout, so 41 of Olo's C compilations are made again in each, 2.4 s for the longest. The result could be kept by what was compiled and given the name asked for.
+- [ ] A build script that writes something else every time it runs has everything above it compiled again wherever Cargo runs the script: `grammers-tl-types` generates its source in an order that changes, 3.7 s for the crate and seven more after it. Putting a build script's run back, as recorded, would do away with that and with the scripts' own time.
 
 - [ ] A build can start from an earlier one only when what differs was read by compilers Cargo started. A changed manifest or lock file, a changed input of a build script and changed C that a build script compiles leave Cargo to carry the build out: 22 s for a check of all of Olo. For C, leaving out what Cargo remembers of the build script's run would have Cargo run the script again. For a manifest, the parts whose command lines are unchanged could be found in the earlier build by what they wrote.
 - [ ] A build in which a build script was built again is not recorded when it started from an earlier one, because the script ran where its earlier version had written. Clearing what the earlier version wrote first would make the build one that can be recorded.

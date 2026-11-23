@@ -1,5 +1,19 @@
 # Work journal
 
+## 2026-11-23 — a build server, and what only showed there (0.16)
+
+- Moved building, testing and measuring to a server: 32 processors, 125 GB of memory, ext4, nothing else running. Jato's suite passed there as it was. Olo's did not go as it had on the laptop, in four ways, all in the first hour.
+- Nothing was put back. Every file of a build was opened before any was copied, and a process may have 1,024 files open: "Too many open files" in the log, and Cargo carried the build out. Files are now opened as they are copied, by the eight threads that copy them.
+- No worktree got the clone's build: "`../.gitconfig` is gone". The clone was directly in the home directory, so git's settings were one step above the workspace and were recorded by the way there as well as by where they are. What a program keeps in the home directory under a name beginning with a dot is found by the home directory's name, and is now recorded only where it is.
+- With every compilation answered, a check of all of Olo after a change to a manifest took 15 s, 30 of them in the kernel. Nearly all of that was Cargo: it starts each compiler as a copy of itself, so that the compiler inherits the pipe its tokens come through, and it had 290 MB to copy page tables for, 2,772 times, one at a time. Given a pipe with a name it starts compilers without the copy. Jato now makes one in the cache directory, with as many tokens as Cargo would have had, unless something says how many compilers to run or a make older than 4.4 is about. 11 s, 13 in the kernel, and at the start 1,300 answers a second where there had been 220.
+- A compiler that takes a token from such a pipe reads and writes a file, and was not recorded for it. A pipe of tokens named in the environment is no longer among what a command examined.
+- The first `build` in a worktree, after only `check` had been recorded, ran 1,228 compilers. 1,113 of them were what build scripts start, C and assembly mostly, the same commands as in the check but for one thing: Cargo puts `target/debug` in the loader's list of directories in a build. The list is no longer part of which command it is. It is kept with the result and compared by what the loader would find: 1,098 compilers now, none of them a build script's.
+- The observer read each thread's whole status to learn its process, in pieces of a few hundred bytes: 131,000 reads for one build of 253 compilers. One read of the top of it now.
+- `JATO_RECIPES` writes what each command is known by into a directory. Comparing two runs' directories found the loader's list in a minute, after an hour of reasoning had not.
+- Measured there, Olo's check of the whole workspace: 82 s from nothing, 0.19 s again, 0.73 s in a new worktree, 5.1 s with a function added to `olo-system`, 11 s with a manifest changed. Cargo alone from nothing: 76 s, and the same with its target directory in memory.
+- Still wrong there: one of Olo's 56 programs names its checkout, so a `build` of the workspace is never put back in another worktree (47 s, 51 compilers run), and recording that build on ext4 takes 20 s after Cargo is done.
+- Qualified with 33 unit and 82 Cargo-project tests, with notes, with the kernel alone and with compressed storage, on ext4 and on Btrfs, on Rust 1.100 and 1.89.
+
 ## 2026-11-22 — one target directory, several commands (0.15)
 
 - Tried the commands an agent uses, one after another in one target directory of Olo and then in worktrees: check, build, clippy, test. Three things showed that a single command in an empty target never had.
