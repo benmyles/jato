@@ -11,8 +11,10 @@
 - The observer read each thread's whole status to learn its process, in pieces of a few hundred bytes: 131,000 reads for one build of 253 compilers. One read of the top of it now.
 - `JATO_RECIPES` writes what each command is known by into a directory. Comparing two runs' directories found the loader's list in a minute, after an hour of reasoning had not.
 - Measured there, Olo's check of the whole workspace: 82 s from nothing, 0.19 s again, 0.73 s in a new worktree, 5.1 s with a function added to `olo-system`, 11 s with a manifest changed. Cargo alone from nothing: 76 s, and the same with its target directory in memory.
-- Still wrong there: one of Olo's 56 programs names its checkout, so a `build` of the workspace is never put back in another worktree (47 s, 51 compilers run), and recording that build on ext4 takes 20 s after Cargo is done.
-- Qualified with 33 unit and 82 Cargo-project tests, with notes, with the kernel alone and with compressed storage, on ext4 and on Btrfs, on Rust 1.100 and 1.89.
+- One of Olo's 56 programs names its checkout, so a `build` of the workspace was never put back in another worktree: 47 s, every compiler answered one at a time and 51 run. A whole build's record now says which compilers wrote output that names where it was made. A build somewhere else starts from it with those left out, as it starts from a build whose sources differ. 12 s: 5.6 s for 21,600 files, and `olo-fuzz` compiled. Output that names the place and is no compiler's of Cargo's, a file written beside the workspace for one, leaves nothing to start from as before.
+- Recording that build took 20 s after Cargo was done. A profile showed nothing but compression: each program has two names, the one Cargo links for people and the compiler's, linking changes the time the file's record was last changed, and so neither was known any more by what the compiler had stored. Both were compressed, to find the cache had them. A file is now read first, which is ten times quicker than compressing it, and one with two names is read once. 2.5 s.
+- Measured there for the dev build of all of Olo: 194 s from nothing after a check, 5.3 s to put back, 12 s in a new worktree, 41 s in a new worktree with a function added to `olo-system` (57 compilers).
+- Qualified with 33 unit and 83 Cargo-project tests, with notes, with the kernel alone and with compressed storage, on ext4 and on Btrfs, on Rust 1.100 and 1.89.
 
 ## 2026-11-22 — one target directory, several commands (0.15)
 

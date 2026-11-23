@@ -1130,7 +1130,34 @@ impl Store {
             staged.digest = digest;
             staged.names = names;
         } else {
-            // No shared extents here. Keep a compressed copy.
+            // No shared extents here: a copy is kept, compressed. Look
+            // first at whether the cache has the file already. Most of
+            // what a build made was stored as each compiler finished, and
+            // a file is read many times faster than it is compressed.
+            use std::io::Seek;
+            let (digest, length, names) = scan::digest_open(&mut source, &needles)?;
+            ensure!(length == before.size, "{} changed size", file.display());
+            for packed in [false, true] {
+                if let Ok(meta) = fs::metadata(object_path(&self.dir, &digest, packed))
+                    && meta.is_file()
+                {
+                    ensure!(
+                        Stamp::of(&source.metadata()?) == before,
+                        "{} changed while it was stored",
+                        file.display()
+                    );
+                    drop(out);
+                    let _ = fs::remove_file(&temp);
+                    staged.digest = digest;
+                    staged.names = names;
+                    staged.temp = None;
+                    staged.packed = packed;
+                    staged.stored = meta.len();
+                    self.remember(before, digest);
+                    return Ok(staged);
+                }
+            }
+            source.rewind()?;
             let mut hasher = blake3::Hasher::new();
             let mut encoder = zstd::stream::write::Encoder::new(&mut out, 3)?;
             let mut buffer = vec![0u8; 256 * 1024];
@@ -1156,6 +1183,11 @@ impl Store {
             encoder.finish()?;
             ensure!(length == before.size, "{} changed size", file.display());
             staged.digest = *hasher.finalize().as_bytes();
+            ensure!(
+                digest == staged.digest,
+                "{} changed while it was stored",
+                file.display()
+            );
             staged.packed = true;
             staged.stored = out.metadata()?.len();
         }

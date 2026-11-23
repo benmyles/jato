@@ -130,6 +130,10 @@ pub struct Manifest {
     /// where the check had been. This command does not make all of them
     /// again when their inputs change.
     pub theirs: Vec<u32>,
+    /// The positions of the parts whose output names where it was made,
+    /// when every such name in the build's output is theirs. A build
+    /// somewhere else starts from this one with those to make again.
+    pub pinned: Vec<u32>,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -280,6 +284,7 @@ impl Manifest {
             positions(&mut w, &part.outputs);
         }
         positions(&mut w, &self.theirs);
+        positions(&mut w, &self.pinned);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -384,6 +389,7 @@ impl Manifest {
             });
         }
         m.theirs = read_positions(&mut r, m.parts.len())?;
+        m.pinned = read_positions(&mut r, m.parts.len())?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -617,15 +623,15 @@ impl Manifest {
     }
 
     /// Every input that is not as it was recorded, where everything else
-    /// the manifest records holds. An error says what else does not, or
-    /// that more than `most` inputs differ.
+    /// the manifest records holds, but for where it was made. An error
+    /// says what else does not, or that more than `most` inputs differ.
     pub fn differences(
         &self,
         here: &mut Here<'_>,
         store: &mut Store,
         most: usize,
     ) -> Result<Vec<Difference>, String> {
-        self.settled(here)?;
+        self.settled_anywhere(here)?;
         let mut found = Vec::new();
         for (at, input) in self.inputs.iter().enumerate() {
             if let Err((why, contents)) = self.as_recorded(input, here, store) {
@@ -682,14 +688,25 @@ impl Manifest {
     /// was: where it is, the environment, the terminal, and what PATH and
     /// a search above the workspace find.
     fn settled(&self, here: &mut Here<'_>) -> Result<(), String> {
+        self.placed(here.roots)?;
+        self.settled_anywhere(here)
+    }
+
+    /// Whether this is where the result's output says it was made.
+    pub fn placed(&self, roots: &Roots) -> Result<(), String> {
         for (root, recorded) in &self.pins {
-            if here.roots.path(*root) != Some(recorded.as_path()) {
+            if roots.path(*root) != Some(recorded.as_path()) {
                 return Err(format!(
                     "its output names {}, which is not where this build is",
                     recorded.display()
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// The same as `settled`, wherever the result was made.
+    fn settled_anywhere(&self, here: &mut Here<'_>) -> Result<(), String> {
         if let Some(work) = here.roots.path(WORK)
             && !self.walks.is_empty()
         {
@@ -1150,6 +1167,7 @@ mod tests {
                 Part::default(),
             ],
             theirs: vec![1],
+            pinned: vec![0],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();

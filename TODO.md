@@ -55,11 +55,12 @@
 - [x] Leave a pipe of tokens that has a name out of what a compiler examined. A build started by make with such a pipe was never recorded.
 - [x] Learn which process a thread belongs to with one read of the top of its status. It was read whole, in 15,000 pieces, half of all the system calls of a build in which every compiler was answered.
 - [x] `JATO_RECIPES` writes what every command is known by where two runs can be compared.
+- [x] Start a build from one made in another checkout whose output names that checkout. The record says which compilers wrote such output, and they are run again. Olo's `build --workspace` in a new worktree: 47 s to 12 s.
+- [x] Read a file before compressing it, and do not compress what the cache holds; read a file that has two names once. Recording a dev build of all of Olo on ext4: 20 s to 2.5 s.
 
 ## Open
 
-- [ ] A build whose output names its checkout, a program that embeds `env!("CARGO_MANIFEST_DIR")` for one, is only put back there, and nothing can start from it elsewhere. One such program among Olo's 56 has every new worktree's first `build --workspace` answered one compiler at a time: 47 s where putting it back would take a few. The record could say which compilers wrote such output, and a build elsewhere could start from it with those to make again.
-- [ ] On a filesystem that cannot clone files, recording a dev build of all of Olo takes 20 s after Cargo is done, for 13,900 files and 13 GB, whether 50 compilers ran or all of them. On Btrfs it takes under a second.
+- [ ] Putting a dev build of all of Olo back on ext4 takes 5.3 s, 14 processor-seconds of it decompressing 13 GB. On a filesystem that clones files none of it is copied.
 - [ ] The `cc` crate names an object file after a hash of the directory its source is in. Source that a build script generates in its output directory is in another directory in every checkout, so 41 of Olo's C compilations are made again in each, 2.4 s for the longest. The result could be kept by what was compiled and given the name asked for.
 - [ ] A build script that writes something else every time it runs has everything above it compiled again wherever Cargo runs the script: `grammers-tl-types` generates its source in an order that changes, 3.7 s for the crate and seven more after it. Putting a build script's run back, as recorded, would do away with that and with the scripts' own time.
 

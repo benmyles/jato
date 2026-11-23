@@ -418,6 +418,78 @@ fn output_that_names_its_checkout_is_not_used_in_another() {
     assert_eq!((hits, misses), (2, 0));
 }
 
+/// A program that says where it was built is its own in every checkout.
+/// The rest of the build is not: another checkout starts from the build
+/// with that program to make again.
+#[test]
+fn a_build_whose_program_names_its_checkout_is_started_from_in_another() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    let main = "fn main() { println!(\"{} {}\", env!(\"CARGO_MANIFEST_DIR\"), leaf::value()); }";
+    write(p.root.join("src/main.rs"), main);
+    let program = |root: &Path| {
+        let out = Command::new(root.join("target/debug/app"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let says = |root: &Path| format!("{} one:none\n", root.display());
+    p.run(&["build"]);
+    assert_eq!(program(&p.root), says(&p.root));
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    // Where it was made it is put back whole.
+    p.clean();
+    p.run(&["build"]);
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+    assert_eq!(program(&p.root), says(&p.root));
+    // Somewhere else the library is put back and the program compiled.
+    let checkout = |name: &str| {
+        let root = p.temp.path().join(name);
+        populate(&root);
+        write(root.join("src/main.rs"), main);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        root
+    };
+    let second = checkout("second/checkout");
+    let out = success(
+        p.command_in(&second)
+            .env("JATO_LOG", "debug")
+            .args(["build"]),
+    );
+    let said = decisions(&out, "cargo");
+    assert!(
+        said.iter().any(|d| d.contains("1 of its 2 compilations")
+            && d.contains("names where it was made")),
+        "{said:?}"
+    );
+    assert!(
+        decisions(&out, "leaf").is_empty(),
+        "{:?}",
+        decisions(&out, "leaf")
+    );
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+    assert_eq!(program(&second), says(&second));
+    assert_eq!(p.stale_for_cargo(&second, &second.join("target")), 0);
+    // That build is put back whole there, and the first one where it was.
+    fs::remove_dir_all(second.join("target")).unwrap();
+    success(p.command_in(&second).args(["build"]));
+    assert_eq!(p.count("build_hit"), 2, "{}", p.stats());
+    assert_eq!(program(&second), says(&second));
+    p.clean();
+    p.run(&["build"]);
+    assert_eq!(p.count("build_hit"), 3, "{}", p.stats());
+    assert_eq!(program(&p.root), says(&p.root));
+    // A third checkout, with the library changed as well.
+    let third = checkout("third");
+    write(third.join("leaf/src/text file"), "two");
+    success(p.command_in(&third).args(["build"]));
+    assert_eq!(p.count("build_near"), 2, "{}", p.stats());
+    assert_eq!(program(&third), format!("{} two:none\n", third.display()));
+}
+
 #[test]
 fn a_path_cargo_must_escape_keeps_its_results_where_they_were_made() {
     let p = Project::named("project with spaces");

@@ -1237,8 +1237,12 @@ pub struct Parts {
     /// A number for each place a command examined.
     numbers: HashMap<Place, u32>,
     /// The commands Cargo started itself, each by the numbers of the
-    /// places it examined and by the places it wrote to.
-    units: Vec<(Vec<u32>, Vec<Place>)>,
+    /// places it examined, by the places it wrote to, and by whether what
+    /// it wrote names where the build is.
+    units: Vec<(Vec<u32>, Vec<Place>, bool)>,
+    /// Something else wrote output that names where the build is: a
+    /// command that Cargo cannot be had to run again by itself.
+    unplaced: bool,
     /// The numbers of the places examined by commands that something else
     /// started, or that wrote nothing by which Cargo could tell them done.
     loose: HashSet<u32>,
@@ -1331,12 +1335,14 @@ impl Parts {
         }
         // An output that names the command's own root names a place inside
         // one of the build's roots, or a place no build root covers.
+        let mut names = false;
         for (_, named) in &manifest.pins {
             for id in [roots::WORK, roots::TARGET] {
                 if let Some(root) = to.path(id)
                     && named.starts_with(root)
                 {
                     self.pins.insert((id, root.to_owned()));
+                    names = true;
                 }
             }
         }
@@ -1356,7 +1362,9 @@ impl Parts {
             }
         }
         if apart {
-            self.units.push((examined, wrote));
+            self.units.push((examined, wrote, names));
+        } else if names {
+            self.unplaced = true;
         }
         for (root, path) in &manifest.removed {
             match place(*root, path) {
@@ -1493,6 +1501,15 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         if manifest.parts.is_empty() {
             continue;
         }
+        // Made somewhere else, with output that says so: of use here if
+        // the record tells which compilers wrote that output.
+        let elsewhere = manifest.placed(&job.roots).err();
+        if let Some(reason) = &elsewhere
+            && manifest.pinned.is_empty()
+        {
+            why.get_or_insert_with(|| reason.clone());
+            continue;
+        }
         let differences = match manifest.differences(&mut here, store, MOST) {
             Ok(differences) => differences,
             Err(reason) => {
@@ -1501,7 +1518,12 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
             }
         };
         match manifest.stale_parts(&differences) {
-            Ok(again) => {
+            Ok(mut again) => {
+                if elsewhere.is_some() {
+                    for &part in &manifest.pinned {
+                        again[part as usize] = true;
+                    }
+                }
                 let count = again.iter().filter(|again| **again).count();
                 if best.as_ref().is_none_or(|best| count < best.count) {
                     best = Some(Near {
@@ -1618,17 +1640,21 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     let first = differences
         .first()
         .map(|difference| manifest.named(difference.input, &job.roots));
+    let differs = match (first, differences.len()) {
+        (None, _) => String::new(),
+        (Some(first), 1) => format!(", {first} differs"),
+        (Some(first), more) => format!(", {first} differs and {} more", more - 1),
+    };
+    let named = match manifest.placed(&job.roots) {
+        Ok(()) => "",
+        Err(_) => ", what they wrote names where it was made",
+    };
     log(
         job.name(),
         format_args!(
-            "starting from an earlier build in {} ms: {count} of its {} compilations to make again, {} differs{}",
+            "starting from an earlier build in {} ms: {count} of its {} compilations to make again{differs}{named}",
             begun.elapsed().as_millis(),
             manifest.parts.len(),
-            first.unwrap_or_default(),
-            match differences.len() {
-                0 | 1 => String::new(),
-                more => format!(" and {} more", more - 1),
-            }
         ),
     );
     Some(Start {
@@ -2311,7 +2337,13 @@ pub fn record(
     let mut known: HashMap<Digest, &Output> = HashMap::new();
     // Compilers of the build this one started from that were not run again,
     // and directories that build recorded the entries of.
-    let mut kept: Vec<(&Part, bool)> = Vec::new();
+    let mut kept: Vec<(&Part, bool, bool)> = Vec::new();
+    // Output that names where the build is, by what it holds, among what
+    // the build's own programs wrote; and whether any of it, or any such
+    // output of a build this one started from, is no compiler's of
+    // Cargo's that could be run again alone.
+    let mut named_here: Vec<Digest> = Vec::new();
+    let mut unplaced = false;
     let mut listed_earlier: HashSet<Place> = HashSet::new();
     if let Some(parts) = parts {
         let mut listed: HashSet<Place> = outputs
@@ -2401,7 +2433,11 @@ pub fn record(
                 for &position in &part.inputs {
                     carry(position, &mut manifest);
                 }
-                kept.push((part, theirs));
+                kept.push((
+                    part,
+                    theirs,
+                    base.pinned.binary_search(&(at as u32)).is_ok(),
+                ));
             }
             for &position in &base.asked {
                 asked.insert(carry(position, &mut manifest));
@@ -2416,7 +2452,12 @@ pub fn record(
             }
             manifest.env.extend(base.env.iter().cloned());
             manifest.which.extend(base.which.iter().cloned());
-            manifest.pins.extend(base.pins.iter().cloned());
+            // What the earlier build wrote that names where it was made
+            // is here only if this is that place: anywhere else it was
+            // left out, to be made again.
+            let here = |(root, path): &&(u8, PathBuf)| roots.path(*root) == Some(path.as_path());
+            manifest.pins.extend(base.pins.iter().filter(here).cloned());
+            unplaced |= base.pinned.is_empty() && base.pins.iter().any(|pin| here(&pin));
             manifest.removed.extend(base.removed.iter().cloned());
             for (place, output) in &carried {
                 known.insert(output.digest, output);
@@ -2590,6 +2631,7 @@ pub fn record(
                 ),
             );
             manifest.pins.push(pin);
+            unplaced = true;
         }
     }
     if job.scope == Scope::Build {
@@ -2654,6 +2696,10 @@ pub fn record(
     }
     let mut staged: Vec<Staged> = Vec::with_capacity(outputs.len());
     let spellings: Vec<u8> = roots.spellings().iter().map(|(id, _)| *id).collect();
+    // A file under two names, as a program is that Cargo links to where
+    // people look for it, is read once: by the first name met, and then
+    // known by where it is kept.
+    let mut twins: HashMap<(u64, u64), usize> = HashMap::new();
     for (root, rel, path) in &outputs {
         // A file that still holds exactly what one of the parts stored
         // needs no second look.
@@ -2672,6 +2718,22 @@ pub fn record(
             });
             continue;
         }
+        let kept = meta.as_ref().and_then(|meta| {
+            use std::os::unix::fs::MetadataExt;
+            (meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
+        });
+        if let Some(first) = kept.and_then(|kept| twins.get(&kept)) {
+            let twin = Output {
+                root: *root,
+                path: rel.clone(),
+                ..manifest.outputs[*first].clone()
+            };
+            manifest.outputs.push(twin);
+            continue;
+        }
+        if let Some(kept) = kept {
+            twins.insert(kept, manifest.outputs.len());
+        }
         let output = store.stage(path, roots).map_err(|e| format!("{e:#}"))?;
         for (id, named) in spellings.iter().zip(&output.names) {
             let pin = (*id, roots.path(*id).unwrap().to_owned());
@@ -2686,6 +2748,9 @@ pub fn record(
                 );
                 manifest.pins.push(pin);
             }
+        }
+        if output.names.contains(&true) {
+            named_here.push(output.digest);
         }
         manifest.outputs.push(Output {
             root: *root,
@@ -2731,7 +2796,9 @@ pub fn record(
             .iter()
             .filter_map(|number| position[*number as usize])
             .collect();
-        for (examined, wrote) in &parts.units {
+        let mut pinned: Vec<u32> = Vec::new();
+        unplaced |= parts.unplaced;
+        for (examined, wrote, names) in &parts.units {
             let inputs = examined.iter().filter_map(|n| position[*n as usize]);
             let inputs = ordered(inputs.collect());
             let outputs = ordered(wrote.iter().filter_map(output_at).collect());
@@ -2739,14 +2806,18 @@ pub fn record(
             // could find missing.
             if outputs.is_empty() {
                 theirs.extend(inputs);
+                unplaced |= *names;
             } else {
+                if *names {
+                    pinned.push(apart.len() as u32);
+                }
                 apart.push(Part { inputs, outputs });
             }
         }
         let mut borrowed = Vec::new();
         if let Some(start) = start {
             let base = &start.manifest;
-            for (part, another) in &kept {
+            for (part, another, names) in &kept {
                 let place = |position: &u32| {
                     let input = &base.inputs[*position as usize];
                     (input.root, input.path.clone())
@@ -2757,15 +2828,31 @@ pub fn record(
                 let inputs = ordered(inputs.collect());
                 if outputs.is_empty() {
                     theirs.extend(inputs);
+                    unplaced |= *names;
                 } else {
                     if *another {
                         borrowed.push(apart.len() as u32);
+                    }
+                    if *names {
+                        pinned.push(apart.len() as u32);
                     }
                     apart.push(Part { inputs, outputs });
                 }
             }
         }
         manifest.theirs = borrowed;
+        // A copy of such output under another name, as Cargo makes of a
+        // program, is left out with the compiler's own. Anything else
+        // that names the place nobody could be had to write again.
+        let theirs_to_write: HashSet<Digest> = pinned
+            .iter()
+            .flat_map(|at| &apart[*at as usize].outputs)
+            .map(|at| manifest.outputs[*at as usize].digest)
+            .collect();
+        unplaced |= named_here
+            .iter()
+            .any(|digest| !theirs_to_write.contains(digest));
+        manifest.pinned = if unplaced { Vec::new() } else { pinned };
         theirs.extend(own.iter().filter_map(input_at));
         let theirs = ordered(theirs);
         let asked = ordered(asked.iter().filter_map(input_at).collect());
