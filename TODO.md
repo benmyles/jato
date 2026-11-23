@@ -57,7 +57,8 @@
 - [x] `JATO_RECIPES` writes what every command is known by where two runs can be compared.
 - [x] Start a build from one made in another checkout whose output names that checkout. The record says which compilers wrote such output, and they are run again. Olo's `build --workspace` in a new worktree: 47 s to 12 s.
 - [x] Read a file before compressing it, and do not compress what the cache holds; read a file that has two names once. Recording a dev build of all of Olo on ext4: 20 s to 2.5 s.
-- [x] Put a build back with a thread for each processor, each taking the next largest file, give files their time as they are written, and move them into place on several threads. A dev build of all of Olo, 21,600 files and 21 GB on ext4: 4.3 to 5.1 s, now 2.8 to 4.1.
+- [x] Put a build back with a thread for each processor up to sixteen, each taking the next largest file, give files their time as they are written, and move them into place on several threads. A dev build of all of Olo, 21,600 files and 21 GB on ext4: 4.3 to 5.1 s, now 2.7 to 4.
+- [x] Read a build's files into the cache on several threads when it is recorded. A dev build of all of Olo: 2.5 s to 1.1 s on ext4, 4.7 s to 2.3 s on Btrfs.
 - [x] Take the time for a build's files before its sources are looked at. A source saved while the files were being written looked older than the build to Cargo.
 
 ## Open

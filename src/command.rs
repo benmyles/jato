@@ -2746,11 +2746,20 @@ pub fn record(
     }
     let mut staged: Vec<Staged> = Vec::with_capacity(outputs.len());
     let spellings: Vec<u8> = roots.spellings().iter().map(|(id, _)| *id).collect();
+    // What becomes of each file: known from one of the parts, the same
+    // file as one met before under another name, or read now.
+    enum From<'a> {
+        Part(&'a Output, u32),
+        Twin(usize),
+        Read(usize),
+    }
     // A file under two names, as a program is that Cargo links to where
     // people look for it, is read once: by the first name met, and then
     // known by where it is kept.
     let mut twins: HashMap<(u64, u64), usize> = HashMap::new();
-    for (root, rel, path) in &outputs {
+    let mut to_read: Vec<&Path> = Vec::new();
+    let mut from: Vec<From<'_>> = Vec::with_capacity(outputs.len());
+    for (at, (_, _, path)) in outputs.iter().enumerate() {
         // A file that still holds exactly what one of the parts stored
         // needs no second look.
         let meta = fs::metadata(path).ok();
@@ -2760,12 +2769,8 @@ pub fn record(
             .and_then(|digest| known.get(&digest))
             .filter(|output| !output.marked);
         if let (Some(output), Some(meta)) = (adopted, &meta) {
-            manifest.outputs.push(Output {
-                root: *root,
-                path: rel.clone(),
-                mode: std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
-                ..(*output).clone()
-            });
+            let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777;
+            from.push(From::Part(output, mode));
             continue;
         }
         let kept = meta.as_ref().and_then(|meta| {
@@ -2773,18 +2778,42 @@ pub fn record(
             (meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
         });
         if let Some(first) = kept.and_then(|kept| twins.get(&kept)) {
-            let twin = Output {
-                root: *root,
-                path: rel.clone(),
-                ..manifest.outputs[*first].clone()
-            };
-            manifest.outputs.push(twin);
+            from.push(From::Twin(*first));
             continue;
         }
         if let Some(kept) = kept {
-            twins.insert(kept, manifest.outputs.len());
+            twins.insert(kept, at);
         }
-        let output = store.stage(path, roots).map_err(|e| format!("{e:#}"))?;
+        from.push(From::Read(to_read.len()));
+        to_read.push(path);
+    }
+    let mut read: Vec<Option<Staged>> = Vec::with_capacity(to_read.len());
+    for output in store.stage_many(&to_read, roots) {
+        read.push(Some(output.map_err(|e| format!("{e:#}"))?));
+    }
+    for ((root, rel, path), from) in outputs.iter().zip(&from) {
+        let output = match from {
+            From::Part(output, mode) => {
+                manifest.outputs.push(Output {
+                    root: *root,
+                    path: rel.clone(),
+                    mode: *mode,
+                    ..(*output).clone()
+                });
+                continue;
+            }
+            // Every file has an entry at its own place, in order.
+            From::Twin(first) => {
+                let twin = Output {
+                    root: *root,
+                    path: rel.clone(),
+                    ..manifest.outputs[*first].clone()
+                };
+                manifest.outputs.push(twin);
+                continue;
+            }
+            From::Read(at) => read[*at].take().expect("each is taken once"),
+        };
         for (id, named) in spellings.iter().zip(&output.names) {
             let pin = (*id, roots.path(*id).unwrap().to_owned());
             if *named && !manifest.pins.contains(&pin) {

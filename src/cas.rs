@@ -459,6 +459,165 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
     (Some(staging), written)
 }
 
+/// Copy one output into the cache directory `dir` and learn its digest and
+/// which of `roots`' spellings its bytes name; `clone` says whether to try
+/// sharing its extents. With it comes what the file looked like while it
+/// held those bytes, if it was at rest, to know it by later.
+fn stage_file(
+    dir: &Path,
+    clone: bool,
+    file: &Path,
+    roots: &Roots,
+) -> Result<(Staged, Option<(Stamp, Digest)>)> {
+    let spellings = roots.spellings();
+    let needles: Vec<&[u8]> = spellings.iter().map(|(_, s)| *s).collect();
+    let mut source = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+    let meta = source.metadata()?;
+    ensure!(meta.is_file(), "{} is not a regular file", file.display());
+    let before = Stamp::of(&meta);
+    let mode = meta.permissions().mode() & 0o777;
+    // One process can hold several stores, each staging at once.
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = dir
+        .join("objects")
+        .join(format!("tmp-{}-{serial}", std::process::id()));
+    let mut staged = Staged {
+        digest: [0; 32],
+        size: before.size,
+        mode,
+        marked: false,
+        names: vec![false; needles.len()],
+        temp: Some(temp.clone()),
+        packed: false,
+        stored: before.size,
+    };
+    let create = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+    };
+    if before.size <= TEXT_LIMIT {
+        let mut bytes = Vec::with_capacity(before.size as usize);
+        source.read_to_end(&mut bytes)?;
+        let names: Vec<bool> = needles
+            .iter()
+            .map(|n| scan::names_path(&bytes, n))
+            .collect();
+        let text = names.contains(&true) && memchr::memchr(0, &bytes).is_none();
+        if text || before.size < CLONE_FLOOR {
+            let stored = if text {
+                roots.mark(&bytes)
+            } else {
+                (&bytes[..]).into()
+            };
+            staged.digest = *blake3::hash(&stored).as_bytes();
+            if object_path(dir, &staged.digest, false).is_file() {
+                staged.temp = None;
+            } else {
+                let mut out = create()?;
+                out.write_all(&stored)?;
+                out.set_permissions(fs::Permissions::from_mode(0o444))?;
+            }
+            staged.size = stored.len() as u64;
+            staged.stored = stored.len() as u64;
+            staged.marked = text;
+            staged.names = if text {
+                vec![false; needles.len()]
+            } else {
+                names
+            };
+            ensure!(
+                Stamp::of(&source.metadata()?) == before,
+                "{} changed while it was stored",
+                file.display()
+            );
+            // For text that names a root this is what it says with
+            // the roots' names taken out, which is all a command that
+            // reads it there learns that it would not learn anywhere.
+            let digest = staged.digest;
+            return Ok((staged, Some((before, digest))));
+        }
+        use std::io::Seek;
+        source.rewind()?;
+    }
+    let mut out = create()?;
+    if clone && clone_file(&source, &out).is_ok() {
+        // The clone is a private snapshot. Its digest is the digest of
+        // what the cache holds, whatever happens to the original.
+        let (digest, length, names) = scan::digest_open(&mut out, &needles)?;
+        ensure!(length == before.size, "{} changed size", file.display());
+        staged.digest = digest;
+        staged.names = names;
+    } else {
+        // No shared extents here: a copy is kept, compressed. Look
+        // first at whether the cache has the file already. Most of
+        // what a build made was stored as each compiler finished, and
+        // a file is read many times faster than it is compressed.
+        use std::io::Seek;
+        let (digest, length, names) = scan::digest_open(&mut source, &needles)?;
+        ensure!(length == before.size, "{} changed size", file.display());
+        for packed in [false, true] {
+            if let Ok(meta) = fs::metadata(object_path(dir, &digest, packed))
+                && meta.is_file()
+            {
+                ensure!(
+                    Stamp::of(&source.metadata()?) == before,
+                    "{} changed while it was stored",
+                    file.display()
+                );
+                drop(out);
+                let _ = fs::remove_file(&temp);
+                staged.digest = digest;
+                staged.names = names;
+                staged.temp = None;
+                staged.packed = packed;
+                staged.stored = meta.len();
+                return Ok((staged, Some((before, digest))));
+            }
+        }
+        source.rewind()?;
+        let mut hasher = blake3::Hasher::new();
+        let mut encoder = zstd::stream::write::Encoder::new(&mut out, 3)?;
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut tail: Vec<u8> = Vec::new();
+        let keep = needles.iter().map(|n| n.len() + 1).max().unwrap_or(0);
+        let mut length = 0u64;
+        loop {
+            let n = source.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+            encoder.write_all(&buffer[..n])?;
+            length += n as u64;
+            // Look for roots in this block and across its start.
+            tail.extend_from_slice(&buffer[..n]);
+            for (needle, found) in needles.iter().zip(&mut staged.names) {
+                *found = *found || scan::names_path(&tail, needle);
+            }
+            let drop = tail.len().saturating_sub(keep);
+            tail.drain(..drop);
+        }
+        encoder.finish()?;
+        ensure!(length == before.size, "{} changed size", file.display());
+        staged.digest = *hasher.finalize().as_bytes();
+        ensure!(
+            digest == staged.digest,
+            "{} changed while it was stored",
+            file.display()
+        );
+        staged.packed = true;
+        staged.stored = out.metadata()?.len();
+    }
+    out.set_permissions(fs::Permissions::from_mode(0o444))?;
+    let learned = (Stamp::of(&source.metadata()?) == before).then_some((before, staged.digest));
+    Ok((staged, learned))
+}
+
 impl Store {
     pub fn open() -> Result<Self> {
         let env_limit = env::var("JATO_MAX_SIZE")
@@ -853,11 +1012,14 @@ impl Store {
         };
         let bytes: u64 = sources.iter().map(|w| w.output.size).sum();
         // Each piece of work leaves a staged file beside its destination,
-        // made by as many threads as there are processors: each of them
-        // mostly unpacks or copies.
+        // made by as many threads as there are processors, up to sixteen.
+        // Each mostly unpacks or copies, and all of them ask the kernel
+        // for memory to write into: with the page cache full, 32 threads
+        // took four times the kernel's time of eight to put 21 GB in
+        // place, and were done a tenth sooner than sixteen.
         let most = std::thread::available_parallelism().map_or(8, |n| n.get());
         let threads = if tree {
-            most.clamp(1, 64).min(sources.len() / 16 + 1)
+            most.clamp(1, 16).min(sources.len() / 16 + 1)
         } else {
             1
         };
@@ -1161,157 +1323,61 @@ impl Store {
     /// Copy one output into the cache directory and learn its digest and
     /// which of `roots`' spellings its bytes name.
     pub fn stage(&mut self, file: &Path, roots: &Roots) -> Result<Staged> {
-        let spellings = roots.spellings();
-        let needles: Vec<&[u8]> = spellings.iter().map(|(_, s)| *s).collect();
-        let mut source = File::open(file).with_context(|| format!("opening {}", file.display()))?;
-        let meta = source.metadata()?;
-        ensure!(meta.is_file(), "{} is not a regular file", file.display());
-        let before = Stamp::of(&meta);
-        let mode = meta.permissions().mode() & 0o777;
-        // One process can hold several stores, each staging at once.
-        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp = self
-            .dir
-            .join("objects")
-            .join(format!("tmp-{}-{serial}", std::process::id()));
-        let mut staged = Staged {
-            digest: [0; 32],
-            size: before.size,
-            mode,
-            marked: false,
-            names: vec![false; needles.len()],
-            temp: Some(temp.clone()),
-            packed: false,
-            stored: before.size,
-        };
-        let create = || {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)
-        };
-        if before.size <= TEXT_LIMIT {
-            let mut bytes = Vec::with_capacity(before.size as usize);
-            source.read_to_end(&mut bytes)?;
-            let names: Vec<bool> = needles
-                .iter()
-                .map(|n| scan::names_path(&bytes, n))
-                .collect();
-            let text = names.contains(&true) && memchr::memchr(0, &bytes).is_none();
-            if text || before.size < CLONE_FLOOR {
-                let stored = if text {
-                    roots.mark(&bytes)
-                } else {
-                    (&bytes[..]).into()
-                };
-                staged.digest = *blake3::hash(&stored).as_bytes();
-                if object_path(&self.dir, &staged.digest, false).is_file() {
-                    staged.temp = None;
-                } else {
-                    let mut out = create()?;
-                    out.write_all(&stored)?;
-                    out.set_permissions(fs::Permissions::from_mode(0o444))?;
-                }
-                staged.size = stored.len() as u64;
-                staged.stored = stored.len() as u64;
-                staged.marked = text;
-                staged.names = if text {
-                    vec![false; needles.len()]
-                } else {
-                    names
-                };
-                ensure!(
-                    Stamp::of(&source.metadata()?) == before,
-                    "{} changed while it was stored",
-                    file.display()
-                );
-                // For text that names a root this is what it says with
-                // the roots' names taken out, which is all a command that
-                // reads it there learns that it would not learn anywhere.
-                self.remember(before, staged.digest);
-                return Ok(staged);
-            }
-            use std::io::Seek;
-            source.rewind()?;
-        }
-        let mut out = create()?;
-        if self.clone && clone_file(&source, &out).is_ok() {
-            // The clone is a private snapshot. Its digest is the digest of
-            // what the cache holds, whatever happens to the original.
-            let (digest, length, names) = scan::digest_open(&mut out, &needles)?;
-            ensure!(length == before.size, "{} changed size", file.display());
-            staged.digest = digest;
-            staged.names = names;
-        } else {
-            // No shared extents here: a copy is kept, compressed. Look
-            // first at whether the cache has the file already. Most of
-            // what a build made was stored as each compiler finished, and
-            // a file is read many times faster than it is compressed.
-            use std::io::Seek;
-            let (digest, length, names) = scan::digest_open(&mut source, &needles)?;
-            ensure!(length == before.size, "{} changed size", file.display());
-            for packed in [false, true] {
-                if let Ok(meta) = fs::metadata(object_path(&self.dir, &digest, packed))
-                    && meta.is_file()
-                {
-                    ensure!(
-                        Stamp::of(&source.metadata()?) == before,
-                        "{} changed while it was stored",
-                        file.display()
-                    );
-                    drop(out);
-                    let _ = fs::remove_file(&temp);
-                    staged.digest = digest;
-                    staged.names = names;
-                    staged.temp = None;
-                    staged.packed = packed;
-                    staged.stored = meta.len();
-                    self.remember(before, digest);
-                    return Ok(staged);
-                }
-            }
-            source.rewind()?;
-            let mut hasher = blake3::Hasher::new();
-            let mut encoder = zstd::stream::write::Encoder::new(&mut out, 3)?;
-            let mut buffer = vec![0u8; 256 * 1024];
-            let mut tail: Vec<u8> = Vec::new();
-            let keep = needles.iter().map(|n| n.len() + 1).max().unwrap_or(0);
-            let mut length = 0u64;
-            loop {
-                let n = source.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..n]);
-                encoder.write_all(&buffer[..n])?;
-                length += n as u64;
-                // Look for roots in this block and across its start.
-                tail.extend_from_slice(&buffer[..n]);
-                for (needle, found) in needles.iter().zip(&mut staged.names) {
-                    *found = *found || scan::names_path(&tail, needle);
-                }
-                let drop = tail.len().saturating_sub(keep);
-                tail.drain(..drop);
-            }
-            encoder.finish()?;
-            ensure!(length == before.size, "{} changed size", file.display());
-            staged.digest = *hasher.finalize().as_bytes();
-            ensure!(
-                digest == staged.digest,
-                "{} changed while it was stored",
-                file.display()
-            );
-            staged.packed = true;
-            staged.stored = out.metadata()?.len();
-        }
-        out.set_permissions(fs::Permissions::from_mode(0o444))?;
-        if Stamp::of(&source.metadata()?) == before {
-            self.remember(before, staged.digest);
+        let (staged, learned) = stage_file(&self.dir, self.clone, file, roots)?;
+        if let Some((stamp, digest)) = learned {
+            self.remember(stamp, digest);
         }
         Ok(staged)
+    }
+
+    /// The same for many files at once, on as many threads as there are
+    /// processors: each file is read through, and a build's programs are
+    /// gigabytes.
+    pub fn stage_many(&mut self, files: &[&Path], roots: &Roots) -> Vec<Result<Staged>> {
+        type Done = Result<(Staged, Option<(Stamp, Digest)>)>;
+        let most = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let threads = most.clamp(1, 16).min(files.len() / 4 + 1);
+        let (dir, clone) = (self.dir.clone(), self.clone);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = || -> Vec<(usize, Done)> {
+            let mut done = Vec::new();
+            loop {
+                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(file) = files.get(at) else {
+                    return done;
+                };
+                done.push((at, stage_file(&dir, clone, file, roots)));
+            }
+        };
+        let mut all: Vec<(usize, Done)> = if threads == 1 {
+            work()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            })
+        };
+        all.sort_by_key(|(at, _)| *at);
+        let mut staged: Vec<Result<Staged>> = Vec::with_capacity(files.len());
+        for (at, done) in all {
+            // A thread that failed outright left its files unread.
+            while staged.len() < at {
+                staged.push(Err(anyhow::anyhow!("a file could not be stored")));
+            }
+            staged.push(done.map(|(staged, learned)| {
+                if let Some((stamp, digest)) = learned {
+                    self.remember(stamp, digest);
+                }
+                staged
+            }));
+        }
+        while staged.len() < files.len() {
+            staged.push(Err(anyhow::anyhow!("a file could not be stored")));
+        }
+        staged
     }
 
     /// Make a finished command part of the cache. False if it does not fit.
