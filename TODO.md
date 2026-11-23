@@ -58,11 +58,13 @@
 - [x] Start a build from one made in another checkout whose output names that checkout. The record says which compilers wrote such output, and they are run again. Olo's `build --workspace` in a new worktree: 47 s to 12 s.
 - [x] Read a file before compressing it, and do not compress what the cache holds; read a file that has two names once. Recording a dev build of all of Olo on ext4: 20 s to 2.5 s.
 - [x] Put a build back with a thread for each processor up to sixteen, each taking the next largest file, give files their time as they are written, and move them into place on several threads. A dev build of all of Olo, 21,600 files and 21 GB on ext4: 4.3 to 5.1 s, now 2.7 to 4.
+- [x] Say in `jato stats` whether the cache's filesystem clones files, and how large a build was that the budget turned away.
 - [x] Read a build's files into the cache on several threads when it is recorded. A dev build of all of Olo: 2.5 s to 1.1 s on ext4, 4.7 s to 2.3 s on Btrfs.
 - [x] Take the time for a build's files before its sources are looked at. A source saved while the files were being written looked older than the build to Cargo.
 
 ## Open
 
+- [ ] The budget nobody set is a tenth of the filesystem and at least 10 GiB, and a result is turned away when what it wrote takes more than half of it. A dev build of all of Olo is 21 GiB: on a filesystem of 90 GB it was never recorded, the cache kept throwing out what the build's own compilers had just stored, and every build was made from nothing in four minutes. `jato stats` says why. A whole build made of results the cache already holds adds a record and nothing else, and could be counted that way; and a budget too small for the project could be said outright the first time.
 - [ ] Putting a dev build of all of Olo back on ext4 takes 3 to 4 s, two or more of them writing 21 GB through memory at the rate memory takes it. On a filesystem that clones files none of it is copied.
 - [ ] The `cc` crate names an object file after a hash of the directory its source is in. Source that a build script generates in its output directory is in another directory in every checkout, so 41 of Olo's C compilations are made again in each, 2.4 s for the longest. The result could be kept by what was compiled and given the name asked for.
 - [ ] A build script that writes something else every time it runs has everything above it compiled again wherever Cargo runs the script: `grammers-tl-types` generates its source in an order that changes, 3.7 s for the crate and seven more after it. Putting a build script's run back, as recorded, would do away with that and with the scripts' own time.

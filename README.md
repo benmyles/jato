@@ -233,6 +233,37 @@ A result becomes visible in one transaction, after its files are in place. Each 
 
 Next to results the cache keeps the state rustc saved for each crate of a workspace, which is about as large as the crate's compiled output. It is stored once however many checkouts are handed it.
 
+### On a build server
+
+Measured on a server with 32 processors, 125 GB of memory and a disk that writes 7.8 GB a second, for Olo's whole workspace (121 packages, 56 programs):
+
+| | ext4 | Btrfs |
+| --- | ---: | ---: |
+| `check` from nothing | 82 s | 79 s |
+| `check` in a new worktree | 0.5 to 0.7 s | 1.0 to 1.3 s |
+| `check` in a new worktree, a function added to a crate 54 others use | 5.1 s | |
+| `check` in a new worktree, a manifest changed | 11 s | 11 s |
+| `build` from nothing, after the check | 194 s | 200 s |
+| `build` put back, 21,600 files and 21 GB | 2.7 to 4 s | 1.3 s |
+| `build` in a new worktree, one program compiled again for where it is | 8.5 to 10 s | 6.5 to 7 s |
+| `build` in a new worktree, the function added | 41 s | 45 s |
+| Room for the cache and three target directories | 8 GB and 22 GB each | 33 GB in all |
+
+Cargo alone takes 76 s for the check from nothing, whether its target directory is on the disk or in memory.
+
+Put the cache and the checkouts on a filesystem that clones files where one is to be had. Nothing is copied when a build is put back there, and a target directory takes no room that the cache does not already take. `jato stats` says whether the cache's filesystem clones. A file on any filesystem can hold one:
+
+```sh
+truncate -s 300G /srv/builds.img && mkfs.btrfs /srv/builds.img
+mkdir -p /srv/builds && mount -o loop,noatime /srv/builds.img /srv/builds
+```
+
+Memory is used without being asked for: the kernel keeps what was last read and written in whatever memory is free, the cache and the target directories with it. Three ways of setting memory aside were measured on that server and none made a build quicker. A target directory in memory: the check from nothing took 75.7 s against 76.3. The dev build put back into memory: 3.9 s against 4.3 to 5.1. And the cache and the checkouts on a Btrfs filesystem kept in memory instead of on the disk: 1.3 s against 1.2 for a check in a new worktree, and 10.6 s against 7.9 for the build after it. A slow disk would change that, and then the same two commands make the filesystem in a file under `/dev/shm`. Jato has no setting for memory because there is nothing it could do with one that the kernel is not doing.
+
+What a machine with many processors gains is in how a build is put back and recorded: both are done on up to sixteen threads.
+
+The budget of a cache nobody set one for is a tenth of its filesystem, at least 10 GiB and at most 100 GiB. A debug build of a large workspace can be larger than a small filesystem's tenth: Olo's is 21 GiB. Such a build is not recorded, `jato stats` says so, and `jato limit` sets a budget that holds it.
+
 There is no daemon, and nothing runs between builds. The cache holds compiled artifacts and diagnostics, which may include values embedded by `env!`.
 
 ## What is not reused

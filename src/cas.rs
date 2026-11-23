@@ -199,6 +199,22 @@ pub struct Stats {
     /// Why the latest build that was recorded is only put back in the
     /// target directory it was made in, if that is so.
     pub only_there: Option<(u64, String)>,
+    /// Whether the filesystem the cache is on can clone files, so that
+    /// results are stored and put back without being copied.
+    pub clones: bool,
+}
+
+/// Whether one file in `dir` can be made a clone of another.
+fn clones(dir: &Path) -> bool {
+    let name = |which: &str| dir.join(format!("tmp-clone-{}-{which}", std::process::id()));
+    let (from, to) = (name("a"), name("b"));
+    let made = (|| -> io::Result<()> {
+        fs::write(&from, [0u8; 4096])?;
+        clone_file(&File::open(&from)?, &File::create(&to)?)
+    })();
+    let _ = fs::remove_file(&from);
+    let _ = fs::remove_file(&to);
+    made.is_ok()
 }
 
 /// A record that may stand for a command, before it has been read.
@@ -1595,6 +1611,7 @@ impl Store {
             counters,
             unrecorded: self.noted("unrecorded"),
             only_there: self.noted("only_there"),
+            clones: self.clone && clones(&self.dir.join("objects")),
         })
     }
 

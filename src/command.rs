@@ -2954,7 +2954,18 @@ pub fn record(
             }
             Ok(manifest)
         }
-        Ok(false) => Err("it is larger than half the cache".into()),
+        Ok(false) => {
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            let files: u64 = manifest.outputs.iter().map(|output| output.size).sum();
+            Err(match store.budget() {
+                Ok(budget) => format!(
+                    "it is larger than half the cache: its files take {:.1} GiB and the budget is {:.1} GiB, which `jato limit` sets",
+                    gib(files),
+                    gib(budget)
+                ),
+                Err(_) => "it is larger than half the cache".into(),
+            })
+        }
         Err(e) => Err(format!("{e:#}")),
     }
 }

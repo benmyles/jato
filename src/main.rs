@@ -506,6 +506,15 @@ fn report(stats: &cas::Stats) -> String {
     let count = |name: &str| stats.counters.get(name).copied().unwrap_or(0);
     let mut out = String::new();
     let _ = writeln!(out, "Cache      {}", stats.directory.display());
+    let _ = writeln!(
+        out,
+        "           {}",
+        if stats.clones {
+            "files are cloned here: results are kept and put back without copying"
+        } else {
+            "files are not cloned here: results are kept compressed and put back as copies (Btrfs and XFS can clone)"
+        }
+    );
     let (whole, made, left) = (
         count("build_hit"),
         count("build_miss"),
