@@ -288,7 +288,7 @@ impl Server {
         store.count(job.counter("miss"), 1);
         self.scopes.begin(pid, job.observer(&store));
         let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
-        let report = self.scopes.end(pid).unwrap_or_default();
+        let mut report = self.scopes.end(pid).unwrap_or_default();
         let Ok(done) = done else {
             // The wrapper went away mid-compilation: the build was stopped.
             self.unusable("a compiler was interrupted");
@@ -321,6 +321,22 @@ impl Server {
             && !report.network
             && std::env::var_os("JATO_ASYNC_RECORD").is_none_or(|v| v != "0");
         if async_record {
+            // Verify every absent path right at compiler exit before waking
+            // Cargo, so files created by subsequently scheduled crates cannot
+            // cause spurious "appeared while it ran" rejections while this
+            // unit stages in the background.
+            for (path, access) in &mut report.paths {
+                if access.kind == crate::observe::Kind::Absent
+                    && !access.written
+                    && !access.removed
+                    && !access.created
+                    && !access.appeared
+                    && std::fs::metadata(path).is_ok()
+                {
+                    access.appeared = true;
+                }
+            }
+            report.absent_verified = true;
             let _ = wire::send(&mut stream, &[0]);
             drop(stream);
             let _slot = self.acquire_recorder();

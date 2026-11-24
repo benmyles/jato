@@ -248,6 +248,9 @@ pub struct Report {
     /// The programs the command started from the directory
     /// `Config::programs_in` names, in the order it started them.
     pub programs: Vec<PathBuf>,
+    /// Whether `Kind::Absent` paths were already verified still-absent right
+    /// when the observed command exited (before waking Cargo asynchronously).
+    pub absent_verified: bool,
 }
 
 #[derive(Default, Clone)]

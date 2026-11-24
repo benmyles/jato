@@ -2953,7 +2953,10 @@ pub fn record(
             // between.
             // A link that leads nowhere, or nowhere this user may go, was
             // missing in the same sense and is still.
-            Kind::Absent if access.appeared || (now.is_ok() && fs::metadata(path).is_ok()) => {
+            Kind::Absent
+                if access.appeared
+                    || (!report.absent_verified && now.is_ok() && fs::metadata(path).is_ok()) =>
+            {
                 return Err(format!("{} appeared while it ran", path.display()));
             }
             Kind::Absent => State::Absent,
