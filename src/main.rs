@@ -4,6 +4,7 @@ mod dev;
 mod facts;
 mod jobs;
 mod manifest;
+mod mount;
 mod observe;
 mod roots;
 mod scan;
@@ -110,6 +111,7 @@ Environment
                       program; none are told of by the program itself
   JATO_COALESCE=0     Let identical concurrent compilations run independently
   JATO_REMAP=0        Leave real workspace and target paths in compiled output
+  JATO_MOUNT=0        Disable unprivileged mount-namespace target canonicalization
   JATO_STORAGE=packed Keep compressed copies even where files can be cloned
   JATO_VERIFY=1       Check restored bytes on filesystems that checksum them
   JATO_CACHE_TESTS=0  Run tests without caching their results

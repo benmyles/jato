@@ -438,6 +438,9 @@ pub struct Job {
     /// descriptor: the descriptor is free, and the program has been seen to
     /// keep one.
     descriptor: bool,
+    /// Canonical target mountpoint when unprivileged user+mount namespaces are
+    /// active for this compilation.
+    mount: Option<PathBuf>,
     /// A compiler other than rustc, started by a build script.
     pub tool: bool,
     /// Output filename remapping for `cc`-crate hashed object outputs.
@@ -482,6 +485,7 @@ impl Job {
             scope: Scope::Unit,
             remap,
             descriptor: true,
+            mount: None,
             tool: false,
             tool_out: None,
             salt: Vec::new(),
@@ -545,6 +549,7 @@ impl Job {
             scope: Scope::Unit,
             remap,
             descriptor: false,
+            mount: None,
             tool: true,
             tool_out,
             salt: Vec::new(),
@@ -565,6 +570,7 @@ impl Job {
             scope: Scope::Build,
             remap: false,
             descriptor: false,
+            mount: None,
             tool: false,
             tool_out: None,
             salt,
@@ -706,6 +712,28 @@ impl Job {
     /// a descriptor and named through that, for crates rustc writes
     /// itself: a linker would have to be trusted to keep the descriptor.
     /// Returns the argument to replace, and the directory to hold open.
+    /// Enable canonical target bind-mounting for this compilation when
+    /// unprivileged user+mount namespaces are permitted on this kernel.
+    pub fn enable_mount(&mut self, cache: &Path) {
+        if self.tool
+            || !self.remap
+            || !self.facts.compiles()
+            || self.roots.path(roots::TARGET).is_none()
+        {
+            return;
+        }
+        if let Some(mp) = crate::mount::available(cache) {
+            self.mount = Some(mp);
+            self.descriptor = false;
+        }
+    }
+
+    /// `(real_target, canonical_mountpoint)` when this compilation runs inside
+    /// a private target mount namespace.
+    pub fn mounted(&self) -> Option<(&Path, &Path)> {
+        Some((self.roots.path(roots::TARGET)?, self.mount.as_deref()?))
+    }
+
     fn aliased_out_dir(&self) -> Option<(usize, OsString, Option<&Path>)> {
         let at = self.facts.out_dir_at?;
         self.facts.incremental.as_ref()?;
@@ -713,6 +741,18 @@ impl Job {
             return None;
         }
         let out = self.facts.hint.as_ref()?;
+        if let Some((target, mp)) = self.mounted() {
+            let rest = out.strip_prefix(target).ok()?;
+            if rest.as_os_str().is_empty() {
+                return None;
+            }
+            let mut arg = OsString::new();
+            if self.request.args[at].as_bytes().starts_with(b"--out-dir=") {
+                arg.push("--out-dir=");
+            }
+            arg.push(mp.join(rest));
+            return Some((at, arg, None));
+        }
         let (alias, rest, held) = match out.strip_prefix(&self.request.cwd) {
             Ok(rest) => (WORK_ALIAS, rest, None),
             Err(_) => {
@@ -778,11 +818,19 @@ impl Job {
             .iter()
             .position(|a| a.as_bytes().starts_with(b"-"))
             .unwrap_or(0);
+        let mounted = self.mounted();
         let arg = |i: usize| {
-            replaced
-                .iter()
-                .find(|(at, _)| *at == i)
-                .map_or_else(|| args[i].clone(), |(_, new)| new.clone())
+            if let Some((_, new)) = replaced.iter().find(|(at, _)| *at == i) {
+                return new.clone();
+            }
+            if let Some((real_target, mp)) = mounted {
+                let prev = i.checked_sub(1).map(|p| args[p].as_os_str());
+                if let Some(rewritten) = crate::mount::rewrite_arg(prev, &args[i], real_target, mp)
+                {
+                    return rewritten;
+                }
+            }
+            args[i].clone()
         };
         argv.extend((0..options).map(arg));
         argv.extend(extra.map(OsString::from));
@@ -807,6 +855,13 @@ impl Job {
             // as it would have under the directory's own name.
             if self.held().is_some() {
                 argv.push(format!("--remap-path-prefix={HELD_ALIAS}={TARGET_ALIAS}").into());
+            }
+            if let Some((_, mp)) = mounted {
+                let mut map = OsString::from("--remap-path-prefix=");
+                map.push(mp);
+                map.push("=");
+                map.push(TARGET_ALIAS);
+                argv.push(map);
             }
         }
         argv.extend((options..args.len()).map(arg));
@@ -913,6 +968,9 @@ impl Job {
             unlisted: self.facts.search.clone(),
             state: self.facts.incremental.clone(),
             programs_in: None,
+            mount: self
+                .mounted()
+                .map(|(real, mp)| (mp.to_owned(), real.to_owned())),
         }
     }
 }
@@ -1358,11 +1416,13 @@ pub fn run_piped(
     argv: &[OsString],
     observed: Option<(&Job, &Store)>,
     held: Option<&Path>,
+    mounted: Option<(&Path, &Path)>,
 ) -> Result<(Ran, Report)> {
     run_piped_config(
         argv,
         observed.map(|(job, store)| job.observer(store)),
         held,
+        mounted,
         false,
     )
 }
@@ -1371,6 +1431,7 @@ pub fn run_piped_config(
     argv: &[OsString],
     observed: Option<observe::Config>,
     held: Option<&Path>,
+    mounted: Option<(&Path, &Path)>,
     strip_session: bool,
 ) -> Result<(Ran, Report)> {
     let begun = Instant::now();
@@ -1386,11 +1447,21 @@ pub fn run_piped_config(
         hold(&mut cmd, dir)?;
     }
     let (mut child, session) = match observed {
-        Some(config) => {
+        Some(mut config) => {
+            if config.mount.is_none()
+                && let Some((real, mp)) = mounted
+            {
+                config.mount = Some((mp.to_owned(), real.to_owned()));
+            }
             let (child, session) = observe::spawn(&mut cmd, config)?;
             (child, Some(session))
         }
-        None => (cmd.spawn()?, None),
+        None => {
+            if let Some((real, mp)) = mounted {
+                crate::mount::attach(&mut cmd, real, mp)?;
+            }
+            (cmd.spawn()?, None)
+        }
     };
     drop(cmd);
     let out = child.stdout.take().unwrap();
@@ -4930,16 +5001,19 @@ fn options_mark(job: &Job, cache_dir: &Path) -> Option<(Vec<u8>, [u8; 8])> {
             let dir = scratch.join(if other { "other" } else { "same" });
             fs::create_dir_all(dir.join("out")).ok()?;
             let argv = job.probe(&source, &dir, other)?;
-            let child = Command::new(&argv[0])
+            let mut probe_cmd = Command::new(&argv[0]);
+            probe_cmd
                 .args(&argv[1..])
                 .current_dir(&job.request.cwd)
                 .env_clear()
                 .envs(&job.request.env)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
+                .stderr(Stdio::null());
+            if let Some((real, mp)) = job.mounted() {
+                crate::mount::attach(&mut probe_cmd, real, mp).ok()?;
+            }
+            let child = probe_cmd.spawn().ok()?;
             running.push((child, dir));
         }
         let mut starts = Vec::new();
@@ -5405,7 +5479,7 @@ fn wrap_alone(program: &OsStr, args: &[OsString]) -> Result<i32> {
 }
 
 /// Look up, run and record a command that nothing else is watching.
-fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
+fn alone(mut job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
     let mut store = match Store::open() {
         Ok(store) => store,
         Err(e) => {
@@ -5413,6 +5487,7 @@ fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
             return passthrough(original(program, args));
         }
     };
+    job.enable_mount(&store.dir);
     let recipe = job.recipe();
     let print = |outcome: Outcome| -> Result<i32> {
         io::stdout().write_all(&outcome.stdout)?;
@@ -5453,10 +5528,15 @@ fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
             drop(lock);
             drop(store);
             let mut cmd = original(&argv[0], &argv[1..]);
-            if let Some(dir) = job.held()
-                && hold(&mut cmd, dir).is_err()
-            {
-                // Without the directory only Cargo's own command line
+            let setup = if let Some((real, mp)) = job.mounted() {
+                crate::mount::attach(&mut cmd, real, mp).is_ok()
+            } else if let Some(dir) = job.held() {
+                hold(&mut cmd, dir).is_ok()
+            } else {
+                true
+            };
+            if !setup {
+                // Without the mount/descriptor only Cargo's own command line
                 // means anything.
                 cmd = original(program, args);
             }
@@ -5475,9 +5555,14 @@ fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
             store.flush();
             let since = std::time::SystemTime::now();
             let mut cmd = original(&argv[0], &argv[1..]);
-            if let Some(dir) = job.held()
-                && hold(&mut cmd, dir).is_err()
-            {
+            let setup = if let Some((real, mp)) = job.mounted() {
+                crate::mount::attach(&mut cmd, real, mp).is_ok()
+            } else if let Some(dir) = job.held() {
+                hold(&mut cmd, dir).is_ok()
+            } else {
+                true
+            };
+            if !setup {
                 drop(lock);
                 drop(store);
                 return passthrough(original(program, args));
@@ -5496,7 +5581,7 @@ fn alone(job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
         Run::Recorded => (),
     }
     store.count(job.counter("miss"), 1);
-    let (ran, report) = match run_piped(&argv, Some((&job, &store)), job.held()) {
+    let (ran, report) = match run_piped(&argv, Some((&job, &store)), job.held(), job.mounted()) {
         Ok(ran) => ran,
         Err(e) => {
             // The command may not have started at all. Run it plainly so

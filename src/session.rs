@@ -88,13 +88,16 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
             }
             let place = place(r.byte()? != 0);
             let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_real = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_mp = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mounted = mount_real.as_deref().zip(mount_mp.as_deref());
             let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
             // The supervisor is already watching this process's children.
-            let ran = match command::run_piped(&argv, None, held.as_deref()) {
+            let ran = match command::run_piped(&argv, None, held.as_deref(), mounted) {
                 Ok((ran, _)) => ran,
-                // That command line needs the directory it could not be
+                // That command line needs the directory/mount it could not be
                 // started with. Cargo's own does not.
-                Err(_) if held.is_some() => return Ok(None),
+                Err(_) if held.is_some() || mounted.is_some() => return Ok(None),
                 Err(e) => return Err(e),
             };
             drop(place);
@@ -119,12 +122,20 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
             }
             let place = place(r.byte()? != 0);
             let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_real = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_mp = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mounted = mount_real.as_deref().zip(mount_mp.as_deref());
             drop(stream);
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).env_remove("JATO_SESSION");
-            if let Some(dir) = &held
-                && command::hold(&mut cmd, dir).is_err()
-            {
+            let setup = if let Some((real, mp)) = mounted {
+                crate::mount::attach(&mut cmd, real, mp).is_ok()
+            } else if let Some(dir) = &held {
+                command::hold(&mut cmd, dir).is_ok()
+            } else {
+                true
+            };
+            if !setup {
                 cmd = Command::new(program);
                 cmd.args(args).env_remove("JATO_SESSION");
             }
@@ -141,14 +152,22 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
             }
             let place = place(r.byte()? != 0);
             let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_real = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_mp = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mounted = mount_real.as_deref().zip(mount_mp.as_deref());
             let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..])
                 .env_remove("JATO_SESSION")
                 .env(crate::jobs::HELD, "1");
-            if let Some(dir) = &held
-                && command::hold(&mut cmd, dir).is_err()
-            {
+            let setup = if let Some((real, mp)) = mounted {
+                crate::mount::attach(&mut cmd, real, mp).is_ok()
+            } else if let Some(dir) = &held {
+                command::hold(&mut cmd, dir).is_ok()
+            } else {
+                true
+            };
+            if !setup {
                 drop(place);
                 drop(stream);
                 let mut fallback = Command::new(program);
@@ -170,6 +189,9 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
             }
             let place = place(r.byte()? != 0);
             let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_real = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mount_mp = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let mounted = mount_real.as_deref().zip(mount_mp.as_deref());
             let async_ok = r.byte()? != 0;
             let store_dir = PathBuf::from(os(r.bytes()?));
             let mut ignore = Vec::new();
@@ -187,23 +209,29 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
                 unlisted,
                 state,
                 programs_in: None,
+                mount: mounted.map(|(real, mp)| (mp.to_owned(), real.to_owned())),
             };
             let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
-            let (ran, mut report) =
-                match command::run_piped_config(&argv, Some(config), held.as_deref(), true) {
-                    Ok(done) => done,
-                    Err(e) => {
-                        log(
-                            &program.to_string_lossy(),
-                            format_args!("not observed: {e:#}"),
-                        );
-                        drop(place);
-                        drop(stream);
-                        let mut fallback = Command::new(program);
-                        fallback.args(args).env_remove("JATO_SESSION");
-                        return command::passthrough(fallback).map(Some);
-                    }
-                };
+            let (ran, mut report) = match command::run_piped_config(
+                &argv,
+                Some(config),
+                held.as_deref(),
+                mounted,
+                true,
+            ) {
+                Ok(done) => done,
+                Err(e) => {
+                    log(
+                        &program.to_string_lossy(),
+                        format_args!("not observed: {e:#}"),
+                    );
+                    drop(place);
+                    drop(stream);
+                    let mut fallback = Command::new(program);
+                    fallback.args(args).env_remove("JATO_SESSION");
+                    return command::passthrough(fallback).map(Some);
+                }
+            };
             drop(place);
             if async_ok && ran.success && report.incomplete.is_none() && !report.network {
                 for (path, access) in &mut report.paths {
@@ -405,7 +433,7 @@ impl Server {
             env,
             spare: spare && !tool,
         };
-        let job = if tool {
+        let mut job = if tool {
             Job::tool(request, self.roots.path(crate::roots::TARGET))
         } else {
             Job::unit(request, self.roots.path(crate::roots::TARGET))
@@ -418,6 +446,7 @@ impl Server {
                 return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
             }
         };
+        job.enable_mount(&store.dir);
         let recipe = job.recipe();
         let reply = |stream: &mut UnixStream, outcome: &Outcome| {
             let mut w = Writer(vec![HIT]);
@@ -456,6 +485,9 @@ impl Server {
                 w.0.push((job.tool || job.facts.compiles()).into());
                 // And the directory to start it with on a descriptor, if any.
                 w.optional(job.held().map(|dir| dir.as_os_str().as_bytes()));
+                let mounted = job.mounted();
+                w.optional(mounted.map(|(real, _)| real.as_os_str().as_bytes()));
+                w.optional(mounted.map(|(_, mp)| mp.as_os_str().as_bytes()));
                 store.count(job.counter("miss"), 1);
                 scopes.begin(pid, job.observer(&store));
                 let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
@@ -570,6 +602,9 @@ impl Server {
                 let argv = job.argv();
                 let compiles = job.tool || job.facts.compiles();
                 let held = job.held().map(|dir| dir.as_os_str().as_bytes());
+                let mounted = job.mounted();
+                let mount_real = mounted.map(|(real, _)| real.as_os_str().as_bytes());
+                let mount_mp = mounted.map(|(_, mp)| mp.as_os_str().as_bytes());
                 match run {
                     Run::Continued => {
                         log(job.name(), "left to rustc, unwatched and unrecorded");
@@ -582,6 +617,8 @@ impl Server {
                         }
                         w.0.push(compiles.into());
                         w.optional(held);
+                        w.optional(mount_real);
+                        w.optional(mount_mp);
                         let _ = wire::send(&mut stream, &w.0);
                     }
                     Run::Seeding => {
@@ -598,6 +635,8 @@ impl Server {
                         }
                         w.0.push(compiles.into());
                         w.optional(held);
+                        w.optional(mount_real);
+                        w.optional(mount_mp);
                         let done =
                             wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
                         drop(stream);
@@ -638,6 +677,8 @@ impl Server {
                         }
                         w.0.push(compiles.into());
                         w.optional(held);
+                        w.optional(mount_real);
+                        w.optional(mount_mp);
                         w.0.push(async_ok.into());
                         w.bytes(store.dir.as_os_str().as_bytes());
                         w.number(obs.ignore.len() as u64);
@@ -1308,6 +1349,7 @@ fn supervise(
         // The build scripts Cargo runs are told apart, each with what it
         // and everything it starts examines and writes.
         programs_in: job.roots.path(crate::roots::TARGET).map(Path::to_owned),
+        mount: None,
     };
     let mut fallback = copy_of(&cmd);
     // And the tokens for this build's own compilers, kept in the cache

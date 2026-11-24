@@ -382,6 +382,7 @@ fn execute_observed(
         unlisted: Vec::new(),
         state: None,
         programs_in: None,
+        mount: None,
     };
     let (mut child, session) = observe::spawn(&mut cmd, config)?;
     drop(cmd);

@@ -498,6 +498,10 @@ pub struct Config {
     /// noted with the paths it used. For a build this is the target
     /// directory, and the programs are its build scripts.
     pub programs_in: Option<PathBuf>,
+    /// Optional canonical target bind-mount `(mountpoint, real_target)`.
+    /// Paths under `mountpoint` reported by the child are translated back to
+    /// `real_target` in the host namespace before recording.
+    pub mount: Option<(PathBuf, PathBuf)>,
 }
 
 /// The library that watched programs load, as it was built with this
@@ -1043,6 +1047,16 @@ mod imp {
         Some((meta.dev(), meta.ino()))
     }
 
+    /// This `jato` executable's `(dev, ino)` identity, used to distinguish
+    /// Jato's own target bind-mount setup from arbitrary user `unshare`/`mount`.
+    fn own_jato() -> Option<(u64, u64)> {
+        static OWN: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+        *OWN.get_or_init(|| {
+            let meta = fs::metadata("/proc/self/exe").ok()?;
+            Some((meta.dev(), meta.ino()))
+        })
+    }
+
     /// Whether a thread has ended or is ending. A program that exits takes
     /// its other threads with it, and one of them may have been waiting
     /// here for its call to be looked at. That call is never made, so
@@ -1178,7 +1192,13 @@ mod imp {
                     _ => return None,
                 }
             };
-            Some(joined(base.as_os_str().as_bytes(), name))
+            let resolved = joined(base.as_os_str().as_bytes(), name);
+            if let Some((mp, real)) = &self.config.mount
+                && let Ok(rest) = resolved.strip_prefix(mp)
+            {
+                return Some(real.join(rest));
+            }
+            Some(resolved)
         }
 
         fn ignored(&self, path: &Path) -> bool {
@@ -1190,6 +1210,15 @@ mod imp {
         }
 
         fn touch_ref(&mut self, path: &Path, mut how: Use) {
+            let mapped;
+            let path = if let Some((mp, real)) = &self.config.mount
+                && let Ok(rest) = path.strip_prefix(mp)
+            {
+                mapped = real.join(rest);
+                mapped.as_path()
+            } else {
+                path
+            };
             if self.ignored(path) {
                 if let Some(dir) = &self.config.state
                     && let Ok(rest) = path.strip_prefix(dir)
@@ -1553,7 +1582,44 @@ mod imp {
                 nr::IO_URING_SETUP | nr::NAME_TO_HANDLE_AT | nr::OPEN_BY_HANDLE_AT => {
                     self.incomplete("a program can open files without naming them")
                 }
-                nr::CHROOT | nr::MOUNT | nr::PIVOT_ROOT | nr::UNSHARE | nr::SETNS => {
+                nr::UNSHARE => {
+                    let expected = (libc::CLONE_NEWUSER | libc::CLONE_NEWNS) as u64;
+                    let allowed = self.config.mount.is_some()
+                        && a[0] == expected
+                        && running(tid).is_some()
+                        && running(tid) == own_jato();
+                    if !allowed {
+                        self.incomplete("a program changed its view of the filesystem");
+                    }
+                }
+                nr::MOUNT => {
+                    let allowed = if let Some((mp, real)) = self.config.mount.clone()
+                        && running(tid).is_some()
+                        && running(tid) == own_jato()
+                    {
+                        let dst = self
+                            .string(tid, a[1])
+                            .map(|b| PathBuf::from(OsString::from_vec(b)));
+                        let flags = a[3] as libc::c_ulong;
+                        if dst.as_deref() == Some(Path::new("/")) && flags & libc::MS_PRIVATE != 0 {
+                            true
+                        } else if dst.as_deref() == Some(mp.as_path()) && flags & libc::MS_BIND != 0
+                        {
+                            let src = self
+                                .string(tid, a[0])
+                                .map(|b| PathBuf::from(OsString::from_vec(b)));
+                            src.as_deref() == Some(real.as_path())
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !allowed {
+                        self.incomplete("a program changed its view of the filesystem");
+                    }
+                }
+                nr::CHROOT | nr::PIVOT_ROOT | nr::SETNS => {
                     self.incomplete("a program changed its view of the filesystem")
                 }
                 _ => (),
@@ -2234,9 +2300,18 @@ mod imp {
             }
             None => (None, None),
         };
+        let mount_plan = match &config.mount {
+            Some((mp, real)) => Some(crate::mount::Plan::new(real, mp)?),
+            None => None,
+        };
         let notes_to = writing.as_ref().map(AsRawFd::as_raw_fd);
         unsafe {
             cmd.pre_exec(move || {
+                // Enter private target mount namespace before installing the
+                // seccomp filter so Jato's own unshare/mount stay out of band.
+                if let Some(plan) = &mount_plan {
+                    plan.enter()?;
+                }
                 // The copy stays open in the command and all it starts.
                 if let Some(socket) = notes_to
                     && libc::dup2(socket, NOTES_FD) < 0
