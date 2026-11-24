@@ -27,7 +27,7 @@ On six open-source Rust workspaces in new git worktrees (`check --workspace`, ex
 
 ## Get started
 
-Build Jato on Linux with Rust 1.89 or later and a C toolchain. SQLite and Zstandard are bundled, and so is the library watched programs load, which is built with Jato on x86-64. Install directly from GitHub or from a local checkout:
+Build Jato on Linux with Rust 1.89 or later and a C toolchain. SQLite and Zstandard are bundled, and so are the small preload libraries watched programs load (built with Jato on Linux x86-64 and aarch64). Install directly from GitHub or from a local checkout:
 
 ```sh
 cargo install --locked --git https://github.com/benmyles/jato
@@ -121,7 +121,9 @@ Tried on Olo's own history, each in a new worktree, against the check of the new
 
 Nothing is left to start from where Cargo's settings differ, or what a program examined that is neither Cargo nor part of what a build script did. Cargo then carries the build out, with every compiler answered from the cache. `JATO_NEAR=0` has it carry out every build that is not recorded.
 
-### C, C++ and assembly in build scripts
+### Build scripts and the C, C++ and assembly they compile
+
+Jato caches Cargo build-script executions directly (`script_hit`/`script_miss`) via a minimal zero-symbol preload library (`libjato_script.so`, separate from the read-note library so it works even with `JATO_NOTES=0`). Each build script is keyed by its binary's BLAKE3 digest, arguments, working directory, and normalized environment, verified against every file, directory, symlink, subprocess, and nested C/Rust tool compilation observed while it ran. Passing, hermetic scripts whose surviving writes stay inside `OUT_DIR` replay deterministically across clean builds, worktrees, and config changes—eliminating downstream recompilation cascades from non-deterministic code generators—while relocating `OUT_DIR`/`WORK` paths in stdout directives and text outputs and preserving exact whole-build attribution. `JATO_CACHE_SCRIPTS=0` disables build-script caching.
 
 A build script that compiles C starts the compiler itself, and Cargo gives nobody a say in that. For the Cargo commands Jato runs, a directory at the head of `PATH` holds the names `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `nasm` and `yasm`, each leading back to Jato, for those of them the rest of `PATH` finds. Started by a build script under one of these names, Jato finds the program itself and treats its run like a run of rustc: looked up, and otherwise run under observation and recorded, with every header it opened or looked for among what the result depends on. gcc and clang are also told the workspace's and the target directory's other names, through `-ffile-prefix-map`, so that debugging information compiled from a file in the workspace does not tie the build to one checkout.
 
@@ -149,6 +151,8 @@ The files of a build that is put back all get one time, taken just before Jato l
 
 ### Edits
 
+When you edit sources in an already-built target directory (outside a rapid editing spell and while the machine is not overloaded), Jato verifies unchanged outputs in parallel, removes only the stale outputs (leaving `rustc`'s `incremental/` state untouched), and runs Cargo under watch so the edited state is recorded as a whole build (`build_continued`) while also catching hidden inputs Cargo would miss (such as files read only by procedural macros or edits with older timestamps). Another checkout or worktree with that edited state then gets an instant whole-build hit. `JATO_RECORD_EDITS=0` skips in-place whole-build recording.
+
 A crate compiled again within ten minutes of its last compilation in the same target directory is being edited. rustc compiles it incrementally from the state it saved, Jato looks for a recorded result (which is how undoing an edit is instant) and otherwise leaves the compiler unwatched and its output unrecorded, because the next edit replaces it. The first compilation after a pause is recorded again. `JATO_EDIT_WINDOW` sets the pause in seconds; `0` records every compilation.
 
 Watching a compiler is free while processors are free. On a machine where every one is in use, each file the compiler asks about costs it a turn at the processor, and a short compilation can take several times as long: checking `olo-system` and its 54 dependents after an edit took 17 to 25 s watched and 7 to 14 s unwatched at a load of 45 to 55 on 15 processors. So in a target directory that is already built, compilations are left unwatched while the load average is at or above the number of processors, and recorded when it is below. A build made from nothing is always recorded. `JATO_BUSY` sets the load; `0` always watches.
@@ -157,7 +161,7 @@ A target directory that was restored holds none of the state rustc saves for com
 
 What rustc makes of the state depends on the crate. For a library it reuses its analysis and the code it generated for every module that was not edited. For a program or a test in another target directory it reuses the analysis and generates all code again: rustc ties the code of anything it links to the real locations of the libraries linked in, whatever names they are given by. In the target directory the state was saved in, after a clean, a program's code is reused too.
 
-rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. rustc still checks each saved result against the sources before using it, and if the state does not begin the way Jato expects it is left out and the crate is compiled from scratch. State is kept for the output directory it was made with, since rustc generates all code again for any other. A target directory inside the workspace reads the same in every checkout. One kept anywhere else, such as a scratch `CARGO_TARGET_DIR` for each checkout, is held open for the compiler on a descriptor and named through that, `/proc/self/fd/219`, when the crate is a library, which rustc writes itself. Programs, tests and procedural macros there are compiled without state the first time: a linker would have to keep the descriptor. `JATO_SAVED_STATE=0` turns this off.
+rustc accepts saved state only under the options it was made with, and the workspace's location is one of them. Jato sets the few bytes at the start of the state that stand for the options to this checkout's, which it learns by having the compiler compile a one-line crate, and names the output directory through `/proc/self/cwd` so that it reads the same everywhere. Where unprivileged Linux user and mount namespaces are permitted by the kernel, Jato can also bind-mount the target directory at a canonical path inside a private mount namespace (`JATO_MOUNT=0` disables it) so `rustc` sees identical `.rlib` and `--out-dir` paths across checkouts and out-of-tree target directories, falling back automatically when user namespaces are restricted. rustc still checks each saved result against the sources before using it, and if the state does not begin the way Jato expects it is left out and the crate is compiled from scratch. State is kept for the output directory it was made with, since rustc generates all code again for any other. A target directory inside the workspace reads the same in every checkout. One kept anywhere else, such as a scratch `CARGO_TARGET_DIR` for each checkout, is held open for the compiler on a descriptor and named through that, `/proc/self/fd/219`, when the crate is a library, which rustc writes itself. Programs, tests and procedural macros there are compiled without state the first time: a linker would have to keep the descriptor. `JATO_SAVED_STATE=0` turns this off.
 
 ### Builds at the same time
 
@@ -165,7 +169,16 @@ Every compiler started through Jato takes one of as many places as the machine h
 
 Two builds that need the same compilation at the same moment run it once: the second waits for the first and uses its result. `JATO_COALESCE=0` lets them run independently.
 
-Cargo shares out a token for every compiler it runs at once, through a pipe the compilers inherit. To hand on a pipe that has no name it starts each compiler as a copy of itself, with all the memory it holds for the workspace, which then becomes the compiler. Where Jato has an answer ready for every compiler that copying is most of what is left: for a check of all of Olo with 2,618 compilations answered and 49 run, 29 of 60 processor-seconds, and it is done one compiler at a time. Jato gives Cargo its tokens in a pipe that has a name, kept in the cache directory for as long as the build runs. Cargo then starts a compiler without a copy of itself, and that check took 11 s where it had taken 15. The number of tokens is the one Cargo would have chosen. Where anything says how many compilers to run, `-j`, `CARGO_BUILD_JOBS`, a `jobs` setting or tokens handed down by make, the arrangement is left as it is. So it is where a build script would find a make older than 4.4, which stops at a pipe with a name. `JATO_JOBSERVER=0` leaves Cargo its own pipe always.
+Cargo shares out a token for every compiler it runs at once, through a pipe the compilers inherit. To hand on a pipe that has no name it starts each compiler as a copy of itself, with all the memory it holds for the workspace, which then becomes the compiler. Where Jato has an answer ready for every compiler that copying is most of what is left: for a check of all of Olo with 2,618 compilations answered and 49 run, 29 of 60 processor-seconds, and it is done one compiler at a time. Jato gives Cargo its tokens in a shared machine-wide named FIFO (`tokens-shared` in the cache directory) coordinated by file locks across all concurrent builds sharing the cache, so Cargo, `rustc -Zthreads`, LLVM codegen threads, and GNU `make` share a single global token pool and clean up automatically when the last build exits. Cargo then starts a compiler without a copy of itself, and that check took 11 s where it had taken 15. The number of tokens is the one Cargo would have chosen (or `JATO_JOBS`). Where anything says how many compilers to run, `-j`, `CARGO_BUILD_JOBS`, a `jobs` setting or tokens handed down by make, the arrangement is left as it is. So it is where a build script would find a make older than 4.4, which stops at a pipe with a name. `JATO_JOBSERVER=0` leaves Cargo its own pipe always.
+
+### Shared and remote caches
+
+Set `JATO_REMOTE` or persist a remote URL with `jato remote <URL>` to share verified whole builds, single compilations, C tool outputs, build-script runs, and test results across machines or CI runners with zero daemon and zero extra dependencies:
+
+- `file:///path/to/shared/dir` (or `/path/to/shared/dir`) for a shared directory or NFS mount
+- `http://host[:port][/prefix]` for any HTTP/1.1 PUT/GET/HEAD CAS server (with optional `JATO_REMOTE_TOKEN` Bearer auth)
+
+On a local miss, Jato fetches remote candidate manifests, cryptographically verifies the manifest and detail digests, checks local inputs *before* downloading any output objects, downloads missing zstd-compressed objects in parallel with streaming BLAKE3 verification, and adopts them transactionally into the local store. `JATO_REMOTE_READONLY=1` pulls without pushing. Transport errors or corrupted remote blobs never fail a build.
 
 ## Use with other tools
 
@@ -203,7 +216,7 @@ Nothing is changed outside the build Jato runs, and `JATO_DISABLE=1` turns all o
 | `jato watch --watch ../schemas -- check --all-targets` | Watch an additional file or directory. |
 | `jato watch --debounce 40` | Use a fixed 40 ms quiet window. By default a completed save of one Rust file starts a check at once; other small edits get 16 ms and bursts or configuration changes 100 ms. |
 
-The watcher uses native filesystem events and Cargo metadata. It follows workspace directories, member directories and direct local path dependencies, honors ignore rules, and leaves out Cargo's outputs and Jato's cache. A new save supersedes a running job, including its compiler and test processes.
+The watcher uses native filesystem events and Cargo metadata, and routes each job through `jato` itself so saves benefit from whole-build hits on undo, in-place whole-build recording, cross-command seeding, build-script caching, and observed test caching. It follows workspace directories, member directories and direct local path dependencies, honors ignore rules, and leaves out Cargo's outputs and Jato's cache. A new save supersedes a running job, including its compiler and test processes.
 
 `jato dev build`, `run`, `test` and `watch` select the Cargo profile `jato-dev`, which inherits the project's `dev` profile, uses 16 codegen units, keeps line tables for workspace members and omits debug information for dependencies. Its outputs go to `target/jato-dev`. An explicit `--profile` or `--release` takes precedence.
 
@@ -214,10 +227,14 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_CACHE_DIR` | Private directory on a local filesystem. Defaults to `$XDG_CACHE_HOME/jato`, or `~/.cache/jato`. Builds that share it share results and processors. |
 | `jato limit 32GiB` | Set the budget for this cache directory. Without one it is a tenth of the filesystem, at least 10 GiB and at most 100 GiB. `jato limit` prints it; `--unset` removes it. |
 | `jato memory 64GiB` | Set a RAM budget for accelerating builds on high-memory machines: scales SQLite `cache_size`/`mmap_size` and stores hot objects uncompressed on non-cloning filesystems for single-pass SIMD BLAKE3 restores at memory bandwidth. `jato memory` prints it; `--unset` turns it off. |
+| `jato remote <URL>` | Configure a shared/remote cache (`file:///path` or `http://host[:port][/prefix]`). `jato remote` prints it; `--unset` clears it. |
+| `JATO_REMOTE` | Remote cache URL for this process (overrides `jato remote`; `0` disables). |
+| `JATO_REMOTE_READONLY=1` | Pull from the remote cache without pushing local results. |
+| `JATO_REMOTE_TOKEN` | Bearer token sent in `Authorization: Bearer <token>` for HTTP remotes. |
 | `JATO_MEMORY=64GiB` | Memory budget for this process (overrides `jato memory`). |
 | `JATO_MAX_SIZE=4GiB` | Budget for this process when none is stored with `jato limit`. |
 | `jato gc 10GiB` | Evict older low-value results down to this size. `jato gc` uses the budget; `jato gc 0` empties the cache. It also removes what earlier versions of Jato left in the directory. |
-| `jato stats [--json]` | Builds put back whole, started near, or seeded; Rust, C/asm, and test results reused, run, left to rustc during edits or not storable; disk and hot memory tier use. |
+| `jato stats [--json]` | Builds put back whole, started near, seeded, or continued in-place; Rust, C/asm, build-script, and test results reused, run, left to rustc during edits or not storable; remote pulls/pushes; disk and hot memory tier use. |
 | `jato why` | Print why the last build was not recorded or was pinned to its target directory, plus filesystem/memory tips. |
 | `JATO_LOG=debug` | Say for each command whether it was reused and, if not, what had changed, and for a build put back how long each step took. An absolute path appends to that file, with times. |
 | `JATO_RECIPES=/dir` | Write what each command is known by into a file of its own in this directory, a line for each thing, with the workspace and the target directory as marks. Two runs' directories compared show why a command of one was not found for the other. |
@@ -227,13 +244,16 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | `JATO_BUSY=8` | The load average from which compilations in a built target are left unwatched. Defaults to the number of processors; `0` always watches. |
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
 | `JATO_NEAR=0` | Never start a build from a recorded one whose sources differ. |
+| `JATO_RECORD_EDITS=0` | Skip in-place whole-build recording after edits in an already-built target. |
 | `JATO_SEED=0` | Never seed an empty target directory from another command's build. |
+| `JATO_CACHE_SCRIPTS=0` | Run build scripts without caching their executions. |
 | `JATO_CACHE_TESTS=0` | Run `jato test` without caching test results. |
 | `JATO_PARALLEL_TESTS=0` | Run workspace test binaries one at a time. |
 | `JATO_ASYNC_RECORD=0` | Wait for linked compiler output staging before waking Cargo. |
 | `JATO_JOBSERVER=0` | Leave Cargo to make the pipe its compilers share tokens through. `1` gives it one with a name without asking `make` its version. |
 | `JATO_TOOLS=0` | Leave the C compilers and assemblers that build scripts start to themselves. |
 | `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state in the cache or hand it to other checkouts. |
+| `JATO_MOUNT=0` | Disable optional unprivileged mount-namespace target canonicalization. |
 | `JATO_NOTES=0` | Have the kernel report every file call of a watched program; none are told of by the program itself. |
 | `JATO_STORAGE=packed` | Keep compressed copies even where files can be cloned. |
 | `JATO_VERIFY=1` | Check the digest of restored files on a filesystem that checksums them. |
