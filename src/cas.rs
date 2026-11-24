@@ -2805,6 +2805,88 @@ impl Store {
                 .is_ok_and(|digest| digest == output.digest)
     }
 
+    /// Verify in parallel that every non-skipped output already holds its
+    /// recorded bytes and permissions on disk. Short-circuits on the first
+    /// mismatch and records any newly hashed stamps.
+    pub fn holds_all_parallel(
+        &mut self,
+        outputs: &[crate::manifest::Output],
+        skip: &[bool],
+        roots: &Roots,
+    ) -> bool {
+        let mut checks: Vec<(usize, PathBuf)> = Vec::with_capacity(outputs.len());
+        for (i, output) in outputs.iter().enumerate() {
+            if skip.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(dest) = roots.join(output.root, &output.path) else {
+                return false;
+            };
+            checks.push((i, dest));
+        }
+        if checks.is_empty() {
+            return true;
+        }
+        if checks.len() < 128 {
+            for (i, dest) in checks {
+                if !self.holds(&outputs[i], &dest, roots) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        self.preload_stamps();
+        let known = &self.known;
+        let shared = self.shared.as_deref();
+        let most = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let threads = most.clamp(2, 16).min(checks.len() / 64 + 1);
+        let each = checks.len().div_ceil(threads);
+        let mismatch = std::sync::atomic::AtomicBool::new(false);
+        type HoldsLane = (bool, Vec<(Stamp, Digest)>, u64);
+        let lanes: Vec<HoldsLane> = std::thread::scope(|scope| {
+            let handles: Vec<_> = checks
+                .chunks(each)
+                .map(|chunk| {
+                    let mismatch = &mismatch;
+                    scope.spawn(move || {
+                        let mut learned = Vec::new();
+                        let mut hashed = 0u64;
+                        for (i, dest) in chunk {
+                            if mismatch.load(std::sync::atomic::Ordering::Relaxed) {
+                                return (false, learned, hashed);
+                            }
+                            let (ok, l, h) =
+                                holds_readonly(&outputs[*i], dest, roots, known, shared);
+                            if let Some(pair) = l {
+                                learned.push(pair);
+                            }
+                            hashed += h;
+                            if !ok {
+                                mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return (false, learned, hashed);
+                            }
+                        }
+                        (true, learned, hashed)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or((false, Vec::new(), 0)))
+                .collect()
+        });
+        let mut all_ok = true;
+        let mut all_learned = Vec::new();
+        let mut total_hashed = 0u64;
+        for (ok, l, h) in lanes {
+            all_ok &= ok;
+            all_learned.extend(l);
+            total_hashed += h;
+        }
+        self.remember_many(all_learned, total_hashed);
+        all_ok
+    }
+
     /// Count a record as used now, when the index is next written.
     pub fn touch(&mut self, key: &Digest) {
         self.used.push(*key);

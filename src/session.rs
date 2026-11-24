@@ -277,6 +277,7 @@ enum Mode {
     Watched {
         scopes: Scopes,
         parts: Box<Mutex<Parts>>,
+        in_place_edit: bool,
     },
     Unwatched {
         cargo_exe: Option<(u64, u64)>,
@@ -472,9 +473,13 @@ impl Server {
             return reply(&mut stream, &outcome).map_err(Into::into);
         }
         match &self.mode {
-            Mode::Watched { scopes, .. } => {
+            Mode::Watched {
+                scopes,
+                in_place_edit,
+                ..
+            } => {
                 // Inside a build that is recorded whole, every compilation is.
-                command::choose(&job, &mut store, &recipe, true);
+                command::choose(&job, &mut store, &recipe, true, *in_place_edit);
                 let argv = job.argv();
                 let mut w = Writer(vec![RUN]);
                 w.number(argv.len() as u64);
@@ -598,7 +603,7 @@ impl Server {
                 }
             }
             Mode::Unwatched { .. } => {
-                let run = command::choose(&job, &mut store, &recipe, false);
+                let run = command::choose(&job, &mut store, &recipe, false, false);
                 let argv = job.argv();
                 let compiles = job.tool || job.facts.compiles();
                 let held = job.held().map(|dir| dir.as_os_str().as_bytes());
@@ -1079,6 +1084,24 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
     // cache with per-inode singleflight deduplication, and bounded background
     // recording.
     if command::mostly_built_cached(&job, &store, &recipe, Some(&mut cache)) {
+        if let Some(start) =
+            command::continue_from_cached(&job, &mut store, &recipe, Some(&mut cache))
+        {
+            let again = copy_of(&cmd);
+            let prepared = Prepared { job, store, recipe };
+            return match supervise(cmd, prepared, name, begun, true, Some(start))? {
+                Supervised::Ran(code) => Ok(code),
+                Supervised::Unwatched(cmd) => command::passthrough(cmd),
+                Supervised::Doubted => match prepare(&again, name)? {
+                    Some(prepared) => match supervise(again, prepared, name, begun, true, None)? {
+                        Supervised::Ran(code) => Ok(code),
+                        Supervised::Unwatched(cmd) => command::passthrough(cmd),
+                        Supervised::Doubted => bail!("a build from nothing cannot be in doubt"),
+                    },
+                    None => command::passthrough(again),
+                },
+            };
+        }
         log(
             name,
             "the target is already built: leaving this build to Cargo",
@@ -1261,6 +1284,28 @@ pub fn ready(cmd: Command, name: &str) {
         Err(e) => log(name, format_args!("lookup failed: {e:#}")),
     }
     if command::mostly_built_cached(&job, &store, &recipe, Some(&mut cache)) {
+        if let Some(start) =
+            command::continue_from_cached(&job, &mut store, &recipe, Some(&mut cache))
+        {
+            let again = copy_of(&cmd);
+            let prepared = Prepared { job, store, recipe };
+            let res = match supervise(cmd, prepared, name, begun, false, Some(start)) {
+                Ok(Supervised::Doubted) => prepare(&again, name).and_then(|p| match p {
+                    Some(prepared) => supervise(again, prepared, name, begun, false, None),
+                    None => Ok(Supervised::Unwatched(again)),
+                }),
+                other => other,
+            };
+            if let Err(e) = res {
+                log(
+                    name,
+                    format_args!("the build ahead of the command failed: {e:#}"),
+                );
+            }
+            if STOPPED.load(Ordering::Acquire) {
+                std::process::exit(130);
+            }
+        }
         return;
     }
     let prepared = Prepared { job, store, recipe };
@@ -1375,10 +1420,12 @@ fn supervise(
     store.set_shared_stamps(shared_stamps.clone());
     let recorder_limit =
         (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).clamp(2, 8);
+    let in_place_edit = start.as_ref().is_some_and(|s| s.in_place);
     let server = Arc::new(Server {
         mode: Mode::Watched {
             scopes: session.scopes(),
             parts: Box::new(Mutex::new(Parts::starting_from(start))),
+            in_place_edit,
         },
         roots: job.roots.clone(),
         cargo: child.id(),

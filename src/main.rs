@@ -100,6 +100,7 @@ Environment
   JATO_WHOLE_BUILDS=0 Reuse single compilations only
   JATO_NEAR=0         Never start a build from an earlier one whose sources
                       differ; have Cargo carry out the whole of it
+  JATO_RECORD_EDITS=0 Skip whole-build recording for edits in built targets
   JATO_SEED=0         Never seed an empty target from another command's build
   JATO_ASYNC_RECORD=0 Wait for compiler output staging before waking Cargo
   JATO_JOBSERVER=0    Leave Cargo to make its own jobserver pipe (1 forces
@@ -592,6 +593,13 @@ fn report(stats: &cas::Stats) -> String {
                 "           {seeded} of those made seeded an empty target from another command's build"
             );
         }
+        let continued = count("build_continued");
+        if continued > 0 {
+            let _ = writeln!(
+                out,
+                "           {continued} of those made continued in-place in an already-built target"
+            );
+        }
     }
     if let Some((ago, why)) = &stats.unrecorded {
         let ago = match *ago {
@@ -693,6 +701,7 @@ fn report(stats: &cas::Stats) -> String {
         "build_left_to_cargo",
         "build_near",
         "build_seeded",
+        "build_continued",
         "tool_hit",
         "tool_miss",
         "tool_stored",

@@ -2488,8 +2488,10 @@ fn a_run_of_edits_is_left_to_rustc_and_a_pause_ends_it() {
     assert_eq!(p.count("stored"), stored + 4, "{}", p.stats());
     assert_eq!(p.count("continued"), 4, "{}", p.stats());
     p.clean();
+    let known_after = p.count("build_hit");
     let (hits, misses) = p.during(|| assert_eq!(run(&mut spell()).unwrap(), "five:none\n"));
-    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_hit"), known_after + 1, "{}", p.stats());
 }
 
 #[test]
@@ -3455,10 +3457,11 @@ fn the_compiler_s_saved_state_is_kept_for_other_checkouts() {
     assert_eq!(out.stdout, b"renewed\n");
     assert_eq!(p.count("state_given"), 6, "{}", p.stats());
     assert_eq!(p.count("state_saved"), 4, "{}", p.stats());
-    // Two more results, for the two crates compiled, and no more state.
+    // Two crate results plus the continued whole build, and no extra state
+    // entries (the older state lot was replaced in place).
     assert_eq!(
         p.stats()["entries"].as_u64().unwrap(),
-        kept + 2,
+        kept + 3,
         "{}",
         p.stats()
     );
@@ -3517,13 +3520,15 @@ fn saved_state_follows_a_library_into_a_target_directory_elsewhere() {
     assert_eq!(out.stdout, b"edited elsewhere\n");
     assert_eq!(p.count("state_given"), 1, "{}", p.stats());
     assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
-    // What was compiled this way is a result like any other.
+    // What was compiled this way is a whole-build result like any other.
     fs::remove_dir_all(&second).unwrap();
+    let hits_before = p.count("build_hit");
     let (hits, misses) = p.during(|| {
         let out = success(command(&copy, &second).args(["run", "-q"]));
         assert_eq!(out.stdout, b"edited elsewhere\n");
     });
-    assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_hit"), hits_before + 1, "{}", p.stats());
 }
 
 #[test]
@@ -5843,4 +5848,59 @@ fn memory_hot_tier_parallel_verification_and_why_command_work() {
     );
     let unset = success(p.command().args(["memory", "--unset"]));
     assert_eq!(String::from_utf8_lossy(&unset.stdout).trim(), "0 bytes");
+}
+
+#[test]
+fn edits_in_a_built_target_record_a_whole_build_and_catch_hidden_inputs() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // Initial cold build records whole build B0.
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+
+    // Edit in-place in the already-built target (no `cargo clean`!).
+    // Jato continues from B0 in-place and records B1 as a whole build.
+    write(p.root.join("leaf/src/text file"), "edited-in-place");
+    assert_eq!(p.run(&["run", "-q"]).stdout, b"edited-in-place:none\n");
+    assert_eq!(p.count("build_continued"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+
+    // A brand-new checkout with the edited sources gets an instant whole-build
+    // hit for B1 with zero compilations!
+    let other = p.temp.path().join("second/checkout");
+    populate(&other);
+    fs::copy(p.root.join("Cargo.lock"), other.join("Cargo.lock")).unwrap();
+    write(other.join("leaf/src/text file"), "edited-in-place");
+    let before_hits = p.count("build_hit");
+    let (hits, misses) = p.during(|| {
+        let out = success(p.command_in(&other).args(["run", "-q"]));
+        assert_eq!(out.stdout, b"edited-in-place:none\n");
+    });
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_hit"), before_hits + 1, "{}", p.stats());
+
+    // Verify hidden input detection in an already-built target: a file only a
+    // proc macro reads changes while Cargo thinks the crate is up to date.
+    let pm = Project::whole();
+    add_macros(&pm.root);
+    write(
+        pm.root.join("leaf/Cargo.toml"),
+        "[package]\nname='leaf'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nmacros={path='../macros'}\n",
+    );
+    write(pm.root.join("leaf/src/lib.rs"), "pub use macros::*;");
+    write(
+        pm.root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", leaf::hidden!()); }",
+    );
+    write(pm.root.join("hidden.txt"), "secret-v1");
+    assert_eq!(pm.run(&["run", "-q"]).stdout, b"secret-v1\n");
+    assert_eq!(pm.count("build_stored"), 1, "{}", pm.stats());
+    // Change ONLY the hidden file read by the proc macro (even with an older mtime!).
+    write(pm.root.join("hidden.txt"), "secret-v2");
+    make_old(&pm.root.join("hidden.txt"));
+    assert_eq!(pm.run(&["run", "-q"]).stdout, b"secret-v2\n");
+    assert_eq!(pm.count("build_continued"), 1, "{}", pm.stats());
+    assert_eq!(pm.count("build_stored"), 2, "{}", pm.stats());
 }

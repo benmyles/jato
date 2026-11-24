@@ -1817,6 +1817,10 @@ pub struct Start {
     /// The programs of the build scripts that have to run again, by
     /// their positions among the outputs.
     rerun: Vec<u32>,
+    /// Whether this build is continuing in-place from a recorded build already
+    /// sitting in the target directory (so compiled crates should also mark
+    /// their edit window timestamps).
+    pub in_place: bool,
     /// How long the build took that this one starts from.
     cost_ms: u64,
 }
@@ -2244,7 +2248,234 @@ pub fn start_from_cached(
         now,
         replanned,
         rerun,
+        in_place: false,
         cost_ms: restored.cost_ms,
+    })
+}
+
+/// Continue an edited build in-place in an already-built target directory so
+/// the resulting build is recorded whole (and any hidden inputs Cargo would
+/// miss, such as files read only by proc macros or older mtimes, are
+/// recompiled) without rewriting unchanged files or disturbing `incremental/`.
+///
+/// Respects `JATO_EDIT_WINDOW` and `JATO_BUSY`: rapid follow-up edits within
+/// an editing spell or on an overloaded machine fall back to
+/// `supervise_unwatched`.
+pub fn continue_from_cached(
+    job: &Job,
+    store: &mut Store,
+    recipe: &Digest,
+    mut cache: Option<&mut LookupCache>,
+) -> Option<Start> {
+    if env::var_os("JATO_NEAR").is_some_and(|v| v == "0")
+        || env::var_os("JATO_RECORD_EDITS").is_some_and(|v| v == "0")
+    {
+        return None;
+    }
+    let target = job.roots.path(roots::TARGET)?;
+    if !target.is_dir() {
+        return None;
+    }
+    let window = env::var("JATO_EDIT_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EDIT_WINDOW);
+    if window > 0 && busy() {
+        return None;
+    }
+    let mut edit_hash = blake3::Hasher::new_derive_key("jato edited build here v1");
+    edit_hash.update(recipe);
+    edit_hash.update(target.as_os_str().as_bytes());
+    let edit_key = *edit_hash.finalize().as_bytes();
+    if window > 0 {
+        let recent = store
+            .since_noted(&edit_key)
+            .is_some_and(|seconds| seconds < window);
+        if recent {
+            return None;
+        }
+    }
+    // Find the most recent recorded build of this exact command in this target.
+    let key = builds_here(&job.roots)
+        .into_iter()
+        .rev()
+        .find_map(|(r, k)| (r == *recipe).then_some(k))?;
+    let begun = Instant::now();
+    store.begin_read();
+    let manifest = if let Some(cached) = cache.as_deref_mut().and_then(|c| c.manifests.remove(&key))
+    {
+        match cached.into_full() {
+            Ok(m) => m,
+            Err(_) => {
+                store.end_read();
+                return None;
+            }
+        }
+    } else {
+        let Some(entry) = store.entry(&key).ok().flatten() else {
+            store.end_read();
+            return None;
+        };
+        let stored = store.record(&entry).unwrap_or_default();
+        match Manifest::decode_verified(&stored, recipe, &key) {
+            Ok(m) => m,
+            Err(_) => {
+                store.end_read();
+                return None;
+            }
+        }
+    };
+    if manifest.parts.is_empty() {
+        store.end_read();
+        return None;
+    }
+    let elsewhere = manifest.placed(&job.roots).err();
+    if elsewhere.is_some() && manifest.pinned.is_empty() {
+        store.end_read();
+        return None;
+    }
+    let seen = cache
+        .map(|c| std::mem::take(&mut c.seen))
+        .unwrap_or_default();
+    let mut here = Here::with_seen(
+        &job.roots,
+        &job.request.env,
+        &job.path,
+        job.facts.width,
+        job.facts.ansi,
+        seen,
+    );
+    let Ok(differences) = manifest.differences_with_seen(&mut here, store, MOST, false) else {
+        store.end_read();
+        return None;
+    };
+    let Ok(Stale {
+        mut again,
+        scripts,
+        replanned,
+    }) = manifest.stale_parts(&differences)
+    else {
+        store.end_read();
+        return None;
+    };
+    if !replanned.is_empty() && manifest.replans >= REPLANS {
+        store.end_read();
+        return None;
+    }
+    if elsewhere.is_some() {
+        for &part in &manifest.pinned {
+            again[part as usize] = true;
+        }
+    }
+    let count = again.iter().filter(|a| **a).count();
+    let mut leave = vec![false; manifest.outputs.len()];
+    let mut owed = vec![false; manifest.outputs.len()];
+    let mut kept: HashSet<u32> = HashSet::new();
+    let mut gone: HashMap<Digest, bool> = HashMap::new();
+    for (at, (part, again)) in manifest.parts.iter().zip(&again).enumerate() {
+        let own = manifest.theirs.binary_search(&(at as u32)).is_err();
+        for &output in &part.outputs {
+            if *again {
+                leave[output as usize] = true;
+                owed[output as usize] = own;
+                *gone
+                    .entry(manifest.outputs[output as usize].digest)
+                    .or_default() |= own;
+            } else {
+                kept.insert(output);
+            }
+        }
+    }
+    for (at, output) in manifest.outputs.iter().enumerate() {
+        if output.size > 0
+            && !kept.contains(&(at as u32))
+            && let Some(own) = gone.get(&output.digest)
+        {
+            leave[at] = true;
+            owed[at] |= *own;
+        }
+        if !replanned.is_empty() && output.root != roots::TARGET {
+            leave[at] = true;
+            owed[at] = false;
+        }
+    }
+    let mut rerun: Vec<u32> = Vec::new();
+    for (script, again) in manifest.scripts.iter().zip(&scripts) {
+        if *again || leave[script.program as usize] {
+            rerun.push(script.program);
+            for &output in &script.outputs {
+                if !leave[output as usize] {
+                    leave[output as usize] = true;
+                    owed[output as usize] = false;
+                }
+            }
+        }
+    }
+    // Every kept output must still match what the recorded build left on disk;
+    // otherwise an earlier unwatched edit diverged the target and we fall back.
+    if !store.holds_all_parallel(&manifest.outputs, &leave, &job.roots) {
+        store.end_read();
+        return None;
+    }
+    let cost_ms = 0u64;
+    store.end_read();
+    // Unlink stale outputs inside TARGET (leaving rustc's `incremental/` dir
+    // completely intact so edits compile incrementally at full speed) so Cargo
+    // is guaranteed to recompile hidden inputs and rerun stale build scripts.
+    let mut emptied: BTreeSet<PathBuf> = BTreeSet::new();
+    for (output, left) in manifest.outputs.iter().zip(&leave) {
+        if *left
+            && output.root == roots::TARGET
+            && let Some(path) = job.roots.join(output.root, &output.path)
+            && fs::remove_file(&path).is_ok()
+        {
+            emptied.extend(
+                path.ancestors()
+                    .skip(1)
+                    .take_while(|dir| *dir != target)
+                    .map(Path::to_owned),
+            );
+        }
+    }
+    for directory in emptied.iter().rev() {
+        let _ = fs::remove_dir(directory);
+    }
+    for (root, path) in &manifest.removed {
+        if let Some(path) = job.roots.join(*root, path) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let now = differences
+        .iter()
+        .filter(|difference| manifest.asked.binary_search(&difference.input).is_ok())
+        .filter_map(|difference| {
+            Some((difference.input, manifest.now(difference.input, &mut here)?))
+        })
+        .collect();
+    store.count("build_continued", 1);
+    if !replanned.is_empty() {
+        store.count("build_replanned", 1);
+    }
+    log(
+        job.name(),
+        format_args!(
+            "continuing in-place from recorded build in {} ms: {count} of its {} compilations to make again",
+            begun.elapsed().as_millis(),
+            manifest.parts.len(),
+        ),
+    );
+    Some(Start {
+        placed: leave.iter().map(|left| !left).collect(),
+        owed,
+        other: false,
+        prune_unused: false,
+        manifest,
+        again,
+        now,
+        replanned,
+        rerun,
+        in_place: true,
+        cost_ms,
     })
 }
 
@@ -2390,6 +2621,7 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
             now: HashMap::new(),
             replanned: Vec::new(),
             rerun: Vec::new(),
+            in_place: false,
             cost_ms: 0,
         });
     }
@@ -2724,6 +2956,7 @@ pub fn seed_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start>
         now,
         replanned,
         rerun,
+        in_place: false,
         cost_ms: restored.cost_ms,
     })
 }
@@ -3643,6 +3876,15 @@ pub fn record(
             .map(|(root, rel, _)| (*root, rel.clone()))
             .collect();
         for (place, output) in &parts.outputs {
+            if place.0 == roots::TARGET {
+                for directory in place.1.ancestors().skip(1) {
+                    if directory.as_os_str().is_empty()
+                        || !made.insert((place.0, directory.to_owned()))
+                    {
+                        break;
+                    }
+                }
+            }
             made.insert(place.clone());
             known.insert(output.digest, output);
             if !listed.contains(place)
@@ -5272,8 +5514,16 @@ pub enum Run {
 /// that is built for months keeps contributing results.
 ///
 /// `building` is set inside a build that is being recorded as a whole,
-/// where nothing is left unwatched.
-pub fn choose(job: &Job, store: &mut Store, recipe: &Digest, building: bool) -> Run {
+/// where nothing is left unwatched. `note_edit` marks each compiled crate's
+/// edit-window timestamp even while recording a whole in-place edit build, so
+/// immediate follow-up edits enter the fast unwatched edit loop.
+pub fn choose(
+    job: &Job,
+    store: &mut Store,
+    recipe: &Digest,
+    building: bool,
+    note_edit: bool,
+) -> Run {
     let Some(directory) = job.facts.incremental.as_ref() else {
         return Run::Recorded;
     };
@@ -5289,6 +5539,12 @@ pub fn choose(job: &Job, store: &mut Store, recipe: &Digest, building: bool) -> 
         has_saved_work(directory, job.name())
     };
     if building {
+        if note_edit {
+            let mut hash = blake3::Hasher::new_derive_key("jato compiled here v1");
+            hash.update(recipe);
+            hash.update(directory.as_os_str().as_bytes());
+            let _ = store.since_noted(hash.finalize().as_bytes());
+        }
         return Run::Recorded;
     }
     let window = env::var("JATO_EDIT_WINDOW")
@@ -5509,7 +5765,7 @@ fn alone(mut job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
         (_, Some((outcome, _))) => return print(outcome),
         (lock, None) => lock,
     };
-    let run = choose(&job, &mut store, &recipe, false);
+    let run = choose(&job, &mut store, &recipe, false, false);
     // The compiler will run. With other builds going on, wait for a
     // processor to run it on.
     let place = if job.tool || job.facts.compiles() {
