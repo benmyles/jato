@@ -1,6 +1,6 @@
 [package]
 name = "jato"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Remembers Rust builds: whole Cargo commands and single compilations, across checkouts and target directories"

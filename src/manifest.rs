@@ -75,6 +75,30 @@ pub struct Difference {
     pub input: u32,
     /// It is still a file, with other contents.
     pub contents: bool,
+    /// It is still a directory, with other entries.
+    pub entries: bool,
+}
+
+/// How an input differs from what was recorded, in the two ways that
+/// leave it the kind of thing it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Changed {
+    Contents,
+    Entries,
+    Otherwise,
+}
+
+/// What a build that starts from another has to do about the inputs that
+/// differ.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stale {
+    /// Which of the earlier build's parts have to be made again.
+    pub again: Vec<bool>,
+    /// The inputs among those that differ which are Cargo's own to make
+    /// something of: manifests, lock files and the directories it finds
+    /// packages and targets in. Cargo reads them again whenever it runs
+    /// and decides again what to build.
+    pub replanned: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -134,6 +158,14 @@ pub struct Manifest {
     /// when every such name in the build's output is theirs. A build
     /// somewhere else starts from this one with those to make again.
     pub pinned: Vec<u32>,
+    /// The positions, among `own`, of the inputs that only the command's
+    /// own program examined: Cargo, and nothing it started.
+    pub cargos: Vec<u32>,
+    /// How many times, one build starting from another, this build's
+    /// line has been made with manifests that had changed. What Cargo
+    /// keeps of a compilation that is no longer part of the build stays
+    /// behind each time.
+    pub replans: u32,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -285,6 +317,8 @@ impl Manifest {
         }
         positions(&mut w, &self.theirs);
         positions(&mut w, &self.pinned);
+        positions(&mut w, &self.cargos);
+        w.number(self.replans.into());
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -390,6 +424,8 @@ impl Manifest {
         }
         m.theirs = read_positions(&mut r, m.parts.len())?;
         m.pinned = read_positions(&mut r, m.parts.len())?;
+        m.cargos = read_positions(&mut r, m.inputs.len())?;
+        m.replans = r.number()? as u32;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -634,13 +670,14 @@ impl Manifest {
         self.settled_anywhere(here)?;
         let mut found = Vec::new();
         for (at, input) in self.inputs.iter().enumerate() {
-            if let Err((why, contents)) = self.as_recorded(input, here, store) {
+            if let Err((why, changed)) = self.as_recorded(input, here, store) {
                 if found.len() == most {
                     return Err(format!("{why}, and more than {most} other files"));
                 }
                 found.push(Difference {
                     input: at as u32,
-                    contents,
+                    contents: changed == Changed::Contents,
+                    entries: changed == Changed::Entries,
                 });
             }
         }
@@ -648,21 +685,29 @@ impl Manifest {
     }
 
     /// Which parts a build that starts from this one has to make again,
-    /// given the inputs that differ. An error is the position of an input
-    /// whose change leaves nothing to start from.
-    pub fn stale_parts(&self, differences: &[Difference]) -> Result<Vec<bool>, u32> {
-        let mut again = vec![false; self.parts.len()];
+    /// given the inputs that differ, and which of those inputs are left
+    /// to Cargo. An error is the position of an input whose change leaves
+    /// nothing to start from.
+    pub fn stale_parts(&self, differences: &[Difference]) -> Result<Stale, u32> {
+        let mut stale = Stale {
+            again: vec![false; self.parts.len()],
+            replanned: Vec::new(),
+        };
         for difference in differences {
             let at = difference.input;
-            if self.own.binary_search(&at).is_ok() {
-                return Err(at);
-            }
             let mut examined = false;
-            for (part, again) in self.parts.iter().zip(&mut again) {
+            for (part, again) in self.parts.iter().zip(&mut stale.again) {
                 if part.inputs.binary_search(&at).is_ok() {
                     *again = true;
                     examined = true;
                 }
+            }
+            if self.own.binary_search(&at).is_ok() {
+                if !self.cargo_s_to_plan_with(difference) {
+                    return Err(at);
+                }
+                stale.replanned.push(at);
+                continue;
             }
             // Cargo goes by whether a file it asks about is there. What
             // the file holds is the business of whoever reads it.
@@ -671,7 +716,25 @@ impl Manifest {
                 return Err(at);
             }
         }
-        Ok(again)
+        Ok(stale)
+    }
+
+    /// Whether an input of the build's own that differs is one Cargo
+    /// alone examined and plans the build by: a manifest or a lock file
+    /// that holds something else, or a directory it finds packages or
+    /// targets in that has other entries. Cargo reads these again every
+    /// time it runs, and what follows from them for a compilation is in
+    /// what Cargo remembers of it: it runs the compilations for which
+    /// that has changed, and those that are new. Nothing else may have
+    /// examined the input, and nothing else of Cargo's own may differ:
+    /// its settings reach compilers in ways it does not remember.
+    fn cargo_s_to_plan_with(&self, difference: &Difference) -> bool {
+        if self.cargos.binary_search(&difference.input).is_err() {
+            return false;
+        }
+        let name = self.inputs[difference.input as usize].path.file_name();
+        let plan = name.is_some_and(|name| name == "Cargo.toml" || name == "Cargo.lock");
+        (difference.contents && plan) || difference.entries
     }
 
     /// What `position` among the inputs is called here.
@@ -858,8 +921,8 @@ impl Manifest {
         input: &Input,
         here: &mut Here<'_>,
         store: &mut Store,
-    ) -> Result<(), (String, bool)> {
-        let other = |why: String| Err((why, false));
+    ) -> Result<(), (String, Changed)> {
+        let other = |why: String| Err((why, Changed::Otherwise));
         let Some(path) = here.roots.join(input.root, &input.path) else {
             return other("it was recorded with a target directory this command lacks".into());
         };
@@ -884,7 +947,10 @@ impl Manifest {
                 let own = own_names((input.root, &input.path), &path, outputs, here.roots);
                 match list(&path, &own) {
                     Ok(names) if names == *recorded => Ok(()),
-                    Ok(_) => other(format!("the entries of {} changed", path.display())),
+                    Ok(_) => Err((
+                        format!("the entries of {} changed", path.display()),
+                        Changed::Entries,
+                    )),
                     Err(e) => other(format!("{}: {e}", path.display())),
                 }
             }
@@ -911,7 +977,7 @@ impl Manifest {
                 if digest == *recorded {
                     Ok(())
                 } else {
-                    Err((changed(), true))
+                    Err((changed(), Changed::Contents))
                 }
             }
             _ => other(changed()),
@@ -1168,6 +1234,8 @@ mod tests {
             ],
             theirs: vec![1],
             pinned: vec![0],
+            cargos: vec![2],
+            replans: 3,
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
@@ -1224,26 +1292,62 @@ mod tests {
         let other = |input: u32| Difference {
             input,
             contents: true,
+            entries: false,
         };
         let gone = |input: u32| Difference {
             input,
             contents: false,
+            entries: false,
         };
-        assert_eq!(m.stale_parts(&[]), Ok(vec![false, false]));
-        assert_eq!(m.stale_parts(&[other(1)]), Ok(vec![true, false]));
-        assert_eq!(m.stale_parts(&[other(2)]), Ok(vec![false, true]));
-        assert_eq!(m.stale_parts(&[gone(2)]), Ok(vec![false, true]));
-        assert_eq!(m.stale_parts(&[other(3)]), Ok(vec![true, true]));
+        let again = |differences: &[Difference]| m.stale_parts(differences).map(|s| s.again);
+        assert_eq!(again(&[]), Ok(vec![false, false]));
+        assert_eq!(again(&[other(1)]), Ok(vec![true, false]));
+        assert_eq!(again(&[other(2)]), Ok(vec![false, true]));
+        assert_eq!(again(&[gone(2)]), Ok(vec![false, true]));
+        assert_eq!(again(&[other(3)]), Ok(vec![true, true]));
         // A file only Cargo asked about holds something else: nobody
         // read it.
-        assert_eq!(m.stale_parts(&[other(4)]), Ok(vec![false, false]));
-        // What Cargo read itself, and a file it asked about that is gone.
-        assert_eq!(m.stale_parts(&[other(2), other(0)]), Err(0));
-        assert_eq!(m.stale_parts(&[gone(1)]), Err(1));
-        assert_eq!(m.stale_parts(&[gone(4)]), Err(4));
+        assert_eq!(again(&[other(4)]), Ok(vec![false, false]));
+        // What the build itself read, and a file Cargo asked about that
+        // is gone.
+        assert_eq!(again(&[other(2), other(0)]), Err(0));
+        assert_eq!(again(&[gone(1)]), Err(1));
+        assert_eq!(again(&[gone(4)]), Err(4));
         // An input in no list is the build's own.
         let mut loose = m.clone();
         loose.own.clear();
         assert_eq!(loose.stale_parts(&[other(0)]), Err(0));
+
+        // A manifest that only Cargo examined is Cargo's to plan with
+        // again: nothing is made again for it here, and Cargo is left to
+        // see what follows. One that is gone, or that something else
+        // read as well, leaves nothing to start from.
+        let mut planned = m.clone();
+        planned.inputs.push(input("crates"));
+        planned.inputs.push(input(".cargo/config.toml"));
+        planned.own = vec![0, 5, 6];
+        planned.cargos = vec![0, 5, 6];
+        let entries = |input: u32| Difference {
+            input,
+            contents: false,
+            entries: true,
+        };
+        assert_eq!(
+            planned.stale_parts(&[other(0), other(2)]),
+            Ok(Stale {
+                again: vec![false, true],
+                replanned: vec![0],
+            })
+        );
+        assert_eq!(
+            planned.stale_parts(&[entries(5)]).map(|s| s.replanned),
+            Ok(vec![5])
+        );
+        assert_eq!(planned.stale_parts(&[gone(0)]), Err(0));
+        // Settings are Cargo's own too, and no plan: they reach
+        // compilers in ways Cargo does not remember.
+        assert_eq!(planned.stale_parts(&[other(6)]), Err(6));
+        planned.cargos = vec![5];
+        assert_eq!(planned.stale_parts(&[other(0)]), Err(0));
     }
 }

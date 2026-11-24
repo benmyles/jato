@@ -1469,7 +1469,7 @@ fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
     let out = success(p.command_in(&second).args(["run", "-q"]));
     assert_eq!(out.stdout, b"2 one:none 5\n");
     assert_eq!(p.count("build_near"), 0, "{}", p.stats());
-    // A manifest differs.
+    // A manifest differs, and the lock file that went with it is gone.
     let third = copy("third", "1");
     let manifest = fs::read_to_string(third.join("side/Cargo.toml")).unwrap();
     write(
@@ -1479,13 +1479,16 @@ fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
     fs::remove_file(third.join("Cargo.lock")).unwrap();
     let out = success(p.command_in(&third).args(["run", "-q"]));
     assert_eq!(out.stdout, b"1 one:none 5\n");
-    assert_eq!(p.count("build_near"), 0, "{}", p.stats());
-    // A file appears where Cargo looks for programs to build.
+    // That is Cargo's own to plan the build with again, and the build
+    // starts from the first: see the test of manifests that differ.
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    // A file appears where Cargo looked for programs to build and found
+    // no directory.
     let fourth = copy("fourth", "1");
     write(fourth.join("src/bin/extra.rs"), "fn main() {}");
     success(p.command_in(&fourth).args(["build"]));
     assert!(fourth.join("target/debug/extra").exists());
-    assert_eq!(p.count("build_near"), 0, "{}", p.stats());
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
     // The build script itself differs. Its compiler is one of Cargo's, so
     // the build starts from the first, and Cargo builds the script again
     // and runs it. What it then leaves in a directory the first script
@@ -1501,8 +1504,230 @@ fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
     let stored = p.count("build_stored");
     let out = success(p.command_in(&fifth).args(["run", "-q"]));
     assert_eq!(out.stdout, b"11 one:none 5\n");
-    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_near"), 2, "{}", p.stats());
     assert_eq!(p.count("build_stored"), stored, "{}", p.stats());
+}
+
+/// Every file under a target directory but the compiler's saved state,
+/// whose directories are named anew each time, and Jato's own note of
+/// the builds it recorded there.
+fn files_of(target: &Path) -> std::collections::BTreeSet<PathBuf> {
+    fn walk(dir: &Path, top: &Path, into: &mut std::collections::BTreeSet<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap().map(|entry| entry.unwrap()) {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                if entry.file_name() != "incremental" {
+                    walk(&path, top, into);
+                }
+            } else if !entry.file_name().to_string_lossy().starts_with(".jato-") {
+                into.insert(path.strip_prefix(top).unwrap().to_owned());
+            }
+        }
+    }
+    let mut all = std::collections::BTreeSet::new();
+    walk(target, target, &mut all);
+    all
+}
+
+/// Cargo reads its manifests and lock file whenever it runs and plans the
+/// build by them. A build whose manifests differ from a recorded one's
+/// starts from that one, and Cargo is left to see what follows: which
+/// compilations are as they were, which have to be run, and which are no
+/// longer part of the build.
+#[test]
+fn a_build_whose_manifests_differ_starts_from_one_made_before() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    add_side(&p.root);
+    write(p.root.join("src/bin/one.rs"), "fn main() {}");
+    assert_eq!(
+        p.run(&["run", "-q", "--bin", "app"]).stdout,
+        b"one:none 5\n"
+    );
+    p.run(&["build"]);
+    let program = |root: &Path| {
+        let out = Command::new(root.join("target/debug/app"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let copy = |name: &str| {
+        let root = checkout(&p, name);
+        write(root.join("src/bin/one.rs"), "fn main() {}");
+        root
+    };
+    // What a build of the same sources from nothing leaves in its target
+    // directory, with a cache of its own.
+    let from_nothing = |root: &Path| {
+        let target = root.join("target-from-nothing");
+        success(
+            p.command_in(root)
+                .env("CARGO_TARGET_DIR", &target)
+                .env("JATO_CACHE_DIR", root.join("cache-of-its-own"))
+                .args(["build"]),
+        );
+        files_of(&target)
+    };
+    let build = |root: &Path| {
+        let out = success(p.command_in(root).env("JATO_LOG", "debug").args(["build"]));
+        let said = decisions(&out, "cargo");
+        assert!(
+            said.iter()
+                .any(|d| d.contains("Cargo plans the build again")),
+            "{said:?}"
+        );
+        out
+    };
+    let compiled =
+        |out: &Output, name: &str| decisions(out, name).iter().any(|d| d.starts_with("stored"));
+
+    // A manifest that says something more, of no consequence to any
+    // compilation: nothing is compiled.
+    let second = copy("second");
+    let manifest = fs::read_to_string(second.join("Cargo.toml")).unwrap();
+    write(
+        second.join("Cargo.toml"),
+        &format!("{manifest}\n[package.metadata.notes]\nkept = true\n"),
+    );
+    let (hits, misses) = p.during(|| drop(build(&second)));
+    assert_eq!((hits, misses), (0, 0), "{}", p.stats());
+    assert_eq!(p.count("build_replanned"), 1, "{}", p.stats());
+    assert_eq!(program(&second), "one:none 5\n");
+    assert_eq!(p.stale_for_cargo(&second, &second.join("target")), 0);
+    assert_eq!(files_of(&second.join("target")), from_nothing(&second));
+    // And the build is one to put back.
+    let stored = p.count("build_hit");
+    fs::remove_dir_all(second.join("target")).unwrap();
+    success(p.command_in(&second).args(["build"]));
+    assert_eq!(p.count("build_hit"), stored + 1, "{}", p.stats());
+    assert_eq!(p.stale_for_cargo(&second, &second.join("target")), 0);
+
+    // A library's edition changes: the library is compiled, and what
+    // uses it. The third crate is not.
+    let third = copy("third");
+    let manifest = fs::read_to_string(third.join("leaf/Cargo.toml")).unwrap();
+    write(
+        third.join("leaf/Cargo.toml"),
+        &manifest.replace("2021", "2018"),
+    );
+    let out = build(&third);
+    assert!(compiled(&out, "leaf") && compiled(&out, "app"), "{:?}", out);
+    assert!(
+        decisions(&out, "side").is_empty(),
+        "{:?}",
+        decisions(&out, "side")
+    );
+    assert_eq!(program(&third), "one:none 5\n");
+    assert_eq!(p.stale_for_cargo(&third, &third.join("target")), 0);
+    // What the compilers of the library as it was had written is gone,
+    // and nothing is there that a build from nothing lacks but what
+    // Cargo keeps to itself of a compilation.
+    let (here, clean) = (files_of(&third.join("target")), from_nothing(&third));
+    assert!(
+        clean.is_subset(&here),
+        "{:?}",
+        clean.difference(&here).collect::<Vec<_>>()
+    );
+    let more: Vec<_> = here.difference(&clean).collect();
+    assert!(
+        more.iter().all(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            !(name.ends_with(".rlib") || name.ends_with(".rmeta") || name.ends_with(".d"))
+                && path.extension().is_some()
+        }),
+        "{more:?}"
+    );
+
+    // A library gets a new version: Cargo compiles the library and what
+    // uses it, and writes the lock file. A build that changed what it
+    // had read is not recorded, as ever.
+    let fourth = copy("fourth");
+    let manifest = fs::read_to_string(fourth.join("side/Cargo.toml")).unwrap();
+    write(
+        fourth.join("side/Cargo.toml"),
+        &manifest.replace("0.1.0", "0.2.0"),
+    );
+    let lock = fs::read_to_string(fourth.join("Cargo.lock")).unwrap();
+    let out = build(&fourth);
+    assert!(compiled(&out, "side") && compiled(&out, "app"), "{:?}", out);
+    assert!(
+        decisions(&out, "leaf").is_empty(),
+        "{:?}",
+        decisions(&out, "leaf")
+    );
+    assert_ne!(fs::read_to_string(fourth.join("Cargo.lock")).unwrap(), lock);
+    assert_eq!(program(&fourth), "one:none 5\n");
+    assert_eq!(p.stale_for_cargo(&fourth, &fourth.join("target")), 0);
+    let (here, clean) = (files_of(&fourth.join("target")), from_nothing(&fourth));
+    assert!(
+        clean.is_subset(&here),
+        "{:?}",
+        clean.difference(&here).collect::<Vec<_>>()
+    );
+
+    // A program is added where Cargo looks for programs, and a crate
+    // beside the others that the application now uses.
+    let fifth = copy("fifth");
+    write(
+        fifth.join("src/bin/two.rs"),
+        "fn main() { println!(\"two\"); }",
+    );
+    write(
+        fifth.join("more/Cargo.toml"),
+        "[package]\nname='more'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(fifth.join("more/src/lib.rs"), "pub fn more() -> u32 { 9 }");
+    let manifest = fs::read_to_string(fifth.join("Cargo.toml")).unwrap();
+    write(
+        fifth.join("Cargo.toml"),
+        &format!("{manifest}more={{path='more'}}\n"),
+    );
+    write(
+        fifth.join("src/main.rs"),
+        "fn main() { println!(\"{} {} {}\", leaf::value(), side::side(), more::more()); }",
+    );
+    let out = build(&fifth);
+    assert!(compiled(&out, "more") && compiled(&out, "two"), "{:?}", out);
+    assert!(decisions(&out, "leaf").is_empty() && decisions(&out, "side").is_empty());
+    assert_eq!(program(&fifth), "one:none 5 9\n");
+    let two = Command::new(fifth.join("target/debug/two"))
+        .output()
+        .unwrap();
+    assert_eq!(two.stdout, b"two\n");
+    assert_eq!(p.stale_for_cargo(&fifth, &fifth.join("target")), 0);
+    let (here, clean) = (files_of(&fifth.join("target")), from_nothing(&fifth));
+    assert!(
+        clean.is_subset(&here),
+        "{:?}",
+        clean.difference(&here).collect::<Vec<_>>()
+    );
+    assert_eq!(p.count("build_replanned"), 4, "{}", p.stats());
+
+    // A manifest that a build script reads is not Cargo's alone.
+    let q = Project::whole();
+    let script = "fn main() { let m = std::fs::read_to_string(\"Cargo.toml\").unwrap(); println!(\"cargo:rustc-env=LEAF_ENV={}\", m.len()); println!(\"cargo:rerun-if-changed=build.rs\"); }";
+    write(q.root.join("leaf/build.rs"), script);
+    q.run(&["build"]);
+    let sixth = q.temp.path().join("sixth");
+    populate(&sixth);
+    write(sixth.join("leaf/build.rs"), script);
+    fs::copy(q.root.join("Cargo.lock"), sixth.join("Cargo.lock")).unwrap();
+    let manifest = fs::read_to_string(sixth.join("leaf/Cargo.toml")).unwrap();
+    write(
+        sixth.join("leaf/Cargo.toml"),
+        &format!("{manifest}\n[package.metadata.notes]\nkept = true\n"),
+    );
+    success(q.command_in(&sixth).args(["build"]));
+    assert_eq!(q.count("build_near"), 0, "{}", q.stats());
+    let out = Command::new(sixth.join("target/debug/app"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.stdout,
+        format!("one:{}\n", manifest.len() + 38).as_bytes()
+    );
 }
 
 #[test]

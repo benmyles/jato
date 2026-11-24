@@ -924,7 +924,7 @@ fn supervise(
         .and_then(|start| {
             // The tests name a file here to go through what follows.
             let pretended = || std::env::var_os("JATO_TEST_DOUBT").map(PathBuf::from);
-            start.unmade(&job.roots).or_else(pretended)
+            start.unmade(&job.roots, &report).or_else(pretended)
         });
     if let Some(unmade) = unmade {
         log(

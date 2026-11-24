@@ -1110,7 +1110,10 @@ impl Store {
             return verdict.map(|_| None);
         }
         for (i, dest) in dests.iter().enumerate() {
+            // What is left out is taken out of the target directory, for
+            // Cargo to find missing. A file anywhere else is the person's.
             if left(i)
+                && manifest.outputs[i].root == crate::roots::TARGET
                 && let Err(e) = fs::remove_file(dest)
                 && e.kind() != io::ErrorKind::NotFound
             {

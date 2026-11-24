@@ -7,7 +7,8 @@
 use crate::cas::{Staged, Store};
 use crate::facts::{Facts, keyed};
 use crate::manifest::{
-    Difference, Env, Here, Input, Manifest, Output, Part, Place, State, Walk, path_dirs, which,
+    Difference, Env, Here, Input, Manifest, Output, Part, Place, Stale, State, Walk, path_dirs,
+    which,
 };
 use crate::observe::{self, Kind, Report, Stamp};
 use crate::roots::{self, Roots, Surroundings};
@@ -26,7 +27,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v7";
+const EPOCH: &str = "jato command v8";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -1438,6 +1439,12 @@ pub struct Start {
     /// What the files hold now that Cargo had asked about and that have
     /// changed since, by their positions among the inputs.
     now: HashMap<u32, State>,
+    /// The inputs that differ and are Cargo's own to plan the build with
+    /// again, by their positions: manifests, lock files, and directories
+    /// it finds packages and targets in. With any of these the build is
+    /// Cargo's to lay out anew: a compilation of the earlier build may
+    /// no longer be part of it.
+    replanned: Vec<u32>,
     /// How long the build took that this one starts from.
     cost_ms: u64,
 }
@@ -1453,11 +1460,35 @@ impl Start {
     /// compiler again when what it wrote is gone. If it ever did not, what
     /// had been built on the missing file would be out of date and nothing
     /// else would say so.
-    pub fn unmade(&self, roots: &Roots) -> Option<PathBuf> {
+    ///
+    /// Where Cargo planned the build again, a compilation that was left
+    /// out may be none of this build's any more, under another name or
+    /// gone. Cargo asks about what each compilation of a build wrote
+    /// before it decides anything, so a file it never asked about is one
+    /// it did not have to make.
+    pub fn unmade(&self, roots: &Roots, report: &Report) -> Option<PathBuf> {
         let owed = self.manifest.outputs.iter().zip(&self.owed);
         owed.filter(|(_, owed)| **owed)
             .filter_map(|(output, _)| roots.join(output.root, &output.path))
+            .filter(|path| self.replanned.is_empty() || report.paths.contains_key(path))
             .find(|path| !path.exists())
+    }
+
+    /// Which of the earlier build's compilations, among those not made
+    /// again, are no longer part of a build that Cargo planned anew: the
+    /// ones none of whose files Cargo asked about.
+    fn dropped(&self, roots: &Roots, report: &Report) -> Vec<bool> {
+        let asked = |output: &u32| {
+            let output = &self.manifest.outputs[*output as usize];
+            roots
+                .join(output.root, &output.path)
+                .is_some_and(|path| report.paths.contains_key(&path))
+        };
+        self.manifest
+            .parts
+            .iter()
+            .map(|part| !self.replanned.is_empty() && !part.outputs.iter().any(asked))
+            .collect()
     }
 
     /// Take out of the target directory everything that was put in place,
@@ -1502,6 +1533,13 @@ impl Start {
 /// How many recorded builds are looked at for one to start from, and how
 /// many inputs may differ from the one chosen.
 const NEAR: usize = 4;
+
+/// How many times in a row a build may start from one whose manifests
+/// differed. Each time, what Cargo itself keeps of the compilations that
+/// are no longer part of the build stays in the target directory and in
+/// the record, as it does where Cargo is used alone: small files, of no
+/// use and in nobody's way, that a build made from nothing does not have.
+const REPLANS: u32 = 8;
 const MOST: usize = 4096;
 
 /// Look for a recorded build of this command that differs from the present
@@ -1524,10 +1562,12 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     // The one with the fewest compilations to make again.
     struct Near {
         count: usize,
+        far: usize,
         at: usize,
         manifest: Manifest,
         again: Vec<bool>,
         differences: Vec<Difference>,
+        replanned: Vec<u32>,
     }
     let mut best: Option<Near> = None;
     let mut why = None;
@@ -1558,25 +1598,43 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
             }
         };
         match manifest.stale_parts(&differences) {
-            Ok(mut again) => {
+            Ok(stale) if !stale.replanned.is_empty() && manifest.replans >= REPLANS => {
+                why.get_or_insert_with(|| {
+                    format!(
+                        "{} differs, and the nearest build has been planned again {REPLANS} times",
+                        manifest.named(stale.replanned[0], &job.roots)
+                    )
+                });
+            }
+            Ok(Stale {
+                mut again,
+                replanned,
+            }) => {
                 if elsewhere.is_some() {
                     for &part in &manifest.pinned {
                         again[part as usize] = true;
                     }
                 }
                 let count = again.iter().filter(|again| **again).count();
-                if best.as_ref().is_none_or(|best| count < best.count) {
+                // A manifest that differs may have Cargo compile nothing
+                // or everything. It is taken for a few compilations, so
+                // that of two builds the one whose manifests are the
+                // same is the nearer.
+                let far = count + 8 * replanned.len();
+                if best.as_ref().is_none_or(|best| far < best.far) {
                     best = Some(Near {
                         count,
+                        far,
                         at,
                         manifest,
                         again,
                         differences,
+                        replanned,
                     });
                 }
                 // Near enough: looking at another costs as much as these
                 // few compilations might.
-                if count <= 4 {
+                if far <= 4 {
                     break;
                 }
             }
@@ -1596,6 +1654,8 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         manifest,
         again,
         differences,
+        replanned,
+        ..
     }) = best
     else {
         store.end_read();
@@ -1634,6 +1694,14 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         {
             leave[at] = true;
             owed[at] |= *own;
+        }
+        // With manifests that differ, what the earlier build wrote
+        // outside the target directory, a lock file for one, is not
+        // what this build would write there. The files that are there
+        // are the ones this build is of.
+        if !replanned.is_empty() && output.root != roots::TARGET {
+            leave[at] = true;
+            owed[at] = false;
         }
     }
     let mut damaged = false;
@@ -1687,10 +1755,17 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         Ok(()) => "",
         Err(_) => ", what they wrote names where it was made",
     };
+    let planned = match replanned.len() {
+        0 => "",
+        _ => ", and Cargo plans the build again",
+    };
+    if !replanned.is_empty() {
+        store.count("build_replanned", 1);
+    }
     log(
         job.name(),
         format_args!(
-            "starting from an earlier build in {} ms: {count} of its {} compilations to make again{differs}{named}",
+            "starting from an earlier build in {} ms: {count} of its {} compilations to make again{differs}{named}{planned}",
             begun.elapsed().as_millis(),
             manifest.parts.len(),
         ),
@@ -1702,6 +1777,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         manifest,
         again,
         now,
+        replanned,
         cost_ms: restored.cost_ms,
     })
 }
@@ -1845,6 +1921,7 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
             placed,
             manifest,
             now: HashMap::new(),
+            replanned: Vec::new(),
             cost_ms: 0,
         });
     }
@@ -2003,9 +2080,51 @@ pub fn record(
     // two are one build, of which this run made only what had changed.
     let start = parts.and_then(|parts| parts.start.as_ref());
     let mut carried: HashMap<Place, &Output> = HashMap::new();
+    // Compilations of the earlier build that are none of this one's,
+    // where Cargo planned the build again: what they wrote is taken out
+    // of the target directory, with any copy of it under another name
+    // that Cargo did not ask about either.
+    let dropped: Vec<bool> = start.map_or_else(Vec::new, |start| start.dropped(roots, report));
+    let mut gone: HashSet<Place> = HashSet::new();
+    if let Some(start) = start
+        && dropped.contains(&true)
+    {
+        let base = &start.manifest;
+        let mut theirs: HashSet<u32> = HashSet::new();
+        let mut bytes: HashSet<Digest> = HashSet::new();
+        for (part, dropped) in base.parts.iter().zip(&dropped) {
+            theirs.extend(&part.outputs);
+            if *dropped {
+                for &output in &part.outputs {
+                    gone.insert(start.place(output));
+                    bytes.insert(base.outputs[output as usize].digest);
+                }
+            }
+        }
+        for (at, output) in base.outputs.iter().enumerate() {
+            let copy = output.size > 0
+                && bytes.contains(&output.digest)
+                && !theirs.contains(&(at as u32))
+                && output.root == roots::TARGET;
+            if copy
+                && let Some(path) = roots.join(output.root, &output.path)
+                && !report.paths.contains_key(&path)
+            {
+                gone.insert((output.root, output.path.clone()));
+            }
+        }
+        for (place, placed) in base.outputs.iter().zip(&start.placed) {
+            if *placed
+                && gone.contains(&(place.root, place.path.clone()))
+                && let Some(path) = roots.join(place.root, &place.path)
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
     if let Some(start) = start {
         for (output, placed) in start.manifest.outputs.iter().zip(&start.placed) {
-            if *placed {
+            if *placed && !gone.contains(&(output.root, output.path.clone())) {
                 // And the directories it made to put its files in, which
                 // were there for this run to find.
                 for directory in output.path.ancestors().skip(1) {
@@ -2026,6 +2145,10 @@ pub fn record(
     // among them the files Cargo itself only asked about.
     let mut own: HashSet<Place> = HashSet::new();
     let mut asked: HashSet<Place> = HashSet::new();
+    // Among the build's own inputs, those only its own program examined;
+    // and every place that program or what it started examined this time.
+    let mut cargos: HashSet<Place> = HashSet::new();
+    let mut examined_now: HashSet<Place> = HashSet::new();
     // Programs this run started from inside the target directory.
     let mut started: Vec<(Place, PathBuf)> = Vec::new();
     // The names found in each listed directory. Those that turn out to be
@@ -2248,7 +2371,11 @@ pub fn record(
             asked.insert((root, rel.to_owned()));
         } else {
             own.insert((root, rel.to_owned()));
+            if job.scope == Scope::Build && !access.others {
+                cargos.insert((root, rel.to_owned()));
+            }
         }
+        examined_now.insert((root, rel.to_owned()));
         manifest.inputs.push(Input {
             root,
             path: rel.to_owned(),
@@ -2460,7 +2587,11 @@ pub fn record(
             let mut carry = |position: u32, manifest: &mut Manifest| -> Place {
                 let input = &base.inputs[position as usize];
                 let place = (input.root, input.path.clone());
-                if !made.contains(&place) && have.insert(place.clone()) {
+                // What Cargo planned this build with again is recorded as
+                // this build found it, or not at all if it was not looked
+                // at this time.
+                let planned = start.replanned.contains(&position);
+                if !planned && !made.contains(&place) && have.insert(place.clone()) {
                     let mut input = input.clone();
                     if let Some(state) = start.now.get(&position) {
                         input.state = state.clone();
@@ -2488,6 +2619,10 @@ pub fn record(
                 if *again && theirs && remade == 0 {
                     continue;
                 }
+                // No part of the build as Cargo planned it this time.
+                if dropped[at] && remade == 0 {
+                    continue;
+                }
                 if *again || remade > 0 {
                     let missing = part.outputs.iter().find(|output| !made_again(output));
                     let missing = missing.map(|output| start.place(*output).1);
@@ -2513,9 +2648,18 @@ pub fn record(
                 let nowhere =
                     !apart[position as usize] && base.asked.binary_search(&position).is_err();
                 if listed || nowhere {
-                    own.insert(carry(position, &mut manifest));
+                    let place = carry(position, &mut manifest);
+                    // Still only Cargo's, unless something else examined
+                    // it this time.
+                    if base.cargos.binary_search(&position).is_ok()
+                        && !examined_now.contains(&place)
+                    {
+                        cargos.insert(place.clone());
+                    }
+                    own.insert(place);
                 }
             }
+            manifest.replans = base.replans + u32::from(!start.replanned.is_empty());
             manifest.env.extend(base.env.iter().cloned());
             manifest.which.extend(base.which.iter().cloned());
             // What the earlier build wrote that names where it was made
@@ -2954,6 +3098,10 @@ pub fn record(
         manifest.asked = asked
             .into_iter()
             .filter(|at| theirs.binary_search(at).is_err())
+            .collect();
+        manifest.cargos = ordered(cargos.iter().filter_map(input_at).collect())
+            .into_iter()
+            .filter(|at| theirs.binary_search(at).is_ok())
             .collect();
         manifest.own = theirs;
         manifest.parts = apart;

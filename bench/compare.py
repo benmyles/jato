@@ -13,6 +13,10 @@ through the same steps:
   copy_edit   one source file changed in that copy, where nothing was compiled
   copy_new    the sources at a third path with one file changed already, and
               nothing built there yet: a new worktree with an edit in it
+  copy_manifest
+              the sources at a fourth path with the manifest of the edited
+              file's package changed, and nothing built there yet: a new
+              worktree at a commit that touched a Cargo.toml
   edit_first  one source file changed, in the target that was restored
   edit        the median of further changes to that file
   undo        the file as it was before the changes
@@ -36,7 +40,7 @@ import tempfile
 import time
 
 TOOLS = ["cargo", "jato", "jato-wrapper", "kache", "kache-shim", "sccache"]
-STEPS = ["cold", "fresh", "restore", "new_target", "copy", "copy_edit", "copy_new", "edit_first", "edit", "undo"]
+STEPS = ["cold", "fresh", "restore", "new_target", "copy", "copy_edit", "copy_new", "copy_manifest", "edit_first", "edit", "undo"]
 TICK = os.sysconf("SC_CLK_TCK")
 
 
@@ -275,6 +279,14 @@ def main():
                         changed = third / options.edit
                         changed.write_bytes(changed.read_bytes() + f"\npub fn changed_before_any_build_{trial}() -> u64 {{ {time.time_ns()} }}\n".encode())
                         record("copy_new", step("copy_new", third, third / "target"))
+                        fourth = private / "fourth" / "project"
+                        fourth.parent.mkdir()
+                        copy_project(fourth)
+                        # The manifest of the package the edited file is in.
+                        package = next(d for d in (fourth / options.edit).parents if (d / "Cargo.toml").exists())
+                        manifest = package / "Cargo.toml"
+                        manifest.write_bytes(manifest.read_bytes() + f"\n[package.metadata.changed]\nat = {time.time_ns()}\n".encode())
+                        record("copy_manifest", step("copy_manifest", fourth, fourth / "target"))
                     edited = project / options.edit
                     original = edited.read_bytes()
                     later = []

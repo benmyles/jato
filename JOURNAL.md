@@ -1,5 +1,14 @@
 # Work journal
 
+## 2026-11-24 — builds whose manifests differ, and kache on the server (0.17)
+
+- Put kache 2.3.0 on the server and ran `bench/compare.py` there, Jato 0.16.0 and kache side by side, with a step that was missing: a copy of the sources with a manifest changed and nothing built yet. For `check` of all of Olo Jato was ahead everywhere but there (14.3 s against 11.8) and in further edits (5.2 against 3.2), both taken while kache still had the machine busy. For `build` kache took 15 s for the changed manifest and Jato 72: Cargo carried the build out, ran every build script again, and what two of them write differently each time had 1,220 crates named and dozens compiled.
+- A build now starts from a recorded one across manifests and lock files that differ. They are Cargo's to read, it reads them every time it runs, and what follows from them for a compilation is in what Cargo remembers of it. The record says which of its inputs only Cargo examined. Where such a manifest or lock file holds something else, or a directory Cargo finds packages or programs in has other entries, the earlier build's files are put in place and Cargo plans the build again.
+- Three things had to be right for that. A compilation Cargo no longer asks about is none of the build's: Cargo asks about what every compilation of a build wrote before it decides anything, so what a compilation wrote that was never asked about is taken out of the target directory and the record, and is not owed. What the earlier build wrote outside the target directory, a lock file for one, is neither put back nor removed: the files there are the ones this build is of. And of two earlier builds the one whose manifests are the same is the nearer.
+- What Cargo itself keeps of a compilation that has gone stays behind, as it does wherever Cargo is used alone, so the line of such builds is cut after eight.
+- Compared file for file with a build of the same sources from nothing, in the suite and on Olo: for a manifest that says more and changes nothing the two target directories hold the same 13,089 files, differing only where two builds from nothing differ. That check of all of Olo took 2.1 s where it had taken 11.
+- It does not apply to the change Olo makes most: one of its build scripts reads the lock file, and what a build script read has to be as it was.
+
 ## 2026-11-23 — a build server, and what only showed there (0.16)
 
 - Moved building, testing and measuring to a server: 32 processors, 125 GB of memory, ext4, nothing else running. Jato's suite passed there as it was. Olo's did not go as it had on the laptop, in four ways, all in the first hour.
