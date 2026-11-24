@@ -930,7 +930,7 @@ fn cpu() -> Vec<u8> {
     id
 }
 
-fn encode_detail(code: i32, stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_detail(code: i32, stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
     let mut detail = Vec::with_capacity(stdout.len() + stderr.len() + 12);
     detail.extend_from_slice(&code.to_le_bytes());
     detail.extend_from_slice(&(stdout.len() as u64).to_le_bytes());
@@ -939,7 +939,7 @@ fn encode_detail(code: i32, stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
     detail
 }
 
-fn decode_detail(detail: &[u8]) -> Option<(i32, &[u8], &[u8])> {
+pub(crate) fn decode_detail(detail: &[u8]) -> Option<(i32, &[u8], &[u8])> {
     let code = i32::from_le_bytes(detail.get(..4)?.try_into().ok()?);
     let len = u64::from_le_bytes(detail.get(4..12)?.try_into().ok()?) as usize;
     let rest = &detail[12..];
@@ -1271,7 +1271,7 @@ pub fn run_piped(
 /// Unix sockets that libc consults for user and host names, and the one a
 /// build's own supervisor listens on. Talking to any other service means
 /// work was done where it could not be seen.
-fn harmless_socket(path: &Path) -> bool {
+pub(crate) fn harmless_socket(path: &Path) -> bool {
     path.starts_with("/run/nscd")
         || path.starts_with("/var/run/nscd")
         || path.starts_with("/run/systemd/userdb")

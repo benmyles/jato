@@ -5467,3 +5467,230 @@ fn a_build_script_writing_a_pinned_output_still_lets_another_checkout_start_from
     assert_eq!(p.count("build_near"), 1, "{}", p.stats());
     assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
 }
+
+#[test]
+fn tests_are_cached_across_checkouts_and_invalidated_by_fixtures_and_env() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    add_side(&p.root);
+    let setup = |root: &Path| {
+        write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\".\", \"leaf\", \"side\"]\n[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nleaf={path='leaf'}\nside={path='side'}\n",
+        );
+        write(root.join("leaf/fixture.txt"), "expected-v1\n");
+        write(
+            root.join("leaf/src/lib.rs"),
+            r#"pub fn value() -> &'static str { include_str!("text file").trim() }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reads_fixture_and_env_and_cleans_temp() {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let got = std::fs::read_to_string(format!("{dir}/fixture.txt")).unwrap();
+        let mode = std::env::var("TEST_MODE").unwrap_or_else(|_| "v1".into());
+        assert_eq!(got.trim(), format!("expected-{mode}"));
+        // Temporary file created and removed before exit must stay cacheable.
+        let tmp = std::env::temp_dir().join(format!("jato-test-tmp-{}", std::process::id()));
+        std::fs::write(&tmp, "scratch").unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "scratch");
+        std::fs::remove_file(&tmp).unwrap();
+    }
+}
+"#,
+        );
+        write(
+            root.join("tests/runs_app.rs"),
+            r#"#[test]
+fn integration_runs_binary() {
+    let bin = std::env::var("CARGO_BIN_EXE_app").unwrap();
+    let out = std::process::Command::new(bin).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "one 5");
+}
+"#,
+        );
+    };
+    setup(&p.root);
+    success(
+        Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&p.root),
+    );
+
+    let c1 = checkout(&p, "c1");
+    setup(&c1);
+    let out1 = success(p.command_in(&c1).args(["test", "--workspace"]));
+    let s1 = String::from_utf8_lossy(&out1.stdout);
+    assert!(
+        s1.contains("reads_fixture_and_env_and_cleans_temp ... ok"),
+        "{s1}"
+    );
+    assert!(s1.contains("integration_runs_binary ... ok"), "{s1}");
+    let misses1 = p.count("test_miss");
+    let stored1 = p.count("test_stored");
+    assert!(misses1 >= 2 && stored1 >= 2, "{}", p.stats());
+
+    // Re-running in `c1` must hit cache for every test binary!
+    let out2 = success(p.command_in(&c1).args(["test", "--workspace"]));
+    let s2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        s2.contains("reads_fixture_and_env_and_cleans_temp ... ok"),
+        "{s2}"
+    );
+    assert!(s2.contains("integration_runs_binary ... ok"), "{s2}");
+    assert_eq!(p.count("test_miss"), misses1, "{}", p.stats());
+    assert!(p.count("test_hit") >= 2, "{}", p.stats());
+
+    // Running in a brand-new checkout `c2` must ALSO hit test cache across checkouts!
+    let c2 = checkout(&p, "c2");
+    setup(&c2);
+    let hits_before_c2 = p.count("test_hit");
+    let out3 = success(p.command_in(&c2).args(["test", "--workspace"]));
+    let s3 = String::from_utf8_lossy(&out3.stdout);
+    assert!(
+        s3.contains("reads_fixture_and_env_and_cleans_temp ... ok"),
+        "{s3}"
+    );
+    assert!(s3.contains("integration_runs_binary ... ok"), "{s3}");
+    assert_eq!(p.count("test_miss"), misses1, "{}", p.stats());
+    assert!(p.count("test_hit") >= hits_before_c2 + 2, "{}", p.stats());
+
+    // Editing only `fixture.txt` (no .rs changes!) MUST invalidate `leaf`'s test!
+    write(c2.join("leaf/fixture.txt"), "expected-v2\n");
+    let failed = p
+        .command_in(&c2)
+        .args(["test", "-p", "leaf"])
+        .output()
+        .unwrap();
+    assert!(
+        !failed.status.success(),
+        "edited fixture must cause test to rerun and fail"
+    );
+    assert!(p.count("test_miss") > misses1, "{}", p.stats());
+
+    // Setting `TEST_MODE=v2` makes it pass again AND caches the new env variant!
+    let misses_before_env = p.count("test_miss");
+    success(
+        p.command_in(&c2)
+            .env("TEST_MODE", "v2")
+            .args(["test", "-p", "leaf"]),
+    );
+    assert_eq!(p.count("test_miss"), misses_before_env + 1, "{}", p.stats());
+    let hits_before_env = p.count("test_hit");
+    success(
+        p.command_in(&c2)
+            .env("TEST_MODE", "v2")
+            .args(["test", "-p", "leaf"]),
+    );
+    assert_eq!(p.count("test_hit"), hits_before_env + 1, "{}", p.stats());
+
+    // Sync `--nocapture` mode also caches and replays cleanly.
+    let misses_nc = p.count("test_miss");
+    success(p.command_in(&c2).env("TEST_MODE", "v2").args([
+        "test",
+        "-p",
+        "leaf",
+        "--",
+        "--nocapture",
+    ]));
+    assert_eq!(p.count("test_miss"), misses_nc + 1, "{}", p.stats());
+    let hits_nc = p.count("test_hit");
+    success(p.command_in(&c2).env("TEST_MODE", "v2").args([
+        "test",
+        "-p",
+        "leaf",
+        "--",
+        "--nocapture",
+    ]));
+    assert_eq!(p.count("test_hit"), hits_nc + 1, "{}", p.stats());
+}
+
+#[test]
+fn uncacheable_tests_are_never_cached_and_parallel_tests_execute_concurrently() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    // 1. Network-using test must NOT be cached.
+    write(
+        p.root.join("tests/net_test.rs"),
+        r#"#[test]
+fn connects_loopback() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _client = std::net::TcpStream::connect(addr).unwrap();
+}
+"#,
+    );
+    // 2. Persistent side-effecting test must NOT be cached.
+    let artifact = p.temp.path().join("side-effect.txt");
+    write(
+        p.root.join("tests/side_effect.rs"),
+        &format!(
+            r#"#[test]
+fn leaves_file_behind() {{
+    std::fs::write({:?}, "written").unwrap();
+}}
+"#,
+            artifact.to_str().unwrap()
+        ),
+    );
+    // 3. Four independent test binaries that run in parallel and cache cleanly.
+    for i in 1..=4 {
+        write(
+            p.root.join(format!("tests/par_{i}.rs")),
+            &format!(
+                r#"#[test]
+fn par_ok_{i}() {{
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!({i} + 1, {});
+}}
+"#,
+                i + 1
+            ),
+        );
+    }
+
+    // Network test: passes, marked uncacheable, misses again on second run.
+    success(p.command().args(["test", "--test", "net_test"]));
+    let u1 = p.count("test_uncacheable");
+    assert!(u1 >= 1, "network test must be uncacheable: {}", p.stats());
+    let m1 = p.count("test_miss");
+    success(p.command().args(["test", "--test", "net_test"]));
+    assert_eq!(p.count("test_miss"), m1 + 1, "{}", p.stats());
+
+    // Side-effecting test: passes, marked uncacheable, misses again on second run.
+    success(p.command().args(["test", "--test", "side_effect"]));
+    assert!(
+        p.count("test_uncacheable") > u1,
+        "side-effecting test must be uncacheable: {}",
+        p.stats()
+    );
+    assert!(artifact.is_file());
+    let m2 = p.count("test_miss");
+    success(p.command().args(["test", "--test", "side_effect"]));
+    assert_eq!(p.count("test_miss"), m2 + 1, "{}", p.stats());
+
+    // Parallel binaries: all 4 run, pass, store, and then all 4 hit on repeat.
+    let out = success(p.command().args([
+        "test", "--test", "par_1", "--test", "par_2", "--test", "par_3", "--test", "par_4",
+    ]));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for i in 1..=4 {
+        assert!(text.contains(&format!("par_ok_{i} ... ok")), "{text}");
+    }
+    let hits_before = p.count("test_hit");
+    let misses_before = p.count("test_miss");
+    let out2 = success(p.command().args([
+        "test", "--test", "par_1", "--test", "par_2", "--test", "par_3", "--test", "par_4",
+    ]));
+    let text2 = String::from_utf8_lossy(&out2.stdout);
+    for i in 1..=4 {
+        assert!(text2.contains(&format!("par_ok_{i} ... ok")), "{text2}");
+    }
+    assert_eq!(p.count("test_miss"), misses_before, "{}", p.stats());
+    assert_eq!(p.count("test_hit"), hits_before + 4, "{}", p.stats());
+}

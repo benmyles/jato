@@ -22,6 +22,24 @@ mod session {
     }
     pub fn ready(_: std::process::Command, _: &str) {}
 }
+#[cfg(target_os = "linux")]
+mod tests_cache;
+#[cfg(not(target_os = "linux"))]
+mod tests_cache {
+    use anyhow::Result;
+    use std::ffi::OsString;
+    pub fn run(cmd: std::process::Command, _: &[OsString]) -> Result<i32> {
+        crate::command::passthrough(cmd)
+    }
+    pub fn runner(args: &[OsString]) -> Result<i32> {
+        let Some((binary, rest)) = args.split_first() else {
+            anyhow::bail!("missing test binary");
+        };
+        let mut cmd = std::process::Command::new(binary);
+        cmd.args(rest);
+        crate::command::passthrough(cmd)
+    }
+}
 mod tools;
 mod watch;
 mod wire;
@@ -84,12 +102,15 @@ Environment
   JATO_REMAP=0        Leave real workspace and target paths in compiled output
   JATO_STORAGE=packed Keep compressed copies even where files can be cloned
   JATO_VERIFY=1       Check restored bytes on filesystems that checksum them
+  JATO_CACHE_TESTS=0  Run tests without caching their results
+  JATO_PARALLEL_TESTS=0
+                      Run workspace test binaries one at a time
   JATO_DISABLE=1      Run Cargo and the compiler directly
 ";
 
 /// Programs that stand in for a compiler in order to cache or distribute
 /// its work.
-const LAUNCHERS: &[&str] = &[
+pub(crate) const LAUNCHERS: &[&str] = &[
     "kache",
     "ccache",
     "sccache",
@@ -482,7 +503,13 @@ fn cargo(args: &[OsString], options: CargoOptions) -> Result<i32> {
     match subcommand(args) {
         Some((_, "build" | "b" | "check" | "c" | "clippy")) => session::build(cmd, "cargo"),
         Some((_, "test" | "t" | "bench")) if flag("--no-run") => session::build(cmd, "cargo"),
-        Some((at, "test" | "t" | "bench" | "run" | "r")) => {
+        Some((at, "test" | "t")) => {
+            if let Some(build) = build_only(args, at) {
+                session::ready(cargo_command(&build, options)?, "cargo");
+            }
+            tests_cache::run(cmd, args)
+        }
+        Some((at, "bench" | "run" | "r")) => {
             if let Some(build) = build_only(args, at) {
                 session::ready(cargo_command(&build, options)?, "cargo");
             }
@@ -577,6 +604,14 @@ fn report(stats: &cas::Stats) -> String {
             count("tool_uncacheable")
         );
     }
+    let (hits, misses) = (count("test_hit"), count("test_miss"));
+    if hits + misses > 0 {
+        let _ = writeln!(
+            out,
+            "Tests      {hits} results reused, {misses} run ({} of those could not be stored)",
+            count("test_uncacheable")
+        );
+    }
     let _ = writeln!(
         out,
         "Saved      {:.1} s of earlier work not done again",
@@ -628,6 +663,16 @@ fn report(stats: &cas::Stats) -> String {
         "build_miss",
         "build_stored",
         "build_left_to_cargo",
+        "build_near",
+        "build_seeded",
+        "tool_hit",
+        "tool_miss",
+        "tool_stored",
+        "tool_uncacheable",
+        "test_hit",
+        "test_miss",
+        "test_stored",
+        "test_uncacheable",
     ];
     for (name, value) in &stats.counters {
         if !SHOWN.contains(&name.as_str()) {
@@ -680,6 +725,10 @@ fn run() -> Result<i32> {
         Some("__answer") if args.len() == 2 => {
             let fd = args[1].to_str().and_then(|s| s.parse().ok());
             return Ok(observe::answer(fd.context("bad descriptor")?));
+        }
+        // Started by Cargo via CARGO_TARGET_<TRIPLE>_RUNNER for test caching.
+        Some("__test") if args.len() >= 2 => {
+            return tests_cache::runner(&args[1..]);
         }
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
