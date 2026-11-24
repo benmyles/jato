@@ -88,12 +88,28 @@ enum Changed {
     Otherwise,
 }
 
+/// A program the build ran from its target directory, a build script,
+/// with what it and everything it started examined of the build's own
+/// inputs and wrote of its outputs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Script {
+    /// The program's file, by its position among the outputs.
+    pub program: u32,
+    pub inputs: Vec<u32>,
+    pub outputs: Vec<u32>,
+}
+
 /// What a build that starts from another has to do about the inputs that
 /// differ.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stale {
     /// Which of the earlier build's parts have to be made again.
     pub again: Vec<bool>,
+    /// Which of its build scripts have to run again: those that examined
+    /// something that differs. Cargo runs a build script whose program
+    /// has been made again, so the compiler that made it is among the
+    /// parts above.
+    pub scripts: Vec<bool>,
     /// The inputs among those that differ which are Cargo's own to make
     /// something of: manifests, lock files and the directories it finds
     /// packages and targets in. Cargo reads them again whenever it runs
@@ -166,6 +182,18 @@ pub struct Manifest {
     /// keeps of a compilation that is no longer part of the build stays
     /// behind each time.
     pub replans: u32,
+    /// The build scripts the build ran.
+    pub scripts: Vec<Script>,
+    /// The positions, among `own`, of the inputs the command's own
+    /// program read or listed, whoever else examined them.
+    pub read: Vec<u32>,
+    /// The positions, among `own`, of the inputs examined by a program
+    /// that was neither the command's own nor part of what a build script
+    /// did, or by a build script that cannot be had to run again.
+    pub strays: Vec<u32>,
+    /// The positions of the outputs the command's own program wrote:
+    /// what Cargo keeps for itself in a target directory.
+    pub ours: Vec<u32>,
 }
 
 /// A file a command wrote, and the object that holds its bytes.
@@ -319,6 +347,15 @@ impl Manifest {
         positions(&mut w, &self.pinned);
         positions(&mut w, &self.cargos);
         w.number(self.replans.into());
+        w.number(self.scripts.len() as u64);
+        for script in &self.scripts {
+            w.number(script.program.into());
+            positions(&mut w, &script.inputs);
+            positions(&mut w, &script.outputs);
+        }
+        positions(&mut w, &self.read);
+        positions(&mut w, &self.strays);
+        positions(&mut w, &self.ours);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
         let mut packer = zstd::bulk::Compressor::new(1)?;
         packer.include_checksum(true)?;
@@ -426,6 +463,21 @@ impl Manifest {
         m.pinned = read_positions(&mut r, m.parts.len())?;
         m.cargos = read_positions(&mut r, m.inputs.len())?;
         m.replans = r.number()? as u32;
+        for _ in 0..r.count()? {
+            let program = r.number()? as u32;
+            ensure!(
+                (program as usize) < m.outputs.len(),
+                "a script without a program"
+            );
+            m.scripts.push(Script {
+                program,
+                inputs: read_positions(&mut r, m.inputs.len())?,
+                outputs: read_positions(&mut r, m.outputs.len())?,
+            });
+        }
+        m.read = read_positions(&mut r, m.inputs.len())?;
+        m.strays = read_positions(&mut r, m.inputs.len())?;
+        m.ours = read_positions(&mut r, m.outputs.len())?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
         Ok(m)
     }
@@ -687,10 +739,11 @@ impl Manifest {
     /// Which parts a build that starts from this one has to make again,
     /// given the inputs that differ, and which of those inputs are left
     /// to Cargo. An error is the position of an input whose change leaves
-    /// nothing to start from.
-    pub fn stale_parts(&self, differences: &[Difference]) -> Result<Stale, u32> {
+    /// nothing to start from, and why.
+    pub fn stale_parts(&self, differences: &[Difference]) -> Result<Stale, (u32, &'static str)> {
         let mut stale = Stale {
             again: vec![false; self.parts.len()],
+            scripts: vec![false; self.scripts.len()],
             replanned: Vec::new(),
         };
         for difference in differences {
@@ -703,38 +756,112 @@ impl Manifest {
                 }
             }
             if self.own.binary_search(&at).is_ok() {
-                if !self.cargo_s_to_plan_with(difference) {
-                    return Err(at);
+                // A program nobody can have run again examined it.
+                if self.strays.binary_search(&at).is_ok() {
+                    return Err((
+                        at,
+                        "which a program examined that cannot be had to run again",
+                    ));
                 }
-                stale.replanned.push(at);
+                // The build scripts that examined it run again, and see
+                // for themselves.
+                let mut scripted = false;
+                for (script, again) in self.scripts.iter().zip(&mut stale.scripts) {
+                    if script.inputs.binary_search(&at).is_ok() {
+                        *again = true;
+                        scripted = true;
+                    }
+                }
+                // What Cargo itself made of it, it has to be able to make
+                // again: all there is to it where no script looked.
+                let cargo_s = self.read.binary_search(&at).is_ok() || !scripted;
+                if cargo_s {
+                    if !self.cargo_s_to_plan_with(difference, scripted) {
+                        return Err((at, "which the build itself examined"));
+                    }
+                    stale.replanned.push(at);
+                }
                 continue;
             }
             // Cargo goes by whether a file it asks about is there. What
             // the file holds is the business of whoever reads it.
             let asked = self.asked.binary_search(&at).is_ok();
-            if (asked && !difference.contents) || !(asked || examined) {
-                return Err(at);
+            // What it finds there this time is for Cargo to plan with.
+            if asked && !difference.contents {
+                if !self.cargo_s_to_plan_with(difference, false) {
+                    return Err((at, "which Cargo had found there"));
+                }
+                stale.replanned.push(at);
+            }
+            if !(asked || examined) {
+                return Err((at, "which the build itself examined"));
+            }
+        }
+        // A build script runs again when Cargo finds its program made
+        // again: by the compiler that wrote it, or wrote a file of the
+        // same bytes that Cargo then copied to where it runs it.
+        for (script, again) in self.scripts.iter().zip(&stale.scripts) {
+            if !*again {
+                continue;
+            }
+            let program = &self.outputs[script.program as usize];
+            let makes = |part: &&Part| {
+                part.outputs
+                    .iter()
+                    .any(|at| self.outputs[*at as usize].digest == program.digest)
+            };
+            match self.parts.iter().position(|part| makes(&part)) {
+                Some(part) if program.size > 0 => stale.again[part] = true,
+                _ => {
+                    let at = differences
+                        .iter()
+                        .map(|difference| difference.input)
+                        .find(|at| script.inputs.binary_search(at).is_ok());
+                    return Err((
+                        at.unwrap_or(0),
+                        "and no compiler of the build made the build script that read it",
+                    ));
+                }
             }
         }
         Ok(stale)
     }
 
-    /// Whether an input of the build's own that differs is one Cargo
-    /// alone examined and plans the build by: a manifest or a lock file
-    /// that holds something else, or a directory it finds packages or
-    /// targets in that has other entries. Cargo reads these again every
-    /// time it runs, and what follows from them for a compilation is in
-    /// what Cargo remembers of it: it runs the compilations for which
-    /// that has changed, and those that are new. Nothing else may have
-    /// examined the input, and nothing else of Cargo's own may differ:
-    /// its settings reach compilers in ways it does not remember.
-    fn cargo_s_to_plan_with(&self, difference: &Difference) -> bool {
-        if self.cargos.binary_search(&difference.input).is_err() {
+    /// Whether an input that differs, and that Cargo's own program
+    /// examined, is Cargo's to make something of again. Cargo reads its
+    /// manifests and lock files, lists the directories it finds packages
+    /// and targets in and asks which files are there every time it runs,
+    /// and what follows from them for a compilation is in what Cargo
+    /// remembers of it: it runs the compilations for which that has
+    /// changed, and those that are new.
+    ///
+    /// So anything that only Cargo examined may differ, with two
+    /// exceptions. Its settings reach compilers in ways it does not
+    /// remember. And what it found in the target directory was the state
+    /// it built on. Where build scripts examined the input as well, and
+    /// run again for it, `scripted` says so: then what Cargo read has to
+    /// be a manifest, a lock file or a directory.
+    fn cargo_s_to_plan_with(&self, difference: &Difference, scripted: bool) -> bool {
+        let input = &self.inputs[difference.input as usize];
+        let settings = input
+            .path
+            .components()
+            .any(|part| part.as_os_str() == ".cargo")
+            || input
+                .path
+                .file_name()
+                .is_some_and(|name| name == "rust-toolchain" || name == "rust-toolchain.toml");
+        if settings || input.root == crate::roots::TARGET {
             return false;
         }
-        let name = self.inputs[difference.input as usize].path.file_name();
-        let plan = name.is_some_and(|name| name == "Cargo.toml" || name == "Cargo.lock");
-        (difference.contents && plan) || difference.entries
+        if !scripted {
+            let only = |list: &[u32]| list.binary_search(&difference.input).is_ok();
+            return only(&self.cargos) || only(&self.asked);
+        }
+        let name = input.path.file_name();
+        name.is_some_and(|name| name == "Cargo.toml" || name == "Cargo.lock")
+            || difference.entries
+            || matches!(input.state, State::Dir(_))
     }
 
     /// What `position` among the inputs is called here.
@@ -1236,6 +1363,14 @@ mod tests {
             pinned: vec![0],
             cargos: vec![2],
             replans: 3,
+            scripts: vec![Script {
+                program: 0,
+                inputs: vec![0, 2],
+                outputs: vec![0],
+            }],
+            read: vec![0],
+            strays: vec![2],
+            ours: vec![0],
         };
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
@@ -1299,7 +1434,11 @@ mod tests {
             contents: false,
             entries: false,
         };
-        let again = |differences: &[Difference]| m.stale_parts(differences).map(|s| s.again);
+        let again = |differences: &[Difference]| {
+            m.stale_parts(differences)
+                .map(|s| s.again)
+                .map_err(|(at, _)| at)
+        };
         assert_eq!(again(&[]), Ok(vec![false, false]));
         assert_eq!(again(&[other(1)]), Ok(vec![true, false]));
         assert_eq!(again(&[other(2)]), Ok(vec![false, true]));
@@ -1311,12 +1450,21 @@ mod tests {
         // What the build itself read, and a file Cargo asked about that
         // is gone.
         assert_eq!(again(&[other(2), other(0)]), Err(0));
-        assert_eq!(again(&[gone(1)]), Err(1));
-        assert_eq!(again(&[gone(4)]), Err(4));
+        // A file Cargo asked about that is gone is Cargo's to miss: the
+        // compiler that read it is left out, and Cargo plans again.
+        assert_eq!(
+            m.stale_parts(&[gone(1)]),
+            Ok(Stale {
+                again: vec![true, false],
+                scripts: vec![],
+                replanned: vec![1],
+            })
+        );
+        assert_eq!(m.stale_parts(&[gone(4)]).map(|s| s.replanned), Ok(vec![4]));
         // An input in no list is the build's own.
         let mut loose = m.clone();
         loose.own.clear();
-        assert_eq!(loose.stale_parts(&[other(0)]), Err(0));
+        assert_eq!(loose.stale_parts(&[other(0)]).map_err(|(at, _)| at), Err(0));
 
         // A manifest that only Cargo examined is Cargo's to plan with
         // again: nothing is made again for it here, and Cargo is left to
@@ -1336,6 +1484,7 @@ mod tests {
             planned.stale_parts(&[other(0), other(2)]),
             Ok(Stale {
                 again: vec![false, true],
+                scripts: vec![],
                 replanned: vec![0],
             })
         );
@@ -1343,11 +1492,88 @@ mod tests {
             planned.stale_parts(&[entries(5)]).map(|s| s.replanned),
             Ok(vec![5])
         );
-        assert_eq!(planned.stale_parts(&[gone(0)]), Err(0));
+        // One that is gone is Cargo's to miss.
+        assert_eq!(
+            planned.stale_parts(&[gone(0)]).map(|s| s.replanned),
+            Ok(vec![0])
+        );
         // Settings are Cargo's own too, and no plan: they reach
         // compilers in ways Cargo does not remember.
-        assert_eq!(planned.stale_parts(&[other(6)]), Err(6));
+        assert_eq!(
+            planned.stale_parts(&[other(6)]).map_err(|(at, _)| at),
+            Err(6)
+        );
         planned.cargos = vec![5];
-        assert_eq!(planned.stale_parts(&[other(0)]), Err(0));
+        assert_eq!(
+            planned.stale_parts(&[other(0)]).map_err(|(at, _)| at),
+            Err(0)
+        );
+
+        // A build script read the manifest too, and a file of its own.
+        // It runs again for either, by having the compiler that made its
+        // program run again: the first here, whose output is the program.
+        let mut scripted = planned.clone();
+        scripted.inputs.push(input("data.txt"));
+        scripted.own = vec![0, 5, 6, 7];
+        scripted.read = vec![0, 5, 6];
+        scripted.outputs = vec![
+            Output {
+                root: 2,
+                path: "debug/build/app/script".into(),
+                digest: [7; 32],
+                size: 9,
+                mode: 0o755,
+                marked: false,
+            },
+            Output {
+                root: 2,
+                path: "debug/deps/libb.rlib".into(),
+                digest: [8; 32],
+                size: 9,
+                mode: 0o644,
+                marked: false,
+            },
+        ];
+        scripted.scripts = vec![Script {
+            program: 0,
+            inputs: vec![0, 7],
+            outputs: vec![],
+        }];
+        assert_eq!(
+            scripted.stale_parts(&[other(7)]),
+            Ok(Stale {
+                again: vec![true, false],
+                scripts: vec![true],
+                replanned: vec![],
+            })
+        );
+        assert_eq!(
+            scripted.stale_parts(&[other(0)]),
+            Ok(Stale {
+                again: vec![true, false],
+                scripts: vec![true],
+                replanned: vec![0],
+            })
+        );
+        // A file the script read that is gone is the script's to miss.
+        assert_eq!(
+            scripted.stale_parts(&[gone(7)]).map(|s| s.scripts),
+            Ok(vec![true])
+        );
+        // Something that cannot be run again read it as well.
+        scripted.strays = vec![7];
+        assert_eq!(
+            scripted.stale_parts(&[other(7)]).map_err(|(at, _)| at),
+            Err(7)
+        );
+        // No compiler of the build made the program.
+        scripted.strays.clear();
+        scripted.outputs[0].digest = [9; 32];
+        scripted.parts[0].outputs = vec![1];
+        scripted.parts[1].outputs = vec![];
+        assert_eq!(
+            scripted.stale_parts(&[other(7)]).map_err(|(at, _)| at),
+            Err(7)
+        );
     }
 }

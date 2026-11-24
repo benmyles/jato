@@ -112,6 +112,19 @@ pub struct Access {
     /// Listed by such a program. What the command's own program lists and
     /// another only asks about was listed by the first alone.
     pub listed_by_others: bool,
+    /// The programs the command started from the directory it was told to
+    /// tell them apart in, a build's scripts, in whose doing the path was
+    /// used: each by its number in `Report::programs`, from one.
+    pub by: Vec<u16>,
+    /// Used by a program that is neither the command's own nor part of
+    /// what one of those did.
+    pub stray: bool,
+    /// The last of those programs to write here, if any did.
+    pub wrote: u16,
+    /// Read or listed by the command's own program, whoever else used it.
+    pub own_read: bool,
+    /// Written by the command's own program.
+    pub own_wrote: bool,
     /// When the command first used the path and when it made the file its
     /// own, counted in the system calls reported until then. Zero for a
     /// file it never made.
@@ -160,14 +173,34 @@ impl Access {
         }
         whole.others |= later.others;
         whole.listed_by_others |= later.listed_by_others;
+        for program in later.by {
+            if !whole.by.contains(&program) {
+                whole.by.push(program);
+            }
+        }
+        whole.stray |= later.stray;
+        whole.own_read |= later.own_read;
+        whole.own_wrote |= later.own_wrote;
+        if later.wrote != 0 {
+            whole.wrote = later.wrote;
+        }
         *self = whole;
     }
 }
 
 impl Report {
-    /// Take in the record of a part of the command that was kept apart.
-    pub fn absorb(&mut self, part: Report) {
-        for (path, access) in part.paths {
+    /// Take in the record of a part of the command that was kept apart,
+    /// which ran in the doing of the program numbered `under`, or of none.
+    pub fn absorb(&mut self, part: Report, under: u16) {
+        for (path, mut access) in part.paths {
+            if under == 0 {
+                access.stray = true;
+            } else {
+                access.by = vec![under];
+                if access.written {
+                    access.wrote = under;
+                }
+            }
             match self.paths.get_mut(&path) {
                 Some(known) => {
                     known.absorb(access);
@@ -212,6 +245,9 @@ pub struct Report {
     pub reported: std::collections::BTreeMap<u32, u64>,
     /// Names used directly inside the directory `Config::state` names.
     pub state: std::collections::BTreeSet<OsString>,
+    /// The programs the command started from the directory
+    /// `Config::programs_in` names, in the order it started them.
+    pub programs: Vec<PathBuf>,
 }
 
 #[derive(Default, Clone)]
@@ -226,6 +262,11 @@ pub struct Config {
     /// The library to load into the command, through which it tells of
     /// the files it reads without waiting to be asked. See `fast/shim.rs`.
     pub fast: Option<PathBuf>,
+    /// A directory whose programs, when the command itself starts one,
+    /// are told apart: what each did, and everything it started did, is
+    /// noted with the paths it used. For a build this is the target
+    /// directory, and the programs are its build scripts.
+    pub programs_in: Option<PathBuf>,
 }
 
 /// The library that watched programs load, as it was built with this
@@ -737,6 +778,11 @@ mod imp {
         /// Whether that thread runs another program than the command's
         /// own.
         others: bool,
+        /// The program, of those told apart, in whose doing that thread
+        /// runs: its number, or none.
+        under: u16,
+        /// The program the call being looked at is about to start.
+        starting: Option<PathBuf>,
     }
 
     /// The command line of the program a thread belongs to, for telling
@@ -970,14 +1016,36 @@ mod imp {
                         writer: None,
                         others: false,
                         listed_by_others: false,
+                        by: Vec::new(),
+                        stray: false,
+                        wrote: 0,
+                        own_read: false,
+                        own_wrote: false,
                         first: self.now,
                         made: 0,
                     },
                 );
             }
+            if matches!(how, Use::Execute) {
+                self.starting = Some(path.clone());
+            }
             let access = self.report.paths.get_mut(&path).unwrap();
             access.others |= self.others;
             access.listed_by_others |= self.others && matches!(how, Use::List);
+            if self.others {
+                match self.under {
+                    0 => access.stray = true,
+                    under if !access.by.contains(&under) => access.by.push(under),
+                    _ => (),
+                }
+                if matches!(how, Use::Write { .. }) {
+                    access.wrote = self.under;
+                }
+            } else if matches!(how, Use::Read | Use::List | Use::Execute) {
+                access.own_read = true;
+            } else if matches!(how, Use::Write { .. }) {
+                access.own_wrote = true;
+            }
             // A program that was run was run, whoever made it and whenever.
             access.executed |= matches!(how, Use::Execute);
             match how {
@@ -1330,6 +1398,14 @@ mod imp {
         /// Whether each thread runs one of the leader's programs, and when
         /// that was last worked out.
         program: HashMap<u32, (bool, u64)>,
+        /// The processes in which the command itself started a program
+        /// from the directory it tells programs apart in, each with the
+        /// program's number and the program's file, by which the process
+        /// is known for the same one however long it runs.
+        started: HashMap<u32, (u16, (u64, u64))>,
+        /// The program in whose doing each thread runs, and when that was
+        /// last worked out.
+        under: HashMap<u32, (u16, u64)>,
     }
 
     /// The process a thread belongs to and that process's parent. Both
@@ -1434,10 +1510,15 @@ mod imp {
                 None => None,
             };
             let others = !matches!(scope, Some(None)) || !self.own_program(process);
+            let under = match scope {
+                Some(None) if others => self.under_program(process),
+                _ => 0,
+            };
             let record = |tracker: &mut Tracker| {
                 tracker.caller = process;
                 tracker.now = now;
                 tracker.others = others;
+                tracker.under = under;
                 tracker.report.noted += 1;
                 tracker.touch(path.clone(), how());
             };
@@ -1478,6 +1559,72 @@ mod imp {
             });
             self.program.insert(tid, (own, self.events));
             own
+        }
+
+        /// The command's own program is starting `program` in the process
+        /// of thread `tid`. One from the directory programs are told
+        /// apart in gets a number, and what that process and everything
+        /// it starts does from now on is noted as its doing.
+        fn starts(&mut self, tid: u32, program: PathBuf) {
+            let Some(within) = &self.whole.config.programs_in else {
+                return;
+            };
+            if !program.starts_with(within) || self.whole.report.programs.len() >= 60_000 {
+                return;
+            }
+            let Ok(file) = fs::metadata(&program) else {
+                return;
+            };
+            let process = ids(tid).map_or(tid, |(process, _)| process);
+            self.whole.report.programs.push(program);
+            let number = self.whole.report.programs.len() as u16;
+            self.started
+                .insert(process, (number, (file.dev(), file.ino())));
+            self.under.insert(tid, (number, self.events));
+        }
+
+        /// The program, of those told apart, in whose doing a thread
+        /// runs: the nearest process above it, or its own, in which one
+        /// was started. Zero for none.
+        fn under_program(&mut self, tid: u32) -> u16 {
+            if self.started.is_empty() {
+                return 0;
+            }
+            // As long as an answer about whose scope a thread is in.
+            if let Some((number, at)) = self.under.get(&tid)
+                && self.events - at < 200_000
+            {
+                return *number;
+            }
+            // A process is the one a program was started in for as long
+            // as it runs that program: its number may be given to another
+            // once it has gone.
+            let still = |started: &HashMap<u32, (u16, (u64, u64))>, process: u32| {
+                started
+                    .get(&process)
+                    .filter(|(_, program)| running(process) == Some(*program))
+                    .map(|(number, _)| *number)
+            };
+            let mut found = 0;
+            if let Some((process, mut parent)) = ids(tid) {
+                match still(&self.started, process) {
+                    Some(number) => found = number,
+                    None => {
+                        for _ in 0..64 {
+                            if let Some(number) = still(&self.started, parent) {
+                                found = number;
+                                break;
+                            }
+                            match ids(parent) {
+                                Some((_, next)) if parent > 1 => parent = next,
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            self.under.insert(tid, (found, self.events));
+            found
         }
 
         /// A thread is about to become another program, if the call
@@ -1583,12 +1730,18 @@ mod imp {
             state.leader.get_or_insert(tid);
             let scope = state.scope_of(tid);
             let others = scope.is_some() || !state.own_program(tid);
+            let under = match scope {
+                None if others => state.under_program(tid),
+                _ => 0,
+            };
             let tracker = match scope {
                 Some(scope) => state.scopes.get_mut(&scope).unwrap(),
                 None => &mut state.whole,
             };
             tracker.now = now;
             tracker.others = others;
+            tracker.under = under;
+            tracker.starting = None;
             // Recording must never keep the command from continuing.
             let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tracker.handle(&data, tid)
@@ -1596,7 +1749,15 @@ mod imp {
             if recorded.is_err() {
                 tracker.incomplete("the observer failed");
             }
+            let starting = tracker.starting.take();
             if matches!(data.nr as u32, nr::EXECVE | nr::EXECVEAT) {
+                // The command's own program starting another.
+                if scope.is_none()
+                    && !others
+                    && let Some(program) = starting
+                {
+                    state.starts(tid, program);
+                }
                 state.becomes_another(tid);
             }
         }
@@ -1628,6 +1789,8 @@ mod imp {
                     caller: 0,
                     now: 0,
                     others: true,
+                    under: 0,
+                    starting: None,
                 },
             );
         }
@@ -1646,10 +1809,18 @@ mod imp {
         }
 
         /// Count what a scope recorded as the doing of the command as a
-        /// whole after all, as it would have been without the scope.
-        pub fn absorb(&self, report: Report) {
+        /// whole after all, as it would have been without the scope: of
+        /// the program numbered `under`, if it ran in the doing of one.
+        pub fn absorb(&self, report: Report, under: u16) {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            state.whole.report.absorb(report);
+            state.whole.report.absorb(report, under);
+        }
+
+        /// The program, of those the command tells apart, in whose doing
+        /// `process` runs. Zero for none.
+        pub fn under_program(&self, process: u32) -> u16 {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.under_program(process)
         }
 
         /// The record for `root`'s descendants, which have all exited.
@@ -1763,6 +1934,8 @@ mod imp {
                 caller: 0,
                 now: 0,
                 others: false,
+                under: 0,
+                starting: None,
             },
             scopes: HashMap::new(),
             owner: HashMap::new(),
@@ -1772,6 +1945,8 @@ mod imp {
             been: Vec::new(),
             became: 0,
             program: HashMap::new(),
+            started: HashMap::new(),
+            under: HashMap::new(),
         }));
         let noted = {
             let state = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2009,6 +2184,11 @@ mod tests {
             writer: None,
             others: false,
             listed_by_others: false,
+            by: Vec::new(),
+            stray: false,
+            wrote: 0,
+            own_read: false,
+            own_wrote: false,
             first,
             made: 0,
         }
@@ -2085,11 +2265,18 @@ mod tests {
                 ..seen(5, true)
             },
         );
-        whole.absorb(part);
+        whole.absorb(part, 3);
         assert!(whole.network);
-        assert!(whole.paths["/nowhere/only-the-part".as_ref() as &Path].read);
+        let alone = &whole.paths["/nowhere/only-the-part".as_ref() as &Path];
+        assert!(alone.read && alone.by == [3] && !alone.stray);
         // Nothing is there now, so the removal was the last word.
         let shared = &whole.paths["/nowhere/shared".as_ref() as &Path];
-        assert!(shared.removed && shared.read);
+        assert!(shared.removed && shared.read && shared.by == [3]);
+        // A part that ran in no build script's doing is anybody's.
+        let mut part = Report::default();
+        part.paths.insert("/nowhere/shared".into(), read(6));
+        whole.absorb(part, 0);
+        let shared = &whole.paths["/nowhere/shared".as_ref() as &Path];
+        assert!(shared.stray && shared.by == [3]);
     }
 }

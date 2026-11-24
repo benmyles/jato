@@ -7,8 +7,8 @@
 use crate::cas::{Staged, Store};
 use crate::facts::{Facts, keyed};
 use crate::manifest::{
-    Difference, Env, Here, Input, Manifest, Output, Part, Place, Stale, State, Walk, path_dirs,
-    which,
+    Difference, Env, Here, Input, Manifest, Output, Part, Place, Script, Stale, State, Walk,
+    path_dirs, which,
 };
 use crate::observe::{self, Kind, Report, Stamp};
 use crate::roots::{self, Roots, Surroundings};
@@ -27,7 +27,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v8";
+const EPOCH: &str = "jato command v9";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -814,6 +814,7 @@ impl Job {
             // name. The files it settles on are opened, and recorded.
             unlisted: self.facts.search.clone(),
             state: self.facts.incremental.clone(),
+            programs_in: None,
         }
     }
 }
@@ -1283,6 +1284,13 @@ pub struct Parts {
     /// Something else wrote output that names where the build is: a
     /// command that Cargo cannot be had to run again by itself.
     unplaced: bool,
+    /// The commands a build script started, each by the number of the
+    /// script, the numbers of the places it examined, and the places it
+    /// wrote to.
+    scripted: Vec<(u16, Vec<u32>, Vec<Place>)>,
+    /// The numbers of the places examined by commands that neither Cargo
+    /// started as compilers nor a build script started.
+    strayed: HashSet<u32>,
     /// The numbers of the places examined by commands that something else
     /// started, or that wrote nothing by which Cargo could tell them done.
     loose: HashSet<u32>,
@@ -1302,7 +1310,9 @@ impl Parts {
     /// Take in the record of one command. Its paths are relative to the
     /// roots of that command and are restated for the build's. `cargo`
     /// says whether Cargo started the command itself.
-    pub fn add(&mut self, manifest: &Manifest, from: &Roots, to: &Roots, cargo: bool) {
+    /// `under` is the number of the build script the command was started
+    /// in the doing of, where it was one's.
+    pub fn add(&mut self, manifest: &Manifest, from: &Roots, to: &Roots, cargo: bool, under: u16) {
         let place = |root: u8, path: &Path| -> Option<Place> {
             let absolute = from.join(root, path)?;
             let (root, rest) = to.split(&absolute);
@@ -1325,6 +1335,11 @@ impl Parts {
                 examined.push(number);
             } else {
                 self.loose.insert(number);
+                if cargo || under == 0 {
+                    self.strayed.insert(number);
+                } else {
+                    examined.push(number);
+                }
             }
             let link = match &input.link {
                 Some(link) => match text(link) {
@@ -1403,8 +1418,11 @@ impl Parts {
         }
         if apart {
             self.units.push((examined, wrote, names));
-        } else if names {
-            self.unplaced = true;
+        } else {
+            self.unplaced |= names;
+            if !cargo && under != 0 {
+                self.scripted.push((under, examined, wrote));
+            }
         }
         for (root, path) in &manifest.removed {
             match place(*root, path) {
@@ -1445,6 +1463,9 @@ pub struct Start {
     /// Cargo's to lay out anew: a compilation of the earlier build may
     /// no longer be part of it.
     replanned: Vec<u32>,
+    /// The programs of the build scripts that have to run again, by
+    /// their positions among the outputs.
+    rerun: Vec<u32>,
     /// How long the build took that this one starts from.
     cost_ms: u64,
 }
@@ -1472,6 +1493,23 @@ impl Start {
             .filter_map(|(output, _)| roots.join(output.root, &output.path))
             .filter(|path| self.replanned.is_empty() || report.paths.contains_key(path))
             .find(|path| !path.exists())
+    }
+
+    /// A build script that had to run again, whose program is there and
+    /// was not run. Cargo runs a build script when its program has been
+    /// made again. If it ever did not, what the script wrote before would
+    /// stand for inputs it never saw.
+    pub fn unrun(&self, roots: &Roots, report: &Report) -> Option<PathBuf> {
+        self.rerun
+            .iter()
+            .filter_map(|program| {
+                let (root, path) = self.place(*program);
+                roots.join(root, &path)
+            })
+            .find(|path| {
+                let ran = report.paths.get(path).is_some_and(|access| access.executed);
+                path.exists() && !ran
+            })
     }
 
     /// Which of the earlier build's compilations, among those not made
@@ -1535,11 +1573,13 @@ impl Start {
 const NEAR: usize = 4;
 
 /// How many times in a row a build may start from one whose manifests
-/// differed. Each time, what Cargo itself keeps of the compilations that
-/// are no longer part of the build stays in the target directory and in
-/// the record, as it does where Cargo is used alone: small files, of no
-/// use and in nobody's way, that a build made from nothing does not have.
-const REPLANS: u32 = 8;
+/// differed. What a compilation or a build script wrote that is no
+/// longer part of the build is taken away each time, and so is what
+/// Cargo kept for itself in a directory it no longer looks at. A file of
+/// Cargo's in a directory it shares among compilations, a list of a
+/// program's sources beside the program, stays behind as it does where
+/// Cargo is used alone, and a build made from nothing does not have it.
+const REPLANS: u32 = 32;
 const MOST: usize = 4096;
 
 /// Look for a recorded build of this command that differs from the present
@@ -1568,6 +1608,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         again: Vec<bool>,
         differences: Vec<Difference>,
         replanned: Vec<u32>,
+        scripts: Vec<bool>,
     }
     let mut best: Option<Near> = None;
     let mut why = None;
@@ -1608,6 +1649,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
             }
             Ok(Stale {
                 mut again,
+                scripts,
                 replanned,
             }) => {
                 if elsewhere.is_some() {
@@ -1630,6 +1672,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
                         again,
                         differences,
                         replanned,
+                        scripts,
                     });
                 }
                 // Near enough: looking at another costs as much as these
@@ -1638,12 +1681,9 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
                     break;
                 }
             }
-            Err(position) => {
+            Err((position, reason)) => {
                 why.get_or_insert_with(|| {
-                    format!(
-                        "{} differs, which the build itself examined",
-                        manifest.named(position, &job.roots)
-                    )
+                    format!("{} differs, {reason}", manifest.named(position, &job.roots))
                 });
             }
         }
@@ -1655,6 +1695,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         again,
         differences,
         replanned,
+        scripts,
         ..
     }) = best
     else {
@@ -1702,6 +1743,21 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         if !replanned.is_empty() && output.root != roots::TARGET {
             leave[at] = true;
             owed[at] = false;
+        }
+    }
+    // What a build script wrote that has to run again is left out with
+    // its program: the script writes what it writes this time where
+    // nothing of the last time is.
+    let mut rerun: Vec<u32> = Vec::new();
+    for (script, again) in manifest.scripts.iter().zip(&scripts) {
+        if *again {
+            rerun.push(script.program);
+            for &output in &script.outputs {
+                if !leave[output as usize] {
+                    leave[output as usize] = true;
+                    owed[output as usize] = false;
+                }
+            }
         }
     }
     let mut damaged = false;
@@ -1759,13 +1815,18 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         0 => "",
         _ => ", and Cargo plans the build again",
     };
+    let scripted = match rerun.len() {
+        0 => String::new(),
+        1 => ", with a build script to run again".to_owned(),
+        more => format!(", with {more} build scripts to run again"),
+    };
     if !replanned.is_empty() {
         store.count("build_replanned", 1);
     }
     log(
         job.name(),
         format_args!(
-            "starting from an earlier build in {} ms: {count} of its {} compilations to make again{differs}{named}{planned}",
+            "starting from an earlier build in {} ms: {count} of its {} compilations to make again{differs}{named}{planned}{scripted}",
             begun.elapsed().as_millis(),
             manifest.parts.len(),
         ),
@@ -1778,6 +1839,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         again,
         now,
         replanned,
+        rerun,
         cost_ms: restored.cost_ms,
     })
 }
@@ -1922,6 +1984,7 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
             manifest,
             now: HashMap::new(),
             replanned: Vec::new(),
+            rerun: Vec::new(),
             cost_ms: 0,
         });
     }
@@ -2080,15 +2143,18 @@ pub fn record(
     // two are one build, of which this run made only what had changed.
     let start = parts.and_then(|parts| parts.start.as_ref());
     let mut carried: HashMap<Place, &Output> = HashMap::new();
-    // Compilations of the earlier build that are none of this one's,
-    // where Cargo planned the build again: what they wrote is taken out
-    // of the target directory, with any copy of it under another name
-    // that Cargo did not ask about either.
+    // What of the earlier build is none of this one's. Where Cargo
+    // planned the build again: what a compilation wrote that Cargo no
+    // longer asked about, with any copy of it under another name that it
+    // did not ask about either, what a build script wrote whose program
+    // went that way, and what Cargo kept for itself in a directory it had
+    // nothing to do with this time. And wherever a build script ran
+    // again: what it had written before and did not write now. All of it
+    // is taken out of the target directory, as a build from nothing
+    // would not have it.
     let dropped: Vec<bool> = start.map_or_else(Vec::new, |start| start.dropped(roots, report));
     let mut gone: HashSet<Place> = HashSet::new();
-    if let Some(start) = start
-        && dropped.contains(&true)
-    {
+    if let Some(start) = start {
         let base = &start.manifest;
         let mut theirs: HashSet<u32> = HashSet::new();
         let mut bytes: HashSet<Digest> = HashSet::new();
@@ -2113,13 +2179,72 @@ pub fn record(
                 gone.insert((output.root, output.path.clone()));
             }
         }
-        for (place, placed) in base.outputs.iter().zip(&start.placed) {
-            if *placed
-                && gone.contains(&(place.root, place.path.clone()))
-                && let Some(path) = roots.join(place.root, &place.path)
-            {
-                let _ = fs::remove_file(path);
+        if !start.replanned.is_empty() {
+            let touched: HashSet<&Path> = report
+                .paths
+                .keys()
+                .filter_map(|path| path.parent())
+                .collect();
+            for &at in &base.ours {
+                let output = &base.outputs[at as usize];
+                if output.root == roots::TARGET
+                    && let Some(path) = roots.join(output.root, &output.path)
+                    && path.parent().is_some_and(|dir| !touched.contains(dir))
+                {
+                    gone.insert((output.root, output.path.clone()));
+                }
             }
+        }
+        let ran: HashSet<Place> = report
+            .programs
+            .iter()
+            .map(|program| {
+                let (root, rel) = roots.split(program);
+                (root, rel.to_owned())
+            })
+            .collect();
+        let written_now = |place: &Place| {
+            parts.is_some_and(|parts| parts.outputs.contains_key(place))
+                || roots.join(place.0, &place.1).is_some_and(|path| {
+                    report.paths.get(&path).is_some_and(|access| access.written)
+                })
+        };
+        for script in &base.scripts {
+            let program = start.place(script.program);
+            let outputs = script.outputs.iter().map(|at| start.place(*at));
+            if gone.contains(&program) {
+                gone.extend(outputs);
+            } else if ran.contains(&program) {
+                gone.extend(outputs.filter(|place| !written_now(place)));
+            }
+        }
+        if !gone.is_empty() {
+            log(
+                job.name(),
+                format_args!(
+                    "taking away {} files of the earlier build that are no part of this one: of {} compilations Cargo did not ask about, and what build scripts wrote that have gone or ran again",
+                    gone.len(),
+                    dropped.iter().filter(|dropped| **dropped).count(),
+                ),
+            );
+        }
+        // The directories that leaves empty go with it, the deepest
+        // first.
+        let mut emptied: BTreeSet<PathBuf> = BTreeSet::new();
+        for (output, placed) in base.outputs.iter().zip(&start.placed) {
+            if *placed
+                && output.root == roots::TARGET
+                && gone.contains(&(output.root, output.path.clone()))
+                && let Some(path) = roots.join(output.root, &output.path)
+                && fs::remove_file(&path).is_ok()
+                && let Some(target) = roots.path(roots::TARGET)
+            {
+                let above = path.ancestors().skip(1);
+                emptied.extend(above.take_while(|dir| *dir != target).map(Path::to_owned));
+            }
+        }
+        for directory in emptied.iter().rev() {
+            let _ = fs::remove_dir(directory);
         }
     }
     if let Some(start) = start {
@@ -2149,6 +2274,17 @@ pub fn record(
     // and every place that program or what it started examined this time.
     let mut cargos: HashSet<Place> = HashSet::new();
     let mut examined_now: HashSet<Place> = HashSet::new();
+    // Those its own program read or listed, those a program examined
+    // that nobody can have run again, and for each build script, by its
+    // number less one, the places it examined and wrote to.
+    let mut read_own: HashSet<Place> = HashSet::new();
+    let mut strayed: HashSet<Place> = HashSet::new();
+    let mut scripts_did: Vec<(Vec<Place>, Vec<Place>)> =
+        vec![Default::default(); report.programs.len()];
+    // What the command's own program wrote, and everything written this
+    // time by it or by what it started.
+    let mut ours: HashSet<Place> = HashSet::new();
+    let mut made_now: HashSet<Place> = HashSet::new();
     // Programs this run started from inside the target directory.
     let mut started: Vec<(Place, PathBuf)> = Vec::new();
     // The names found in each listed directory. Those that turn out to be
@@ -2240,6 +2376,12 @@ pub fn record(
                 ));
             }
             made.insert((root, rel.to_owned()));
+            made_now.insert((root, rel.to_owned()));
+            if let Some(did) = scripts_did.get_mut((access.wrote as usize).wrapping_sub(1)) {
+                did.1.push((root, rel.to_owned()));
+            } else if access.own_wrote {
+                ours.insert((root, rel.to_owned()));
+            }
             match &now {
                 Ok(meta) if meta.is_file() => outputs.push((root, rel.to_owned(), path.clone())),
                 Ok(meta) if meta.is_dir() => (),
@@ -2373,6 +2515,18 @@ pub fn record(
             own.insert((root, rel.to_owned()));
             if job.scope == Scope::Build && !access.others {
                 cargos.insert((root, rel.to_owned()));
+            }
+            if access.own_read {
+                read_own.insert((root, rel.to_owned()));
+            }
+            if access.stray {
+                strayed.insert((root, rel.to_owned()));
+            }
+            for program in &access.by {
+                match scripts_did.get_mut((*program as usize).wrapping_sub(1)) {
+                    Some(did) => did.0.push((root, rel.to_owned())),
+                    None => drop(strayed.insert((root, rel.to_owned()))),
+                }
             }
         }
         examined_now.insert((root, rel.to_owned()));
@@ -2649,12 +2803,19 @@ pub fn record(
                     !apart[position as usize] && base.asked.binary_search(&position).is_err();
                 if listed || nowhere {
                     let place = carry(position, &mut manifest);
-                    // Still only Cargo's, unless something else examined
-                    // it this time.
-                    if base.cargos.binary_search(&position).is_ok()
-                        && !examined_now.contains(&place)
-                    {
-                        cargos.insert(place.clone());
+                    // Who examined it then still stands, unless it was
+                    // examined this time.
+                    if !examined_now.contains(&place) {
+                        let was = |list: &[u32]| list.binary_search(&position).is_ok();
+                        if was(&base.cargos) {
+                            cargos.insert(place.clone());
+                        }
+                        if was(&base.read) {
+                            read_own.insert(place.clone());
+                        }
+                        if was(&base.strays) {
+                            strayed.insert(place.clone());
+                        }
                     }
                     own.insert(place);
                 }
@@ -3099,10 +3260,96 @@ pub fn record(
             .into_iter()
             .filter(|at| theirs.binary_search(at).is_err())
             .collect();
-        manifest.cargos = ordered(cargos.iter().filter_map(input_at).collect())
+        let own_at = |place: &Place| input_at(place).filter(|at| theirs.binary_search(at).is_ok());
+        manifest.cargos = ordered(cargos.iter().filter_map(own_at).collect());
+        manifest.read = ordered(read_own.iter().filter_map(own_at).collect());
+        // The build scripts, each by its program among the outputs, with
+        // what it and the compilers it started examined and wrote. One
+        // whose program is no output of the build cannot be had to run
+        // again, and what it examined is as good as anybody's.
+        let mut strays: Vec<u32> = strayed.iter().filter_map(own_at).collect();
+        let of_own = |at: &u32| theirs.binary_search(at).is_ok();
+        strays.extend(
+            parts
+                .strayed
+                .iter()
+                .filter_map(|number| position[*number as usize])
+                .filter(of_own),
+        );
+        let mut scripts: BTreeMap<u32, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
+        let mut ran_now: HashSet<Place> = HashSet::new();
+        for (number, program) in report.programs.iter().enumerate() {
+            let number = number as u16 + 1;
+            let (root, rel) = roots.split(program);
+            let place = (root, rel.to_owned());
+            let (examined, wrote) = &scripts_did[number as usize - 1];
+            let mut inputs: Vec<u32> = examined.iter().filter_map(own_at).collect();
+            let mut outputs: Vec<u32> = wrote.iter().filter_map(output_at).collect();
+            for (under, numbers, wrote) in &parts.scripted {
+                if *under == number {
+                    let at = numbers.iter().filter_map(|n| position[*n as usize]);
+                    inputs.extend(at.filter(of_own));
+                    outputs.extend(wrote.iter().filter_map(output_at));
+                }
+            }
+            match output_at(&place) {
+                Some(program) => {
+                    let script = scripts.entry(program).or_default();
+                    script.0.extend(inputs);
+                    script.1.extend(outputs);
+                }
+                None => strays.extend(inputs),
+            }
+            ran_now.insert(place);
+        }
+        // A compiler said to be some script's whose number nobody has.
+        for (under, numbers, _) in &parts.scripted {
+            if *under as usize > report.programs.len() {
+                let at = numbers.iter().filter_map(|n| position[*n as usize]);
+                strays.extend(at.filter(of_own));
+            }
+        }
+        // The scripts of the build this one started from that did not run
+        // this time, with what they did then.
+        if let Some(start) = start {
+            let base = &start.manifest;
+            for script in &base.scripts {
+                let place = start.place(script.program);
+                let Some(program) = output_at(&place).filter(|_| !ran_now.contains(&place)) else {
+                    continue;
+                };
+                let inputs = script.inputs.iter().map(|at| {
+                    let input = &base.inputs[*at as usize];
+                    (input.root, input.path.clone())
+                });
+                let outputs = script.outputs.iter().map(|at| start.place(*at));
+                let script = scripts.entry(program).or_default();
+                script.0.extend(inputs.filter_map(|place| own_at(&place)));
+                script
+                    .1
+                    .extend(outputs.filter_map(|place| output_at(&place)));
+            }
+        }
+        manifest.scripts = scripts
             .into_iter()
-            .filter(|at| theirs.binary_search(at).is_ok())
+            .map(|(program, (inputs, outputs))| Script {
+                program,
+                inputs: ordered(inputs),
+                outputs: ordered(outputs),
+            })
             .collect();
+        manifest.strays = ordered(strays);
+        // What Cargo kept for itself, this time or before.
+        if let Some(start) = start {
+            let base = &start.manifest;
+            for &at in &base.ours {
+                let place = start.place(at);
+                if start.placed[at as usize] && !made_now.contains(&place) {
+                    ours.insert(place);
+                }
+            }
+        }
+        manifest.ours = ordered(ours.iter().filter_map(output_at).collect());
         manifest.own = theirs;
         manifest.parts = apart;
     }
@@ -3704,6 +3951,30 @@ pub fn finish(
                     }
                 ),
             );
+            if job.scope == Scope::Build {
+                // What a later build could start from this one by.
+                let of_scripts = |pick: fn(&Script) -> usize| -> usize {
+                    manifest.scripts.iter().map(pick).sum()
+                };
+                log(
+                    job.name(),
+                    format_args!(
+                        "  of its inputs {} are the compilers', {} only Cargo examined, {} its {} build scripts examined and {} a program that cannot be run again; of its outputs {} are the compilers', {} the build scripts' and {} Cargo's own",
+                        manifest.inputs.len() - manifest.own.len() - manifest.asked.len(),
+                        manifest.cargos.len() + manifest.asked.len(),
+                        of_scripts(|script| script.inputs.len()),
+                        manifest.scripts.len(),
+                        manifest.strays.len(),
+                        manifest
+                            .parts
+                            .iter()
+                            .map(|part| part.outputs.len())
+                            .sum::<usize>(),
+                        of_scripts(|script| script.outputs.len()),
+                        manifest.ours.len(),
+                    ),
+                );
+            }
         }
         Err(why) => {
             store.count(job.counter("uncacheable"), 1);

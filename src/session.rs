@@ -148,9 +148,9 @@ impl Server {
         parts.unusable.get_or_insert_with(|| why.to_owned());
     }
 
-    fn used(&self, job: &Job, manifest: &crate::manifest::Manifest, cargo: bool) {
+    fn used(&self, job: &Job, manifest: &crate::manifest::Manifest, cargo: bool, under: u16) {
         let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
-        parts.add(manifest, &job.roots, &self.roots, cargo);
+        parts.add(manifest, &job.roots, &self.roots, cargo, under);
     }
 
     /// Whether the process that started `pid` is Cargo: runs a program
@@ -192,6 +192,13 @@ impl Server {
             return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
         }
         let cargo = !tool && self.started_by_cargo(pid);
+        // The build script in whose doing a compiler was started that is
+        // none of Cargo's own.
+        let under = if cargo {
+            0
+        } else {
+            self.scopes.under_program(pid)
+        };
         let request = Request {
             program,
             args,
@@ -232,7 +239,7 @@ impl Server {
             (lock, found) = command::before_running(&job, &mut store, &recipe);
         }
         if let Some((outcome, manifest)) = found {
-            self.used(&job, &manifest, cargo);
+            self.used(&job, &manifest, cargo, under);
             store.flush();
             self.stores
                 .lock()
@@ -276,7 +283,7 @@ impl Server {
         );
         let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
             Ok(manifest) => {
-                self.used(&job, &manifest, cargo);
+                self.used(&job, &manifest, cargo, under);
                 Some(report)
             }
             // A build goes on after a command that failed where the
@@ -286,7 +293,7 @@ impl Server {
             // way it was the build's doing, as it would have been without
             // a record of its own.
             Err(_) if job.tool || !ran.success => {
-                self.scopes.absorb(report);
+                self.scopes.absorb(report, under);
                 None
             }
             // A Rust compilation that worked but cannot be reused leaves
@@ -806,6 +813,9 @@ fn supervise(
         ignore,
         unlisted: Vec::new(),
         state: None,
+        // The build scripts Cargo runs are told apart, each with what it
+        // and everything it starts examines and writes.
+        programs_in: job.roots.path(crate::roots::TARGET).map(Path::to_owned),
     };
     // And the tokens for this build's own compilers, kept in the cache
     // directory until Cargo has gone.
@@ -924,13 +934,16 @@ fn supervise(
         .and_then(|start| {
             // The tests name a file here to go through what follows.
             let pretended = || std::env::var_os("JATO_TEST_DOUBT").map(PathBuf::from);
-            start.unmade(&job.roots, &report).or_else(pretended)
+            start
+                .unmade(&job.roots, &report)
+                .or_else(|| start.unrun(&job.roots, &report))
+                .or_else(pretended)
         });
     if let Some(unmade) = unmade {
         log(
             name,
             format_args!(
-                "Cargo did not make {} again: taking away what this build started from, and building from nothing",
+                "Cargo did not make or run {} again: taking away what this build started from, and building from nothing",
                 unmade.display()
             ),
         );

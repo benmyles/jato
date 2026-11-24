@@ -1431,7 +1431,7 @@ fn what_only_a_macro_reads_is_compiled_again_in_a_build_started_from_another() {
 }
 
 #[test]
-fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
+fn what_a_build_script_reads_has_it_run_again_and_settings_leave_nothing_to_start_from() {
     if !observes() {
         return;
     }
@@ -1463,12 +1463,14 @@ fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
         root
     };
     // What the build script read differs: Cargo would not run it again
-    // in a target directory that holds its output.
+    // in a target directory that holds its output. It runs again all the
+    // same, for the compiler that made it does.
     let second = copy("second", "2");
     make_old(&second.join("number.txt"));
     let out = success(p.command_in(&second).args(["run", "-q"]));
     assert_eq!(out.stdout, b"2 one:none 5\n");
-    assert_eq!(p.count("build_near"), 0, "{}", p.stats());
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.stale_for_cargo(&second, &second.join("target")), 0);
     // A manifest differs, and the lock file that went with it is gone.
     let third = copy("third", "1");
     let manifest = fs::read_to_string(third.join("side/Cargo.toml")).unwrap();
@@ -1481,14 +1483,25 @@ fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
     assert_eq!(out.stdout, b"1 one:none 5\n");
     // That is Cargo's own to plan the build with again, and the build
     // starts from the first: see the test of manifests that differ.
-    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_near"), 2, "{}", p.stats());
     // A file appears where Cargo looked for programs to build and found
-    // no directory.
+    // no directory: Cargo's to find, like the manifest.
     let fourth = copy("fourth", "1");
     write(fourth.join("src/bin/extra.rs"), "fn main() {}");
     success(p.command_in(&fourth).args(["build"]));
     assert!(fourth.join("target/debug/extra").exists());
-    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_near"), 3, "{}", p.stats());
+    assert_eq!(p.stale_for_cargo(&fourth, &fourth.join("target")), 0);
+    // Settings of Cargo's appear. What they do to a compilation Cargo
+    // does not always remember, so the build is carried out.
+    let sixth = copy("sixth", "1");
+    write(
+        sixth.join(".cargo/config.toml"),
+        "[env]\nLEAF_ENV = \"set\"\n",
+    );
+    let out = success(p.command_in(&sixth).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"1 one:set 5\n");
+    assert_eq!(p.count("build_near"), 3, "{}", p.stats());
     // The build script itself differs. Its compiler is one of Cargo's, so
     // the build starts from the first, and Cargo builds the script again
     // and runs it. What it then leaves in a directory the first script
@@ -1504,7 +1517,7 @@ fn a_change_to_what_the_build_itself_reads_leaves_nothing_to_start_from() {
     let stored = p.count("build_stored");
     let out = success(p.command_in(&fifth).args(["run", "-q"]));
     assert_eq!(out.stdout, b"11 one:none 5\n");
-    assert_eq!(p.count("build_near"), 2, "{}", p.stats());
+    assert_eq!(p.count("build_near"), 4, "{}", p.stats());
     assert_eq!(p.count("build_stored"), stored, "{}", p.stats());
 }
 
@@ -1622,23 +1635,9 @@ fn a_build_whose_manifests_differ_starts_from_one_made_before() {
     assert_eq!(program(&third), "one:none 5\n");
     assert_eq!(p.stale_for_cargo(&third, &third.join("target")), 0);
     // What the compilers of the library as it was had written is gone,
-    // and nothing is there that a build from nothing lacks but what
-    // Cargo keeps to itself of a compilation.
-    let (here, clean) = (files_of(&third.join("target")), from_nothing(&third));
-    assert!(
-        clean.is_subset(&here),
-        "{:?}",
-        clean.difference(&here).collect::<Vec<_>>()
-    );
-    let more: Vec<_> = here.difference(&clean).collect();
-    assert!(
-        more.iter().all(|path| {
-            let name = path.file_name().unwrap().to_string_lossy();
-            !(name.ends_with(".rlib") || name.ends_with(".rmeta") || name.ends_with(".d"))
-                && path.extension().is_some()
-        }),
-        "{more:?}"
-    );
+    // with what Cargo kept of them: file for file what a build from
+    // nothing leaves.
+    assert_eq!(files_of(&third.join("target")), from_nothing(&third));
 
     // A library gets a new version: Cargo compiles the library and what
     // uses it, and writes the lock file. A build that changed what it
@@ -1660,12 +1659,7 @@ fn a_build_whose_manifests_differ_starts_from_one_made_before() {
     assert_ne!(fs::read_to_string(fourth.join("Cargo.lock")).unwrap(), lock);
     assert_eq!(program(&fourth), "one:none 5\n");
     assert_eq!(p.stale_for_cargo(&fourth, &fourth.join("target")), 0);
-    let (here, clean) = (files_of(&fourth.join("target")), from_nothing(&fourth));
-    assert!(
-        clean.is_subset(&here),
-        "{:?}",
-        clean.difference(&here).collect::<Vec<_>>()
-    );
+    assert_eq!(files_of(&fourth.join("target")), from_nothing(&fourth));
 
     // A program is added where Cargo looks for programs, and a crate
     // beside the others that the application now uses.
@@ -1697,15 +1691,11 @@ fn a_build_whose_manifests_differ_starts_from_one_made_before() {
         .unwrap();
     assert_eq!(two.stdout, b"two\n");
     assert_eq!(p.stale_for_cargo(&fifth, &fifth.join("target")), 0);
-    let (here, clean) = (files_of(&fifth.join("target")), from_nothing(&fifth));
-    assert!(
-        clean.is_subset(&here),
-        "{:?}",
-        clean.difference(&here).collect::<Vec<_>>()
-    );
+    assert_eq!(files_of(&fifth.join("target")), from_nothing(&fifth));
     assert_eq!(p.count("build_replanned"), 4, "{}", p.stats());
 
-    // A manifest that a build script reads is not Cargo's alone.
+    // A manifest that a build script reads as well is that script's to
+    // read again: it runs, and Cargo plans the build.
     let q = Project::whole();
     let script = "fn main() { let m = std::fs::read_to_string(\"Cargo.toml\").unwrap(); println!(\"cargo:rustc-env=LEAF_ENV={}\", m.len()); println!(\"cargo:rerun-if-changed=build.rs\"); }";
     write(q.root.join("leaf/build.rs"), script);
@@ -1720,7 +1710,48 @@ fn a_build_whose_manifests_differ_starts_from_one_made_before() {
         &format!("{manifest}\n[package.metadata.notes]\nkept = true\n"),
     );
     success(q.command_in(&sixth).args(["build"]));
-    assert_eq!(q.count("build_near"), 0, "{}", q.stats());
+    assert_eq!(q.count("build_near"), 1, "{}", q.stats());
+    assert_eq!(q.count("build_replanned"), 1, "{}", q.stats());
+
+    // A library with a build script gets a new version. Cargo runs the
+    // script for the library as it now is, in a directory of its own,
+    // and what the script wrote for the library as it was goes with what
+    // Cargo kept of that run.
+    let r = Project::whole();
+    let script = "fn main() { let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/made.rs\"), \"pub const MADE: u32 = 3;\").unwrap(); println!(\"cargo:rerun-if-changed=build.rs\"); }";
+    let ready = |root: &Path| {
+        write(root.join("leaf/build.rs"), script);
+        write(
+            root.join("leaf/src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/made.rs\"));\npub fn value() -> u32 { MADE }",
+        );
+    };
+    ready(&r.root);
+    assert_eq!(r.run(&["run", "-q"]).stdout, b"3\n");
+    r.run(&["build"]);
+    let seventh = r.temp.path().join("seventh");
+    populate(&seventh);
+    ready(&seventh);
+    let manifest = fs::read_to_string(seventh.join("leaf/Cargo.toml")).unwrap();
+    write(
+        seventh.join("leaf/Cargo.toml"),
+        &manifest.replace("0.1.0", "0.3.0"),
+    );
+    success(r.command_in(&seventh).args(["build"]));
+    assert_eq!(r.count("build_replanned"), 1, "{}", r.stats());
+    let out = Command::new(seventh.join("target/debug/app"))
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, b"3\n");
+    assert_eq!(r.stale_for_cargo(&seventh, &seventh.join("target")), 0);
+    let target = seventh.join("target-from-nothing");
+    success(
+        r.command_in(&seventh)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("JATO_CACHE_DIR", seventh.join("cache-of-its-own"))
+            .args(["build"]),
+    );
+    assert_eq!(files_of(&seventh.join("target")), files_of(&target));
     let out = Command::new(sixth.join("target/debug/app"))
         .output()
         .unwrap();
@@ -1759,24 +1790,58 @@ fn a_build_started_from_another_that_fails_is_finished_by_the_next() {
 }
 
 #[test]
-fn a_change_to_c_that_a_build_script_compiles_leaves_nothing_to_start_from() {
+fn changed_c_that_a_build_script_compiles_has_the_script_run_again() {
     if !observes() {
         return;
     }
-    // Cargo does not know what a build script's compiler wrote, and would
-    // not run the script again for its being gone.
+    // Cargo does not know what a build script's compiler read, and would
+    // not run the script again for a header that looks older than what
+    // the script wrote. The record of the build says which script it was
+    // that had the header read, and the script runs again because the
+    // compiler that made it does.
     let p = Project::whole();
     compile_c(&p.root);
     assert_eq!(p.run(&["run", "-q"]).stdout, b"42\n");
-    let second = p.temp.path().join("second/checkout");
-    populate(&second);
-    compile_c(&second);
-    fs::copy(p.root.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
-    write(second.join("native/answer.h"), "#define ANSWER 44\n");
-    make_old(&second.join("native/answer.h"));
-    let out = success(p.command_in(&second).args(["run", "-q"]));
+    let copy = |name: &str| {
+        let root = p.temp.path().join(name).join("checkout");
+        populate(&root);
+        compile_c(&root);
+        fs::copy(p.root.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        write(root.join("native/answer.h"), "#define ANSWER 44\n");
+        make_old(&root.join("native/answer.h"));
+        root
+    };
+    let second = copy("second");
+    let compiled = p.count("tool_stored");
+    let out = success(
+        p.command_in(&second)
+            .env("JATO_LOG", "debug")
+            .args(["run", "-q"]),
+    );
     assert_eq!(out.stdout, b"44\n");
-    assert_eq!(p.count("build_near"), 0, "{}", p.stats());
+    let said = decisions(&out, "cargo");
+    assert!(
+        said.iter()
+            .any(|d| d.contains("a build script to run again")),
+        "{said:?}"
+    );
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("tool_stored"), compiled + 1, "{}", p.stats());
+    // The library has nothing to do with it.
+    assert!(
+        decisions(&out, "leaf").is_empty(),
+        "{:?}",
+        decisions(&out, "leaf")
+    );
+    assert_eq!(p.stale_for_cargo(&second, &second.join("target")), 0);
+    // The build is one to put back.
+    let third = copy("third");
+    let whole = p.count("build_hit");
+    assert_eq!(
+        success(p.command_in(&third).args(["run", "-q"])).stdout,
+        b"44\n"
+    );
+    assert_eq!(p.count("build_hit"), whole + 1, "{}", p.stats());
 }
 
 /// Run a command whose input and output are a terminal of so many
