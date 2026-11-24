@@ -113,6 +113,8 @@ python3 bench/compare.py --offline --project /path/to/olo --command check --c-co
 
 The data is in `bench/olo-server-0.17-{check,build}-{jato,kache}.json`.
 
+`bench/same.py A/target B/target` compares two target directories file by file, with where each is taken out of what the files say: for a build that started from another against one of the same sources made from nothing, in a second worktree with a cache of its own.
+
 ## ripgrep
 
 ripgrep 14.1.1 on Rust 1.100, default dev profile, median of three rotating runs; load average 21 to 30. `jato` is `jato build`; `jato wrapper` is plain Cargo with Jato as `RUSTC_WRAPPER`, which reuses single compilations only.
