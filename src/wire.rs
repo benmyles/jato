@@ -114,3 +114,38 @@ pub fn receive(stream: &mut impl Read) -> io::Result<Vec<u8>> {
     stream.read_exact(&mut message)?;
     Ok(message)
 }
+
+/// Whether the peer connected on `stream` runs as the same effective user as
+/// this process. Abstract Linux Unix sockets have no filesystem permissions,
+/// so supervisors verify peer credentials before accepting any request.
+#[cfg(target_os = "linux")]
+pub fn same_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    ok == 0
+        && len as usize == std::mem::size_of::<libc::ucred>()
+        && cred.uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn socketpair_peer_is_same_user() {
+        let (a, b) = UnixStream::pair().unwrap();
+        assert!(same_user(&a));
+        assert!(same_user(&b));
+    }
+}

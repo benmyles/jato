@@ -87,6 +87,8 @@ Environment
                       cache; default is the number of processors, 0 any number
   JATO_LOG=debug      Explain each decision on stderr; an absolute path
                       appends to that file
+  JATO_RECIPES        Directory where each command's recipe inputs are written
+                      for comparing cache misses between two runs
   JATO_KEY_ENV        Comma-separated variables a proc macro reads from the
                       environment
   JATO_EDIT_WINDOW    Seconds within which a crate compiled again counts as
@@ -99,6 +101,8 @@ Environment
                       differ; have Cargo carry out the whole of it
   JATO_SEED=0         Never seed an empty target from another command's build
   JATO_ASYNC_RECORD=0 Wait for compiler output staging before waking Cargo
+  JATO_JOBSERVER=0    Leave Cargo to make its own jobserver pipe (1 forces
+                      a named FIFO without checking make's version)
   JATO_TOOLS=0        Leave the C compilers and assemblers that build scripts
                       start to themselves
   JATO_SAVED_STATE=0  Leave rustc's incremental state out of the cache
@@ -292,9 +296,11 @@ fn main() {
     // The directory in which compilers' names lead to this program is for
     // build scripts. Whatever this process looks up or starts finds the
     // programs themselves.
-    if let (Some(stand_ins), Some(path)) = (env::var_os(tools::DIRECTORY), env::var_os("PATH")) {
+    let stand_ins = env::var_os(tools::DIRECTORY);
+    let raw_path = env::var_os("PATH");
+    if let (Some(stand_ins), Some(path)) = (&stand_ins, &raw_path) {
         // Nothing else is running yet in this process.
-        unsafe { env::set_var("PATH", tools::without(&path, &stand_ins)) };
+        unsafe { env::set_var("PATH", tools::without(path, stand_ins)) };
     }
     if let Some(name) = env::args_os()
         .next()
@@ -302,7 +308,13 @@ fn main() {
     {
         let args: Vec<_> = env::args_os().skip(1).collect();
         let path = env::var_os("PATH").unwrap_or_default();
-        let code = match tools::find(name, &path) {
+        let program = stand_ins
+            .as_deref()
+            .zip(raw_path.as_deref())
+            .and_then(|(dir, raw)| tools::after(raw, dir))
+            .and_then(|tail| tools::find(name, &tail))
+            .or_else(|| tools::find(name, &path));
+        let code = match program {
             Some(program) => command::stand_in(&program, &args).unwrap_or_else(|e| {
                 eprintln!("jato: {name}: {e:#}");
                 1

@@ -67,6 +67,16 @@ pub fn without(path: &OsStr, dir: &OsStr) -> OsString {
     env::join_paths(kept).unwrap_or_else(|_| path.to_owned())
 }
 
+/// The entries of `path` that follow `dir`, if `dir` appears in `path`.
+/// Used when a stand-in is invoked directly by a wrapper placed ahead of it
+/// on `PATH`, so looking up the real compiler does not loop back to the wrapper.
+pub fn after(path: &OsStr, dir: &OsStr) -> Option<OsString> {
+    let mut dirs = env::split_paths(path);
+    dirs.find(|entry| entry.as_os_str() == dir)?;
+    let rest: Vec<_> = dirs.filter(|entry| entry.as_os_str() != dir).collect();
+    env::join_paths(rest).ok()
+}
+
 /// Where `path` finds the program `name`: a file that may be run and is
 /// not this program under another name.
 pub fn find(name: &str, path: &OsStr) -> Option<PathBuf> {
@@ -164,5 +174,13 @@ mod tests {
     fn the_directory_of_stand_ins_is_left_out_of_a_search() {
         let path = OsStr::new("/a/stand-ins:/usr/bin:/a/stand-ins:/bin");
         assert_eq!(without(path, OsStr::new("/a/stand-ins")), "/usr/bin:/bin");
+        assert_eq!(
+            after(
+                OsStr::new("/shim:/a/stand-ins:/usr/bin:/bin"),
+                OsStr::new("/a/stand-ins")
+            ),
+            Some(OsString::from("/usr/bin:/bin"))
+        );
+        assert_eq!(after(path, OsStr::new("/missing")), None);
     }
 }

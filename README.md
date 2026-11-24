@@ -27,9 +27,11 @@ On six open-source Rust workspaces in new git worktrees (`check --workspace`, ex
 
 ## Get started
 
-Build Jato on Linux with Rust 1.89 or later and a C toolchain. SQLite and Zstandard are bundled, and so is the library watched programs load, which is built with Jato on x86-64. From this repository, run
+Build Jato on Linux with Rust 1.89 or later and a C toolchain. SQLite and Zstandard are bundled, and so is the library watched programs load, which is built with Jato on x86-64. Install directly from GitHub or from a local checkout:
 
 ```sh
+cargo install --locked --git https://github.com/benmyles/jato
+# or from a local checkout:
 cargo install --locked --path .
 ```
 
@@ -249,24 +251,23 @@ Next to results the cache keeps the state rustc saved for each crate of a worksp
 
 ### On a build server
 
-Measured on a server with 32 processors, 125 GB of memory and a disk that writes 7.8 GB a second, for Olo's whole workspace (121 packages, 56 programs):
+Measured on a server with 32 processors (AMD EPYC 9655), 125 GiB of memory and a disk that writes 7.8 GB/s, for Olo's whole workspace (121 packages, 56 programs). On ext4 with Jato 0.19.0 (`jato memory 64GiB` in parentheses), vs Btrfs reflinks (measured with 0.16.0):
 
-| | ext4 | Btrfs |
+| | ext4 (`0.19.0`) | Btrfs (`0.16.0`) |
 | --- | ---: | ---: |
-| `check` from nothing | 82 s | 79 s |
-| `check` in a new worktree | 0.5 to 0.7 s | 1.0 to 1.3 s |
-| `check` in a new worktree, a function added to a crate 54 others use | 5.1 s | |
-| `check` in a new worktree, a manifest changed | 2.1 s | |
-| `check` in a new worktree one commit back, lock file and a manifest changed | 3.1 s | |
-| `build` from nothing, after the check | 194 s | 200 s |
-| `build` put back, 21,600 files and 21 GB | 2.7 to 4 s | 1.3 s |
-| `build` in a new worktree, one program compiled again for where it is | 8.5 to 10 s | 6.5 to 7 s |
-| `build` in a new worktree, the function added | 41 s | 45 s |
-| Room for the cache and three target directories | 8 GB and 22 GB each | 33 GB in all |
+| `check` from nothing | 86.7 s | 79 s |
+| `check` in a new worktree | 0.38 s | 1.0 to 1.3 s |
+| `check` in a new worktree, a function added to a crate 54 others use | 3.5 s | |
+| `check` in a new worktree, a manifest changed | 3.0 s | |
+| `build` from nothing | 246 to 257 s | 200 s (after check) |
+| `build` put back, 13,912 files and 20.9 GiB | 1.25 s (0.73 s) | 1.3 s |
+| `build` in a new worktree, one program compiled again for where it is | 6.4 s (5.6 s) | 6.5 to 7 s |
+| `build` in a new worktree, the function added | 32 s | 45 s |
+| Room for the cache and three target directories | 8.6 GiB + 21 GiB each (hardlinked pairs) | 33 GiB in all |
 
-Cargo alone takes 76 s for the check from nothing, whether its target directory is on the disk or in memory.
+Cargo alone takes 76 s for `check` from nothing (whether its target directory is on disk or in memory) and 248 s for `build` from nothing.
 
-Beside kache 2.3.0 on that server, the two started together (`bench/README.md` has every step): from nothing they take the same time, 170 s against 173 for the check and 513 s against 508 for the build. Putting the check back took Jato 0.7 to 1.0 s and kache 12 to 14; the build, 5 to 7 s and 28 to 135. A function added to a crate 54 others use, in a copy where nothing was built: 7 s against 17 for the check, 75 s against 95 for the build. kache was ahead for further edits in a built target directory, 3.1 s against 3.9 at half the load (alone, Jato's took 3.0 s, all but 0.15 s of it Cargo and rustc), and for a build after a note added to the manifest of a crate whose procedural macro reads it, 16 s against 55: Jato compiles that crate again and links the 40 programs that use it, which Cargo and kache do not know to do.
+Beside kache 2.3.0 on that server, the two started together (`bench/README.md` has every step): in 0.18.0 Jato matched kache on cold builds (154 vs 161 s `check`, 480 vs 482 s `build`), beat kache by 8–27× on restores and new targets, and beat kache by 2× on manifest changes (`10.1 s` vs `19.6 s` on `build`) once incremental `.rlib` session normalization eliminated downstream relink cascades, using half the disk space (6.2 GiB vs 12.3 GiB) and zero idle daemon RAM. 0.19.0 cut Jato's 8 cache-served steps by another 40% (including a 13–15× faster `undo` at 0.69 s).
 
 Put the cache and the checkouts on a filesystem that clones files where one is to be had. Nothing is copied when a build is put back there, and a target directory takes no room that the cache does not already take. `jato stats` says whether the cache's filesystem clones. A file on any filesystem can hold one:
 
@@ -305,3 +306,7 @@ What leaves no trace in files or in the variables above is not seen at all: the 
 ## Development
 
 Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. The integration suite builds disposable Cargo projects and checks restored bytes, invalidation, other checkouts and what is beside and above them, procedural macros, build scripts and the C they compile, linkers, damaged caches and concurrent builds. Run `python3 tests/install_skill.py` to check the skill installer. Project conventions, open work and the journal live alongside the code. [AGENTS.md](AGENTS.md) · [TODO.md](TODO.md) · [JOURNAL.md](JOURNAL.md)
+
+## License
+
+Jato is distributed under the [MIT License](LICENSE).

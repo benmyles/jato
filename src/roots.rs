@@ -551,61 +551,61 @@ mod surroundings {
     #[test]
     fn what_is_beside_a_workspace_is_told_from_what_has_a_name_of_its_own() {
         let here = around(
-            "/nowhere/ben/src/olo",
+            "/nowhere/user/src/app",
             &[
-                ("HOME", "/nowhere/ben"),
+                ("HOME", "/nowhere/user"),
                 (
                     "PATH",
-                    "/usr/bin:/nowhere/ben/bin:/nowhere/ben/src/tools/bin",
+                    "/usr/bin:/nowhere/user/bin:/nowhere/user/src/tools/bin",
                 ),
-                ("PWD", "/nowhere/ben/src/olo"),
-                ("OLDPWD", "/nowhere/ben/src/other"),
+                ("PWD", "/nowhere/user/src/app"),
+                ("OLDPWD", "/nowhere/user/src/other"),
             ],
         );
         // A crate next to the checkout, and the directory both are in.
-        assert!(here.beside(Path::new("/nowhere/ben/src/shared/Cargo.toml")));
-        assert!(here.beside(Path::new("/nowhere/ben/src/.cargo/config.toml")));
-        assert!(!here.named(Path::new("/nowhere/ben/src/other/lib.rs")));
+        assert!(here.beside(Path::new("/nowhere/user/src/shared/Cargo.toml")));
+        assert!(here.beside(Path::new("/nowhere/user/src/.cargo/config.toml")));
+        assert!(!here.named(Path::new("/nowhere/user/src/other/lib.rs")));
         // The person's other files and the system's are further away.
-        assert!(!here.beside(Path::new("/nowhere/ben/notes.txt")));
+        assert!(!here.beside(Path::new("/nowhere/user/notes.txt")));
         assert!(!here.beside(Path::new("/usr/lib64/libc.so.6")));
         // Cargo's home, and a directory PATH names, are reached by name.
-        assert!(here.named(Path::new("/nowhere/ben/.cargo/registry/index")));
-        assert!(here.named(Path::new("/nowhere/ben/src/tools/bin/protoc")));
+        assert!(here.named(Path::new("/nowhere/user/.cargo/registry/index")));
+        assert!(here.named(Path::new("/nowhere/user/src/tools/bin/protoc")));
         assert!(here.named(Path::new("/usr/bin/cc")));
         // A home directory the workspace is in names nothing in particular.
-        assert!(!here.named(Path::new("/nowhere/ben/notes.txt")));
+        assert!(!here.named(Path::new("/nowhere/user/notes.txt")));
 
         // Directly in a home directory, everything else there is beside it.
-        let low = around("/nowhere/ben/olo", &[("HOME", "/nowhere/ben")]);
-        assert!(low.beside(Path::new("/nowhere/ben/shared/lib.rs")));
+        let low = around("/nowhere/user/app", &[("HOME", "/nowhere/user")]);
+        assert!(low.beside(Path::new("/nowhere/user/shared/lib.rs")));
         assert!(!low.beside(Path::new("/nowhere/other/file")));
         // All but what programs keep there for the person, under names
         // that begin with a dot: those they find by the home directory.
-        assert!(low.beside(Path::new("/nowhere/ben/.gitconfig")));
-        assert!(low.kept(Path::new("/nowhere/ben/.gitconfig")));
-        assert!(low.kept(Path::new("/nowhere/ben/.config/git/config")));
-        assert!(!low.kept(Path::new("/nowhere/ben/shared/.gitconfig")));
-        assert!(!low.kept(Path::new("/nowhere/ben/shared/lib.rs")));
-        assert!(!low.kept(Path::new("/nowhere/ben")));
+        assert!(low.beside(Path::new("/nowhere/user/.gitconfig")));
+        assert!(low.kept(Path::new("/nowhere/user/.gitconfig")));
+        assert!(low.kept(Path::new("/nowhere/user/.config/git/config")));
+        assert!(!low.kept(Path::new("/nowhere/user/shared/.gitconfig")));
+        assert!(!low.kept(Path::new("/nowhere/user/shared/lib.rs")));
+        assert!(!low.kept(Path::new("/nowhere/user")));
         assert!(!low.kept(Path::new("/nowhere/other/.gitconfig")));
         // Not a workspace that is itself in such a place, nor one that is
         // not in the home directory at all.
-        let hidden = around("/nowhere/ben/.work/olo", &[("HOME", "/nowhere/ben")]);
-        assert!(!hidden.kept(Path::new("/nowhere/ben/.work/shared/lib.rs")));
-        assert!(hidden.kept(Path::new("/nowhere/ben/.gitconfig")));
-        let away = around("/elsewhere/src/olo", &[("HOME", "/nowhere/ben")]);
-        assert!(!away.kept(Path::new("/nowhere/ben/.gitconfig")));
+        let hidden = around("/nowhere/user/.work/app", &[("HOME", "/nowhere/user")]);
+        assert!(!hidden.kept(Path::new("/nowhere/user/.work/shared/lib.rs")));
+        assert!(hidden.kept(Path::new("/nowhere/user/.gitconfig")));
+        let away = around("/elsewhere/src/app", &[("HOME", "/nowhere/user")]);
+        assert!(!away.kept(Path::new("/nowhere/user/.gitconfig")));
         // At the top of the filesystem nothing is.
-        assert!(!around("/olo", &[]).beside(Path::new("/shared/lib.rs")));
+        assert!(!around("/app", &[]).beside(Path::new("/shared/lib.rs")));
     }
 
     #[test]
     fn a_place_above_a_workspace_is_written_from_inside_it() {
-        let here = around("/nowhere/ben/src/olo", &[]);
+        let here = around("/nowhere/user/src/app", &[]);
         for (path, up, rest) in [
-            ("/nowhere/ben/src/shared/lib.rs", 1, "shared/lib.rs"),
-            ("/nowhere/ben/src", 1, ""),
+            ("/nowhere/user/src/shared/lib.rs", 1, "shared/lib.rs"),
+            ("/nowhere/user/src", 1, ""),
             ("/nowhere/.cargo/config.toml", 3, ".cargo/config.toml"),
             ("/.cargo/config.toml", 4, ".cargo/config.toml"),
             ("/usr/lib/libc.so", 4, "usr/lib/libc.so"),
@@ -613,7 +613,7 @@ mod surroundings {
             assert_eq!(here.above(Path::new(path)), (up, Path::new(rest)), "{path}");
             let way = Surroundings::from_inside(up, Path::new(rest));
             // Followed from the workspace, the way leads back.
-            let mut back = PathBuf::from("/nowhere/ben/src/olo");
+            let mut back = PathBuf::from("/nowhere/user/src/app");
             for part in way.components() {
                 match part {
                     std::path::Component::ParentDir => drop(back.pop()),

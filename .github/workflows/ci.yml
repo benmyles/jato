@@ -26,6 +26,9 @@ jobs:
       - name: Test with every file call reported by the kernel
         if: matrix.rust == 'stable'
         run: JATO_NOTES=0 cargo +stable test --locked --test cargo
+      - name: Test with packed storage
+        if: matrix.rust == 'stable'
+        run: JATO_STORAGE=packed cargo +stable test --locked --test cargo
       - name: Test with upstream mold and the pinned nightly
         if: matrix.rust == 'stable'
         run: |

@@ -104,9 +104,23 @@ impl Project {
             .env_remove("JATO_DISABLE")
             .env_remove("JATO_LOG")
             .env_remove("JATO_MAX_SIZE")
+            .env_remove("JATO_MEMORY")
             .env_remove("JATO_KEY_ENV")
             .env_remove("JATO_OBSERVED")
             .env_remove("JATO_PATH")
+            .env_remove("JATO_CACHE_TESTS")
+            .env_remove("JATO_PARALLEL_TESTS")
+            .env_remove("JATO_SEED")
+            .env_remove("JATO_NEAR")
+            .env_remove("JATO_ASYNC_RECORD")
+            .env_remove("JATO_STAND_INS")
+            .env_remove("JATO_SESSION")
+            .env_remove("JATO_TEST_SESSION")
+            .env_remove("JATO_REMOTE")
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .env("TERM", "xterm-256color")
             // Tests edit and build within seconds and expect each result to
             // be recorded. The test of editing spells says otherwise.
             .env("JATO_EDIT_WINDOW", "0")
@@ -117,6 +131,14 @@ impl Project {
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("RUSTC_BOOTSTRAP")
             .env_remove("LEAF_ENV");
+        if let (Some(stand_ins), Some(path)) =
+            (std::env::var_os("JATO_STAND_INS"), std::env::var_os("PATH"))
+        {
+            let kept = std::env::split_paths(&path).filter(|dir| dir.as_os_str() != stand_ins);
+            if let Ok(cleaned) = std::env::join_paths(kept) {
+                cmd.env("PATH", cleaned);
+            }
+        }
         if !self.whole {
             cmd.env("JATO_WHOLE_BUILDS", "0");
         }
@@ -1876,6 +1898,10 @@ fn on_terminal(cmd: &mut Command, columns: u16) -> (bool, Vec<u8>) {
     assert_eq!(made, 0);
     let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(ours), OwnedFd::from_raw_fd(theirs)) };
     let mut child = cmd
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
+        .env_remove("CLICOLOR_FORCE")
         .stdin(theirs.try_clone().unwrap())
         .stdout(theirs.try_clone().unwrap())
         .stderr(theirs)
@@ -4594,7 +4620,12 @@ fn a_program_found_earlier_on_path_is_noticed() {
         return;
     }
     let p = Project::new();
-    let Some(system_cc) = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+    let mut search = std::env::var_os("PATH").unwrap();
+    if let Some(stand_ins) = std::env::var_os("JATO_STAND_INS") {
+        let kept = std::env::split_paths(&search).filter(|dir| dir.as_os_str() != stand_ins);
+        search = std::env::join_paths(kept).unwrap();
+    }
+    let Some(system_cc) = std::env::split_paths(&search)
         .map(|dir| dir.join("cc"))
         .find(|cc| cc.is_file())
     else {
@@ -4602,7 +4633,7 @@ fn a_program_found_earlier_on_path_is_noticed() {
     };
     let build = |extra: Option<&Path>| {
         let mut paths: Vec<PathBuf> = extra.into_iter().map(Path::to_owned).collect();
-        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        paths.extend(std::env::split_paths(&search));
         let mut cmd = p.command();
         // Link through the C compiler found on PATH.
         cmd.env("PATH", std::env::join_paths(paths).unwrap())

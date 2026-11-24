@@ -1108,6 +1108,9 @@ fn supervise_unwatched(mut cmd: Command, job: Job, mut store: Store) -> Result<i
             if accepting.stop.load(Ordering::Acquire) {
                 break;
             }
+            if !wire::same_user(&stream) {
+                continue;
+            }
             let server = accepting.clone();
             server.busy.fetch_add(1, Ordering::AcqRel);
             std::thread::spawn(move || {
@@ -1306,6 +1309,7 @@ fn supervise(
         // and everything it starts examines and writes.
         programs_in: job.roots.path(crate::roots::TARGET).map(Path::to_owned),
     };
+    let mut fallback = copy_of(&cmd);
     // And the tokens for this build's own compilers, kept in the cache
     // directory until Cargo has gone.
     let tokens = crate::jobs::offer(&mut cmd, &store.dir);
@@ -1313,11 +1317,12 @@ fn supervise(
         Ok(started) => started,
         Err(e) => {
             log(name, format_args!("not observed: {e:#}"));
-            crate::jobs::withdraw(&mut cmd, tokens);
-            cmd.env_remove("JATO_SESSION")
+            drop(tokens);
+            fallback
+                .env_remove("JATO_SESSION")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
-            return Ok(Supervised::Unwatched(cmd));
+            return Ok(Supervised::Unwatched(fallback));
         }
     };
     // The command holds the other end of the terminal pair. Keeping a copy
@@ -1346,6 +1351,9 @@ fn supervise(
         for stream in listener.incoming().flatten() {
             if accepting.stop.load(Ordering::Acquire) {
                 break;
+            }
+            if !wire::same_user(&stream) {
+                continue;
             }
             let server = accepting.clone();
             server.busy.fetch_add(1, Ordering::AcqRel);

@@ -419,6 +419,46 @@ fn execute_observed(
     ))
 }
 
+/// Execute a test binary directly without seccomp observation (used as a
+/// fallback when a test binary or its child requires its own seccomp user
+/// notification listener).
+fn execute_direct(req: &TestRequest, runner_var: &str, stream: bool) -> Result<Ran> {
+    let begun = Instant::now();
+    let mut cmd = test_command(req, runner_var);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let copy_out = std::thread::spawn(move || {
+        if stream {
+            tee(out, io::stdout())
+        } else {
+            tee(out, io::sink())
+        }
+    });
+    let (stderr, streamed_err) = if stream {
+        tee(err, io::stderr())
+    } else {
+        tee(err, io::sink())
+    };
+    let (stdout, streamed_out) = copy_out
+        .join()
+        .unwrap_or((None, Err(io::Error::other("output thread failed"))));
+    if streamed_err.and(streamed_out).is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    Ok(Ran {
+        code: exit_code(status),
+        success: status.success(),
+        stdout,
+        stderr,
+        millis: begun.elapsed().as_millis() as u64,
+    })
+}
+
 /// Record a passing, hermetic, side-effect-free test execution.
 fn record_test(
     req: &TestRequest,
@@ -691,8 +731,20 @@ fn run_one(
         return Ok(hit);
     }
     store.count("test_miss", 1);
-    let (ran, report) = execute_observed(req, store, runner_var, stream)?;
-    if ran.success
+    let (mut ran, report) = execute_observed(req, store, runner_var, stream)?;
+    if !ran.success
+        && report
+            .incomplete
+            .as_deref()
+            .is_some_and(|why| why.contains("system call listener"))
+    {
+        log(
+            &label,
+            "re-running unobserved: test requires a seccomp listener of its own",
+        );
+        store.count("test_uncacheable", 1);
+        ran = execute_direct(req, runner_var, stream)?;
+    } else if ran.success
         && let Err(why) = record_test(req, &roots, &recipe, &ran, &report, store)
     {
         store.count("test_uncacheable", 1);
@@ -955,6 +1007,9 @@ pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
                 if stopping.load(Ordering::Acquire) {
                     break;
                 }
+                if !wire::same_user(&stream) {
+                    continue;
+                }
                 let Ok(req) = read_request(&mut stream) else {
                     continue;
                 };
@@ -1025,6 +1080,9 @@ pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
         for mut stream in listener.incoming().flatten() {
             if stopping.load(Ordering::Acquire) {
                 break;
+            }
+            if !wire::same_user(&stream) {
+                continue;
             }
             let Ok(req) = read_request(&mut stream) else {
                 let _ = wire::send(&mut stream, &[DECLINE]);

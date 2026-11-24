@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.89"
 description = "Remembers Rust builds: whole Cargo commands and single compilations, across checkouts and target directories"
 license = "MIT"
+repository = "https://github.com/benmyles/jato"
+readme = "README.md"
+keywords = ["cargo", "rustc", "cache", "build", "incremental"]
+categories = ["development-tools::build-utils", "development-tools::cargo-plugins"]
 
 [dependencies]
 anyhow = "1"
