@@ -1,6 +1,6 @@
 # Jato measurements
 
-The whole Olo workspace was measured on a build server with Jato 0.17.0 and on a laptop with Jato 0.15.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
+The whole Olo workspace was measured on a build server with Jato 0.18.0 and 0.17.0 and on a laptop with Jato 0.15.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
 
 Benchmarks ran on an Intel Core Ultra 7 356H (16 logical processors, 15 available to the session, 62 GiB) with Fedora 45, Linux 7.3.4 and Btrfs with zstd compression. The machine was shared with other people's builds throughout: its load average is given with each set of numbers, and wall-clock times moved with it. Comparisons within one table were taken in one sitting, rotating the order of contenders where there was more than one run.
 
@@ -57,7 +57,67 @@ Before Jato remembered the C that build scripts compile (0.13), a copied checkou
 
 After the check from nothing Jato's store held 3,100 MiB and kache's 1,608 MiB, the target directories 3,071 and 1,600 MiB: rustc's incremental state, which kache builds without and which is what makes the edits above cheap. Of Jato's target directory 16 MiB was its own; the rest is shared with the store, block for block, and a restored target directory shares all of it. kache's daemon held 42 MiB between builds. [Jato's samples](olo-workspace-0.15-jato.json), [kache's](olo-workspace-0.15-kache.json), and the runs with 0.13.0 ([first](olo-workspace-0.13-watched.json), [second](olo-workspace-0.13.json))
 
-## The whole Olo workspace on a build server
+## The whole Olo workspace on a build server (0.18.0)
+
+Jato 0.18.0 and kache 2.3.0 on the same 32-processor AMD EPYC 9655 server (125 GiB RAM, Ubuntu 26.04, Linux 7.0, ext4), started together one command each on Olo (`d01bd55a`, 121 packages, 56 binaries, 20.6 GiB dev target, pinned `nightly-2026-11-14`, mold 2.40.4). Zero uncacheable units or builds in either run.
+
+`check --workspace`:
+
+| Seconds, processor-seconds, load | Jato 0.18.0 | | | kache 2.3.0 | | | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nothing stored, nothing built | 153.88 | 2,249 | 7 | 160.55 | 2,302 | 7 | 1.04× |
+| The same check again | 0.13 | 0.2 | 52 | 0.59 | 0.5 | 48 | 4.65× |
+| Target directory removed | 1.52 | 2.9 | 48 | 11.85 | 62.6 | 45 | 7.82× |
+| A target directory never used | 0.99 | 2.8 | 48 | 11.41 | 87.6 | 41 | 11.49× |
+| The sources copied to another path | 0.52 | 2.6 | 48 | 10.37 | 112.3 | 39 | 20.02× |
+| A function added to `olo-system` in that copy | 3.34 | 28.4 | 48 | 9.41 | 183.5 | 35 | 2.82× |
+| A third copy, the function added before anything is built there | 6.14 | 33.6 | 45 | 20.99 | 156.2 | 33 | 3.42× |
+| A fourth copy, a note added to `olo-system`'s manifest first | 3.80 | 8.4 | 42 | 10.72 | 124.4 | 23 | 2.82× |
+| A function added in the restored target | 4.38 | 26.4 | 41 | 7.19 | 125.5 | 22 | 1.64× |
+| Further such edits, median of three | 3.98 | 23.3 | 41 | 3.08 | 24.3 | 22 | 0.77× |
+| The edits undone | 0.26 | 0.4 | 37 | 2.96 | 26.2 | 21 | 11.28× |
+
+Store size: Jato 1,351 MiB (0 MiB idle RAM) vs kache 1,794 MiB (115 MiB daemon RSS).
+
+`build --workspace`, dev profile, 56 programs (20.6 GiB):
+
+| Seconds, processor-seconds, load | Jato 0.18.0 | | | kache 2.3.0 | | | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nothing stored, nothing built | 480.44 | 7,478 | 19 | 482.26 | 7,430 | 19 | 1.00× |
+| The same build again | 0.15 | 0.2 | 62 | 1.84 | 0.7 | 62 | 12.25× |
+| Target directory removed | 3.06 | 22.4 | 57 | 30.13 | 102.9 | 57 | 9.86× |
+| A target directory never used | 5.19 | 26.3 | 56 | 138.71 | 2,022.6 | 50 | 26.71× |
+| The sources copied to another path | 18.21 | 82.6 | 56 | 22.22 | 98.6 | 60 | 1.22× |
+| A function added to `olo-system` in that copy | 54.62 | 672.7 | 50 | 78.67 | 1,331.0 | 53 | 1.44× |
+| A third copy, the function added before anything is built there | 72.70 | 771.8 | 61 | 89.17 | 1,090.1 | 35 | 1.23× |
+| A fourth copy, a note added to `olo-system`'s manifest first | 10.06 | 82.9 | 67 | 19.59 | 80.5 | 16 | 1.95× |
+| A function added in the restored target | 18.24 | 136.5 | 60 | 35.98 | 620.9 | 15 | 1.97× |
+| Further such edits, median of two | 13.14 | 62.1 | 66 | 11.74 | 60.6 | 22 | 0.89× |
+| The edits undone | 15.27 | 14.6 | 60 | 11.40 | 66.4 | 40 | 0.75× |
+
+Store size: Jato 6,155 MiB (zstd-1, 0 MiB idle RAM) vs kache 12,319 MiB (2× smaller disk). With `copy_manifest`, incremental `.rlib` session normalization eliminated the 40-binary relink cascade (10.06 s / 82.9 cpu vs 55.01 s / 710 cpu in 0.17.0, and 1.95× faster than kache despite running at load 67 vs kache's 16). Raw data: `bench/olo-server-0.18-{check,build}-{jato,kache}.json`.
+
+With the configurable RAM hot tier (`jato memory 64GiB`) on ext4 (quiet machine, Olo `build --workspace`, 13,912 files, 20.6 GiB):
+- Cold `build --workspace`: **239.81 s** (vs bare Cargo's 248.1 s).
+- Fresh `build --workspace` (72,742 inputs checked in parallel across 8 threads): **0.13 s** (62 ms input verification).
+- Full 20.6 GiB restore (single-pass SIMD BLAKE3 verified from page cache): **1.78 s** (1,456 ms write = 14.2 GB/s).
+- Cross-command target seeding in brand-new worktrees: `jato test -p olo-system --no-run` **14.40 s** (seeded 13,909 files, pruned 11,486 unused files, 0 Cargo stale units on subsequent restore); `jato clippy -p olo-system` **11.37 s** (seeded in 1.02 s).
+
+Observed test caching + parallel workspace test execution (`jato test --workspace` on `ripgrep`, ext4):
+- Cold build + cold parallel tests: **7.17 s**; warm repeat with cached tests: **1.42 s**; brand-new worktree (restored build + cached tests): **1.68 s** — against **2.97 s** for bare `cargo test --workspace` in an already-built target.
+
+Six open-source Rust workspaces (`check --workspace`, ext4, fresh git worktree `b` and edited worktree `c` with a function added to the most-depended library):
+
+| Workspace | Cold | New worktree `b` (0.17 → 0.18) | Edited worktree `c` (compilers) | Cargo stale in `b` |
+| --- | ---: | ---: | ---: | ---: |
+| `ripgrep` | 2.8 s | 0.1 s | — | 0 |
+| `rust-analyzer` (142 crates) | 26.1 s | 9.0 s → **0.4 s** (22.5×) | 7.2 s (31, was 274) | 0 |
+| `cargo` (34 crates) | 16.5 s | 8.5 s → **0.7 s** (12×) | 3.2 s (12, was 703) | 0 |
+| `tokio` | 4.5 s | **0.4 s** | 1.2 s (5) | 0 |
+| `nushell` | 47.8 s | 20.9 s → **2.5 s** (8.4×) | 9.3 s (42) | 0 |
+| `ruff` | 37.9 s | unrecorded → **9.1 s** (5 of 529 units) | 11.2 s (59) | 0 |
+
+## The whole Olo workspace on a build server (0.17.0)
 
 Jato 0.17.0 and kache 2.3.0 on a server with 32 processors (AMD EPYC 9655), 125 GiB of memory, Ubuntu 26.04, Linux 7.0 and ext4 on a disk that writes 7.8 GB a second, with nothing else running. Olo at commit `d01bd55a`, the pinned `nightly-2026-11-14`, mold 2.40.4. The two were started together, one command each, so each had the other's load beside it: Jato was done first both times, and kache's last steps ran on a quieter machine than Jato's. One run each. The load is the one-minute average when the step began.
 

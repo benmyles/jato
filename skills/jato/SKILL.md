@@ -26,7 +26,8 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 - A project's first build with Jato has to be made in an empty target directory to be of use anywhere else: run `cargo clean` first, or build in a new worktree. In a target directory that Cargo or another cache filled, Cargo finds everything up to date and Jato has nothing to keep; `jato stats` then says that the last build is only put back where it was made.
 - The first build of a state compiles and records. Later builds of that state, anywhere on the machine that shares the cache, are restored: in another git worktree or clone, on another branch, after a commit that left the built files alone.
-- In a new worktree, build with `jato` before or after editing, as suits the task. A first build of sources that differ from ones built before starts from that earlier build: Cargo compiles what changed and what depends on it, plans the build again where a manifest or the lock file changed, and runs again the build scripts whose inputs changed. `jato stats` counts these as `build_near`. Changed settings of Cargo's (`.cargo/config.toml`, `rust-toolchain.toml`) have Cargo carry out the whole build, with each compiler answered from the cache.
+- In a new worktree, build with `jato` before or after editing, as suits the task. A first build of sources that differ from ones built before starts from that earlier build: Cargo compiles what changed and what depends on it, plans the build again where a manifest or the lock file changed, and runs again the build scripts whose inputs changed. `jato stats` counts these as `build_near`. Running a new command in an empty target directory (such as `jato test -p foo` or `jato clippy` after `jato build --workspace`) seeds the target from a compatible recorded build and prunes unused parts when done (`build_seeded`). Changed settings of Cargo's (`.cargo/config.toml`, `rust-toolchain.toml`) have Cargo carry out the whole build, with each compiler answered from the cache.
+- `jato test` restores/builds test binaries (or the library ahead of `jato test --doc`), caches passing hermetic test runs across re-runs and worktrees by observing every file/fixture/subprocess touched (`test_hit`/`test_miss`), and runs workspace test binaries in parallel across cores (disable with `JATO_CACHE_TESTS=0` or `JATO_PARALLEL_TESTS=0`). Failing, network, external-socket, and side-effecting tests are never cached.
 - After editing, Cargo and rustc compile what changed at their usual speed. Undoing an edit returns to a recorded build at once.
 - In a target that was restored, the first edit of a crate is compiled incrementally all the same: Jato hands rustc the state it saved where the crate was last compiled under watch. `jato stats` counts this as `state_given`.
 - C, C++ and assembly that build scripts compile are remembered like Rust, through the names `cc`, `gcc`, `clang`, `nasm` and their relatives at the head of `PATH` for the Cargo commands Jato runs. `jato stats` counts them as `tool_hit` and `tool_miss`. `JATO_TOOLS=0` turns this off.
@@ -40,8 +41,8 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 ## On a build server
 
-- Keep the cache and the checkouts on a filesystem that clones files, Btrfs or XFS: a build is then put back without copying anything, and target directories share their room with the cache. On ext4 every file is copied: 21 GB and 3 to 4 s for a debug build of a large workspace, against 1.3 s and no room. `jato stats` says which the cache directory is on.
-- Free memory already serves as the cache of the disk. Keeping the cache or a target directory in memory by hand makes nothing quicker on a disk that is fast.
+- Keep the cache and the checkouts on a filesystem that clones files, Btrfs or XFS: a build is then put back without copying anything, and target directories share their room with the cache. `jato stats` says which the cache directory is on.
+- On a high-RAM server without reflinks (such as ext4), set a memory budget (`jato memory 64GiB` or `JATO_MEMORY=64GiB`) so hot objects stay uncompressed in the Linux page cache and restore via single-pass SIMD BLAKE3 at memory bandwidth (~1.8 s for 21 GiB on ext4) while scaling SQLite's index cache.
 
 ## Choose an edit loop
 
@@ -56,4 +57,4 @@ When a command was compiled that should have been found, run both builds with `J
 
 A procedural macro that reads an environment variable needs it named: `JATO_KEY_ENV=NAME,OTHER`. Files and directories a macro or build script reads are seen without help. A compilation that uses the network is never stored.
 
-To inspect the cache budget, run `jato limit`; to set it for every project using that cache, `jato limit 32GiB`. `jato gc 10GiB` evicts least-recently-used results down to a size.
+To inspect why the last build was not recorded or was pinned, run `jato why`. To inspect the cache budget, run `jato limit`; to set it for every project using that cache, `jato limit 32GiB`. `jato memory 64GiB` sets the hot uncompressed RAM tier; `jato gc 10GiB` evicts older low-value results down to a size.

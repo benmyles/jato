@@ -1,0 +1,172 @@
+{
+  "project": "olo",
+  "command": "check",
+  "c_compilers": "own",
+  "packages": [],
+  "cargo_args": [
+    "--workspace"
+  ],
+  "edit": "crates/system/src/lib.rs",
+  "versions": {
+    "cargo": "cargo 1.102.0-nightly (ede6cefea 2026-11-11)",
+    "rustc": "rustc 1.102.0-nightly (5f4effd57 2026-11-13)",
+    "kache": "kache 2.3.0"
+  },
+  "runs": 1,
+  "jobs": null,
+  "processors": 32,
+  "kernel": "7.0.0-44-generic",
+  "filesystem": "ext4",
+  "median": {
+    "kache": {
+      "cold": {
+        "seconds": 160.553,
+        "cpu": 2302.36
+      },
+      "fresh": {
+        "seconds": 0.591,
+        "cpu": 0.49
+      },
+      "restore": {
+        "seconds": 11.849,
+        "cpu": 62.58
+      },
+      "new_target": {
+        "seconds": 11.411,
+        "cpu": 87.58
+      },
+      "copy": {
+        "seconds": 10.371,
+        "cpu": 112.27
+      },
+      "copy_edit": {
+        "seconds": 9.413,
+        "cpu": 183.53
+      },
+      "copy_new": {
+        "seconds": 20.99,
+        "cpu": 156.22
+      },
+      "copy_manifest": {
+        "seconds": 10.716,
+        "cpu": 124.38
+      },
+      "edit_first": {
+        "seconds": 7.188,
+        "cpu": 125.48
+      },
+      "edit": {
+        "seconds": 3.075,
+        "cpu": 24.27
+      },
+      "undo": {
+        "seconds": 2.956,
+        "cpu": 26.17
+      }
+    }
+  },
+  "samples": {
+    "kache": {
+      "cold": [
+        {
+          "seconds": 160.553,
+          "cpu": 2302.36,
+          "load": 6.7,
+          "compiled": 325
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.591,
+          "cpu": 0.49,
+          "load": 48.4,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 11.849,
+          "cpu": 62.58,
+          "load": 45.0,
+          "compiled": 325
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 11.411,
+          "cpu": 87.58,
+          "load": 41.4,
+          "compiled": 8
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 10.371,
+          "cpu": 112.27,
+          "load": 39.2,
+          "compiled": 9
+        }
+      ],
+      "copy_edit": [
+        {
+          "seconds": 9.413,
+          "cpu": 183.53,
+          "load": 35.3,
+          "compiled": 0
+        }
+      ],
+      "copy_new": [
+        {
+          "seconds": 20.99,
+          "cpu": 156.22,
+          "load": 32.9,
+          "compiled": 8
+        }
+      ],
+      "copy_manifest": [
+        {
+          "seconds": 10.716,
+          "cpu": 124.38,
+          "load": 23.0,
+          "compiled": 8
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 7.188,
+          "cpu": 125.48,
+          "load": 21.7,
+          "compiled": 0
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 3.075,
+          "cpu": 24.27,
+          "load": 22.4,
+          "compiled": 0
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 2.956,
+          "cpu": 26.17,
+          "load": 21.3,
+          "compiled": 0
+        }
+      ]
+    }
+  },
+  "details": {
+    "kache": [
+      {
+        "store_bytes": 1881790972,
+        "store_extents": null,
+        "target_bytes": 1681417786,
+        "target_extents": null,
+        "daemon_rss_kib": 120412,
+        "store_bytes_end": 1906588993
+      }
+    ]
+  }
+}

@@ -1,36 +1,26 @@
 # Jato
 
-Jato remembers Rust builds. A build that has been made before, with the same sources, settings and toolchain, is put back without starting Cargo: after `cargo clean`, in another target directory, in a git worktree created a moment ago. A build of sources that differ a little from ones built before starts from that build, and Cargo compiles what changed. Builds that do have to compile go at Cargo's speed, reuse every compilation that still applies, the C that build scripts compile included, and take turns at the processors when several are started together.
+Jato remembers Rust builds and tests. A build that has been made before, with the same sources, settings and toolchain, is put back without starting Cargo: after `cargo clean`, in another target directory, in a git worktree created a moment ago. A build of sources that differ a little from ones built before starts from that build, and Cargo compiles what changed. A new Cargo command in an empty target directory (`jato test -p foo`, `jato clippy`, `jato build` after `jato check`) seeds from a compatible recorded build of the workspace and prunes unused outputs when done. Passing, hermetic test runs are cached across re-runs and worktrees, and workspace test binaries run in parallel across available cores. Builds that do have to compile go at Cargo's speed (or faster, with asynchronous recording and a named jobserver pipe), reuse every compilation that still applies, the C that build scripts compile included, and take turns at the processors when several are started together.
 
-On Olo's `olo-system`, 279 compilations with the project's pinned nightly, measured against kache 2.3 and bare Cargo on a 15-processor machine that was busy with other builds:
+Checking and building all 121 packages of Olo (1,502 Rust compilations, 113 build scripts compiling ~1,100 C/C++/asm files, 56 dev binaries, 20.6 GiB) on a 32-core AMD EPYC 9655 build server (ext4), Jato 0.18.0 and kache 2.3.0 started side by side:
 
-| Seconds | Jato | kache | Cargo |
-| --- | ---: | ---: | ---: |
-| The same build again | 0.09 | 0.60 | 0.55 |
-| Target directory removed | 0.20 | 2.6 | as cold |
-| A target directory never used | 0.21 | 3.1 | as cold |
-| The sources copied to another path | 0.33 | 6.8 | as cold |
-| First edit of the top crate in that copy | 13 | 25 | |
-| Later edits | 8.0 | 7.8 | 9.9 |
-| The edits undone | 0.12 | 6.3 | 9.0 |
+| Seconds (ext4, side by side) | `check`: Jato 0.18 | `check`: kache 2.3 | `build`: Jato 0.18 | `build`: kache 2.3 |
+| --- | ---: | ---: | ---: | ---: |
+| Nothing stored, nothing built | **153.9** | 160.6 | **480.4** | 482.3 |
+| The same command again (72k inputs) | **0.13** | 0.59 | **0.15** | 1.84 |
+| Target directory removed | **1.52** | 11.85 | **3.06** | 30.13 |
+| A target directory never used | **0.99** | 11.41 | **5.19** | 138.71 |
+| Sources copied to another path | **0.52** | 10.37 | **18.21** | 22.22 |
+| Function added to `olo-system` in that copy | **3.34** | 9.41 | **54.62** | 78.67 |
+| New worktree with that edit before first build | **6.14** | 20.99 | **72.70** | 89.17 |
+| New worktree with `Cargo.toml` changed | **3.80** | 10.72 | **10.06** | 19.59 |
+| First edit in the restored target | **4.38** | 7.19 | **18.24** | 35.98 |
+| The edits undone | **0.26** | 2.96 | 15.27 | 11.40 |
+| Disk store / idle daemon RAM | **1.3 GiB / 0** | 1.8 GiB / 115 MiB | **6.2 GiB / 0** | 12.3 GiB / 115 MiB |
 
-Checking all 121 packages of that workspace in a clone of its repository, with the 1,100 C, C++ and assembly files its build scripts compile. Jato 0.15 and kache ran side by side, at a load of 29 to 38:
+With `jato memory 64GiB` on ext4 (uncompressed hot tier in the kernel page cache + single-pass SIMD BLAKE3 restore), Olo's cold `build --workspace` finishes in **239.8 s** (faster than bare Cargo's 248.1 s), `fresh` checks 72,742 inputs in **0.13 s**, and a full **20.6 GiB** verified restore takes **1.78 s (14.2 GB/s)**.
 
-| Seconds | Jato | kache |
-| --- | ---: | ---: |
-| The same check again | 0.83 | 1.37 |
-| Target directory removed | 2.2 | 18.0 |
-| A target directory never used | 2.5 | 30.3 |
-| The sources copied to another path | 3.8 | 13.2 |
-| A function added to `olo-system` in that copy | 8.4 | 16.6 |
-| Another copy, the function added before anything is built there | 14.8 | 32.8 |
-| Further edits in a built target, median | 8.5 | 24.5 |
-| The edits undone | 0.92 | 41.8 |
-| Nothing stored, nothing built | 914 | 938 |
-
-In a git worktree a first build with nothing changed is put back in 2 s, one with a line changed in one program takes 7 s, and the next worktree with that change 2 s again.
-
-A build from nothing takes the processor time it takes with bare Cargo: 769 processor-seconds against 763 for `olo-system`, 2,319 against kache's 2,297 for the whole workspace. On ripgrep, a small project, the restores took 0.07 to 0.34 s with Jato, 0.38 to 0.70 s with kache and 5 to 8 s with sccache, and a build from nothing 5 to 8% more processor time than bare Cargo's. [All measurements, with conditions and reproduction commands](bench/README.md)
+On six open-source Rust workspaces in new git worktrees (`check --workspace`, ext4): `ripgrep` 0.1 s, `rust-analyzer` 0.4 s, `cargo` 0.7 s, `tokio` 0.4 s, `nushell` 2.5 s, `ruff` 9.1 s (5 of 529 compilations). On `ripgrep`, `jato test --workspace` in a brand-new worktree takes **1.68 s** (restored build + cached tests) against **2.97 s** for bare `cargo test --workspace` in an already-built target. [All measurements, with conditions and reproduction commands](bench/README.md)
 
 ## Get started
 
@@ -96,9 +86,15 @@ On a miss Cargo runs under the observer, with each compiler it starts asking Jat
 
 `jato test`, `bench` and `run` first get the build they need: restored if it is recorded, made on its own if not, showing only what is being compiled. Then Cargo runs the command you asked for and finds the build done. A test name filter and a program's arguments are not part of the build.
 
-### One target directory, several commands
+### One target directory, several commands, and cross-command seeding
 
-A check, a build, clippy and the tests of a workspace share one target directory, and Cargo uses for each what the others made: build scripts and procedural macros are built once, and clippy checks dependencies exactly as `cargo check` does. A build made where another command's recorded build already is, with all of that build's inputs as they were, is recorded as resting on it. The record holds that build's files with its own, under everything either depended on, and is put back whole in a worktree where the other command was never run. For one package of Olo, clippy first in a new worktree took 55 s without this and 0.5 s with it.
+A check, a build, clippy and the tests of a workspace share one target directory, and Cargo uses for each what the others made: build scripts and procedural macros are built once, and clippy checks dependencies exactly as `cargo check` does. A build made where another command's recorded build already is, with all of that build's inputs as they were, is recorded as resting on it. The record holds that build's files with its own, under everything either depended on, and is put back whole in a worktree where the other command was never run.
+
+When a command has never been recorded before and runs in an empty target directory (such as `jato test -p foo`, `jato clippy`, or `jato build` in a fresh worktree after only `jato check --workspace` or `jato build --workspace` was recorded), Jato seeds the target directory from a compatible recorded whole build of the same toolchain and profile, leaving out stale compilers and build scripts. Once Cargo completes, any outputs from the seed build that Cargo never asked about are pruned so the resulting target directory and recorded manifest match a build from nothing. `JATO_SEED=0` disables cross-command seeding.
+
+### Cached and parallel tests (`jato test`)
+
+`jato test` first restores or builds the test binaries (or the package library for `jato test --doc`), then intercepts compiled test binary executions through `CARGO_TARGET_<TRIPLE>_RUNNER` while keeping Cargo's exact environment, working directory, and arguments. Each test binary run is keyed by the binary's BLAKE3 digest, arguments, working directory, and filtered full environment, and observed via seccomp + the fast read-note library so any fixture file, directory listing, symlink, shared library, or child process it touches is recorded automatically. Passing (`exit 0`), network-free, external-socket-free, survivor-free, side-effect-free test runs (allowing scratch temp files removed before exit) are cached and reused across re-runs and worktrees. When running multiple test binaries across a workspace (without `--nocapture`, `--test-threads=1`, or `--list`), Jato runs them concurrently across available cores while presenting deterministic Cargo-formatted output. `JATO_CACHE_TESTS=0` disables test caching and `JATO_PARALLEL_TESTS=0` runs test binaries serially. Real user runners (such as `qemu` or `valgrind`) are left untouched.
 
 ### Builds that start from an earlier one
 
@@ -212,17 +208,24 @@ The watcher uses native filesystem events and Cargo metadata. It follows workspa
 | --- | --- |
 | `JATO_CACHE_DIR` | Private directory on a local filesystem. Defaults to `$XDG_CACHE_HOME/jato`, or `~/.cache/jato`. Builds that share it share results and processors. |
 | `jato limit 32GiB` | Set the budget for this cache directory. Without one it is a tenth of the filesystem, at least 10 GiB and at most 100 GiB. `jato limit` prints it; `--unset` removes it. |
+| `jato memory 64GiB` | Set a RAM budget for accelerating builds on high-memory machines: scales SQLite `cache_size`/`mmap_size` and stores hot objects uncompressed on non-cloning filesystems for single-pass SIMD BLAKE3 restores at memory bandwidth. `jato memory` prints it; `--unset` turns it off. |
+| `JATO_MEMORY=64GiB` | Memory budget for this process (overrides `jato memory`). |
 | `JATO_MAX_SIZE=4GiB` | Budget for this process when none is stored with `jato limit`. |
-| `jato gc 10GiB` | Evict least-recently-used results down to this size. `jato gc` uses the budget; `jato gc 0` empties the cache. It also removes what earlier versions of Jato left in the directory. |
-| `jato stats [--json]` | Builds put back whole; Rust compilations and build scripts' C compilations reused, run, left to rustc during edits or not storable; time waited for other builds; disk use. |
+| `jato gc 10GiB` | Evict older low-value results down to this size. `jato gc` uses the budget; `jato gc 0` empties the cache. It also removes what earlier versions of Jato left in the directory. |
+| `jato stats [--json]` | Builds put back whole, started near, or seeded; Rust, C/asm, and test results reused, run, left to rustc during edits or not storable; disk and hot memory tier use. |
+| `jato why` | Print why the last build was not recorded or was pinned to its target directory, plus filesystem/memory tips. |
 | `JATO_LOG=debug` | Say for each command whether it was reused and, if not, what had changed, and for a build put back how long each step took. An absolute path appends to that file, with times. |
 | `JATO_RECIPES=/dir` | Write what each command is known by into a file of its own in this directory, a line for each thing, with the workspace and the target directory as marks. Two runs' directories compared show why a command of one was not found for the other. |
 | `JATO_KEY_ENV=A,B` | Variables a procedural macro reads from the environment. |
-| `JATO_JOBS=8` | Compilers running at once across the builds sharing this cache. |
+| `JATO_JOBS=8` | Compilers (or parallel test binaries) running at once across the builds sharing this cache. |
 | `JATO_EDIT_WINDOW=0` | Record every compilation, including each edit. |
 | `JATO_BUSY=8` | The load average from which compilations in a built target are left unwatched. Defaults to the number of processors; `0` always watches. |
 | `JATO_WHOLE_BUILDS=0` | Reuse single compilations only. |
 | `JATO_NEAR=0` | Never start a build from a recorded one whose sources differ. |
+| `JATO_SEED=0` | Never seed an empty target directory from another command's build. |
+| `JATO_CACHE_TESTS=0` | Run `jato test` without caching test results. |
+| `JATO_PARALLEL_TESTS=0` | Run workspace test binaries one at a time. |
+| `JATO_ASYNC_RECORD=0` | Wait for linked compiler output staging before waking Cargo. |
 | `JATO_JOBSERVER=0` | Leave Cargo to make the pipe its compilers share tokens through. `1` gives it one with a name without asking `make` its version. |
 | `JATO_TOOLS=0` | Leave the C compilers and assemblers that build scripts start to themselves. |
 | `JATO_SAVED_STATE=0` | Do not keep rustc's incremental state in the cache or hand it to other checkouts. |
@@ -269,9 +272,9 @@ truncate -s 300G /srv/builds.img && mkfs.btrfs /srv/builds.img
 mkdir -p /srv/builds && mount -o loop,noatime /srv/builds.img /srv/builds
 ```
 
-Memory is used without being asked for: the kernel keeps what was last read and written in whatever memory is free, the cache and the target directories with it. Three ways of setting memory aside were measured on that server and none made a build quicker. A target directory in memory: the check from nothing took 75.7 s against 76.3. The dev build put back into memory: 3.9 s against 4.3 to 5.1. And the cache and the checkouts on a Btrfs filesystem kept in memory instead of on the disk: 1.3 s against 1.2 for a check in a new worktree, and 10.6 s against 7.9 for the build after it. A slow disk would change that, and then the same two commands make the filesystem in a file under `/dev/shm`. Jato has no setting for memory because there is nothing it could do with one that the kernel is not doing.
+Memory acceleration (`jato memory 64GiB` / `JATO_MEMORY=64GiB`): on high-RAM build servers with non-cloning filesystems like ext4, configuring a memory budget scales SQLite's page cache and mmap window and keeps hot objects up to the budget uncompressed in the cache directory so they stay resident in the Linux kernel page cache. Staging skips zstd compression in a single pass and restores stream single-pass read + SIMD BLAKE3 verification + write without rewinding: on the 32-core EPYC server with `jato memory 64GiB` on ext4, Olo's cold `build --workspace` finished in **239.8 s** (faster than bare Cargo's 248.1 s), `fresh` checked 72,742 inputs in **0.13 s** (62 ms parallel stamp verification), and a full **20.6 GiB** verified restore took **1.78 s (14.2 GB/s)** against 3.1–5.3 s compressed.
 
-What a machine with many processors gains is in how a build is put back and recorded: both are done on up to sixteen threads.
+What a machine with many processors gains is in how a build is verified, put back, recorded, and tested: manifest input checks run on up to 8 lock-free threads, staging and restores run on up to 16 threads, linked compiler outputs record asynchronously behind a bounded pool without blocking Cargo's critical path, and workspace test binaries execute in parallel.
 
 The budget of a cache nobody set one for is a tenth of its filesystem, at least 10 GiB and at most 100 GiB. A debug build of a large workspace can be larger than a small filesystem's tenth: Olo's is 21 GiB. Such a build is not recorded, `jato stats` says so, and `jato limit` sets a budget that holds it.
 
