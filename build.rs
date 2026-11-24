@@ -6,17 +6,24 @@ use std::process::Command;
 use std::{env, fs};
 
 fn main() {
-    for input in ["build.rs", "src/fast/shim.rs", "src/fast/abi.rs"] {
+    for input in [
+        "build.rs",
+        "src/fast/shim.rs",
+        "src/fast/abi.rs",
+        "src/fast/script_shim.rs",
+    ] {
         println!("cargo:rerun-if-changed={input}");
     }
-    let out =
-        PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR")).join("libjato_fast.so");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    let out = out_dir.join("libjato_fast.so");
+    let script_out = out_dir.join("libjato_script.so");
     let target = env::var("TARGET").unwrap_or_default();
-    // The library is written for one processor and one kernel. Elsewhere
-    // Jato watches the way it always has.
-    let wanted = target.starts_with("x86_64") && target.contains("linux");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    // The read-note library is built for Linux x86_64 and aarch64.
+    let is_linux = target.contains("linux");
+    let wanted = (target.starts_with("x86_64") || target.starts_with("aarch64")) && is_linux;
     let built = wanted
-        && Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        && Command::new(&rustc)
             .args([
                 "--edition=2024",
                 "--crate-type=cdylib",
@@ -51,5 +58,42 @@ fn main() {
             );
         }
         fs::write(&out, b"").expect("writing into OUT_DIR");
+    }
+    let script_built = wanted
+        && Command::new(&rustc)
+            .args([
+                "--edition=2024",
+                "--crate-type=cdylib",
+                "--crate-name=jato_script",
+            ])
+            .args([
+                "-C",
+                "panic=abort",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "codegen-units=1",
+            ])
+            .args([
+                "-C",
+                "debuginfo=0",
+                "-C",
+                "strip=symbols",
+                "--cap-lints=allow",
+            ])
+            .arg("--target")
+            .arg(&target)
+            .arg("-o")
+            .arg(&script_out)
+            .arg("src/fast/script_shim.rs")
+            .status()
+            .is_ok_and(|status| status.success());
+    if !script_built {
+        if wanted {
+            println!(
+                "cargo:warning=the build-script interception library could not be built; build scripts will run uncached"
+            );
+        }
+        fs::write(&script_out, b"").expect("writing into OUT_DIR");
     }
 }

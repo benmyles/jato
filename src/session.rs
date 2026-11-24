@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+const REQ_COMPILER: u8 = 0;
+
 const HIT: u8 = 0;
 const RUN: u8 = 1;
 const DECLINE: u8 = 2;
@@ -51,7 +53,7 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
     let Ok(mut stream) = address(session).and_then(|addr| UnixStream::connect_addr(&addr)) else {
         return Ok(None);
     };
-    let mut w = Writer(Vec::new());
+    let mut w = Writer(vec![REQ_COMPILER]);
     w.number(std::process::id().into());
     w.0.push(tool.into());
     w.0.push(command::descriptor_spare().into());
@@ -305,6 +307,9 @@ struct Server {
     /// then expands to all cores once Cargo exits so tail recordings drain
     /// immediately. Tuple is `(active, limit)`.
     recorders: (Mutex<(usize, usize)>, Condvar),
+    /// Nested compiler/tool manifests produced inside active build-script scopes,
+    /// keyed by the build-script wrapper PID.
+    script_children: Mutex<std::collections::HashMap<u32, crate::scripts_cache::ScriptChildren>>,
 }
 
 struct RecorderSlot<'a>(&'a Server);
@@ -367,10 +372,25 @@ impl Server {
         }
     }
 
-    fn used(&self, job: &Job, manifest: &crate::manifest::Manifest, cargo: bool, under: u16) {
+    fn used(&self, from: &Roots, manifest: &crate::manifest::Manifest, cargo: bool, under: u16) {
         if let Mode::Watched { parts, .. } = &self.mode {
             let mut parts = parts.lock().unwrap_or_else(|e| e.into_inner());
-            parts.add(manifest, &job.roots, &self.roots, cargo, under);
+            parts.add(manifest, from, &self.roots, cargo, under);
+        }
+    }
+
+    fn note_script_child(
+        &self,
+        script_pid: u32,
+        manifest: crate::manifest::Manifest,
+        roots: Roots,
+    ) {
+        let mut map = self
+            .script_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(children) = map.get_mut(&script_pid) {
+            children.parts.push((manifest, roots));
         }
     }
 
@@ -394,10 +414,180 @@ impl Server {
         })
     }
 
-    /// Serve one compiler wrapper from its request to its last message.
+    /// Serve one wrapper request (compiler/tool or build script) from its
+    /// request to its last message.
     fn serve(&self, mut stream: UnixStream) -> Result<()> {
         let message = wire::receive(&mut stream)?;
         let mut r = Reader(&message);
+        match r.byte()? {
+            REQ_COMPILER => self.serve_compiler(stream, r),
+            crate::scripts_cache::REQ_SCRIPT => self.serve_script(stream, r),
+            _ => wire::send(&mut stream, &[DECLINE]).map_err(Into::into),
+        }
+    }
+
+    fn serve_script(&self, mut stream: UnixStream, mut r: Reader<'_>) -> Result<()> {
+        let pid = r.number()? as u32;
+        let cwd = PathBuf::from(os(r.bytes()?));
+        let binary = PathBuf::from(os(r.bytes()?));
+        let mut args = Vec::new();
+        for _ in 0..r.count()? {
+            args.push(os(r.bytes()?));
+        }
+        let mut env = Env::new();
+        for _ in 0..r.count()? {
+            let name = os(r.bytes()?);
+            env.insert(name, os(r.bytes()?));
+        }
+        let req = crate::scripts_cache::ScriptRequest {
+            cwd,
+            binary,
+            args,
+            env,
+        };
+        let label = crate::scripts_cache::script_label(&req);
+        let mut store = match self.store() {
+            Ok(store) => store,
+            Err(e) => {
+                log(&label, format_args!("no cache: {e:#}"));
+                return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
+            }
+        };
+        let Ok(meta) = std::fs::metadata(&req.binary) else {
+            self.return_store(store);
+            return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
+        };
+        let Ok(binary_digest) = store.digest_known(&req.binary, observe::Stamp::of(&meta)) else {
+            self.return_store(store);
+            return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
+        };
+        let script_roots =
+            crate::scripts_cache::script_roots(&req, self.roots.path(crate::roots::TARGET));
+        let recipe = crate::scripts_cache::script_recipe(&req, &script_roots, &binary_digest);
+        let under = match &self.mode {
+            Mode::Watched { scopes, .. } => scopes.under_program(pid),
+            Mode::Unwatched { .. } => 0,
+        };
+        if let Ok(Some((outcome, manifest))) =
+            crate::scripts_cache::lookup(&req, &script_roots, &recipe, &mut store)
+        {
+            if let Mode::Watched { scopes, .. } = &self.mode {
+                self.used(&script_roots, &manifest, false, under);
+                scopes.finish_script_process(pid);
+            }
+            self.return_store(store);
+            let mut w = Writer(vec![HIT]);
+            w.number(outcome.code as u32 as u64);
+            w.bytes(&outcome.stdout);
+            w.bytes(&outcome.stderr);
+            return wire::send(&mut stream, &w.0).map_err(Into::into);
+        }
+        store.count("script_miss", 1);
+        let mut ignore = vec![store.dir.clone()];
+        ignore.extend(
+            crate::jobs::TOLD_IN
+                .iter()
+                .filter_map(|name| req.env.get(OsStr::new(name)))
+                .filter_map(|said| crate::jobs::named_pipe(said)),
+        );
+        match &self.mode {
+            Mode::Watched { scopes, .. } => {
+                self.script_children
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pid, crate::scripts_cache::ScriptChildren::default());
+                let obs = observe::Config {
+                    fast: observe::fast_library(&store.dir),
+                    ignore,
+                    unlisted: Vec::new(),
+                    state: None,
+                    programs_in: None,
+                    mount: None,
+                };
+                scopes.begin_script(pid, obs, under);
+                let done =
+                    wire::send(&mut stream, &[RUN]).and_then(|()| wire::receive(&mut stream));
+                let report = scopes.end(pid).unwrap_or_default();
+                let children = self
+                    .script_children
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&pid)
+                    .unwrap_or_default();
+                let Ok(done) = done else {
+                    scopes.absorb(report, under);
+                    self.unusable("a build script was interrupted");
+                    self.return_store(store);
+                    return Ok(());
+                };
+                let mut r = Reader(&done);
+                let ran = Ran {
+                    code: r.number()? as i32,
+                    success: r.byte()? != 0,
+                    stdout: r.optional()?.map(<[u8]>::to_vec),
+                    stderr: r.optional()?.map(<[u8]>::to_vec),
+                    millis: r.number()?,
+                };
+                if ran.success
+                    && let Err(why) = crate::scripts_cache::record(
+                        &req,
+                        &script_roots,
+                        &recipe,
+                        &ran,
+                        &report,
+                        &children,
+                        &mut store,
+                    )
+                {
+                    store.count("script_uncacheable", 1);
+                    log(&label, format_args!("not stored: {why}"));
+                }
+                scopes.absorb(report, under);
+                let _ = wire::send(&mut stream, &[0]);
+            }
+            Mode::Unwatched { .. } => {
+                let mut w = Writer(vec![RUN_OWN]);
+                w.bytes(store.dir.as_os_str().as_bytes());
+                w.number(ignore.len() as u64);
+                for p in &ignore {
+                    w.bytes(p.as_os_str().as_bytes());
+                }
+                let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
+                let Ok(done) = done else {
+                    self.return_store(store);
+                    return Ok(());
+                };
+                let mut r = Reader(&done);
+                let ran = Ran {
+                    code: r.number()? as i32,
+                    success: r.byte()? != 0,
+                    stdout: r.optional()?.map(<[u8]>::to_vec),
+                    stderr: r.optional()?.map(<[u8]>::to_vec),
+                    millis: r.number()?,
+                };
+                let report = Report::decode(&mut r)?;
+                if ran.success
+                    && let Err(why) = crate::scripts_cache::record(
+                        &req,
+                        &script_roots,
+                        &recipe,
+                        &ran,
+                        &report,
+                        &crate::scripts_cache::ScriptChildren::default(),
+                        &mut store,
+                    )
+                {
+                    store.count("script_uncacheable", 1);
+                    log(&label, format_args!("not stored: {why}"));
+                }
+                let _ = wire::send(&mut stream, &[0]);
+            }
+        }
+        self.return_store(store);
+        Ok(())
+    }
+
+    fn serve_compiler(&self, mut stream: UnixStream, mut r: Reader<'_>) -> Result<()> {
         let pid = r.number()? as u32;
         let tool = r.byte()? != 0;
         let spare = r.byte()? != 0;
@@ -413,18 +603,24 @@ impl Server {
             env.insert(name, os(r.bytes()?));
         }
         // What a compiler starts is part of that compiler's work, and is
-        // already being recorded as such.
+        // already being recorded as such. A build-script scope still allows
+        // nested C compilers/assemblers to cache individually.
         if let Mode::Watched { scopes, .. } = &self.mode
             && tool
-            && scopes.inside(pid)
+            && scopes.inside_compiler(pid)
         {
             return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
         }
         let cargo = !tool && self.started_by_cargo(pid);
+        let enclosing_script = match &self.mode {
+            Mode::Watched { scopes, .. } if !cargo => scopes.enclosing_script(pid),
+            _ => None,
+        };
         // The build script in whose doing a compiler was started that is
         // none of Cargo's own.
-        let under = match &self.mode {
-            Mode::Watched { scopes, .. } if !cargo => scopes.under_program(pid),
+        let under = match (&self.mode, enclosing_script) {
+            (_, Some((_, u))) => u,
+            (Mode::Watched { scopes, .. }, None) if !cargo => scopes.under_program(pid),
             _ => 0,
         };
         let request = Request {
@@ -468,7 +664,10 @@ impl Server {
             (lock, found) = command::before_running(&job, &mut store, &recipe);
         }
         if let Some((outcome, manifest)) = found {
-            self.used(&job, &manifest, cargo, under);
+            if let Some((script_pid, _)) = enclosing_script {
+                self.note_script_child(script_pid, manifest.clone(), job.roots.clone());
+            }
+            self.used(&job.roots, &manifest, cargo, under);
             self.return_store(store);
             return reply(&mut stream, &outcome).map_err(Into::into);
         }
@@ -554,7 +753,14 @@ impl Server {
                     let recorded =
                         match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
                             Ok(manifest) => {
-                                self.used(&job, &manifest, cargo, under);
+                                if let Some((script_pid, _)) = enclosing_script {
+                                    self.note_script_child(
+                                        script_pid,
+                                        manifest.clone(),
+                                        job.roots.clone(),
+                                    );
+                                }
+                                self.used(&job.roots, &manifest, cargo, under);
                                 Some(report)
                             }
                             Err(why) => {
@@ -571,7 +777,14 @@ impl Server {
                     let recorded =
                         match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
                             Ok(manifest) => {
-                                self.used(&job, &manifest, cargo, under);
+                                if let Some((script_pid, _)) = enclosing_script {
+                                    self.note_script_child(
+                                        script_pid,
+                                        manifest.clone(),
+                                        job.roots.clone(),
+                                    );
+                                }
+                                self.used(&job.roots, &manifest, cargo, under);
                                 Some(report)
                             }
                             // A build goes on after a command that failed where
@@ -582,7 +795,11 @@ impl Server {
                             // doing, as it would have been without a record of
                             // its own.
                             Err(_) if job.tool || !ran.success => {
-                                scopes.absorb(report, under);
+                                if let Some((script_pid, _)) = enclosing_script {
+                                    scopes.absorb_into(script_pid, report);
+                                } else {
+                                    scopes.absorb(report, under);
+                                }
                                 None
                             }
                             // A Rust compilation that worked but cannot be
@@ -1140,11 +1357,15 @@ fn supervise_unwatched(mut cmd: Command, job: Job, mut store: Store) -> Result<i
             }
         };
     cmd.env("JATO_SESSION", &socket);
+    if let Some(target) = job.roots.path(crate::roots::TARGET) {
+        crate::scripts_cache::offer(&mut cmd, &store.dir, target);
+    }
     let tokens = crate::jobs::offer(&mut cmd, &store.dir);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => {
             crate::jobs::withdraw(&mut cmd, tokens);
+            crate::scripts_cache::withdraw(&mut cmd);
             cmd.env_remove("JATO_SESSION");
             drop(store);
             return command::passthrough(cmd);
@@ -1165,6 +1386,7 @@ fn supervise_unwatched(mut cmd: Command, job: Job, mut store: Store) -> Result<i
         stop: AtomicBool::new(false),
         busy: std::sync::atomic::AtomicUsize::new(0),
         recorders: (Mutex::new((0, recorder_limit)), Condvar::new()),
+        script_children: Mutex::new(std::collections::HashMap::new()),
     });
     let accepting = server.clone();
     let accept = std::thread::spawn(move || {
@@ -1397,6 +1619,9 @@ fn supervise(
         mount: None,
     };
     let mut fallback = copy_of(&cmd);
+    if let Some(target) = job.roots.path(crate::roots::TARGET) {
+        crate::scripts_cache::offer(&mut cmd, &store.dir, target);
+    }
     // And the tokens for this build's own compilers, kept in the cache
     // directory until Cargo has gone.
     let tokens = crate::jobs::offer(&mut cmd, &store.dir);
@@ -1434,6 +1659,7 @@ fn supervise(
         stop: AtomicBool::new(false),
         busy: std::sync::atomic::AtomicUsize::new(0),
         recorders: (Mutex::new((0, recorder_limit)), Condvar::new()),
+        script_children: Mutex::new(std::collections::HashMap::new()),
     });
     let accepting = server.clone();
     let accept = std::thread::spawn(move || {

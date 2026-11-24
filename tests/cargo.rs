@@ -2909,6 +2909,7 @@ fn c_that_a_build_script_compiles_is_remembered_like_rust() {
         success(
             p.command_in(&third)
                 .env("JATO_NEAR", "0")
+                .env("JATO_CACHE_SCRIPTS", "0")
                 .args(["run", "-q"])
         )
         .stdout,
@@ -3175,19 +3176,27 @@ fn the_library_in_watched_programs_stands_in_for_nothing_else() {
     }
     let p = Project::whole();
     p.run(&["build"]);
-    let library = fs::read_dir(p.temp.path().join("cache/lib"))
+    let libs: Vec<PathBuf> = fs::read_dir(p.temp.path().join("cache/lib"))
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
-        .find(|path| path.extension() == Some(OsStr::new("so")))
-        .expect("the library is kept in the cache");
+        .filter(|path| path.extension() == Some(OsStr::new("so")))
+        .collect();
+    let library = libs
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|n| n.starts_with("jato-fast-"))
+        })
+        .expect("the read-note library is kept in the cache");
     // Every program Jato watches loads this ahead of its C library, and
     // anything it defined would be taken for the program's own. It may
     // define the functions it stands in for and nothing more: no memory
     // functions, and nothing a Rust program brings itself.
     let Ok(listed) = Command::new("nm")
         .args(["-D", "--defined-only"])
-        .arg(&library)
+        .arg(library)
         .output()
     else {
         return;
@@ -3203,11 +3212,42 @@ fn the_library_in_watched_programs_stands_in_for_nothing_else() {
             .any(|kind| name.trim_start_matches('_').contains(kind));
         assert!(stood_in_for, "{name} is defined for every watched program");
     }
+    // The build-script interception library must export zero C symbols and
+    // require no external shared libraries.
+    if let Some(script_lib) = libs.iter().find(|path| {
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|n| n.starts_with("jato-script-"))
+    }) {
+        let script_syms = Command::new("nm")
+            .args(["-D", "--defined-only"])
+            .arg(script_lib)
+            .output()
+            .unwrap();
+        let script_defined: Vec<String> = String::from_utf8_lossy(&script_syms.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+            .collect();
+        assert!(
+            script_defined.is_empty(),
+            "jato-script library exported symbols: {script_defined:?}"
+        );
+        let script_needed = Command::new("readelf")
+            .arg("-d")
+            .arg(script_lib)
+            .output()
+            .unwrap();
+        let script_needed_text = String::from_utf8_lossy(&script_needed.stdout);
+        assert!(
+            !script_needed_text.contains("(NEEDED)"),
+            "{script_needed_text}"
+        );
+    }
     // And it asks nothing of the system but what every C library has, so
     // that it loads into a program built against another one.
     let needed = Command::new("readelf")
         .arg("-d")
-        .arg(&library)
+        .arg(library)
         .output()
         .unwrap();
     assert!(
@@ -5903,4 +5943,160 @@ fn edits_in_a_built_target_record_a_whole_build_and_catch_hidden_inputs() {
     assert_eq!(pm.run(&["run", "-q"]).stdout, b"secret-v2\n");
     assert_eq!(pm.count("build_continued"), 1, "{}", pm.stats());
     assert_eq!(pm.count("build_stored"), 2, "{}", pm.stats());
+}
+
+#[test]
+fn build_scripts_are_cached_deterministically_across_checkouts_and_invalidated() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    let setup = |root: &Path, schema: &str, suffix: &str| {
+        write(root.join("leaf/schema.txt"), schema);
+        write(
+            root.join("leaf/build.rs"),
+            r#"use std::time::{SystemTime, UNIX_EPOCH};
+fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let schema = std::fs::read_to_string("schema.txt").unwrap();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        format!("{out}/gen.rs"),
+        format!("pub const GENERATED: &str = \"{}:{}\";\n", schema.trim(), nonce),
+    )
+    .unwrap();
+    println!("cargo:rustc-env=JATO_OUT_ECHO={out}");
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"#,
+        );
+        write(
+            root.join("leaf/src/lib.rs"),
+            r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+pub fn value() -> (&'static str, &'static str) {
+    (GENERATED, env!("JATO_OUT_ECHO"))
+}
+"#,
+        );
+        write(
+            root.join("src/main.rs"),
+            &format!(
+                "fn main() {{ let (g, o) = leaf::value(); println!(\"{{g}}|{{o}}|{suffix}\"); }}\n"
+            ),
+        );
+    };
+    setup(&p.root, "schema-v1", "one");
+    let first = String::from_utf8(p.run(&["run", "-q"]).stdout).unwrap();
+    let parts1: Vec<&str> = first.trim().split('|').collect();
+    assert_eq!(parts1.len(), 3, "{first}");
+    assert!(parts1[0].starts_with("schema-v1:"), "{first}");
+    assert!(parts1[1].starts_with(p.root.to_str().unwrap()), "{first}");
+    assert_eq!(parts1[2], "one");
+    assert_eq!(p.count("script_miss"), 1, "{}", p.stats());
+    assert_eq!(p.count("script_stored"), 1, "{}", p.stats());
+
+    // In a second checkout with a changed `src/main.rs` and `JATO_NEAR=0`
+    // (forcing Cargo to run the build script), the cached build script replays
+    // deterministically with the EXACT same nonce AND relocates `OUT_DIR` in
+    // stdout directives to the new checkout, so `leaf` also hits the compiler cache!
+    let second = p.temp.path().join("second/checkout");
+    populate(&second);
+    setup(&second, "schema-v1", "two");
+    fs::copy(p.root.join("Cargo.lock"), second.join("Cargo.lock")).unwrap();
+    let out2 = String::from_utf8(
+        success(
+            p.command_in(&second)
+                .env("JATO_NEAR", "0")
+                .args(["run", "-q"]),
+        )
+        .stdout,
+    )
+    .unwrap();
+    let parts2: Vec<&str> = out2.trim().split('|').collect();
+    assert_eq!(parts2.len(), 3, "{out2}");
+    assert_eq!(
+        parts2[0], parts1[0],
+        "cached build script must replay deterministic output"
+    );
+    assert!(
+        parts2[1].starts_with(second.to_str().unwrap()),
+        "cached stdout directive must relocate OUT_DIR to second checkout: {out2}"
+    );
+    assert_eq!(parts2[2], "two");
+    assert_eq!(p.count("script_hit"), 1, "{}", p.stats());
+
+    // Build-script caching works even with `JATO_NOTES=0`.
+    let third = p.temp.path().join("third/checkout");
+    populate(&third);
+    setup(&third, "schema-v1", "three");
+    fs::copy(p.root.join("Cargo.lock"), third.join("Cargo.lock")).unwrap();
+    let out3 = String::from_utf8(
+        success(
+            p.command_in(&third)
+                .env("JATO_NEAR", "0")
+                .env("JATO_NOTES", "0")
+                .args(["run", "-q"]),
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(out3.trim().split('|').next(), Some(parts1[0]));
+    assert_eq!(p.count("script_hit"), 2, "{}", p.stats());
+
+    // Changing the untracked file read by the build script invalidates both
+    // the in-place whole build (catching hidden inputs even with an older
+    // mtime) AND the cached build script itself.
+    write(third.join("leaf/schema.txt"), "schema-v2");
+    make_old(&third.join("leaf/schema.txt"));
+    let out4 = String::from_utf8(success(p.command_in(&third).args(["run", "-q"])).stdout).unwrap();
+    assert!(
+        out4.starts_with("schema-v2:"),
+        "changed input must invalidate cached build script: {out4}"
+    );
+    assert_eq!(p.count("script_miss"), 2, "{}", p.stats());
+    assert_eq!(p.count("script_stored"), 2, "{}", p.stats());
+
+    // And in a fresh checkout with `JATO_NEAR=0` and `schema-v3`, Cargo runs
+    // the build script directly and the script cache misses on `schema.txt`.
+    let fourth = p.temp.path().join("fourth/checkout");
+    populate(&fourth);
+    setup(&fourth, "schema-v3", "four");
+    fs::copy(p.root.join("Cargo.lock"), fourth.join("Cargo.lock")).unwrap();
+    let out5 = String::from_utf8(
+        success(
+            p.command_in(&fourth)
+                .env("JATO_NEAR", "0")
+                .args(["run", "-q"]),
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(
+        out5.starts_with("schema-v3:"),
+        "changed input in fresh checkout must invalidate cached build script: {out5}"
+    );
+    assert_eq!(p.count("script_miss"), 3, "{}", p.stats());
+    assert_eq!(p.count("script_stored"), 3, "{}", p.stats());
+
+    // A build script that writes outside OUT_DIR is never cached.
+    let side_fx = Project::whole();
+    write(
+        side_fx.root.join("leaf/build.rs"),
+        r#"fn main() {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    std::fs::write(format!("{dir}/side_effect.txt"), "touched").unwrap();
+}
+"#,
+    );
+    assert_eq!(side_fx.run(&["run", "-q"]).stdout, b"one:none\n");
+    assert_eq!(side_fx.count("script_stored"), 0, "{}", side_fx.stats());
+    assert_eq!(
+        side_fx.count("script_uncacheable"),
+        1,
+        "{}",
+        side_fx.stats()
+    );
 }

@@ -155,7 +155,11 @@ impl Request {
 /// is the same command watched or not.
 pub fn own_environment() -> impl Iterator<Item = (OsString, OsString)> {
     env::vars_os().filter_map(|(name, value)| {
-        if name == "JATO_NOTES_TO" {
+        if name == "JATO_NOTES_TO"
+            || name == "JATO_SCRIPT_BIN"
+            || name == "JATO_SCRIPT_TARGET"
+            || name == "JATO_SCRIPT_DIRECT"
+        {
             return None;
         }
         if name != "LD_PRELOAD" {
@@ -165,7 +169,10 @@ pub fn own_environment() -> impl Iterator<Item = (OsString, OsString)> {
             .as_bytes()
             .split(|b| *b == b':' || *b == b' ')
             .filter(|entry| !entry.is_empty())
-            .filter(|entry| !observe::is_fast_library(Path::new(OsStr::from_bytes(entry))))
+            .filter(|entry| {
+                let p = Path::new(OsStr::from_bytes(entry));
+                !observe::is_fast_library(p) && !observe::is_script_library(p)
+            })
             .collect();
         (!kept.is_empty()).then(|| (name, OsString::from_vec(kept.join(&b':'))))
     })

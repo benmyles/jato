@@ -196,6 +196,7 @@ impl Report {
             if under == 0 {
                 access.stray = true;
             } else {
+                access.stray = false;
                 access.by = vec![under];
                 if access.written {
                     access.wrote = under;
@@ -516,6 +517,13 @@ pub fn is_fast_library(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| name.starts_with("jato-fast-") && name.ends_with(".so"))
+}
+
+/// Whether a path names a copy of the build-script interception library.
+pub fn is_script_library(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with("jato-script-") && name.ends_with(".so"))
 }
 
 /// A file holding that library inside the cache directory, written if it
@@ -1737,12 +1745,18 @@ mod imp {
         )
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ScopeKind {
+        Compiler,
+        Script(u16),
+    }
+
     /// Everything recorded for one observed command: what the command and
     /// its children did, and separately what happened beneath each process
     /// that asked for a record of its own.
     struct State {
         whole: Tracker,
-        scopes: HashMap<u32, Tracker>,
+        scopes: HashMap<u32, (ScopeKind, Tracker)>,
         /// The scope each thread's reports belong to, and when that was
         /// last worked out.
         owner: HashMap<u32, (Option<u32>, u64)>,
@@ -1920,14 +1934,14 @@ mod imp {
             };
             match scope {
                 Some(Some(root)) => match self.scopes.get_mut(&root) {
-                    Some(tracker) => record(tracker),
+                    Some((_, tracker)) => record(tracker),
                     None => record(&mut self.whole),
                 },
                 Some(None) => record(&mut self.whole),
                 // Nothing says whose it was: then it was everyone's.
                 None => {
                     record(&mut self.whole);
-                    self.scopes.values_mut().for_each(record);
+                    self.scopes.values_mut().for_each(|(_, t)| record(t));
                 }
             }
         }
@@ -2131,7 +2145,7 @@ mod imp {
                 _ => 0,
             };
             let tracker = match scope {
-                Some(scope) => state.scopes.get_mut(&scope).unwrap(),
+                Some(scope) => &mut state.scopes.get_mut(&scope).unwrap().1,
                 None => &mut state.whole,
             };
             tracker.now = now;
@@ -2153,6 +2167,19 @@ mod imp {
                     && let Some(program) = starting
                 {
                     state.starts(tid, program);
+                } else if let Some(program) = starting
+                    && let Some(jato) = own_jato()
+                    && fs::metadata(&program).is_ok_and(|m| (m.dev(), m.ino()) == jato)
+                {
+                    // `libjato_script.so` handing a Cargo-started build script
+                    // off to `jato __script` in the same process: preserve
+                    // build-script attribution across the exec into `jato`.
+                    let process = ids(tid).map_or(tid, |(p, _)| p);
+                    if let Some((_, exe)) = state.started.get_mut(&process) {
+                        *exe = jato;
+                        state.under.remove(&tid);
+                        state.under.remove(&process);
+                    }
                 }
                 state.becomes_another(tid);
             }
@@ -2178,17 +2205,45 @@ mod imp {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.scopes.insert(
                 root,
-                Tracker {
-                    report: Report::default(),
-                    config,
-                    buffer: Vec::new(),
-                    caller: 0,
-                    now: 0,
-                    others: true,
-                    under: 0,
-                    starting: None,
-                },
+                (
+                    ScopeKind::Compiler,
+                    Tracker {
+                        report: Report::default(),
+                        config,
+                        buffer: Vec::new(),
+                        caller: 0,
+                        now: 0,
+                        others: true,
+                        under: 0,
+                        starting: None,
+                    },
+                ),
             );
+            state.owner.remove(&root);
+        }
+
+        /// From now on, record what the descendants of a build-script wrapper
+        /// `root` do apart from the rest of the command while allowing nested
+        /// compiler/tool scopes underneath it.
+        pub fn begin_script(&self, root: u32, config: Config, under: u16) {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.scopes.insert(
+                root,
+                (
+                    ScopeKind::Script(under),
+                    Tracker {
+                        report: Report::default(),
+                        config,
+                        buffer: Vec::new(),
+                        caller: 0,
+                        now: 0,
+                        others: true,
+                        under: 0,
+                        starting: None,
+                    },
+                ),
+            );
+            state.owner.remove(&root);
         }
 
         /// Whether `process` runs a program the command itself is or has
@@ -2198,10 +2253,41 @@ mod imp {
             state.own_program(process)
         }
 
-        /// Whether `process` is the root of a scope or runs inside one.
-        pub fn inside(&self, process: u32) -> bool {
-            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            state.scopes.contains_key(&process) || state.scope_of(process).is_some()
+        /// Whether `process` is the root of a compiler scope or runs inside one.
+        pub fn inside_compiler(&self, process: u32) -> bool {
+            let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(state.scopes.get(&process), Some((ScopeKind::Compiler, _))) {
+                return true;
+            }
+            if let Some((_, mut parent)) = ids(process) {
+                for _ in 0..64 {
+                    if let Some((ScopeKind::Compiler, _)) = state.scopes.get(&parent) {
+                        return true;
+                    }
+                    match ids(parent) {
+                        Some((_, next)) if parent > 1 => parent = next,
+                        _ => break,
+                    }
+                }
+            }
+            false
+        }
+
+        /// Nearest enclosing build-script scope `(root_pid, script_number)`, if any.
+        pub fn enclosing_script(&self, process: u32) -> Option<(u32, u16)> {
+            let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, mut parent)) = ids(process) {
+                for _ in 0..64 {
+                    if let Some((ScopeKind::Script(under), _)) = state.scopes.get(&parent) {
+                        return Some((parent, *under));
+                    }
+                    match ids(parent) {
+                        Some((_, next)) if parent > 1 => parent = next,
+                        _ => break,
+                    }
+                }
+            }
+            None
         }
 
         /// Count what a scope recorded as the doing of the command as a
@@ -2210,6 +2296,22 @@ mod imp {
         pub fn absorb(&self, report: Report, under: u16) {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.whole.report.absorb(report, under);
+        }
+
+        /// Count what a nested compiler/tool scope recorded as part of its
+        /// enclosing build-script scope `root`.
+        pub fn absorb_into(&self, root: u32, report: Report) {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, tracker)) = state.scopes.get_mut(&root) {
+                tracker.report.absorb(report, 0);
+            }
+        }
+
+        /// Clear build-script attribution for a finished script process.
+        pub fn finish_script_process(&self, process: u32) {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.started.remove(&process);
+            state.under.remove(&process);
         }
 
         /// The program, of those the command tells apart, in whose doing
@@ -2223,7 +2325,11 @@ mod imp {
         pub fn end(&self, root: u32) -> Option<Report> {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.take_notes();
-            let tracker = state.scopes.remove(&root)?;
+            let (kind, tracker) = state.scopes.remove(&root)?;
+            if matches!(kind, ScopeKind::Script(_)) {
+                state.started.remove(&root);
+                state.under.remove(&root);
+            }
             state.owner.retain(|_, (scope, _)| *scope != Some(root));
             let mut report = tracker.report;
             report.events = state.events;
@@ -2535,13 +2641,19 @@ mod imp {
     pub struct Scopes;
     impl Scopes {
         pub fn begin(&self, _: u32, _: Config) {}
+        pub fn begin_script(&self, _: u32, _: Config, _: u16) {}
         pub fn own_program(&self, _: u32) -> bool {
             false
         }
-        pub fn inside(&self, _: u32) -> bool {
+        pub fn inside_compiler(&self, _: u32) -> bool {
             false
         }
-        pub fn absorb(&self, _: Report) {}
+        pub fn enclosing_script(&self, _: u32) -> Option<(u32, u16)> {
+            None
+        }
+        pub fn absorb(&self, _: Report, _: u16) {}
+        pub fn absorb_into(&self, _: u32, _: Report) {}
+        pub fn finish_script_process(&self, _: u32) {}
         pub fn end(&self, _: u32) -> Option<Report> {
             None
         }

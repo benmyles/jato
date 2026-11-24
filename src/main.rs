@@ -9,6 +9,21 @@ mod observe;
 mod roots;
 mod scan;
 #[cfg(target_os = "linux")]
+mod scripts_cache;
+#[cfg(not(target_os = "linux"))]
+mod scripts_cache {
+    use anyhow::Result;
+    use std::ffi::OsString;
+    pub fn runner(args: &[OsString]) -> Result<i32> {
+        let Some((binary, rest)) = args.split_first() else {
+            anyhow::bail!("missing build-script binary");
+        };
+        let mut cmd = std::process::Command::new(binary);
+        cmd.args(rest).env("JATO_SCRIPT_DIRECT", "1");
+        crate::command::passthrough(cmd)
+    }
+}
+#[cfg(target_os = "linux")]
 mod session;
 #[cfg(not(target_os = "linux"))]
 mod session {
@@ -116,6 +131,8 @@ Environment
   JATO_STORAGE=packed Keep compressed copies even where files can be cloned
   JATO_VERIFY=1       Check restored bytes on filesystems that checksum them
   JATO_CACHE_TESTS=0  Run tests without caching their results
+  JATO_CACHE_SCRIPTS=0
+                      Run build scripts without caching their executions
   JATO_PARALLEL_TESTS=0
                       Run workspace test binaries one at a time
   JATO_DISABLE=1      Run Cargo and the compiler directly
@@ -301,7 +318,8 @@ fn main() {
     // programs themselves.
     let stand_ins = env::var_os(tools::DIRECTORY);
     let raw_path = env::var_os("PATH");
-    if let (Some(stand_ins), Some(path)) = (&stand_ins, &raw_path) {
+    let is_script = env::args_os().nth(1).is_some_and(|a| a == "__script");
+    if !is_script && let (Some(stand_ins), Some(path)) = (&stand_ins, &raw_path) {
         // Nothing else is running yet in this process.
         unsafe { env::set_var("PATH", tools::without(path, stand_ins)) };
     }
@@ -632,6 +650,14 @@ fn report(stats: &cas::Stats) -> String {
             count("tool_uncacheable")
         );
     }
+    let (hits, misses) = (count("script_hit"), count("script_miss"));
+    if hits + misses > 0 {
+        let _ = writeln!(
+            out,
+            "Scripts    {hits} results reused, {misses} run ({} of those could not be stored)",
+            count("script_uncacheable")
+        );
+    }
     let (hits, misses) = (count("test_hit"), count("test_miss"));
     if hits + misses > 0 {
         let _ = writeln!(
@@ -706,6 +732,10 @@ fn report(stats: &cas::Stats) -> String {
         "tool_miss",
         "tool_stored",
         "tool_uncacheable",
+        "script_hit",
+        "script_miss",
+        "script_stored",
+        "script_uncacheable",
         "test_hit",
         "test_miss",
         "test_stored",
@@ -766,6 +796,10 @@ fn run() -> Result<i32> {
         // Started by Cargo via CARGO_TARGET_<TRIPLE>_RUNNER for test caching.
         Some("__test") if args.len() >= 2 => {
             return tests_cache::runner(&args[1..]);
+        }
+        // Started by libjato_script.so for observed build-script caching.
+        Some("__script") if args.len() >= 2 => {
+            return scripts_cache::runner(&args[1..]);
         }
         Some("stats") if args.len() == 1 || args[1..] == ["--json"] => {
             let stats = Store::open()?.stats()?;
