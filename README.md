@@ -315,6 +315,67 @@ There is no daemon, and nothing runs between builds. The cache holds compiled ar
 
 What leaves no trace in files or in the variables above is not seen at all: the time of day, a random number, the state of a machine across the network. A C file that asks for the time it is compiled at, through `__TIME__` or `__DATE__`, is given back with the time of its first compilation, as a Rust crate whose procedural macro reads the clock is.
 
+## Comparing Jato, kache, sccache, and Bazel (Blaze)
+
+These four tools sit at different points between a compiler wrapper and a full build system. **kache** and **sccache** wrap individual compiler calls under Cargo. **Bazel** (the open-source counterpart to Google's internal **Blaze**) replaces Cargo with a declarative polyglot build graph and optional Remote Build Execution (RBE). **Jato** keeps Cargo in charge, but observes real Linux system calls to cache whole builds, near-build deltas, build scripts, C/C++/asm, `rustc` incremental state, and test runs without a build description of its own.
+
+### What each tool does
+
+| | Jato | kache | sccache | Bazel / Blaze |
+| --- | --- | --- | --- | --- |
+| **Build system** | Keeps Cargo (`jato build`/`test`/`check`, or `RUSTC_WRAPPER=jato`) | Keeps Cargo (`RUSTC_WRAPPER` + C/C++/CUDA wrapper) | Keeps Cargo (`RUSTC_WRAPPER` + C/C++/CUDA wrapper) | Replaces Cargo (`BUILD.bazel`, `rules_rust`, `crate_universe`) |
+| **How inputs are learned** | Observed at runtime via Linux `seccomp_unotify` + read-note shim (exact files, dirs, symlinks, child processes) | Parsed from normalized compiler flags and compiler-reported inputs | Parsed from compiler flags, preprocessor/dep-info, and env | Explicitly declared in `BUILD` files and enforced by hermetic sandboxes |
+| **Unit of caching** | Whole Cargo builds (bypasses Cargo on hit), near-build deltas, cross-command target seeding, single `rustc`/C/asm units, build scripts, tests | Single compiler invocations (`rustc`, C/C++, CUDA); Cargo still plans and runs every step | Single non-incremental compiler invocations (`rustc`, C/C++, CUDA) | Every action in a polyglot graph (Rust, C++, Go, Java, Python, codegen, tests) |
+| **Proc macros & hidden file reads** | Observed automatically; unlisted env vars via `JATO_KEY_ENV` | Relies on `rustc` dep-info; untracked reads can be missed | Relies on `rustc` dep-info; untracked reads can be missed | Enforced by sandbox: undeclared inputs fail or are invisible |
+| **Build scripts (`build.rs`) & C/C++** | Caches both `build.rs` executions (`OUT_DIR` + directives) and nested C/C++/asm compilations | Caches C/C++/CUDA via `CC`/`CXX` wrappers; Cargo still runs `build.rs` | Caches C/C++/CUDA via `CC`/`CXX` wrappers; Cargo still runs `build.rs` | First-class sandboxed `cargo_build_script` and C/C++ actions |
+| **Incremental `rustc` state** | Kept and handed on across cleans and worktrees (reuses analysis + unedited library codegen on first edit) | Compiles without `rustc` incremental state (first edit in a restored target compiles crate from scratch) | Skips caching incremental Rust crates (dev-profile workspace crates miss unless `CARGO_INCREMENTAL=0`) | Non-incremental `rustc` actions by default (mitigated by fine-grained targets + RBE) |
+| **Test caching & execution** | Observed caching of passing hermetic test binaries + parallel workspace test runner | None (Cargo runs tests) | None (Cargo runs tests) | First-class sandboxed test caching, sharding, and remote execution |
+| **Daemon & idle RAM** | None (`0 MiB` idle); optional shared named-FIFO jobserver | Background daemon (`21–115 MiB` RSS measured) for async remote sync & concurrency limiting | Local client-server daemon | Persistent JVM server per workspace (hundreds of MiB to multi-GiB on large graphs) |
+| **Local storage & dedup** | SQLite + BLAKE3 CAS; Btrfs/XFS reflinks, ext4 zstd + hardlink dedup + optional RAM hot tier (`jato memory`) | SQLite + BLAKE3 CAS; APFS/Btrfs/XFS reflinks or hardlinks/copies | Flat local disk cache (no reflink target deduplication) | Output base + content-addressed disk cache |
+| **Remote cache & RBE** | Built-in zero-dep `file://` and HTTP/1.1 CAS (`jato remote`); no S3/GCS SDK or RBE | Native S3-compatible remote cache (S3/R2/MinIO) + GitHub Actions; no RBE | S3, GCS, Azure, Redis, Memcached, WebDAV, GHA + `sccache-dist` distributed builds | Industry-standard REAPI: remote caching + Remote Build Execution (RBE) worker farms |
+| **Platforms** | Linux (`x86_64`, `aarch64`, kernel 5.5+); passthrough to Cargo on macOS/Windows | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows (strongest sandboxing on Linux) |
+
+### Relative performance
+
+Measured numbers below come from [bench/README.md](bench/README.md), where each contender gets its own store, daemon, checkout, and target directories and the built binary is verified after every step:
+
+| Scenario | Jato | kache `2.3.0` | sccache `0.19.0` | Bare Cargo | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **Large workspace (Olo `build --workspace`)** — cold¹ | 480.4 s *(246 s solo)* | 482.3 s | — | *(248 s solo)* | Cold parity (~1% CPU overhead) |
+| Olo `build` — warm repeat (`fresh`, 72k inputs)¹ | **0.07–0.15 s** | 1.84 s | — | — | Jato skips Cargo (12–26× faster) |
+| Olo `build` — target removed / new target¹ | **0.73–3.06 s** | 30.1–138.7 s | — | cold | 10–27× faster (`0.73 s` with `jato memory 64GiB`) |
+| Olo `build` — `Cargo.toml` edit in new worktree¹ | **7.6–10.1 s** | 19.6 s | — | cold | 2× faster; near-build + `.rlib` normalization |
+| Olo `build` — first edit in restored target¹ | **10.6–18.2 s** | 36.0 s | — | — | 2–3.4× faster; handed-on `rustc` saved state |
+| Olo `build` — subsequent edits (in-place)¹ | 8.7–13.1 s | 11.7 s | — | — | Parity (Cargo + `rustc` incremental dominate) |
+| Olo `build` — undo edits¹ | **0.69 s** *(0.19)* | 11.4 s | — | — | Whole-build restore (`16×` faster in `0.19.0`) |
+| Olo `check` — target removed / new worktree¹ | **0.37–1.52 s** | 10.4–11.9 s | — | cold | 8–27× faster; store `6.2` vs `12.3 GiB` (`build`) |
+| **Small workspace (`ripgrep 14.1.1` dev)** — restore / copy² | **0.07–0.34 s** | 0.38–0.70 s | 4.86–8.09 s | 9.12–11.32 s | sccache skips incremental dev workspace crates |
+| `ripgrep 14.1.1` dev — subsequent edits² | 0.52 s | 0.53 s | 0.47 s | 0.50 s | Parity across all tools |
+| `ripgrep 14.1.1` dev — undo² | **0.05 s** | 0.16 s | 0.51 s | 0.69 s | Whole-build restore |
+
+¹ Olo (121 packages, 1,502 Rust compilations, 113 build scripts / ~1,100 C/C++/asm files, 56 dev binaries, 20.6–20.9 GiB target, `nightly-2026-11-14`, mold) on a 32-core AMD EPYC 9655, 125 GiB RAM, ext4. Side-by-side runs (`0.18.0` vs `kache 2.3.0`, load 7–67, 1 run each) plus `0.19.0` single-contender runs on the same server (load 15–49).  
+² `ripgrep 14.1.1` (default dev profile, Rust 1.100) on an Intel Core Ultra 7 356H, Btrfs, median of 3 rotating runs, load 21–30.
+
+**Where Bazel / Blaze sits on performance** (not benchmarked in `bench/compare.py`, since migrating a Cargo workspace to `BUILD.bazel` changes the build graph itself):
+- **Cold builds at scale**: With **Remote Build Execution (RBE)**, Bazel/Blaze can fan hundreds of compile and test actions across a remote worker fleet and beat any single-machine tool (Jato, kache, or sccache) on cold builds.
+- **Warm & cross-branch builds**: Cached action hits and selective test re-runs are fast once the Bazel JVM server is hot, though cold-server startup and graph analysis add latency and gigabytes of resident memory that daemonless Jato avoids.
+- **Inner edit loop on a single large crate**: Because Bazel normally runs non-incremental `rustc` actions, editing a large crate locally is typically slower than Cargo/Jato's `rustc` incremental compilation unless the codebase is broken into many small targets.
+
+### When each tool is the right fit (and when it is not)
+
+- **Jato**
+  - *Right fit*: Linux workstations, shared Linux build servers, and multi-worktree coding agents (Claude Code, Codex, Antigravity) on standard Cargo workspaces—especially large workspaces with slow build scripts, C/C++ dependencies, proc macros, or frequent branch/worktree switches where whole-build restores, handed-on incremental state, observed soundness, test caching, and zero-daemon concurrency control pay off most.
+  - *Not the right fit*: macOS or Windows build hosts (Jato passes through to Cargo there); teams that need native S3/GCS/Azure object-store caching out of the box or RBE worker farms; polyglot non-Cargo monorepos.
+- **kache**
+  - *Right fit*: Cross-platform (Linux, macOS, Windows) Rust + C/C++/CUDA teams wanting a fast, modern drop-in `RUSTC_WRAPPER` with reflinks, BLAKE3 keys, and native S3/R2/MinIO + GitHub Actions remote caching without leaving Cargo.
+  - *Not the right fit*: Workspaces where Cargo startup, `build.rs` execution, hidden proc-macro inputs, or cold first-edit compiles in fresh worktrees dominate—kache still runs Cargo and build scripts on every restore and compiles without `rustc` incremental state.
+- **sccache**
+  - *Right fit*: Cross-platform CI pipelines (especially with `CARGO_INCREMENTAL=0`) and mixed Rust/C/C++/CUDA teams that want battle-tested cloud storage backends (S3, GCS, Azure, Redis, Memcached, GHA) or `sccache-dist` distributed compilation.
+  - *Not the right fit*: Local default-profile (`dev`) Cargo development and multi-worktree workflows—sccache does not cache incremental Rust crates, does not bypass Cargo on restores, and does not cache build scripts or tests.
+- **Bazel / Blaze**
+  - *Right fit*: Large polyglot monorepos (Rust + C++ + Go + Protobuf + Python/Java) that require strict hermetic reproducibility, unified cross-language graphs, fine-grained test sharding, and Remote Build Execution (RBE) across clusters.
+  - *Not the right fit*: Cargo-first Rust teams that want zero migration effort, out-of-the-box `Cargo.toml` / `rust-analyzer` / crates.io ergonomics, low idle memory use, and `rustc` incremental compilation without maintaining `BUILD.bazel` files and rule generators.
+
 ## Design references
 
 - BuildXL and Bazel record what an action read and key its result on that. Jato applies the two-step lookup to Cargo without a build description of its own: Cargo stays in charge, and the observation supplies the dependency list. [BuildXL two-phase lookup](https://github.com/microsoft/BuildXL/blob/main/Documentation/Wiki/Advanced-Features/Two-Phase-Cache-Lookup.md) · [Bazel remote caching](https://bazel.build/remote/caching)
