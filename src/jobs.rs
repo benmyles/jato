@@ -164,18 +164,182 @@ pub fn named_pipe(value: &OsStr) -> Option<PathBuf> {
     (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&rest[..end])))
 }
 
-/// The tokens of one build: a pipe with a name, removed with this.
+/// A shared machine-wide jobserver FIFO coordinated across concurrent builds
+/// sharing a cache directory, or a private per-build FIFO when `JATO_JOBS=0`.
 pub struct Tokens {
     path: PathBuf,
     /// Held open both ways, so that the tokens stay in the pipe while no
     /// compiler has it open and nobody waits to open it.
-    _pipe: File,
+    pipe: Option<File>,
+    shared: Option<SharedJobserver>,
+}
+
+struct SharedJobserver {
+    coord_path: PathBuf,
+    active: File,
+    holds_token: bool,
+    pool: usize,
 }
 
 impl Drop for Tokens {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let Some(shared) = self.shared.take() else {
+            drop(self.pipe.take());
+            let _ = fs::remove_file(&self.path);
+            return;
+        };
+        let coord = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&shared.coord_path)
+            .ok();
+        if let Some(ref c) = coord {
+            let _ = lock(c);
+        }
+        // If we can atomically upgrade our shared lock to exclusive, no other
+        // active build is using the shared FIFO and we clean it up cleanly.
+        match shared.active.try_lock() {
+            Ok(()) => {
+                drop(self.pipe.take());
+                let _ = fs::remove_file(&self.path);
+            }
+            Err(_) => {
+                // Other builds are still active on this FIFO. Return our token
+                // unless the FIFO is already full at `pool - 1`.
+                if shared.holds_token
+                    && let Some(mut pipe) = self.pipe.take()
+                {
+                    let mut avail: libc::c_int = 0;
+                    let ok = unsafe {
+                        libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &raw mut avail) == 0
+                    };
+                    if !ok || (avail as usize) < shared.pool.saturating_sub(1) {
+                        let _ = pipe.write(b"|");
+                    }
+                }
+            }
+        }
+        drop(shared.active);
+        drop(coord);
     }
+}
+
+fn acquire_shared_fifo(dir: &Path, pool: usize) -> Option<Tokens> {
+    use std::io::{Read, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let coord_path = dir.join("shared-coord.lock");
+    let coord = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&coord_path)
+        .ok()?;
+    lock(&coord).ok()?;
+    let active = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("shared-active.lock"))
+        .ok()?;
+    let path = dir.join("tokens-shared");
+    let tokens = match active.try_lock() {
+        Ok(()) => {
+            // No other build holds LOCK_SH (even if an earlier build crashed
+            // with SIGKILL, the kernel released its lock). Recreate a fresh
+            // FIFO with `pool - 1` tokens (1 implicit token belongs to us).
+            let _ = fs::remove_file(&path);
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+                return None;
+            }
+            let made = (|| {
+                let mut pipe = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                    .ok()?;
+                pipe.write_all(&vec![b'|'; pool - 1]).ok()?;
+                active.lock_shared().ok()?;
+                Some(Tokens {
+                    path: path.clone(),
+                    pipe: Some(pipe),
+                    shared: Some(SharedJobserver {
+                        coord_path: coord_path.clone(),
+                        active,
+                        holds_token: true,
+                        pool,
+                    }),
+                })
+            })();
+            if made.is_none() {
+                let _ = fs::remove_file(&path);
+            }
+            made
+        }
+        Err(TryLockError::WouldBlock) => {
+            active.lock_shared().ok()?;
+            let mut pipe = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .ok()?;
+            let mut byte = [0u8; 1];
+            let holds_token = matches!(pipe.read(&mut byte), Ok(1));
+            Some(Tokens {
+                path,
+                pipe: Some(pipe),
+                shared: Some(SharedJobserver {
+                    coord_path,
+                    active,
+                    holds_token,
+                    pool,
+                }),
+            })
+        }
+        Err(TryLockError::Error(_)) => None,
+    };
+    drop(coord);
+    tokens
+}
+
+fn acquire_private_fifo(dir: &Path, jobs: usize) -> Option<Tokens> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let path = dir.join(format!("tokens-{}-{nanos:x}", std::process::id()));
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+        return None;
+    }
+    let tokens = (|| {
+        let mut pipe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        // Cargo holds one itself, as make's rules have it.
+        pipe.write_all(&vec![b'|'; jobs - 1]).ok()?;
+        Some(Tokens {
+            path: path.clone(),
+            pipe: Some(pipe),
+            shared: None,
+        })
+    })();
+    if tokens.is_none() {
+        let _ = fs::remove_file(&path);
+    }
+    tokens
 }
 
 /// Give the Cargo that `cmd` starts its tokens in a pipe with a name.
@@ -190,18 +354,31 @@ impl Drop for Tokens {
 /// time there. A pipe with a name is found by that name, nothing has to
 /// be inherited, and Cargo starts a compiler without a copy of itself.
 ///
-/// The number of tokens is the one Cargo would have chosen, and only
-/// where nothing says another: no option, variable or configuration file.
-/// A make older than 4.4 stops at a pipe with a name, so none is given
+/// Concurrent builds sharing the same cache directory share one machine-wide
+/// FIFO (`tokens-shared`) so Cargo, rustc `-Zthreads`, LLVM codegen threads,
+/// and GNU `make` coordinate under a single global token pool (unless
+/// `JATO_JOBS=0` disables cross-build capping, in which case a private FIFO is
+/// used).
+///
+/// The number of tokens is the one Cargo would have chosen (or `JATO_JOBS`),
+/// and only where nothing says another: no option, variable or configuration
+/// file. A make older than 4.4 stops at a pipe with a name, so none is given
 /// where a build script would find such a make.
 pub fn offer(cmd: &mut Command, cache: &Path) -> Option<Tokens> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
     let asked = std::env::var_os("JATO_JOBSERVER");
     if asked.as_deref() == Some(OsStr::new("0")) {
         return None;
     }
-    let jobs = std::thread::available_parallelism().ok()?.get();
+    let cap = limit();
+    let unlimited = std::env::var("JATO_JOBS")
+        .ok()
+        .is_some_and(|v| v.trim() == "0");
+    let jobs = if unlimited {
+        std::thread::available_parallelism().ok()?.get()
+    } else {
+        cap
+    };
     if jobs < 2 || says_how_many(cmd) {
         return None;
     }
@@ -219,38 +396,15 @@ pub fn offer(cmd: &mut Command, cache: &Path) -> Option<Tokens> {
         return None;
     }
     fs::create_dir_all(&dir).ok()?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let path = dir.join(format!("tokens-{}-{nanos:x}", std::process::id()));
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
-        return None;
-    }
-    let tokens = (|| {
-        use std::io::Write;
-        let mut pipe = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .ok()?;
-        // Cargo holds one itself, as make's rules have it.
-        pipe.write_all(&vec![b'|'; jobs - 1]).ok()?;
-        Some(Tokens {
-            path: path.clone(),
-            _pipe: pipe,
-        })
-    })();
-    if tokens.is_none() {
-        let _ = fs::remove_file(&path);
-        return None;
-    }
+    let tokens = if unlimited {
+        acquire_private_fifo(&dir, jobs)?
+    } else {
+        acquire_shared_fifo(&dir, jobs).or_else(|| acquire_private_fifo(&dir, jobs))?
+    };
     let mut said = OsString::from(format!("-j{jobs} --jobserver-auth=fifo:"));
-    said.push(&path);
+    said.push(&tokens.path);
     cmd.env(TOLD_IN[0], said);
-    tokens
+    Some(tokens)
 }
 
 /// Take back what `offer` told a command that is started without it.
@@ -459,5 +613,44 @@ mod tests {
         assert!(take_one_of(Path::new("/proc/nowhere"), 2).file.is_none());
         drop((second, third));
         assert!(take_one_of(dir.path(), 1).file.is_some());
+    }
+
+    #[test]
+    fn shared_jobserver_shares_one_fifo_and_cleans_up_when_last_build_exits() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_bytes = |t: &Tokens| -> usize {
+            let mut avail: libc::c_int = 0;
+            let fd = t.pipe.as_ref().unwrap().as_raw_fd();
+            assert_eq!(
+                unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut avail) },
+                0
+            );
+            avail as usize
+        };
+        let t1 = acquire_shared_fifo(dir.path(), 4).expect("first acquires shared fifo");
+        assert!(t1.path.exists());
+        assert_eq!(fifo_bytes(&t1), 3);
+
+        let t2 = acquire_shared_fifo(dir.path(), 4).expect("second joins same shared fifo");
+        assert_eq!(t1.path, t2.path);
+        // 1 implicit for t1 + 1 implicit for t2 + 2 in FIFO = 4 total.
+        assert_eq!(fifo_bytes(&t2), 2);
+
+        let shared_path = t1.path.clone();
+        // Dropping first build while second is active keeps the FIFO and returns 1 token.
+        drop(t1);
+        assert!(shared_path.exists());
+        assert_eq!(fifo_bytes(&t2), 3);
+
+        // Dropping the last active build unlinks the shared FIFO cleanly.
+        drop(t2);
+        assert!(!shared_path.exists());
+
+        // A new build after idle recreates it cleanly with full tokens.
+        let t3 = acquire_shared_fifo(dir.path(), 4).expect("recreates after idle");
+        assert_eq!(fifo_bytes(&t3), 3);
+        drop(t3);
+        assert!(!shared_path.exists());
     }
 }

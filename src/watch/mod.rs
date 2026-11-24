@@ -7,7 +7,7 @@ mod events;
 mod tree;
 mod workspace;
 
-use crate::{CargoOptions, cargo_command, command};
+use crate::{CargoOptions, command};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
@@ -191,10 +191,12 @@ impl Job {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        let child = cargo_command(args, cargo)?
-            .process_group(0)
-            .spawn()
-            .context("starting Cargo job")?;
+        let mut cmd = std::process::Command::new(env::current_exe()?);
+        if cargo.dev {
+            cmd.arg("dev");
+        }
+        cmd.arg("cargo").args(args);
+        let child = cmd.process_group(0).spawn().context("starting jato job")?;
         #[cfg(target_os = "linux")]
         let completion = {
             // A pidfd becomes readable at exit, even if Cargo finished before

@@ -6100,3 +6100,85 @@ pub fn value() -> (&'static str, &'static str) {
         side_fx.stats()
     );
 }
+
+#[test]
+fn watcher_routes_through_jato_and_gets_whole_build_hit_on_undo() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    let manifest = p.root.join("Cargo.toml");
+    let mut contents = fs::read_to_string(&manifest).unwrap();
+    contents.push_str("\n[workspace]\nmembers=['leaf']\n");
+    write(manifest, &contents);
+    p.run(&["check", "--workspace"]);
+    let mut child = p
+        .command()
+        .args(["watch", "--focus-only", "--debounce", "40"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let (send, recv) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(child);
+    let wait = |marker: &str| {
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut seen = String::new();
+        loop {
+            let line = recv
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|e| panic!("expected {marker:?}: {e}\n{seen}"));
+            if line.contains(marker) {
+                break;
+            }
+            seen.push_str(&line);
+            seen.push('\n');
+        }
+    };
+    // Initial check records a whole build (`cargo check --workspace`).
+    wait("finished in");
+    assert!(p.count("build_stored") >= 1, "{}", p.stats());
+
+    // Edit `leaf` -> runs focused `cargo check -p leaf` and records whole build.
+    write(p.root.join("leaf/src/text file"), "edited-in-watch");
+    wait("cargo check -p leaf");
+    wait("finished in");
+
+    // Edit again, then revert to `"edited-in-watch"` -> `jato watch` routes
+    // through `jato cargo check -p leaf` and gets a whole-build hit!
+    write(p.root.join("leaf/src/text file"), "edited-second");
+    wait("cargo check -p leaf");
+    wait("finished in");
+    let hits_before = p.count("build_hit");
+    write(p.root.join("leaf/src/text file"), "edited-in-watch");
+    wait("cargo check -p leaf");
+    wait("finished in");
+    assert!(
+        p.count("build_hit") > hits_before,
+        "reverting an edit in jato watch should hit the whole-build cache: {}",
+        p.stats()
+    );
+
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGINT);
+    }
+    let _ = child.0.wait();
+}
