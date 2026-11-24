@@ -1,6 +1,6 @@
 # Jato measurements
 
-The whole Olo workspace was measured on a build server with Jato 0.18.0 and 0.17.0 and on a laptop with Jato 0.15.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
+The whole Olo workspace was measured on a build server with Jato 0.19.0, 0.18.0 and 0.17.0 and on a laptop with Jato 0.15.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
 
 Benchmarks ran on an Intel Core Ultra 7 356H (16 logical processors, 15 available to the session, 62 GiB) with Fedora 45, Linux 7.3.4 and Btrfs with zstd compression. The machine was shared with other people's builds throughout: its load average is given with each set of numbers, and wall-clock times moved with it. Comparisons within one table were taken in one sitting, rotating the order of contenders where there was more than one run.
 
@@ -56,6 +56,45 @@ From nothing the two take the same time and the same processor time when they ru
 Before Jato remembered the C that build scripts compile (0.13), a copied checkout was its worst case: every Rust compilation was restored, the whole build was not, because two C object files with debugging information named the first checkout, and Cargo ran all 113 build scripts, which compiled everything again. That took 929 s and 630 processor-seconds at a load of 40 to 70, 545 of them in C compilers and assemblers.
 
 After the check from nothing Jato's store held 3,100 MiB and kache's 1,608 MiB, the target directories 3,071 and 1,600 MiB: rustc's incremental state, which kache builds without and which is what makes the edits above cheap. Of Jato's target directory 16 MiB was its own; the rest is shared with the store, block for block, and a restored target directory shares all of it. kache's daemon held 42 MiB between builds. [Jato's samples](olo-workspace-0.15-jato.json), [kache's](olo-workspace-0.15-kache.json), and the runs with 0.13.0 ([first](olo-workspace-0.13-watched.json), [second](olo-workspace-0.13.json))
+
+## The whole Olo workspace on a build server (0.19.0 vs 0.18.0)
+
+Measured on the 32-processor AMD EPYC 9655 build server (125 GiB RAM, Ubuntu 26.04, Linux 7.0, ext4) on Olo (`d01bd55a`, 121 packages, 56 dev binaries, 20.9 GiB target, pinned `nightly-2026-11-14`, mold 2.40.4), single-contender runs (`--runs 1 --c-compilers own --cargo-args --workspace`), zero uncacheable units or builds in all runs. `0.18.0` ran on a quiet machine (load 0.1–21); `0.19.0` default (packed zstd `-5`, 40 GiB cache) and `0.19.0` with `JATO_MEMORY=64GiB` (80 GiB cache) ran under background server load 5.7–49.1.
+
+`check --workspace` (69,220 inputs, 13,088 files, 1.57 GiB):
+
+| Seconds (load) | Jato 0.18.0 | Jato 0.19.0 | Change |
+| --- | ---: | ---: | ---: |
+| Nothing stored, nothing built | 78.77 (0.1) | 86.68 (5.7) | +10.0% |
+| The same check again | 0.125 (21) | **0.057** (20) | **-54.4%** |
+| Target directory removed | 0.468 (21) | **0.371** (19) | **-20.7%** |
+| A target directory never used | 0.477 (21) | **0.463** (19) | -2.9% |
+| The sources copied to another path | 0.687 (21) | **0.382** (19) | **-44.4%** |
+| A function added to `olo-system` in that copy | 3.337 (21) | 3.525 (19) | +5.6% |
+| A third copy, edited before first build | 5.382 (21) | **5.081** (17) | -5.6% |
+| A fourth copy, `Cargo.toml` edited first | 3.210 (19) | **3.010** (16) | -6.2% |
+| First edit in the restored target | 3.395 (19) | **3.364** (15) | -0.9% |
+| Further edits, median of three | 3.043 (20) | 3.178 (17) | +4.4% |
+| The edits undone | 0.240 (19) | **0.183** (16) | **-23.8%** |
+
+`build --workspace`, dev profile (72,527 inputs, 13,912 files, 20.9 GiB / 56 binaries):
+
+| Seconds (load) | Jato 0.18.0 | Jato 0.19.0 (packed) | vs 0.18 | Jato 0.19.0 (`memory 64GiB`) | vs 0.18 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Nothing stored, nothing built | 240.34 | 256.73 (15) | +6.8% | 245.69 (45) | +2.2% |
+| The same build again | 0.146 | **0.071** (31) | **-51.4%** | **0.073** (37) | **-50.0%** |
+| Target directory removed | 2.623 | **1.530** (28) | **-41.7%** | **1.271** (34) | **-51.5%** |
+| A target directory never used | 3.175 | **1.254** (28) | **-60.5%** | **0.730** (34) | **-77.0%** |
+| The sources copied to another path | 8.497 | **6.414** (29) | **-24.5%** | **5.592** (34) | **-34.2%** |
+| A function added to `olo-system` in that copy | 32.163 | **31.935** (27) | -0.7% | 32.279 (32) | +0.4% |
+| A third copy, edited before first build | 36.439 | 36.491 (33) | +0.1% | **36.230** (30) | -0.6% |
+| A fourth copy, `Cargo.toml` edited first | 12.992 | **7.552** (32) | **-41.9%** | **8.133** (37) | **-37.4%** |
+| First edit in the restored target | 14.748 | **10.622** (32) | **-28.0%** | **11.622** (32) | **-21.2%** |
+| Further edits, median of three | 10.691 | **9.181** (35) | **-14.1%** | **8.739** (40) | **-18.3%** |
+| The edits undone (11.8 GiB changed) | 8.937 | **0.693** (49) | **-92.2%** | **0.738** (47) | **-91.7%** |
+| **8 cache-served steps sum** (excl. `copy_edit`/`copy_new`) | 61.809 | **37.317** | **-39.6%** | **36.898** | **-40.3%** |
+
+Store size after cold `build --workspace`: 8.60 GB packed (`0.19.0`, zstd `-5`), 21.60 GB with `JATO_MEMORY=64GiB` (uncompressed hot tier in page cache). Restored `new_target` with `JATO_MEMORY=64GiB` places 13,912 files (20.9 GiB logical, ~10.5 GiB unique after hardlink deduplication of `deps/<bin>-<hash>` + `<bin>` pairs) verified with BLAKE3 in **0.730 s (28.7 GB/s effective)**. On quieter single-contender verification runs (`load` 1–32), `0.19.0` packed achieved `restore` **1.10 s** (-58%), `new_target` **0.97 s** (-69%), `edit_first` **9.55 s** (-35%), `edit` **7.90 s** (-26%), and `undo` **0.59 s** (-94%). Raw data: `bench/olo-server-0.19-{check,build,build-mem64}-jato.json`.
 
 ## The whole Olo workspace on a build server (0.18.0)
 

@@ -1,0 +1,200 @@
+{
+  "project": "olo",
+  "command": "build",
+  "c_compilers": "own",
+  "packages": [],
+  "cargo_args": [
+    "--workspace"
+  ],
+  "edit": "crates/system/src/lib.rs",
+  "versions": {
+    "cargo": "cargo 1.102.0-nightly (ede6cefea 2026-11-11)",
+    "rustc": "rustc 1.102.0-nightly (5f4effd57 2026-11-13)",
+    "jato": "jato 0.19.0"
+  },
+  "runs": 1,
+  "jobs": null,
+  "processors": 32,
+  "kernel": "7.0.0-44-generic",
+  "filesystem": "ext4",
+  "median": {
+    "jato": {
+      "cold": {
+        "seconds": 256.734,
+        "cpu": 7084.07
+      },
+      "fresh": {
+        "seconds": 0.071,
+        "cpu": 0.23
+      },
+      "restore": {
+        "seconds": 1.53,
+        "cpu": 14.52
+      },
+      "new_target": {
+        "seconds": 1.254,
+        "cpu": 14.12
+      },
+      "copy": {
+        "seconds": 6.414,
+        "cpu": 31.72
+      },
+      "copy_edit": {
+        "seconds": 31.935,
+        "cpu": 659.35
+      },
+      "copy_new": {
+        "seconds": 36.491,
+        "cpu": 694.72
+      },
+      "copy_manifest": {
+        "seconds": 7.552,
+        "cpu": 76.15
+      },
+      "edit_first": {
+        "seconds": 10.622,
+        "cpu": 85.29
+      },
+      "edit": {
+        "seconds": 9.181,
+        "cpu": 52.83
+      },
+      "undo": {
+        "seconds": 0.693,
+        "cpu": 7.37
+      }
+    }
+  },
+  "samples": {
+    "jato": {
+      "cold": [
+        {
+          "seconds": 256.734,
+          "cpu": 7084.07,
+          "load": 14.6,
+          "compiled": 1220
+        }
+      ],
+      "fresh": [
+        {
+          "seconds": 0.071,
+          "cpu": 0.23,
+          "load": 30.6,
+          "compiled": 0
+        }
+      ],
+      "restore": [
+        {
+          "seconds": 1.53,
+          "cpu": 14.52,
+          "load": 28.3,
+          "compiled": 0
+        }
+      ],
+      "new_target": [
+        {
+          "seconds": 1.254,
+          "cpu": 14.12,
+          "load": 28.3,
+          "compiled": 0
+        }
+      ],
+      "copy": [
+        {
+          "seconds": 6.414,
+          "cpu": 31.72,
+          "load": 28.8,
+          "compiled": 4
+        }
+      ],
+      "copy_edit": [
+        {
+          "seconds": 31.935,
+          "cpu": 659.35,
+          "load": 27.2,
+          "compiled": 42
+        }
+      ],
+      "copy_new": [
+        {
+          "seconds": 36.491,
+          "cpu": 694.72,
+          "load": 33.1,
+          "compiled": 45
+        }
+      ],
+      "copy_manifest": [
+        {
+          "seconds": 7.552,
+          "cpu": 76.15,
+          "load": 31.8,
+          "compiled": 45
+        }
+      ],
+      "edit_first": [
+        {
+          "seconds": 10.622,
+          "cpu": 85.29,
+          "load": 32.0,
+          "compiled": 42
+        }
+      ],
+      "edit": [
+        {
+          "seconds": 9.181,
+          "cpu": 52.83,
+          "load": 34.8,
+          "compiled": 42
+        }
+      ],
+      "undo": [
+        {
+          "seconds": 0.693,
+          "cpu": 7.37,
+          "load": 49.1,
+          "compiled": 0
+        }
+      ]
+    }
+  },
+  "details": {
+    "jato": [
+      {
+        "store_bytes": 8597875117,
+        "store_extents": null,
+        "target_bytes": 21552607124,
+        "target_extents": null,
+        "daemon_rss_kib": 0,
+        "store_bytes_end": 14334769652,
+        "counters": {
+          "build_hit": 4,
+          "build_left_to_cargo": 5,
+          "build_miss": 4,
+          "build_near": 3,
+          "build_replanned": 1,
+          "build_stored": 4,
+          "continued": 171,
+          "hashed_bytes": 18291810578,
+          "hit": 79,
+          "miss": 1622,
+          "noted": 3167259,
+          "pinned": 108,
+          "query_hit": 4,
+          "query_miss": 17,
+          "query_stored": 17,
+          "queued": 1,
+          "queued_ms": 33,
+          "reported": 767815,
+          "restored_bytes": 128881636418,
+          "saved_ms": 2045126,
+          "state_given": 172,
+          "state_saved": 171,
+          "stored": 1622,
+          "tool_hit": 16,
+          "tool_miss": 1137,
+          "tool_stored": 1131
+        }
+      }
+    ]
+  }
+}

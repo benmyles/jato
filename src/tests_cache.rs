@@ -289,8 +289,8 @@ fn lookup_test(
     let mut matched = None;
     for candidate in &candidates {
         let stored = store.record(candidate).unwrap_or_default();
-        let manifest = match Manifest::decode(&stored) {
-            Ok(m) if m.key(recipe) == candidate.key => m,
+        let manifest = match Manifest::decode_verified(&stored, recipe, &candidate.key) {
+            Ok(m) => m,
             _ => {
                 forget.push(candidate.key);
                 continue;
@@ -654,7 +654,7 @@ fn record_test(
     manifest.normalize();
     let mut staged = Vec::new();
     match store.commit(recipe, &manifest, &detail, ran.millis, &mut staged) {
-        Ok(true) => {
+        Ok(Some(_)) => {
             store.count("test_stored", 1);
             log(
                 &test_label(&req.binary),
@@ -666,7 +666,7 @@ fn record_test(
             );
             Ok(())
         }
-        Ok(false) => Err("larger than half the cache".into()),
+        Ok(None) => Err("larger than half the cache".into()),
         Err(e) => Err(format!("{e:#}")),
     }
 }

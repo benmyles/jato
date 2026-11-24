@@ -946,6 +946,38 @@ pub(crate) fn decode_detail(detail: &[u8]) -> Option<(i32, &[u8], &[u8])> {
     (len <= rest.len()).then(|| (code, &rest[..len], &rest[len..]))
 }
 
+/// Cached manifest state inside `LookupCache`, lazily decoded only as far as
+/// each lookup stage needs (`Raw` for pinned-out builds, `Core` for `reuse`,
+/// `Full` for `mostly_built` and `start_from`).
+enum CachedManifest {
+    Raw(Vec<u8>),
+    Core(Manifest, Vec<u8>),
+    Full(Manifest),
+}
+
+impl CachedManifest {
+    fn into_full(self) -> Result<Manifest> {
+        match self {
+            Self::Raw(raw) => Manifest::decode_from_raw(&raw),
+            Self::Core(mut m, tail) => {
+                m.decode_tail(&tail)?;
+                Ok(m)
+            }
+            Self::Full(m) => Ok(m),
+        }
+    }
+}
+
+/// Decoded manifests and path observations shared across `reuse`,
+/// `mostly_built`, and `start_from` for a single whole-build lookup so large
+/// build manifests are decoded once and unchanged inputs are stat'd once.
+#[derive(Default)]
+pub struct LookupCache {
+    candidates: Option<Vec<crate::cas::Candidate>>,
+    manifests: HashMap<Digest, CachedManifest>,
+    seen: crate::manifest::SeenCache,
+}
+
 /// Look for a recorded result that holds here and put its files in place.
 /// For a whole build, `tree` leaves files that already hold the right bytes
 /// and writes the others on several threads.
@@ -955,9 +987,19 @@ pub fn reuse(
     recipe: &Digest,
     tree: bool,
 ) -> Result<Option<(Outcome, Manifest)>> {
+    reuse_cached(job, store, recipe, tree, None)
+}
+
+pub fn reuse_cached(
+    job: &Job,
+    store: &mut Store,
+    recipe: &Digest,
+    tree: bool,
+    cache: Option<&mut LookupCache>,
+) -> Result<Option<(Outcome, Manifest)>> {
     store.begin_read();
     let mut forget = Vec::new();
-    let found = search(job, store, recipe, tree, &mut forget);
+    let found = search(job, store, recipe, tree, &mut forget, cache);
     store.end_read();
     for key in forget {
         store.forget(&key);
@@ -976,8 +1018,17 @@ fn search(
     recipe: &Digest,
     tree: bool,
     forget: &mut Vec<Digest>,
+    mut cache: Option<&mut LookupCache>,
 ) -> Result<Option<(Outcome, Manifest)>> {
-    let candidates = store.candidates(recipe)?;
+    let candidates = if let Some(cached) = cache.as_ref().and_then(|c| c.candidates.as_ref()) {
+        cached.clone()
+    } else {
+        let found = store.candidates(recipe)?;
+        if let Some(c) = cache.as_deref_mut() {
+            c.candidates = Some(found.clone());
+        }
+        found
+    };
     // For someone finding out why two commands were not the same one:
     // each as it is known, in a file named for it.
     if let Some(dir) = env::var_os("JATO_RECIPES") {
@@ -1017,27 +1068,61 @@ fn search(
         }
         return Ok(None);
     }
-    let mut here = Here::new(
+    let seen = cache
+        .as_deref_mut()
+        .map(|c| std::mem::take(&mut c.seen))
+        .unwrap_or_default();
+    let mut here = Here::with_seen(
         &job.roots,
         &job.request.env,
         &job.path,
         job.facts.width,
         job.facts.ansi,
+        seen,
     );
     let mut nearest = None;
     // Taken before anything is looked at: a source edited while a build
     // is being put back is newer than the build.
     let time = if tree { time_before(&job.roots) } else { None };
-    for candidate in &candidates {
-        let stored = store.record(candidate).unwrap_or_default();
-        let mut manifest = match Manifest::decode(&stored) {
-            // The index said this result belongs to this command. Only a
-            // record that says so itself is believed.
-            Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
-            _ => {
-                nearest.get_or_insert("its record is unreadable".to_owned());
-                forget.push(candidate.key);
-                continue;
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let (mut manifest, tail) = if let Some(cached) = cache
+            .as_deref_mut()
+            .and_then(|c| c.manifests.remove(&candidate.key))
+        {
+            match cached {
+                CachedManifest::Full(m) => (m, None),
+                CachedManifest::Core(m, t) => (m, Some(t)),
+                CachedManifest::Raw(raw) => match Manifest::decode_from_raw(&raw) {
+                    Ok(m) => (m, None),
+                    Err(_) => {
+                        nearest.get_or_insert("its record is unreadable".to_owned());
+                        forget.push(candidate.key);
+                        continue;
+                    }
+                },
+            }
+        } else {
+            let stored = store.record(candidate).unwrap_or_default();
+            let pin_roots = tree.then_some(&job.roots);
+            match Manifest::decode_for_reuse(&stored, recipe, &candidate.key, pin_roots) {
+                // The index said this result belongs to this command. Only a
+                // record that says so itself is believed.
+                Ok(crate::manifest::ReuseDecode::PinnedOut(why, raw)) => {
+                    nearest.get_or_insert(why);
+                    if tree
+                        && idx < NEAR
+                        && let Some(c) = cache.as_deref_mut()
+                    {
+                        c.manifests.insert(candidate.key, CachedManifest::Raw(raw));
+                    }
+                    continue;
+                }
+                Ok(crate::manifest::ReuseDecode::Core(manifest, tail)) => (*manifest, Some(tail)),
+                Err(_) => {
+                    nearest.get_or_insert("its record is unreadable".to_owned());
+                    forget.push(candidate.key);
+                    continue;
+                }
             }
         };
         let remap_out = if let Some(out) = &job.tool_out {
@@ -1061,6 +1146,16 @@ fn search(
         let asked = Instant::now();
         if let Err(why) = manifest.holds(&mut here, store) {
             nearest.get_or_insert(why);
+            if tree
+                && idx < NEAR
+                && let Some(c) = cache.as_deref_mut()
+            {
+                let entry = match tail {
+                    Some(t) => CachedManifest::Core(manifest, t),
+                    None => CachedManifest::Full(manifest),
+                };
+                c.manifests.insert(candidate.key, entry);
+            }
             continue;
         }
         let held = asked.elapsed();
@@ -1121,7 +1216,13 @@ fn search(
             stdout: stdout.into_owned(),
             stderr: stderr.into_owned(),
         };
+        if let Some(c) = cache.as_deref_mut() {
+            c.seen = here.into_seen();
+        }
         return Ok(Some((outcome, manifest)));
+    }
+    if let Some(c) = cache {
+        c.seen = here.into_seen();
     }
     log(
         job.name(),
@@ -1137,16 +1238,48 @@ fn search(
 /// Whether the target already holds most of what this command last
 /// produced. Cargo will then find most of it up to date, and watching all
 /// of Cargo's own work would cost more than recording it could give back.
-pub fn mostly_built(job: &Job, store: &Store, recipe: &Digest) -> bool {
-    let Ok(candidates) = store.candidates(recipe) else {
+pub fn mostly_built_cached(
+    job: &Job,
+    store: &Store,
+    recipe: &Digest,
+    mut cache: Option<&mut LookupCache>,
+) -> bool {
+    if job.roots.path(roots::TARGET).is_some_and(|t| !t.is_dir()) {
         return false;
+    }
+    let first = if let Some(cached) = cache.as_ref().and_then(|c| c.candidates.as_deref()) {
+        match cached.first() {
+            Some(first) => first.clone(),
+            None => return false,
+        }
+    } else {
+        let Ok(c) = store.candidates(recipe) else {
+            return false;
+        };
+        let Some(first) = c.first().cloned() else {
+            return false;
+        };
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.candidates = Some(c);
+        }
+        first
     };
-    let Some(manifest) = candidates
-        .first()
-        .and_then(|candidate| store.record(candidate))
-        .and_then(|stored| Manifest::decode(&stored).ok())
-    else {
-        return false;
+    let manifest: Manifest = if let Some(cached) = cache
+        .as_deref_mut()
+        .and_then(|c| c.manifests.remove(&first.key))
+    {
+        match cached.into_full() {
+            Ok(m) => m,
+            Err(_) => return false,
+        }
+    } else {
+        let Some(m) = store
+            .record(&first)
+            .and_then(|stored| Manifest::decode(&stored).ok())
+        else {
+            return false;
+        };
+        m
     };
     // What this command's own compilers wrote is what tells. A build
     // rests on what a check left in the target directory, and its record
@@ -1175,7 +1308,12 @@ pub fn mostly_built(job: &Job, store: &Store, recipe: &Digest) -> bool {
                 .is_some_and(|path| path.exists())
         })
         .count();
-    !sample.is_empty() && present * 2 > sample.len()
+    let result = !sample.is_empty() && present * 2 > sample.len();
+    if let Some(c) = cache {
+        c.manifests
+            .insert(first.key, CachedManifest::Full(manifest));
+    }
+    result
 }
 
 /// Copy a stream through while keeping what passed, up to a limit.
@@ -1221,18 +1359,35 @@ pub fn run_piped(
     observed: Option<(&Job, &Store)>,
     held: Option<&Path>,
 ) -> Result<(Ran, Report)> {
+    run_piped_config(
+        argv,
+        observed.map(|(job, store)| job.observer(store)),
+        held,
+        false,
+    )
+}
+
+pub fn run_piped_config(
+    argv: &[OsString],
+    observed: Option<observe::Config>,
+    held: Option<&Path>,
+    strip_session: bool,
+) -> Result<(Ran, Report)> {
     let begun = Instant::now();
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .env(crate::jobs::HELD, "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if strip_session {
+        cmd.env_remove("JATO_SESSION");
+    }
     if let Some(dir) = held {
         hold(&mut cmd, dir)?;
     }
     let (mut child, session) = match observed {
-        Some((job, store)) => {
-            let (child, session) = observe::spawn(&mut cmd, job.observer(store))?;
+        Some(config) => {
+            let (child, session) = observe::spawn(&mut cmd, config)?;
             (child, Some(session))
         }
         None => (cmd.spawn()?, None),
@@ -1735,19 +1890,32 @@ const MOST: usize = 4096;
 /// Look for a recorded build of this command that differs from the present
 /// only in what compilers read, and put its files in place except those the
 /// compilers wrote whose inputs differ.
-pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
+pub fn start_from_cached(
+    job: &Job,
+    store: &mut Store,
+    recipe: &Digest,
+    mut cache: Option<&mut LookupCache>,
+) -> Option<Start> {
     if env::var_os("JATO_NEAR").is_some_and(|v| v == "0") {
         return None;
     }
     let begun = Instant::now();
     store.begin_read();
-    let candidates = store.candidates(recipe).unwrap_or_default();
-    let mut here = Here::new(
+    let candidates = match cache.as_ref().and_then(|c| c.candidates.as_ref()) {
+        Some(cached) => cached.clone(),
+        None => store.candidates(recipe).unwrap_or_default(),
+    };
+    let seen = cache
+        .as_deref_mut()
+        .map(|c| std::mem::take(&mut c.seen))
+        .unwrap_or_default();
+    let mut here = Here::with_seen(
         &job.roots,
         &job.request.env,
         &job.path,
         job.facts.width,
         job.facts.ansi,
+        seen,
     );
     // The one with the fewest compilations to make again.
     struct Near {
@@ -1763,11 +1931,22 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
     let mut best: Option<Near> = None;
     let mut why = None;
     let time = time_before(&job.roots);
-    for (at, candidate) in candidates.iter().enumerate().take(NEAR) {
-        let stored = store.record(candidate).unwrap_or_default();
-        let manifest = match Manifest::decode(&stored) {
-            Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
-            _ => continue,
+    let limit = candidates.len().min(NEAR);
+    for (at, candidate) in candidates.iter().enumerate().take(limit) {
+        let manifest = if let Some(cached) = cache
+            .as_deref_mut()
+            .and_then(|c| c.manifests.remove(&candidate.key))
+        {
+            match cached.into_full() {
+                Ok(manifest) => manifest,
+                Err(_) => continue,
+            }
+        } else {
+            let stored = store.record(candidate).unwrap_or_default();
+            match Manifest::decode_verified(&stored, recipe, &candidate.key) {
+                Ok(manifest) => manifest,
+                Err(_) => continue,
+            }
         };
         if manifest.parts.is_empty() {
             continue;
@@ -1781,7 +1960,8 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
             why.get_or_insert_with(|| reason.clone());
             continue;
         }
-        let differences = match manifest.differences(&mut here, store, MOST) {
+        let save_seen = at + 1 < limit;
+        let differences = match manifest.differences_with_seen(&mut here, store, MOST, save_seen) {
             Ok(differences) => differences,
             Err(reason) => {
                 why.get_or_insert(reason);
@@ -2090,9 +2270,9 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
             continue;
         };
         let stored = store.record(&entry).unwrap_or_default();
-        let manifest = match Manifest::decode(&stored) {
-            Ok(manifest) if manifest.key(&theirs) == key => manifest,
-            _ => continue,
+        let manifest = match Manifest::decode_verified(&stored, &theirs, &key) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
         };
         if manifest.parts.is_empty() {
             continue;
@@ -2317,9 +2497,9 @@ pub fn seed_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start>
     let time = time_before(&job.roots);
     for (at, (cand_recipe, candidate, _, _)) in candidates.iter().enumerate().take(6) {
         let stored = store.record(candidate).unwrap_or_default();
-        let manifest = match Manifest::decode(&stored) {
-            Ok(manifest) if manifest.key(cand_recipe) == candidate.key => manifest,
-            _ => continue,
+        let manifest = match Manifest::decode_verified(&stored, cand_recipe, &candidate.key) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
         };
         if manifest.parts.is_empty() {
             continue;
@@ -2797,7 +2977,178 @@ pub fn record(
         .collect();
     let mut paths: Vec<_> = report.paths.iter().collect();
     paths.sort_by_key(|(path, _)| *path);
-    for (path, access) in paths {
+    // For whole builds with tens of thousands of observed paths, preload
+    // remembered stamps once and parallelize symlink_metadata / metadata /
+    // digest / Cargo dep-info reads across worker threads before the exact
+    // deterministic sequential classification pass.
+    struct PathPrep {
+        now: io::Result<fs::Metadata>,
+        file_digest: Option<Result<Digest, String>>,
+        watched: Vec<Vec<u8>>,
+        dep_error: Option<String>,
+    }
+    let mut prepped: Vec<Option<PathPrep>> = if job.scope == Scope::Build && paths.len() >= 512 {
+        store.preload_stamps();
+        let mut prelim_made = made.clone();
+        for (path, access) in &paths {
+            if access.written && !job.state(path) {
+                let (root, rel) = roots.split(path);
+                prelim_made.insert((root, rel.to_owned()));
+            }
+        }
+        let known_stamps = store.known_stamps();
+        let shared_stamps = store.shared_stamps().map(|s| s.as_ref());
+        let most = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let threads = most.clamp(2, 16);
+        let each = paths.len().div_ceil(threads);
+        type PrepLane = (Vec<Option<PathPrep>>, Vec<(Stamp, Digest)>, u64);
+        let lanes: Vec<PrepLane> = std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .chunks(each)
+                .map(|chunk| {
+                    let prelim_made = &prelim_made;
+                    let repositories = &repositories;
+                    let homes = &homes;
+                    scope.spawn(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        let mut learned = Vec::new();
+                        let mut hashed = 0u64;
+                        for &(path, access) in chunk {
+                            if job.state(path) {
+                                out.push(None);
+                                continue;
+                            }
+                            let examined = !(access.written || access.removed || access.executed);
+                            let listing = access.listing.as_ref().filter(|names| {
+                                access.listed_by_others || goes_by_names(path, names, report)
+                            });
+                            let passed = examined
+                                && access.kind == Kind::Dir
+                                && listing.is_none()
+                                && access.link.is_none();
+                            let git_cargo = examined
+                                && (of_git(path, repositories)
+                                    || (passed && leads_to(path, repositories)));
+                            if (git_cargo && !access.others) || (passed && leads_to(path, homes)) {
+                                out.push(None);
+                                continue;
+                            }
+                            let now = fs::symlink_metadata(path);
+                            let mut file_digest = None;
+                            let mut watched_local = Vec::new();
+                            let mut dep_error = None;
+                            if !access.written
+                                && !access.removed
+                                && !access.created
+                                && access.kind == Kind::File
+                            {
+                                let (root, rel) = roots.split(path);
+                                if !prelim_made.contains(&(root, rel.to_owned())) {
+                                    if root == roots::TARGET {
+                                        let name = path
+                                            .file_name()
+                                            .and_then(OsStr::to_str)
+                                            .unwrap_or_default();
+                                        if name.starts_with("dep-") {
+                                            match fs::read(path)
+                                                .ok()
+                                                .and_then(|b| cargo_env_deps(&b))
+                                            {
+                                                Some(names) => watched_local.extend(names),
+                                                None => {
+                                                    dep_error = Some(format!(
+                                                        "{} does not say which variables Cargo watches",
+                                                        path.display()
+                                                    ));
+                                                }
+                                            }
+                                        } else if matches!(name, "stdout" | "output")
+                                            && let Ok(printed) = fs::read(path)
+                                        {
+                                            watched_local.extend(script_env_deps(&printed));
+                                        }
+                                    }
+                                    if dep_error.is_none()
+                                        && !access.executed
+                                        && *path != Path::new("/etc/ld.so.cache")
+                                        && !(root == roots::TARGET
+                                            && rel == Path::new(".rustc_info.json"))
+                                    {
+                                        let first = access.stamp.unwrap();
+                                        file_digest = Some(match fs::metadata(path) {
+                                            Err(_) => Err(format!(
+                                                "{} went away while it ran",
+                                                path.display()
+                                            )),
+                                            Ok(meta) => {
+                                                let stamp = Stamp::of(&meta);
+                                                let renamed = Stamp {
+                                                    ctime: first.ctime,
+                                                    ..stamp
+                                                } == first
+                                                    && std::os::unix::fs::MetadataExt::nlink(&meta)
+                                                        != access.links;
+                                                if stamp != first && !renamed {
+                                                    Err(format!(
+                                                        "{} changed while it ran",
+                                                        path.display()
+                                                    ))
+                                                } else {
+                                                    match crate::cas::digest_for_check(
+                                                        path,
+                                                        stamp,
+                                                        root == roots::TARGET,
+                                                        roots,
+                                                        known_stamps,
+                                                        shared_stamps,
+                                                    ) {
+                                                        Ok((d, l, h)) => {
+                                                            if let Some(pair) = l {
+                                                                learned.push(pair);
+                                                            }
+                                                            hashed += h;
+                                                            Ok(d)
+                                                        }
+                                                        Err(e) => {
+                                                            Err(format!("{}: {e}", path.display()))
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            out.push(Some(PathPrep {
+                                now,
+                                file_digest,
+                                watched: watched_local,
+                                dep_error,
+                            }));
+                        }
+                        (out, learned, hashed)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let mut all = Vec::with_capacity(paths.len());
+        let mut learned = Vec::new();
+        let mut hashed_bytes = 0u64;
+        for (p, l, h) in lanes {
+            all.extend(p);
+            learned.extend(l);
+            hashed_bytes += h;
+        }
+        store.remember_many(learned, hashed_bytes);
+        all
+    } else {
+        Vec::new()
+    };
+    for (idx, (path, access)) in paths.into_iter().enumerate() {
         if job.state(path) {
             continue;
         }
@@ -2847,7 +3198,11 @@ pub fn record(
             continue;
         }
         let (root, rel) = roots.split(path);
-        let now = fs::symlink_metadata(path);
+        let prep = prepped.get_mut(idx).and_then(Option::take);
+        let (now, prep_digest, prep_watched, prep_dep_err) = match prep {
+            Some(p) => (p.now, p.file_digest, Some(p.watched), p.dep_error),
+            None => (fs::symlink_metadata(path), None, None, None),
+        };
         if access.executed && root == roots::TARGET && start.is_some() {
             started.push(((root, rel.to_owned()), path.clone()));
         }
@@ -2928,20 +3283,27 @@ pub fn record(
         // partly from environment variables, which it reads unseen. The
         // files that say which ones are among those it opened.
         if job.scope == Scope::Build && root == roots::TARGET && access.kind == Kind::File {
-            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
-            if name.starts_with("dep-") {
-                let names = fs::read(path).ok().and_then(|b| cargo_env_deps(&b));
-                let Some(names) = names else {
-                    return Err(format!(
-                        "{} does not say which variables Cargo watches",
-                        path.display()
-                    ));
-                };
+            if let Some(err) = prep_dep_err {
+                return Err(err);
+            }
+            if let Some(names) = prep_watched {
                 watched.extend(names);
-            } else if matches!(name, "stdout" | "output")
-                && let Ok(printed) = fs::read(path)
-            {
-                watched.extend(script_env_deps(&printed));
+            } else {
+                let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+                if name.starts_with("dep-") {
+                    let names = fs::read(path).ok().and_then(|b| cargo_env_deps(&b));
+                    let Some(names) = names else {
+                        return Err(format!(
+                            "{} does not say which variables Cargo watches",
+                            path.display()
+                        ));
+                    };
+                    watched.extend(names);
+                } else if matches!(name, "stdout" | "output")
+                    && let Ok(printed) = fs::read(path)
+                {
+                    watched.extend(script_env_deps(&printed));
+                }
             }
         }
         let state = match access.kind {
@@ -2975,31 +3337,35 @@ pub fn record(
                 if path == Path::new("/etc/ld.so.cache") {
                     continue;
                 }
-                let first = access.stamp.unwrap();
-                let Ok(meta) = fs::metadata(path) else {
-                    return Err(format!("{} went away while it ran", path.display()));
-                };
-                let stamp = Stamp::of(&meta);
-                // rustc and Cargo give a finished file a second name, which
-                // moves its change time and nothing else.
-                let renamed = Stamp {
-                    ctime: first.ctime,
-                    ..stamp
-                } == first
-                    && std::os::unix::fs::MetadataExt::nlink(&meta) != access.links;
-                if stamp != first && !renamed {
-                    return Err(format!("{} changed while it ran", path.display()));
-                }
-                // A program that was run did something whether or not
-                // it may be read, and only its contents say what.
-                let digest = if access.executed {
-                    store.digest_known(path, stamp)
-                } else if root == roots::TARGET {
-                    store.digest_placed(path, stamp, roots)
+                let digest = if let Some(ready) = prep_digest {
+                    ready?
                 } else {
-                    store.digest_seen(path, stamp)
-                }
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+                    let first = access.stamp.unwrap();
+                    let Ok(meta) = fs::metadata(path) else {
+                        return Err(format!("{} went away while it ran", path.display()));
+                    };
+                    let stamp = Stamp::of(&meta);
+                    // rustc and Cargo give a finished file a second name, which
+                    // moves its change time and nothing else.
+                    let renamed = Stamp {
+                        ctime: first.ctime,
+                        ..stamp
+                    } == first
+                        && std::os::unix::fs::MetadataExt::nlink(&meta) != access.links;
+                    if stamp != first && !renamed {
+                        return Err(format!("{} changed while it ran", path.display()));
+                    }
+                    // A program that was run did something whether or not
+                    // it may be read, and only its contents say what.
+                    if access.executed {
+                        store.digest_known(path, stamp)
+                    } else if root == roots::TARGET {
+                        store.digest_placed(path, stamp, roots)
+                    } else {
+                        store.digest_seen(path, stamp)
+                    }
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                };
                 if access.executed {
                     executed.push(path.clone());
                 }
@@ -3054,14 +3420,16 @@ pub fn record(
     // way to an input that is a link is an input too.
     let mut walked: HashSet<PathBuf> = HashSet::new();
     let mut links = Vec::new();
+    let mut path_buf = PathBuf::with_capacity(256);
     for input in &manifest.inputs {
-        let Some(path) = roots.join(input.root, &input.path) else {
+        if !roots.join_into(input.root, &input.path, &mut path_buf) {
             continue;
-        };
-        for dir in path.ancestors().skip(1) {
-            if dir.parent().is_none() || !walked.insert(dir.to_owned()) {
+        }
+        for dir in path_buf.ancestors().skip(1) {
+            if dir.parent().is_none() || walked.contains(dir) {
                 break;
             }
+            walked.insert(dir.to_owned());
             if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
                 && let Ok(target) = fs::read_link(dir)
             {
@@ -3071,14 +3439,11 @@ pub fn record(
     }
     for (dir, target) in links {
         let (root, rel) = roots.split(&dir);
-        if manifest
-            .inputs
-            .iter()
-            .any(|i| i.root == root && i.path == rel)
-        {
+        let place = (root, rel.to_owned());
+        if !examined_now.insert(place.clone()) {
             continue;
         }
-        own.insert((root, rel.to_owned()));
+        own.insert(place);
         manifest.inputs.push(Input {
             root,
             path: rel.to_owned(),
@@ -3097,11 +3462,8 @@ pub fn record(
             continue;
         };
         let (root, rel) = roots.split(&loader);
-        if manifest
-            .inputs
-            .iter()
-            .any(|i| i.root == root && i.path == rel)
-        {
+        let place = (root, rel.to_owned());
+        if !examined_now.insert(place.clone()) {
             continue;
         }
         let Ok(meta) = fs::metadata(&loader) else {
@@ -3115,7 +3477,7 @@ pub fn record(
             .filter(|m| m.file_type().is_symlink())
             .and_then(|_| fs::read_link(&loader).ok())
             .map(|target| roots.mark_os(target.as_os_str()).into_owned());
-        own.insert((root, rel.to_owned()));
+        own.insert(place);
         manifest.inputs.push(Input {
             root,
             path: rel.to_owned(),
@@ -3129,10 +3491,11 @@ pub fn record(
     }
     // A name looked up on PATH can be found somewhere else under another
     // PATH, even while everything recorded above stays as it is.
+    let path_set: HashSet<&Path> = job.path.iter().map(PathBuf::as_path).collect();
     let mut names = BTreeSet::new();
     for path in report.paths.keys() {
         if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
-            && job.path.iter().any(|d| d == dir)
+            && path_set.contains(dir)
         {
             names.insert(name.to_owned());
         }
@@ -3202,6 +3565,7 @@ pub fn record(
     let mut named_here: Vec<Digest> = Vec::new();
     let mut unplaced = false;
     let mut listed_earlier: HashSet<Place> = HashSet::new();
+    let mut carried_meta: HashMap<Place, fs::Metadata> = HashMap::new();
     if let Some(parts) = parts {
         let mut listed: HashSet<Place> = outputs
             .iter()
@@ -3236,13 +3600,13 @@ pub fn record(
         manifest
             .inputs
             .retain(|i| !was_made(&(i.root, i.path.clone())));
-        let have: HashSet<Place> = manifest
+        let mut have: HashSet<Place> = manifest
             .inputs
             .iter()
             .map(|i| (i.root, i.path.clone()))
             .collect();
         for (place, (link, state)) in &parts.inputs {
-            if !was_made(place) && !have.contains(place) {
+            if !was_made(place) && have.insert(place.clone()) {
                 manifest.inputs.push(Input {
                     root: place.0,
                     path: place.1.clone(),
@@ -3258,18 +3622,14 @@ pub fn record(
         // this build's as they were.
         if let Some(start) = start {
             let base = &start.manifest;
-            let mut have: HashSet<Place> = manifest
-                .inputs
-                .iter()
-                .map(|i| (i.root, i.path.clone()))
-                .collect();
+            let replanned_set: HashSet<u32> = start.replanned.iter().copied().collect();
             let mut carry = |position: u32, manifest: &mut Manifest| -> Place {
                 let input = &base.inputs[position as usize];
                 let place = (input.root, input.path.clone());
                 // What Cargo planned this build with again is recorded as
                 // this build found it, or not at all if it was not looked
                 // at this time.
-                let planned = start.replanned.contains(&position);
+                let planned = replanned_set.contains(&position);
                 if !planned && !made.contains(&place) && have.insert(place.clone()) {
                     let mut input = input.clone();
                     if let Some(state) = start.now.get(&position) {
@@ -3337,16 +3697,34 @@ pub fn record(
                     }
                 }
             }
-            for position in 0..base.inputs.len() as u32 {
-                let listed = base.own.binary_search(&position).is_ok();
-                let nowhere =
-                    !apart[position as usize] && base.asked.binary_search(&position).is_err();
+            const F_OWN: u8 = 1 << 0;
+            const F_ASKED: u8 = 1 << 1;
+            const F_CARGOS: u8 = 1 << 2;
+            const F_READ: u8 = 1 << 3;
+            const F_STRAYS: u8 = 1 << 4;
+            let mut flags = vec![0u8; base.inputs.len()];
+            for &p in &base.own {
+                flags[p as usize] |= F_OWN;
+            }
+            for &p in &base.asked {
+                flags[p as usize] |= F_ASKED;
+            }
+            for &p in &base.cargos {
+                flags[p as usize] |= F_CARGOS;
+            }
+            for &p in &base.read {
+                flags[p as usize] |= F_READ;
+            }
+            for &p in &base.strays {
+                flags[p as usize] |= F_STRAYS;
+            }
+            for (pos_usize, &f) in flags.iter().enumerate() {
+                let position = pos_usize as u32;
+                let listed = f & F_OWN != 0;
+                let nowhere = !apart[pos_usize] && (f & F_ASKED == 0);
                 if listed || nowhere {
-                    let was = |list: &[u32]| list.binary_search(&position).is_ok();
                     if dropped_script_only.contains(&position)
-                        && !was(&base.cargos)
-                        && !was(&base.read)
-                        && !was(&base.strays)
+                        && (f & (F_CARGOS | F_READ | F_STRAYS)) == 0
                     {
                         continue;
                     }
@@ -3354,13 +3732,13 @@ pub fn record(
                     // Who examined it then still stands, unless it was
                     // examined this time.
                     if !examined_now.contains(&place) {
-                        if was(&base.cargos) {
+                        if f & F_CARGOS != 0 {
                             cargos.insert(place.clone());
                         }
-                        if was(&base.read) {
+                        if f & F_READ != 0 {
                             read_own.insert(place.clone());
                         }
-                        if was(&base.strays) {
+                        if f & F_STRAYS != 0 {
                             strayed.insert(place.clone());
                         }
                     }
@@ -3379,14 +3757,48 @@ pub fn record(
             if !start.prune_unused {
                 manifest.removed.extend(base.removed.iter().cloned());
             }
+            let mut carried_check: Vec<(u8, PathBuf, PathBuf)> = Vec::new();
             for (place, output) in &carried {
                 known.insert(output.digest, output);
                 if !listed.contains(place)
                     && let Some(path) = roots.join(place.0, &place.1)
-                    && path.is_file()
                 {
                     listed.insert(place.clone());
-                    outputs.push((place.0, place.1.clone(), path));
+                    carried_check.push((place.0, place.1.clone(), path));
+                }
+            }
+            let checked: Vec<Option<fs::Metadata>> = if carried_check.len() >= 256 {
+                let most = std::thread::available_parallelism().map_or(8, |n| n.get());
+                let threads = most.clamp(2, 16);
+                let each = carried_check.len().div_ceil(threads);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = carried_check
+                        .chunks(each)
+                        .map(|chunk| {
+                            scope.spawn(move || {
+                                chunk
+                                    .iter()
+                                    .map(|(_, _, p)| fs::metadata(p).ok().filter(|m| m.is_file()))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap_or_default())
+                        .collect()
+                })
+            } else {
+                carried_check
+                    .iter()
+                    .map(|(_, _, p)| fs::metadata(p).ok().filter(|m| m.is_file()))
+                    .collect()
+            };
+            carried_meta.reserve(carried_check.len());
+            for ((root, rel, path), meta) in carried_check.into_iter().zip(checked) {
+                if let Some(meta) = meta {
+                    carried_meta.insert((root, rel.clone()), meta);
+                    outputs.push((root, rel, path));
                 }
             }
             // A build script that was built again ran in a clean output
@@ -3612,9 +4024,14 @@ pub fn record(
                     rel.file_name().and_then(OsStr::to_str),
                     Some("stdout" | "output")
                 )
-                && let Ok(printed) = fs::read(path)
             {
-                watched.extend(script_env_deps(&printed));
+                let place = (*root, rel.clone());
+                if carried.contains_key(&place) && !made_now.contains(&place) {
+                    continue;
+                }
+                if let Ok(printed) = fs::read(path) {
+                    watched.extend(script_env_deps(&printed));
+                }
             }
         }
         for name in watched {
@@ -3625,26 +4042,51 @@ pub fn record(
             }
         }
     }
+    // Pre-index output directories once so listing filtering and checking are
+    // O(1) instead of scanning all 14k outputs per listed directory.
+    let mut dir_own: HashMap<(u8, &Path), HashSet<&OsStr>> = HashMap::new();
+    let mut direct_out_parents: HashSet<(u8, &Path)> = HashSet::new();
+    for (root, rel, _) in &outputs {
+        if let Some(p) = rel.parent() {
+            direct_out_parents.insert((*root, p));
+        }
+        let mut cur = rel.as_path();
+        while let Some(parent) = cur.parent() {
+            if let Some(name) = cur.file_name()
+                && !dir_own.entry((*root, parent)).or_default().insert(name)
+            {
+                break;
+            }
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            cur = parent;
+        }
+    }
+    let target_root = roots.path(roots::TARGET);
     for input in &mut manifest.inputs {
         let place = (input.root, input.path.clone());
         match (&input.state, listings.remove(&place)) {
             (State::Dir(None), Some(mut names)) => {
                 // The same names are left out when the listing is compared
                 // with the directory later.
-                let own = roots.join(place.0, &place.1).map(|path| {
-                    let written = outputs.iter().map(|(root, rel, _)| (*root, rel.as_path()));
-                    crate::manifest::own_names((place.0, &place.1), &path, written, roots)
+                let own_direct = dir_own.get(&(place.0, place.1.as_path()));
+                let own_target = roots
+                    .join(place.0, &place.1)
+                    .and_then(|path| target_root?.strip_prefix(&path).ok())
+                    .and_then(|rest| rest.components().next())
+                    .map(|c| c.as_os_str());
+                names.retain(|name| {
+                    let s = name.as_os_str();
+                    !own_direct.is_some_and(|set| set.contains(s)) && own_target != Some(s)
                 });
-                names.retain(|name| !own.as_ref().is_some_and(|own| own.contains(name)));
                 input.state = State::Dir(Some(observe::listing_digest(names)));
             }
             // A part listed this directory and left out its own outputs.
             // With other parts writing here, nothing says what it saw.
             (State::Dir(Some(_)), None)
                 if !listed_earlier.contains(&place)
-                    && outputs.iter().any(|(root, rel, _)| {
-                        *root == place.0 && rel.parent() == Some(&place.1)
-                    }) =>
+                    && direct_out_parents.contains(&(place.0, place.1.as_path())) =>
             {
                 return Err(format!(
                     "a compiler listed {}, where the build writes",
@@ -3669,16 +4111,65 @@ pub fn record(
     let mut twins: HashMap<(u64, u64), usize> = HashMap::new();
     let mut to_read: Vec<&Path> = Vec::new();
     let mut from: Vec<From<'_>> = Vec::with_capacity(outputs.len());
-    for (at, (_, _, path)) in outputs.iter().enumerate() {
+    let mut metas: Vec<Option<fs::Metadata>> = Vec::with_capacity(outputs.len());
+    let mut need_meta: Vec<usize> = Vec::new();
+    for (idx, (root, rel, _)) in outputs.iter().enumerate() {
+        if let Some(m) = carried_meta.remove(&(*root, rel.clone())) {
+            metas.push(Some(m));
+        } else {
+            metas.push(None);
+            need_meta.push(idx);
+        }
+    }
+    if need_meta.len() >= 256 {
+        let most = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let threads = most.clamp(2, 16);
+        let each = need_meta.len().div_ceil(threads);
+        let outputs_ref = &outputs;
+        let fetched: Vec<(usize, Option<fs::Metadata>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = need_meta
+                .chunks(each)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&idx| (idx, fs::metadata(&outputs_ref[idx].2).ok()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        for (idx, meta) in fetched {
+            metas[idx] = meta;
+        }
+    } else {
+        for idx in need_meta {
+            metas[idx] = fs::metadata(&outputs[idx].2).ok();
+        }
+    }
+    for (at, ((_, _, path), meta)) in outputs.iter().zip(&metas).enumerate() {
         // A file that still holds exactly what one of the parts stored
-        // needs no second look.
-        let meta = fs::metadata(path).ok();
+        // needs no second look — including when Cargo hardlinked a finished
+        // binary out of `deps/`, which bumps `ctime` and `nlink` without
+        // modifying its bytes.
         let adopted = meta
             .as_ref()
-            .and_then(|meta| store.recall(&Stamp::of(meta)))
+            .and_then(|meta| {
+                let stamp = Stamp::of(meta);
+                store.recall(&stamp).or_else(|| {
+                    use std::os::unix::fs::MetadataExt;
+                    (meta.nlink() > 1 && !report.paths.get(path).is_some_and(|a| a.updated))
+                        .then(|| store.recall_hardlink(&stamp))
+                        .flatten()
+                })
+            })
             .and_then(|digest| known.get(&digest))
             .filter(|output| !output.encoding.is_marked());
-        if let (Some(output), Some(meta)) = (adopted, &meta) {
+        if let (Some(output), Some(meta)) = (adopted, meta) {
             let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777;
             from.push(From::Part(output, mode));
             continue;
@@ -3698,7 +4189,7 @@ pub fn record(
         to_read.push(path);
     }
     let mut read: Vec<Option<Staged>> = Vec::with_capacity(to_read.len());
-    for output in store.stage_many(&to_read, roots) {
+    for output in store.stage_many_with(&to_read, roots, job.scope == Scope::Unit) {
         read.push(Some(output.map_err(|e| format!("{e:#}"))?));
     }
     for ((root, rel, path), from) in outputs.iter().zip(&from) {
@@ -3769,18 +4260,20 @@ pub fn record(
         && let Some(parts) = parts
     {
         // Who examined what, by where each input and output now stands.
-        let input_at = |place: &Place| {
-            let found = manifest
-                .inputs
-                .binary_search_by(|i| (i.root, &i.path).cmp(&(place.0, &place.1)));
-            found.ok().map(|at| at as u32)
-        };
-        let output_at = |place: &Place| {
-            let found = manifest
-                .outputs
-                .binary_search_by(|o| (o.root, &o.path).cmp(&(place.0, &place.1)));
-            found.ok().map(|at| at as u32)
-        };
+        let input_index: HashMap<(u8, &Path), u32> = manifest
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(at, i)| ((i.root, i.path.as_path()), at as u32))
+            .collect();
+        let output_index: HashMap<(u8, &Path), u32> = manifest
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(at, o)| ((o.root, o.path.as_path()), at as u32))
+            .collect();
+        let input_at = |place: &Place| input_index.get(&(place.0, place.1.as_path())).copied();
+        let output_at = |place: &Place| output_index.get(&(place.0, place.1.as_path())).copied();
         let ordered = |mut list: Vec<u32>| {
             list.sort_unstable();
             list.dedup();
@@ -3872,12 +4365,16 @@ pub fn record(
         manifest.theirs = borrowed;
         theirs.extend(own.iter().filter_map(input_at));
         let theirs = ordered(theirs);
+        let mut in_theirs = vec![false; manifest.inputs.len()];
+        for &at in &theirs {
+            in_theirs[at as usize] = true;
+        }
         let asked = ordered(asked.iter().filter_map(input_at).collect());
         manifest.asked = asked
             .into_iter()
-            .filter(|at| theirs.binary_search(at).is_err())
+            .filter(|&at| !in_theirs[at as usize])
             .collect();
-        let own_at = |place: &Place| input_at(place).filter(|at| theirs.binary_search(at).is_ok());
+        let own_at = |place: &Place| input_at(place).filter(|&at| in_theirs[at as usize]);
         manifest.cargos = ordered(cargos.iter().filter_map(own_at).collect());
         manifest.read = ordered(read_own.iter().filter_map(own_at).collect());
         // The build scripts, each by its program among the outputs, with
@@ -3885,7 +4382,7 @@ pub fn record(
         // whose program is no output of the build cannot be had to run
         // again, and what it examined is as good as anybody's.
         let mut strays: Vec<u32> = strayed.iter().filter_map(own_at).collect();
-        let of_own = |at: &u32| theirs.binary_search(at).is_ok();
+        let of_own = |at: &u32| in_theirs[*at as usize];
         strays.extend(
             parts
                 .strayed
@@ -3980,19 +4477,31 @@ pub fn record(
             .flat_map(|at| &apart[*at as usize].outputs)
             .map(|at| manifest.outputs[*at as usize].digest)
             .collect();
+        let mut output_to_part: HashMap<u32, u32> = HashMap::new();
+        let mut digest_to_part: HashMap<Digest, u32> = HashMap::new();
+        for (idx, part) in apart.iter().enumerate() {
+            let idx = idx as u32;
+            for &at in &part.outputs {
+                output_to_part.entry(at).or_insert(idx);
+                let out = &manifest.outputs[at as usize];
+                if out.size > 0 {
+                    digest_to_part.entry(out.digest).or_insert(idx);
+                }
+            }
+        }
         let script_part = |program: u32| -> Option<u32> {
             let prog = &manifest.outputs[program as usize];
-            apart
-                .iter()
-                .position(|part| {
-                    part.outputs.contains(&program)
-                        || (prog.size > 0
-                            && part
-                                .outputs
-                                .iter()
-                                .any(|&at| manifest.outputs[at as usize].digest == prog.digest))
-                })
-                .map(|idx| idx as u32)
+            match (
+                output_to_part.get(&program).copied(),
+                (prog.size > 0)
+                    .then(|| digest_to_part.get(&prog.digest).copied())
+                    .flatten(),
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            }
         };
         for script in &manifest.scripts {
             let has_pinned_output = pinned_scripts.contains(&script.program)
@@ -4044,19 +4553,18 @@ pub fn record(
     let cost = ran.millis + carried_cost;
     let stored = store.commit(recipe, &manifest, &detail, cost, &mut staged);
     match stored {
-        Ok(true) => {
+        Ok(Some(key)) => {
             if !manifest.pins.is_empty() {
                 store.count("pinned", 1);
             }
             if job.scope == Scope::Build {
-                let key = manifest.key(recipe);
                 note_build(roots, recipe, &key);
                 let (env_tag, kind) = build_profile_tag(job);
                 store.note_whole_build(recipe, &key, manifest.outputs.len(), &env_tag, kind);
             }
             Ok(manifest)
         }
-        Ok(false) => {
+        Ok(None) => {
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             let files: u64 = manifest.outputs.iter().map(|output| output.size).sum();
             let msg = match store.budget() {
@@ -4159,13 +4667,13 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
     let earlier = store.candidates(&kept).unwrap_or_default();
     let fresh = earlier.iter().any(|candidate| {
         let stored = store.record(candidate).unwrap_or_default();
-        Manifest::decode(&stored)
-            .is_ok_and(|m| m.key(&kept) == candidate.key && now.saturating_sub(m.saved_at) < lasts)
+        Manifest::decode_verified(&stored, &kept, &candidate.key)
+            .is_ok_and(|m| now.saturating_sub(m.saved_at) < lasts)
     });
     if fresh {
         return;
     }
-    let kept = (|| {
+    let kept: Result<(), String> = (|| {
         // The one crate directory of this name that fits.
         let prefix = format!("{}-", job.name());
         let named = |name: &OsStr| name.to_string_lossy().starts_with(&prefix);
@@ -4176,7 +4684,7 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
                 .filter_map(|name| finished_session(&directory.join(name)))
                 .collect(),
             Left::Since(since) => fs::read_dir(directory)
-                .ok()?
+                .map_err(|e| format!("read_dir incremental: {e}"))?
                 .flatten()
                 .filter(|entry| named(&entry.file_name()))
                 .filter_map(|entry| finished_session(&entry.path()))
@@ -4187,29 +4695,68 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
                 })
                 .collect(),
         };
-        let (session, None) = (sessions.pop()?, sessions.pop()) else {
-            return None;
+        let Some(session) = sessions.pop() else {
+            return Err("no finished session found".into());
         };
+        if sessions.pop().is_some() {
+            return Err("multiple finished sessions found".into());
+        }
         let mut files = Vec::new();
         let mut bytes = 0;
-        for entry in fs::read_dir(&session).ok()? {
-            let entry = entry.ok()?;
-            let meta = entry.metadata().ok()?;
+        for entry in fs::read_dir(&session).map_err(|e| format!("read_dir session: {e}"))? {
+            let entry = entry.map_err(|e| format!("entry: {e}"))?;
+            let meta = entry.metadata().map_err(|e| format!("meta: {e}"))?;
             if !meta.is_file() {
-                return None;
+                return Err(format!("non-file in session: {}", entry.path().display()));
             }
             bytes += meta.len();
             files.push(entry.path());
         }
         if files.is_empty() || files.len() > MOST_FILES || bytes > MOST_BYTES {
-            return None;
+            return Err(format!(
+                "session limits: {} files, {} bytes",
+                files.len(),
+                bytes
+            ));
         }
         files.sort();
         let mut record = Manifest::default();
-        let mut staged = Vec::with_capacity(files.len());
+        // Adopt hardlinked files (such as `metadata.rmeta` hardlinked to the
+        // crate's just-stored `.rmeta`) directly from the store without
+        // re-reading or re-compressing them.
+        let mut to_stage_paths: Vec<PathBuf> = Vec::with_capacity(files.len());
+        let mut adopted: Vec<(PathBuf, Digest, u64)> = Vec::new();
         for path in files {
-            // As it is, whatever it holds: no root is looked for in it.
-            let file = store.stage(&path, &Roots::default()).ok()?;
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = fs::metadata(&path)
+                && meta.nlink() > 1
+                && let Some(digest) = store.recall_hardlink(&Stamp::of(&meta))
+                && store.has_object(&digest)
+            {
+                adopted.push((path, digest, meta.len()));
+                continue;
+            }
+            to_stage_paths.push(path);
+        }
+        let refs: Vec<&Path> = to_stage_paths.iter().map(PathBuf::as_path).collect();
+        // As it is, whatever it holds: no root is looked for in it. Cap
+        // threads so concurrent background `keep_state` workers never starve
+        // active `rustc` compilations on the machine.
+        let staged_results = store.stage_many_capped(&refs, &Roots::default(), true, 4);
+        let mut staged = Vec::with_capacity(to_stage_paths.len());
+        for (path, digest, size) in adopted {
+            let (root, rel) = job.roots.split(&path);
+            record.saved.push(Output {
+                root,
+                path: rel.to_owned(),
+                digest,
+                size,
+                mode: 0o644,
+                encoding: Encoding::Raw,
+            });
+        }
+        for (path, res) in to_stage_paths.into_iter().zip(staged_results) {
+            let file = res.map_err(|e| format!("stage {}: {e:#}", path.display()))?;
             let (root, rel) = job.roots.split(&path);
             record.saved.push(Output {
                 root,
@@ -4221,29 +4768,36 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
             });
             staged.push(file);
         }
+        record
+            .saved
+            .sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
         record.saved_in = whereabouts(&job.roots);
         record.saved_for = job.out_dir_given();
         record.saved_at = now;
         let detail = encode_detail(0, b"", b"");
         record.detail = *blake3::hash(&detail).as_bytes();
-        let stored = store
+        let Some(new) = store
             .commit(&kept, &record, &detail, 0, &mut staged)
-            .ok()
-            .filter(|stored| *stored)?;
+            .map_err(|e| format!("commit: {e:#}"))?
+        else {
+            return Err("exceeded half the cache budget".into());
+        };
         // The new state is in. What it replaces goes, apart from the
         // files the two have in common.
-        let new = record.key(&kept);
         for candidate in earlier.iter().filter(|c| c.key != new) {
             store.retire(&candidate.key);
         }
-        Some(stored)
+        Ok(())
     })();
-    if kept.is_some() {
-        store.count("state_saved", 1);
-        log(
-            job.name(),
-            "kept what the compiler saved, for other checkouts",
-        );
+    match kept {
+        Ok(()) => {
+            store.count("state_saved", 1);
+            log(
+                job.name(),
+                "kept what the compiler saved, for other checkouts",
+            );
+        }
+        Err(why) => log(job.name(), format_args!("did not keep saved state: {why}")),
     }
 }
 
@@ -4258,6 +4812,93 @@ fn state_header(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((bytes.get(..header)?, bytes.get(header..header + 8)?))
 }
 
+/// Key for caching `options_mark` results on disk so repeated cross-checkout
+/// builds reuse the probed option mark without re-spawning two rustc probes.
+fn options_mark_key(job: &Job) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let probe_argv = job.probe(Path::new("/jato/probe.rs"), Path::new("/jato/probe"), false)?;
+    let mut hash = blake3::Hasher::new_derive_key("jato options mark v1");
+    let options = job
+        .request
+        .args
+        .iter()
+        .position(|a| a.as_bytes().starts_with(b"-"))
+        .unwrap_or(0);
+    for prog in std::iter::once(&job.request.program).chain(&job.request.args[..options]) {
+        field(&mut hash, prog.as_bytes());
+        if let Ok(meta) = fs::metadata(prog) {
+            for number in [meta.dev(), meta.ino(), meta.size()] {
+                hash.update(&number.to_le_bytes());
+            }
+            hash.update(&meta.mtime().to_le_bytes());
+            hash.update(&meta.mtime_nsec().to_le_bytes());
+        }
+    }
+    field(&mut hash, job.request.cwd.as_os_str().as_bytes());
+    field(&mut hash, &(probe_argv.len() as u64).to_le_bytes());
+    for arg in &probe_argv {
+        field(&mut hash, arg.as_bytes());
+    }
+    field(&mut hash, b"env");
+    for (k, v) in &job.request.env {
+        let kb = k.as_bytes();
+        if kb.starts_with(b"JATO_")
+            || matches!(
+                kb,
+                b"LD_PRELOAD"
+                    | b"CARGO_MAKEFLAGS"
+                    | b"MAKEFLAGS"
+                    | b"MFLAGS"
+                    | b"SHLVL"
+                    | b"_"
+                    | b"PWD"
+                    | b"OLDPWD"
+            )
+        {
+            continue;
+        }
+        field(&mut hash, kb);
+        field(&mut hash, v.as_bytes());
+    }
+    let hex = hash.finalize().to_hex();
+    Some(hex.as_str()[..24].to_owned())
+}
+
+fn options_mark_cached(job: &Job, cache_dir: &Path) -> Option<(Vec<u8>, [u8; 8])> {
+    let locks = cache_dir.join("locks");
+    let key = options_mark_key(job);
+    if let Some(k) = &key {
+        let cached = locks.join(format!("mark-{k}"));
+        if let Ok(bytes) = fs::read(&cached)
+            && bytes.len() >= 10
+        {
+            let hlen = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+            if bytes.len() == 2 + hlen + 8 && hlen >= 7 && &bytes[2..6] == b"RSIC" {
+                let header = bytes[2..2 + hlen].to_vec();
+                let mark: [u8; 8] = bytes[2 + hlen..].try_into().ok()?;
+                return Some((header, mark));
+            }
+        }
+    }
+    let (header, mark) = options_mark(job, cache_dir)?;
+    if let Some(k) = &key
+        && header.len() <= u16::MAX as usize
+    {
+        let _ = fs::create_dir_all(&locks);
+        let mut buf = Vec::with_capacity(2 + header.len() + 8);
+        buf.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&mark);
+        let tmp = locks.join(format!("mark-{k}.tmp-{}", std::process::id()));
+        if fs::write(&tmp, &buf).is_ok()
+            && fs::rename(&tmp, locks.join(format!("mark-{k}"))).is_err()
+        {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    Some((header, mark))
+}
+
 /// What the compiler writes for this command's options at the start of its
 /// saved state, learned by having it compile a crate of one line.
 ///
@@ -4269,11 +4910,10 @@ fn state_header(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// sources before using it. A second compilation with one more option
 /// that changes nothing else confirms that those bytes are what this
 /// takes them for; if they are not, the state is not used.
-fn options_mark(job: &Job, store: &Store) -> Option<(Vec<u8>, [u8; 8])> {
+fn options_mark(job: &Job, cache_dir: &Path) -> Option<(Vec<u8>, [u8; 8])> {
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = store
-        .dir
+    let scratch = cache_dir
         .join("locks")
         .join(format!("probe-{}-{serial}", std::process::id()));
     let found = (|| {
@@ -4335,33 +4975,44 @@ fn options_mark(job: &Job, store: &Store) -> Option<(Vec<u8>, [u8; 8])> {
     found
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SavedState {
+    /// This exact crate-hash session directory already has local finished work.
+    Own,
+    /// Kept state from the cache was placed into this crate's session directory.
+    Given,
+    /// No usable kept state was found in the cache.
+    None,
+}
+
 /// Before a compilation that has no saved state of rustc's to start from:
 /// give it the state kept for the same command and output directory, from
 /// this checkout or another. The compiler then recompiles what differs
-/// instead of everything. Says whether state was given.
-fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
+/// instead of everything. Checks the exact crate-hash session directory so a
+/// lib target never hides a same-named bin target's missing state.
+fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> SavedState {
     let Some(directory) = &job.facts.incremental else {
-        return false;
+        return SavedState::None;
     };
     if !job.state_travels() {
-        return false;
+        return SavedState::None;
     }
     let kept = state_recipe(job, recipe);
     let Ok(candidates) = store.candidates(&kept) else {
-        return false;
+        return SavedState::None;
     };
     let mut lots: Vec<(&crate::cas::Candidate, Manifest)> = candidates
         .iter()
         .filter_map(|candidate| {
             let stored = store.record(candidate)?;
-            match Manifest::decode(&stored) {
-                Ok(manifest) if manifest.key(&kept) == candidate.key => Some((candidate, manifest)),
-                _ => None,
-            }
+            Manifest::decode_verified(&stored, &kept, &candidate.key)
+                .ok()
+                .map(|manifest| (candidate, manifest))
         })
         .collect();
     // The newest first: there is more than one only while one is replaced.
     lots.sort_by_key(|(_, manifest)| std::cmp::Reverse(manifest.saved_at));
+    let here_where = whereabouts(&job.roots);
     for (candidate, manifest) in &lots {
         let Some(first) = manifest.saved.first() else {
             continue;
@@ -4390,9 +5041,21 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
             .parent()
             .is_some_and(|crate_dir| finished_session(crate_dir).is_some())
         {
-            return false;
+            return SavedState::Own;
         }
-        if !store.place_saved(&manifest.saved, &job.roots) {
+        let need_mark = manifest.saved_in != here_where;
+        let (placed, mark) = if need_mark {
+            std::thread::scope(|s| {
+                let cache_dir = store.dir.as_path();
+                let handle = s.spawn(|| options_mark_cached(job, cache_dir));
+                let placed = store.place_saved(&manifest.saved, &job.roots);
+                let mark = handle.join().ok().flatten();
+                (placed, mark)
+            })
+        } else {
+            (store.place_saved(&manifest.saved, &job.roots), None)
+        };
+        if !placed {
             continue;
         }
         // rustc takes a session whose lock file it can lock.
@@ -4402,11 +5065,11 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
             .map(|(stem, _)| session.with_file_name(format!("{stem}.lock")));
         let ready = (|| {
             fs::File::create(lock.as_ref()?).ok()?;
-            if manifest.saved_in == whereabouts(&job.roots) {
+            if !need_mark {
                 return Some(());
             }
             use std::os::unix::fs::FileExt;
-            let (header, mark) = options_mark(job, store)?;
+            let (header, mark) = mark?;
             let graph = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -4433,15 +5096,15 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> bool {
             job.name(),
             "given the compiler's saved state from an earlier compilation",
         );
-        return true;
+        return SavedState::Given;
     }
-    false
+    SavedState::None
 }
 
 /// Wait for another process that is running this same command on the same
 /// source, so that its result can be reused. The lock is released when the
 /// file is closed, however that happens.
-fn queue(store: &Store, recipe: &Digest, source: Option<Digest>) -> Option<(fs::File, bool)> {
+fn queue(store: &mut Store, recipe: &Digest, source: Option<Digest>) -> Option<(fs::File, bool)> {
     if env::var_os("JATO_COALESCE").is_some_and(|v| v == "0") {
         return None;
     }
@@ -4458,6 +5121,7 @@ fn queue(store: &Store, recipe: &Digest, source: Option<Digest>) -> Option<(fs::
     match file.try_lock() {
         Ok(()) => Some((file, false)),
         Err(fs::TryLockError::WouldBlock) => {
+            store.flush();
             file.lock().ok()?;
             Some((file, true))
         }
@@ -4478,11 +5142,19 @@ pub fn before_running(
             .ok()
     });
     let version = store.data_version();
-    store.flush();
+    let before_keys: Vec<Digest> = store
+        .candidates(recipe)
+        .map(|c| c.into_iter().map(|x| x.key).collect())
+        .unwrap_or_default();
     let lock = queue(store, recipe, source);
     let waited = lock.as_ref().is_some_and(|(_, waited)| *waited);
     let lock = lock.map(|(file, _)| file);
-    if waited || store.data_version() != version {
+    let new_candidate = !waited
+        && store.data_version() != version
+        && store
+            .candidates(recipe)
+            .is_ok_and(|c| c.iter().any(|x| !before_keys.contains(&x.key)));
+    if waited || new_candidate {
         match reuse(job, store, recipe, false) {
             Ok(Some(found)) => {
                 store.count("coalesced", 1);
@@ -4534,8 +5206,14 @@ pub fn choose(job: &Job, store: &mut Store, recipe: &Digest, building: bool) -> 
     if job.scope != Scope::Unit {
         return Run::Recorded;
     }
-    let own = has_saved_work(directory, job.name());
-    let given = !own && saved_state_wanted() && give_saved_state(job, store, recipe);
+    let has_state = if saved_state_wanted() {
+        match give_saved_state(job, store, recipe) {
+            SavedState::Own | SavedState::Given => true,
+            SavedState::None => has_saved_work(directory, job.name()),
+        }
+    } else {
+        has_saved_work(directory, job.name())
+    };
     if building {
         return Run::Recorded;
     }
@@ -4563,7 +5241,7 @@ pub fn choose(job: &Job, store: &mut Store, recipe: &Digest, building: bool) -> 
             "compiled here a moment ago: one of a run of edits",
         );
     }
-    match (recent || dear, own || given) {
+    match (recent || dear, has_state) {
         (false, _) => Run::Recorded,
         (true, true) => Run::Continued,
         (true, false) => Run::Seeding,

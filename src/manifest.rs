@@ -322,11 +322,10 @@ impl Manifest {
         w.0
     }
 
-    /// Identifies a command together with everything its result depends on.
-    pub fn key(&self, recipe: &Digest) -> Digest {
+    fn key_from_conditions(&self, recipe: &Digest, conditions: &[u8]) -> Digest {
         let mut hash = blake3::Hasher::new_derive_key("jato command result v1");
         hash.update(recipe);
-        hash.update(&self.conditions());
+        hash.update(conditions);
         // Saved state depends on nothing. One lot is told from the next by
         // when it was saved.
         if !self.saved.is_empty() {
@@ -335,11 +334,31 @@ impl Manifest {
         *hash.finalize().as_bytes()
     }
 
+    /// Identifies a command together with everything its result depends on.
+    #[cfg(test)]
+    pub fn key(&self, recipe: &Digest) -> Digest {
+        self.key_from_conditions(recipe, &self.conditions())
+    }
+
+    /// Encode this manifest and compute its key from a single serialization
+    /// of its conditions.
+    pub fn encode_with_key(&self, recipe: &Digest) -> Result<(Digest, Vec<u8>)> {
+        let cond = self.conditions();
+        let key = self.key_from_conditions(recipe, &cond);
+        let encoded = self.encode_from(cond)?;
+        Ok((key, encoded))
+    }
+
     /// The stored form. It carries a checksum, and everything needed to
     /// restore the result, so a damaged index can hide a result but cannot
     /// make one stand in for another.
+    #[cfg(test)]
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut w = Writer(self.conditions());
+        self.encode_from(self.conditions())
+    }
+
+    fn encode_from(&self, cond: Vec<u8>) -> Result<Vec<u8>> {
+        let mut w = Writer(cond);
         w.number(self.outputs.len() as u64);
         for output in &self.outputs {
             w.path(output.root, &output.path);
@@ -385,16 +404,178 @@ impl Manifest {
         positions(&mut w, &self.strays);
         positions(&mut w, &self.ours);
         ensure!(w.0.len() <= MAX_MANIFEST, "too many inputs to record");
-        let mut packer = zstd::bulk::Compressor::new(1)?;
+        let mut packer = zstd::bulk::Compressor::new(-5)?;
         packer.include_checksum(true)?;
         Ok(packer.compress(&w.0)?)
     }
 
     pub fn decode(stored: &[u8]) -> Result<Self> {
         let raw = zstd::bulk::decompress(stored, MAX_MANIFEST)?;
-        let mut r = Reader(&raw);
-        let mut m = Manifest::default();
+        Self::decode_from_raw(&raw)
+    }
+
+    /// Decode a full manifest from already-decompressed raw bytes.
+    pub fn decode_from_raw(raw: &[u8]) -> Result<Self> {
+        let (mut m, _, out_end) = Self::decode_core_from_raw(raw)?;
+        m.decode_tail(&raw[out_end..])?;
+        Ok(m)
+    }
+
+    /// Decode a stored manifest and verify that its key matches `expected`
+    /// for `recipe`, hashing the raw condition prefix directly without
+    /// re-serializing all inputs.
+    pub fn decode_verified(stored: &[u8], recipe: &Digest, expected: &Digest) -> Result<Self> {
+        let raw = zstd::bulk::decompress(stored, MAX_MANIFEST)?;
+        let (mut m, cond_end, out_end) = Self::decode_core_from_raw(&raw)?;
+        let key = m.key_from_conditions(recipe, &raw[..cond_end]);
+        ensure!(key == *expected, "manifest key mismatch");
+        m.decode_tail(&raw[out_end..])?;
+        Ok(m)
+    }
+
+    /// Fast decode for `reuse` lookups:
+    /// - For large manifests when `roots` is given, scans `inputs..pins`
+    ///   without allocating and verifies the manifest key; if any pin names
+    ///   another location, rejects immediately without allocating tens of
+    ///   thousands of `Input`/`Output`/`Part` entries and returns the
+    ///   decompressed raw bytes for `start_from` / `mostly_built`.
+    /// - Otherwise decodes only the core (`inputs..saved_at`) and verifies the
+    ///   key, returning the unparsed `parts`/`scripts` tail bytes lazily.
+    pub fn decode_for_reuse(
+        stored: &[u8],
+        recipe: &Digest,
+        expected: &Digest,
+        roots: Option<&Roots>,
+    ) -> Result<ReuseDecode> {
+        let raw = zstd::bulk::decompress(stored, MAX_MANIFEST)?;
+        if let Some(roots) = roots
+            && raw.len() >= 16_384
+            && let Some(why) = Self::check_pins_zero_alloc(&raw, recipe, expected, roots)?
+        {
+            return Ok(ReuseDecode::PinnedOut(why, raw));
+        }
+        let (m, cond_end, out_end) = Self::decode_core_from_raw(&raw)?;
+        let key = m.key_from_conditions(recipe, &raw[..cond_end]);
+        ensure!(key == *expected, "manifest key mismatch");
+        let tail = raw[out_end..].to_vec();
+        Ok(ReuseDecode::Core(Box::new(m), tail))
+    }
+
+    /// Zero-allocation scan of a decompressed manifest to verify its key and
+    /// check whether any `pins` reject `roots`. Returns `Ok(Some(reason))` if
+    /// rejected on `pins`, `Ok(None)` if pins hold, or `Err` on corruption or
+    /// key mismatch.
+    fn check_pins_zero_alloc(
+        raw: &[u8],
+        recipe: &Digest,
+        expected: &Digest,
+        roots: &Roots,
+    ) -> Result<Option<String>> {
+        let mut r = Reader(raw);
+        let n_inputs = r.count()?;
+        for _ in 0..n_inputs {
+            let root = r.byte()?;
+            ensure!(root <= crate::roots::TARGET, "unknown root");
+            let _ = r.bytes()?;
+            let _ = r.optional()?;
+            match r.byte()? {
+                0 | 1 => (),
+                2 | 3 => {
+                    let _ = r.digest()?;
+                }
+                _ => bail!("unknown manifest state"),
+            }
+        }
         for _ in 0..r.count()? {
+            let _ = r.bytes()?;
+            let _ = r.optional()?;
+        }
+        for _ in 0..r.count()? {
+            let _ = r.bytes()?;
+            if r.byte()? != 0 {
+                let root = r.byte()?;
+                ensure!(root <= crate::roots::TARGET, "unknown root");
+                let _ = r.bytes()?;
+            }
+        }
+        let mut mismatch: Option<String> = None;
+        for _ in 0..r.count()? {
+            let root = r.byte()?;
+            ensure!(root <= crate::roots::TARGET, "unknown root");
+            let recorded = Path::new(OsStr::from_bytes(r.bytes()?));
+            if mismatch.is_none() && roots.path(root) != Some(recorded) {
+                mismatch = Some(format!(
+                    "its output names {}, which is not where this build is",
+                    recorded.display()
+                ));
+            }
+        }
+        let Some(why) = mismatch else {
+            return Ok(None);
+        };
+        // Finish scanning conditions (`width`, `ansi`, `walks`) to get `cond_end`.
+        match r.byte()? {
+            0 | 1 => (),
+            _ => {
+                let _ = u16::try_from(r.number()?)?;
+            }
+        }
+        let _ = r.byte()?;
+        for _ in 0..r.count()? {
+            let _ = r.bytes()?;
+            let _ = r.bytes()?;
+            for _ in 0..r.count()? {
+                let _ = r.bytes()?;
+            }
+        }
+        let cond_end = raw.len() - r.0.len();
+        // Skip `outputs`, `removed`, `detail`, `saved`, `saved_in`, `saved_for`
+        // to read `saved_at` when `saved` is non-empty for exact key check.
+        for _ in 0..r.count()? {
+            let root = r.byte()?;
+            ensure!(root <= crate::roots::TARGET, "unknown root");
+            let _ = r.bytes()?;
+            let _ = r.digest()?;
+            let _ = r.number()?;
+            let _ = u32::try_from(r.number()?)?;
+            let _ = Encoding::from_byte(r.byte()?)?;
+        }
+        for _ in 0..r.count()? {
+            let root = r.byte()?;
+            ensure!(root <= crate::roots::TARGET, "unknown root");
+            let _ = r.bytes()?;
+        }
+        let _ = r.digest()?;
+        let n_saved = r.count()?;
+        for _ in 0..n_saved {
+            let root = r.byte()?;
+            ensure!(root <= crate::roots::TARGET, "unknown root");
+            let _ = r.bytes()?;
+            let _ = r.digest()?;
+            let _ = r.number()?;
+        }
+        let _ = r.digest()?;
+        let _ = r.digest()?;
+        let saved_at = if n_saved > 0 { r.number()? } else { 0 };
+        let mut hash = blake3::Hasher::new_derive_key("jato command result v1");
+        hash.update(recipe);
+        hash.update(&raw[..cond_end]);
+        if n_saved > 0 {
+            hash.update(&saved_at.to_le_bytes());
+        }
+        ensure!(
+            *hash.finalize().as_bytes() == *expected,
+            "manifest key mismatch"
+        );
+        Ok(Some(why))
+    }
+
+    fn decode_core_from_raw(raw: &[u8]) -> Result<(Self, usize, usize)> {
+        let mut r = Reader(raw);
+        let mut m = Manifest::default();
+        let n_inputs = r.count()?;
+        m.inputs.reserve(n_inputs.min(200_000));
+        for _ in 0..n_inputs {
             let (root, path) = r.path()?;
             let link = r.optional()?.map(<[u8]>::to_vec);
             let state = match r.byte()? {
@@ -448,7 +629,10 @@ impl Manifest {
             }
             m.walks.push(walk);
         }
-        for _ in 0..r.count()? {
+        let cond_end = raw.len() - r.0.len();
+        let n_outputs = r.count()?;
+        m.outputs.reserve(n_outputs.min(100_000));
+        for _ in 0..n_outputs {
             let (root, path) = r.path()?;
             m.outputs.push(Output {
                 root,
@@ -479,36 +663,57 @@ impl Manifest {
         if !m.saved.is_empty() {
             m.saved_at = r.number()?;
         }
-        m.own = read_positions(&mut r, m.inputs.len())?;
-        m.asked = read_positions(&mut r, m.inputs.len())?;
-        for _ in 0..r.count()? {
-            m.parts.push(Part {
-                inputs: read_positions(&mut r, m.inputs.len())?,
-                outputs: read_positions(&mut r, m.outputs.len())?,
+        let out_end = raw.len() - r.0.len();
+        Ok((m, cond_end, out_end))
+    }
+
+    /// Finish decoding the whole-build tail (`own`, `asked`, `parts`,
+    /// `scripts`, etc.) after `decode_for_reuse`.
+    pub fn decode_tail(&mut self, tail: &[u8]) -> Result<()> {
+        let mut r = Reader(tail);
+        self.own = read_positions(&mut r, self.inputs.len())?;
+        self.asked = read_positions(&mut r, self.inputs.len())?;
+        let n_parts = r.count()?;
+        self.parts.reserve(n_parts.min(32_000));
+        for _ in 0..n_parts {
+            self.parts.push(Part {
+                inputs: read_positions(&mut r, self.inputs.len())?,
+                outputs: read_positions(&mut r, self.outputs.len())?,
             });
         }
-        m.theirs = read_positions(&mut r, m.parts.len())?;
-        m.pinned = read_positions(&mut r, m.parts.len())?;
-        m.cargos = read_positions(&mut r, m.inputs.len())?;
-        m.replans = r.number()? as u32;
+        self.theirs = read_positions(&mut r, self.parts.len())?;
+        self.pinned = read_positions(&mut r, self.parts.len())?;
+        self.cargos = read_positions(&mut r, self.inputs.len())?;
+        self.replans = r.number()? as u32;
         for _ in 0..r.count()? {
             let program = r.number()? as u32;
             ensure!(
-                (program as usize) < m.outputs.len(),
+                (program as usize) < self.outputs.len(),
                 "a script without a program"
             );
-            m.scripts.push(Script {
+            self.scripts.push(Script {
                 program,
-                inputs: read_positions(&mut r, m.inputs.len())?,
-                outputs: read_positions(&mut r, m.outputs.len())?,
+                inputs: read_positions(&mut r, self.inputs.len())?,
+                outputs: read_positions(&mut r, self.outputs.len())?,
             });
         }
-        m.read = read_positions(&mut r, m.inputs.len())?;
-        m.strays = read_positions(&mut r, m.inputs.len())?;
-        m.ours = read_positions(&mut r, m.outputs.len())?;
+        self.read = read_positions(&mut r, self.inputs.len())?;
+        self.strays = read_positions(&mut r, self.inputs.len())?;
+        self.ours = read_positions(&mut r, self.outputs.len())?;
         ensure!(r.0.is_empty(), "trailing manifest bytes");
-        Ok(m)
+        Ok(())
     }
+}
+
+/// Result of `Manifest::decode_for_reuse`.
+pub enum ReuseDecode {
+    /// Key verified, but `pins` do not match the current build roots; holds
+    /// the rejection reason and the already-decompressed raw manifest bytes.
+    PinnedOut(String, Vec<u8>),
+    /// Key verified and core (`inputs..saved_at`) decoded; holds the unparsed
+    /// `own..ours` tail bytes for lazy decoding if `start_from`/`mostly_built`
+    /// later needs them.
+    Core(Box<Manifest>, Vec<u8>),
 }
 
 /// Write positions that rise, each as its distance from the one before.
@@ -561,6 +766,11 @@ pub fn path_dirs(cwd: &Path, env: &Env) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Cached path observations that can be reused across `reuse` -> `start_from`
+/// within the same lookup so unchanged files are never stat'd twice.
+#[derive(Default)]
+pub struct SeenCache(HashMap<PathBuf, Seen>);
+
 /// The situation a manifest is checked against.
 pub struct Here<'a> {
     pub roots: &'a Roots,
@@ -597,6 +807,28 @@ impl<'a> Here<'a> {
             ansi,
             seen: HashMap::new(),
         }
+    }
+
+    pub fn with_seen(
+        roots: &'a Roots,
+        env: &'a Env,
+        path: &'a [PathBuf],
+        width: Option<u16>,
+        ansi: bool,
+        seen: SeenCache,
+    ) -> Self {
+        Self {
+            roots,
+            env,
+            path,
+            width,
+            ansi,
+            seen: seen.0,
+        }
+    }
+
+    pub fn into_seen(self) -> SeenCache {
+        SeenCache(self.seen)
     }
 
     fn examine(&mut self, path: &Path) -> io::Result<Seen> {
@@ -725,7 +957,12 @@ impl Manifest {
     /// what does not.
     pub fn holds(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
         self.settled(here)?;
-        if self.inputs.len() >= 512 {
+        // Whole-build manifests (tens of thousands of inputs) benefit from one
+        // bulk stamp preload and up to 16 lock-free worker threads. Smaller
+        // unit manifests (e.g. 2,000 inputs) check WORK + TARGET first via
+        // indexed stamp lookups so misses fail in sub-millisecond time without
+        // scanning the entire SQLite `stamps` table.
+        if self.inputs.len() >= 8_192 {
             return self.holds_parallel(here, store);
         }
         // What is in the workspace changes most often, and what is outside
@@ -741,12 +978,45 @@ impl Manifest {
         Ok(())
     }
 
+    /// Pre-index output child names per parent directory once so parallel
+    /// `State::Dir(Some(_))` checks never scan all 14k outputs per directory.
+    fn index_dir_own(&self) -> HashMap<(u8, &Path), Vec<OsString>> {
+        let mut by_dir: HashMap<(u8, &Path), Vec<OsString>> = HashMap::new();
+        for out in &self.outputs {
+            let mut cur = out.path.as_path();
+            while let Some(parent) = cur.parent() {
+                if let Some(name) = cur.file_name() {
+                    let entry = by_dir.entry((out.root, parent)).or_default();
+                    let name_os = name.to_os_string();
+                    if !entry.contains(&name_os) {
+                        entry.push(name_os);
+                    }
+                }
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                cur = parent;
+            }
+        }
+        by_dir
+    }
+
     /// Parallel input check for large whole-build manifests (tens of thousands
     /// of inputs), using a single bulk stamp scan and lock-free worker threads.
     fn holds_parallel(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         store.preload_stamps();
         let known = store.known_stamps();
+        let shared = store.shared_stamps().map(|s| s.as_ref());
+        let has_listed = self
+            .inputs
+            .iter()
+            .any(|i| matches!(i.state, State::Dir(Some(_))));
+        let dir_own = if has_listed {
+            Some(self.index_dir_own())
+        } else {
+            None
+        };
         let mut order: Vec<usize> = Vec::with_capacity(self.inputs.len());
         for root in [
             crate::roots::WORK,
@@ -761,26 +1031,22 @@ impl Manifest {
         }
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get())
-            .clamp(2, 8);
+            .clamp(2, 24);
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         let chunk = 64usize;
         let prior_seen = &here.seen;
         let roots = here.roots;
-        type Lane = (
-            Option<(usize, String)>,
-            Vec<(PathBuf, Seen)>,
-            Vec<(Stamp, Digest)>,
-            u64,
-        );
+        let dir_own_ref = dir_own.as_ref();
+        type Lane = (Option<(usize, String)>, Vec<(Stamp, Digest)>, u64);
         let lanes: Vec<Lane> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
                     scope.spawn(|| {
                         let mut err: Option<(usize, String)> = None;
-                        let mut seen_local: Vec<(PathBuf, Seen)> = Vec::new();
                         let mut learned_local: Vec<(Stamp, Digest)> = Vec::new();
                         let mut hashed = 0u64;
+                        let mut path_buf = PathBuf::with_capacity(256);
                         loop {
                             if failed.load(Ordering::Relaxed) {
                                 break;
@@ -800,7 +1066,10 @@ impl Manifest {
                                     roots,
                                     prior_seen,
                                     known,
-                                    &mut seen_local,
+                                    shared,
+                                    dir_own_ref,
+                                    &mut path_buf,
+                                    None,
                                     &mut learned_local,
                                     &mut hashed,
                                 ) {
@@ -813,25 +1082,19 @@ impl Manifest {
                                 }
                             }
                         }
-                        (err, seen_local, learned_local, hashed)
+                        (err, learned_local, hashed)
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| (None, Vec::new(), Vec::new(), 0))
-                })
+                .map(|h| h.join().unwrap_or_else(|_| (None, Vec::new(), 0)))
                 .collect()
         });
         let mut first_err: Option<(usize, String)> = None;
         let mut learned = Vec::new();
         let mut hashed_bytes = 0u64;
-        for (err, seen_local, learned_local, hashed) in lanes {
-            for (path, seen) in seen_local {
-                here.seen.entry(path).or_insert(seen);
-            }
+        for (err, learned_local, hashed) in lanes {
             learned.extend(learned_local);
             hashed_bytes += hashed;
             if let Some((pos, why)) = err
@@ -856,9 +1119,23 @@ impl Manifest {
         store: &mut Store,
         most: usize,
     ) -> Result<Vec<Difference>, String> {
+        self.differences_with_seen(here, store, most, true)
+    }
+
+    /// Like `differences`, with `save_seen` controlling whether observed path
+    /// metadata/digests are merged back into `here.seen` for subsequent
+    /// candidates. Set `save_seen = false` on the last candidate to avoid
+    /// allocating and inserting tens of thousands of `PathBuf` entries.
+    pub fn differences_with_seen(
+        &self,
+        here: &mut Here<'_>,
+        store: &mut Store,
+        most: usize,
+        save_seen: bool,
+    ) -> Result<Vec<Difference>, String> {
         self.settled_anywhere(here)?;
         if self.inputs.len() >= 512 {
-            return self.differences_parallel(here, store, most);
+            return self.differences_parallel(here, store, most, save_seen);
         }
         let mut found = Vec::new();
         for (at, input) in self.inputs.iter().enumerate() {
@@ -881,18 +1158,30 @@ impl Manifest {
         here: &mut Here<'_>,
         store: &mut Store,
         most: usize,
+        save_seen: bool,
     ) -> Result<Vec<Difference>, String> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         store.preload_stamps();
         let known = store.known_stamps();
+        let shared = store.shared_stamps().map(|s| s.as_ref());
+        let has_listed = self
+            .inputs
+            .iter()
+            .any(|i| matches!(i.state, State::Dir(Some(_))));
+        let dir_own = if has_listed {
+            Some(self.index_dir_own())
+        } else {
+            None
+        };
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get())
-            .clamp(2, 8);
+            .clamp(2, 24);
         let next = AtomicUsize::new(0);
         let diff_count = AtomicUsize::new(0);
         let chunk = 64usize;
         let prior_seen = &here.seen;
         let roots = here.roots;
+        let dir_own_ref = dir_own.as_ref();
         type Lane = (
             Vec<(Difference, String)>,
             Vec<(PathBuf, Seen)>,
@@ -907,6 +1196,7 @@ impl Manifest {
                         let mut seen_local: Vec<(PathBuf, Seen)> = Vec::new();
                         let mut learned_local: Vec<(Stamp, Digest)> = Vec::new();
                         let mut hashed = 0u64;
+                        let mut path_buf = PathBuf::with_capacity(256);
                         loop {
                             if diff_count.load(Ordering::Relaxed) > most {
                                 break;
@@ -921,12 +1211,16 @@ impl Manifest {
                                     break;
                                 }
                                 let input = &self.inputs[at];
+                                let sink = save_seen.then_some(&mut seen_local);
                                 if let Err((why, changed)) = self.check_readonly(
                                     input,
                                     roots,
                                     prior_seen,
                                     known,
-                                    &mut seen_local,
+                                    shared,
+                                    dir_own_ref,
+                                    &mut path_buf,
+                                    sink,
                                     &mut learned_local,
                                     &mut hashed,
                                 ) {
@@ -959,8 +1253,10 @@ impl Manifest {
         let mut hashed_bytes = 0u64;
         for (diffs, seen_local, learned_local, hashed) in lanes {
             all_diffs.extend(diffs);
-            for (path, seen) in seen_local {
-                here.seen.entry(path).or_insert(seen);
+            if save_seen {
+                for (path, seen) in seen_local {
+                    here.seen.insert(path, seen);
+                }
             }
             learned.extend(learned_local);
             hashed_bytes += hashed;
@@ -981,16 +1277,20 @@ impl Manifest {
         roots: &Roots,
         prior_seen: &HashMap<PathBuf, Seen>,
         known: &HashMap<(u64, u64), (Stamp, Digest)>,
-        seen_local: &mut Vec<(PathBuf, Seen)>,
+        shared: Option<&crate::cas::SharedStamps>,
+        dir_own: Option<&HashMap<(u8, &Path), Vec<OsString>>>,
+        path_buf: &mut PathBuf,
+        mut seen_local: Option<&mut Vec<(PathBuf, Seen)>>,
         learned_local: &mut Vec<(Stamp, Digest)>,
         hashed: &mut u64,
     ) -> Result<(), (String, Changed)> {
         let other = |why: String| Err((why, Changed::Otherwise));
-        let Some(path) = roots.join(input.root, &input.path) else {
+        if !roots.join_into(input.root, &input.path, path_buf) {
             return other("it was recorded with a target directory this command lacks".into());
-        };
+        }
+        let path: &Path = path_buf.as_path();
         let mut from_prior = false;
-        let mut seen = if let Some(s) = prior_seen.get(&path) {
+        let mut seen = if let Some(s) = prior_seen.get(path) {
             from_prior = true;
             s.clone()
         } else {
@@ -1002,7 +1302,7 @@ impl Manifest {
                         | io::ErrorKind::PermissionDenied
                 )
             };
-            match fs::symlink_metadata(&path) {
+            match fs::symlink_metadata(path) {
                 Err(e) if absent(&e) => Seen {
                     link: None,
                     kind: Kind::Absent,
@@ -1011,14 +1311,14 @@ impl Manifest {
                 },
                 Err(e) => return other(format!("{} cannot be examined: {e}", path.display())),
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    let target = match fs::read_link(&path) {
+                    let target = match fs::read_link(path) {
                         Ok(t) => t,
                         Err(e) => {
                             return other(format!("{} cannot be examined: {e}", path.display()));
                         }
                     };
                     let link = Some(roots.mark_os(target.as_os_str()).into_owned());
-                    match fs::metadata(&path) {
+                    match fs::metadata(path) {
                         Ok(meta) => Seen {
                             link,
                             kind: kind_of(&meta),
@@ -1045,8 +1345,10 @@ impl Manifest {
             }
         };
         let mut push_seen = |s: Seen| {
-            if !from_prior || s.digest.is_some() {
-                seen_local.push((path.clone(), s));
+            if let Some(sink) = seen_local.as_deref_mut()
+                && (!from_prior || s.digest.is_some())
+            {
+                sink.push((path.to_owned(), s));
             }
         };
         if seen.link != input.link {
@@ -1073,12 +1375,33 @@ impl Manifest {
             }
             (State::Dir(Some(recorded)), Kind::Dir) => {
                 push_seen(seen);
-                let outputs = self
-                    .outputs
-                    .iter()
-                    .map(|out| (out.root, out.path.as_path()));
-                let own = own_names((input.root, &input.path), &path, outputs, roots);
-                match list(&path, &own) {
+                let mut own_buf: Vec<OsString>;
+                let own: &[OsString] = if let Some(index) = dir_own {
+                    let target_child = roots
+                        .path(crate::roots::TARGET)
+                        .and_then(|t| t.strip_prefix(path).ok())
+                        .and_then(|rest| rest.components().next())
+                        .map(|c| c.as_os_str().to_owned());
+                    match (index.get(&(input.root, input.path.as_path())), target_child) {
+                        (Some(list), None) => list.as_slice(),
+                        (None, None) => &[],
+                        (list, Some(tc)) => {
+                            own_buf = list.cloned().unwrap_or_default();
+                            if !own_buf.contains(&tc) {
+                                own_buf.push(tc);
+                            }
+                            own_buf.as_slice()
+                        }
+                    }
+                } else {
+                    let outputs = self
+                        .outputs
+                        .iter()
+                        .map(|out| (out.root, out.path.as_path()));
+                    own_buf = own_names((input.root, &input.path), path, outputs, roots);
+                    own_buf.as_slice()
+                };
+                match list(path, own) {
                     Ok(names) if names == *recorded => Ok(()),
                     Ok(_) => Err((
                         format!("the entries of {} changed", path.display()),
@@ -1093,11 +1416,12 @@ impl Manifest {
                     None => {
                         let stamp = seen.stamp.unwrap();
                         let res = crate::cas::digest_for_check(
-                            &path,
+                            path,
                             stamp,
                             input.root == crate::roots::TARGET,
                             roots,
                             known,
+                            shared,
                         );
                         let (digest, learned, bytes) = match res {
                             Ok(v) => v,
@@ -1767,7 +2091,15 @@ mod tests {
         m.normalize();
         let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(decoded, m);
-        let key = m.key(&[1; 32]);
+        let recipe = [1; 32];
+        let (key, encoded) = m.encode_with_key(&recipe).unwrap();
+        assert_eq!(key, m.key(&recipe));
+        assert_eq!(
+            Manifest::decode_verified(&encoded, &recipe, &key).unwrap(),
+            m
+        );
+        assert!(Manifest::decode_verified(&encoded, &[2; 32], &key).is_err());
+        assert!(Manifest::decode_verified(&encoded, &recipe, &[9; 32]).is_err());
         assert_ne!(key, m.key(&[2; 32]));
         let mut other = m.clone();
         other.outputs.clear();
@@ -1966,6 +2298,71 @@ mod tests {
         assert_eq!(
             scripted.stale_parts(&[other(7)]).map_err(|(at, _)| at),
             Err(7)
+        );
+    }
+
+    #[test]
+    fn decode_for_reuse_matches_full_decode_and_rejects_pins() {
+        let mut m = Manifest::default();
+        // Enough inputs so the decompressed manifest exceeds 16 KiB and exercises
+        // the zero-allocation pins fast-rejection path.
+        for i in 0..600u32 {
+            m.inputs.push(Input {
+                root: WORK,
+                path: PathBuf::from(format!("crates/pkg{i}/src/lib.rs")),
+                link: None,
+                state: State::File([i as u8; 32]),
+            });
+        }
+        m.pins.push((WORK, PathBuf::from("/checkout/one")));
+        m.outputs.push(Output {
+            root: crate::roots::TARGET,
+            path: PathBuf::from("debug/app"),
+            digest: [5; 32],
+            size: 123,
+            mode: 0o755,
+            encoding: Encoding::Raw,
+        });
+        m.parts.push(Part {
+            inputs: vec![0, 1, 2],
+            outputs: vec![0],
+        });
+        m.own = vec![3, 4];
+        m.normalize();
+        let recipe = [42u8; 32];
+        let (key, stored) = m.encode_with_key(&recipe).unwrap();
+
+        let other_roots = Roots {
+            work: Some(crate::roots::Root::at(PathBuf::from("/checkout/two"))),
+            target: None,
+        };
+        match Manifest::decode_for_reuse(&stored, &recipe, &key, Some(&other_roots)).unwrap() {
+            ReuseDecode::PinnedOut(why, raw) => {
+                assert!(why.contains("/checkout/one"), "{why}");
+                let full = Manifest::decode_from_raw(&raw).unwrap();
+                assert_eq!(full, m);
+            }
+            ReuseDecode::Core(_, _) => panic!("expected PinnedOut"),
+        }
+
+        let same_roots = Roots {
+            work: Some(crate::roots::Root::at(PathBuf::from("/checkout/one"))),
+            target: None,
+        };
+        match Manifest::decode_for_reuse(&stored, &recipe, &key, Some(&same_roots)).unwrap() {
+            ReuseDecode::Core(mut core, tail) => {
+                assert!(core.parts.is_empty());
+                assert_eq!(core.inputs.len(), m.inputs.len());
+                assert_eq!(core.outputs, m.outputs);
+                core.decode_tail(&tail).unwrap();
+                assert_eq!(*core, m);
+            }
+            ReuseDecode::PinnedOut(why, _) => panic!("unexpected PinnedOut: {why}"),
+        }
+
+        let wrong_key = [99u8; 32];
+        assert!(
+            Manifest::decode_for_reuse(&stored, &recipe, &wrong_key, Some(&other_roots)).is_err()
         );
     }
 }

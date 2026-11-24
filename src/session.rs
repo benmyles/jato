@@ -8,10 +8,10 @@
 //! wrapper it starts asks this process, over a socket, to look its command
 //! up or to record it, so the wrappers stay small and the observer can tell
 //! one compiler's file accesses from another's.
-use crate::cas::Store;
-use crate::command::{self, Job, Outcome, Parts, Ran, Request, log};
+use crate::cas::{SharedStamps, Store};
+use crate::command::{self, Job, LookupCache, Outcome, Parts, Ran, Request, Run, log};
 use crate::manifest::Env;
-use crate::observe::{self, Scopes};
+use crate::observe::{self, Report, Scopes};
 use crate::roots::{Root, Roots};
 use crate::wire::{self, Reader, Writer};
 use anyhow::{Context, Result, bail};
@@ -20,6 +20,7 @@ use std::io::{self, IsTerminal, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,6 +31,9 @@ use std::time::Instant;
 const HIT: u8 = 0;
 const RUN: u8 = 1;
 const DECLINE: u8 = 2;
+const CONTINUE: u8 = 3;
+const SEED: u8 = 4;
+const RUN_OWN: u8 = 5;
 
 fn os(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
@@ -108,6 +112,126 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
             }
             Ok(Some(ran.code))
         }
+        CONTINUE => {
+            let mut argv = Vec::new();
+            for _ in 0..r.count()? {
+                argv.push(os(r.bytes()?));
+            }
+            let place = place(r.byte()? != 0);
+            let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            drop(stream);
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]).env_remove("JATO_SESSION");
+            if let Some(dir) = &held
+                && command::hold(&mut cmd, dir).is_err()
+            {
+                cmd = Command::new(program);
+                cmd.args(args).env_remove("JATO_SESSION");
+            }
+            if let Some(place) = place {
+                cmd.env(crate::jobs::HELD, "1");
+                place.keep_through_exec();
+            }
+            command::passthrough(cmd).map(Some)
+        }
+        SEED => {
+            let mut argv = Vec::new();
+            for _ in 0..r.count()? {
+                argv.push(os(r.bytes()?));
+            }
+            let place = place(r.byte()? != 0);
+            let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..])
+                .env_remove("JATO_SESSION")
+                .env(crate::jobs::HELD, "1");
+            if let Some(dir) = &held
+                && command::hold(&mut cmd, dir).is_err()
+            {
+                drop(place);
+                drop(stream);
+                let mut fallback = Command::new(program);
+                fallback.args(args).env_remove("JATO_SESSION");
+                return command::passthrough(fallback).map(Some);
+            }
+            let status = cmd.status().context("starting the compiler")?;
+            drop(place);
+            let mut w = Writer(Vec::new());
+            w.0.push(status.success().into());
+            w.number(waited);
+            let _ = wire::send(&mut stream, &w.0);
+            Ok(Some(command::exit_code(status)))
+        }
+        RUN_OWN => {
+            let mut argv = Vec::new();
+            for _ in 0..r.count()? {
+                argv.push(os(r.bytes()?));
+            }
+            let place = place(r.byte()? != 0);
+            let held = r.optional()?.map(|dir| PathBuf::from(os(dir)));
+            let async_ok = r.byte()? != 0;
+            let store_dir = PathBuf::from(os(r.bytes()?));
+            let mut ignore = Vec::new();
+            for _ in 0..r.count()? {
+                ignore.push(PathBuf::from(os(r.bytes()?)));
+            }
+            let mut unlisted = Vec::new();
+            for _ in 0..r.count()? {
+                unlisted.push(PathBuf::from(os(r.bytes()?)));
+            }
+            let state = r.optional()?.map(|p| PathBuf::from(os(p)));
+            let config = observe::Config {
+                fast: observe::fast_library(&store_dir),
+                ignore,
+                unlisted,
+                state,
+                programs_in: None,
+            };
+            let waited = place.as_ref().map_or(0, |p| p.waited.as_millis() as u64);
+            let (ran, mut report) =
+                match command::run_piped_config(&argv, Some(config), held.as_deref(), true) {
+                    Ok(done) => done,
+                    Err(e) => {
+                        log(
+                            &program.to_string_lossy(),
+                            format_args!("not observed: {e:#}"),
+                        );
+                        drop(place);
+                        drop(stream);
+                        let mut fallback = Command::new(program);
+                        fallback.args(args).env_remove("JATO_SESSION");
+                        return command::passthrough(fallback).map(Some);
+                    }
+                };
+            drop(place);
+            if async_ok && ran.success && report.incomplete.is_none() && !report.network {
+                for (path, access) in &mut report.paths {
+                    if access.kind == crate::observe::Kind::Absent
+                        && !access.written
+                        && !access.removed
+                        && !access.created
+                        && !access.appeared
+                        && std::fs::metadata(path).is_ok()
+                    {
+                        access.appeared = true;
+                    }
+                }
+                report.absent_verified = true;
+            }
+            let mut w = Writer(Vec::new());
+            w.number(ran.code as u32 as u64);
+            w.0.push(ran.success.into());
+            w.optional(ran.stdout.as_deref());
+            w.optional(ran.stderr.as_deref());
+            w.number(ran.millis);
+            w.number(waited);
+            report.encode(&mut w);
+            if wire::send(&mut stream, &w.0).is_ok() {
+                let _ = wire::receive(&mut stream);
+            }
+            Ok(Some(ran.code))
+        }
         _ => Ok(None),
     }
 }
@@ -121,62 +245,104 @@ fn place(compiles: bool) -> Option<crate::jobs::Place> {
 
 // ---- the supervisor's side ------------------------------------------------
 
+enum Mode {
+    Watched {
+        scopes: Scopes,
+        parts: Box<Mutex<Parts>>,
+    },
+    Unwatched {
+        cargo_exe: Option<(u64, u64)>,
+    },
+}
+
+fn exe_id(pid: u32) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
 struct Server {
-    scopes: Scopes,
+    mode: Mode,
     roots: Roots,
     /// The process Cargo was started in.
     cargo: u32,
-    parts: Mutex<Parts>,
     stores: Mutex<Vec<Store>>,
+    shared_stamps: Arc<SharedStamps>,
     stop: AtomicBool,
     /// Requests still being served, some past the point where their
     /// compiler was told it is done.
     busy: std::sync::atomic::AtomicUsize,
-    /// Caps concurrent asynchronous unit recording so background hashing and
-    /// compression never starve active compilations.
-    recorders: (Mutex<usize>, Condvar),
-    recorder_limit: usize,
+    /// Caps concurrent asynchronous unit recording while Cargo is running so
+    /// background hashing and compression never starve active compilations,
+    /// then expands to all cores once Cargo exits so tail recordings drain
+    /// immediately. Tuple is `(active, limit)`.
+    recorders: (Mutex<(usize, usize)>, Condvar),
 }
 
 struct RecorderSlot<'a>(&'a Server);
 
 impl Drop for RecorderSlot<'_> {
     fn drop(&mut self) {
-        let mut active = self.0.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
-        *active = active.saturating_sub(1);
+        let mut state = self.0.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = state.0.saturating_sub(1);
         self.0.recorders.1.notify_one();
     }
 }
 
 impl Server {
     fn acquire_recorder(&self) -> RecorderSlot<'_> {
-        let mut active = self.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
-        while *active >= self.recorder_limit {
-            active = self
+        let mut state = self.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
+        while state.0 >= state.1 {
+            state = self
                 .recorders
                 .1
-                .wait(active)
+                .wait(state)
                 .unwrap_or_else(|e| e.into_inner());
         }
-        *active += 1;
+        state.0 += 1;
         RecorderSlot(self)
     }
+
+    /// Expand background recording concurrency to all cores once Cargo exits.
+    fn boost_recorders(&self) {
+        let all = std::thread::available_parallelism()
+            .map_or(16, |n| n.get())
+            .max(16);
+        let mut state = self.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.1 = all;
+        self.recorders.1.notify_all();
+    }
+
     fn store(&self) -> Result<Store> {
         let spare = self.stores.lock().unwrap_or_else(|e| e.into_inner()).pop();
         match spare {
             Some(store) => Ok(store),
-            None => Store::open(),
+            None => {
+                let mut store = Store::open()?;
+                store.set_shared_stamps(self.shared_stamps.clone());
+                Ok(store)
+            }
         }
     }
 
+    fn return_store(&self, store: Store) {
+        self.stores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(store);
+    }
+
     fn unusable(&self, why: &str) {
-        let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
-        parts.unusable.get_or_insert_with(|| why.to_owned());
+        if let Mode::Watched { parts, .. } = &self.mode {
+            let mut parts = parts.lock().unwrap_or_else(|e| e.into_inner());
+            parts.unusable.get_or_insert_with(|| why.to_owned());
+        }
     }
 
     fn used(&self, job: &Job, manifest: &crate::manifest::Manifest, cargo: bool, under: u16) {
-        let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
-        parts.add(manifest, &job.roots, &self.roots, cargo, under);
+        if let Mode::Watched { parts, .. } = &self.mode {
+            let mut parts = parts.lock().unwrap_or_else(|e| e.into_inner());
+            parts.add(manifest, &job.roots, &self.roots, cargo, under);
+        }
     }
 
     /// Whether the process that started `pid` is Cargo: runs a program
@@ -191,7 +357,12 @@ impl Server {
         let parent = stat
             .rsplit_once(") ")
             .and_then(|(_, rest)| rest.split(' ').nth(1)?.parse::<u32>().ok());
-        parent.is_some_and(|parent| parent == self.cargo || self.scopes.own_program(parent))
+        parent.is_some_and(|parent| match &self.mode {
+            Mode::Watched { scopes, .. } => parent == self.cargo || scopes.own_program(parent),
+            Mode::Unwatched { cargo_exe } => {
+                parent == self.cargo || cargo_exe.is_some_and(|exe| exe_id(parent) == Some(exe))
+            }
+        })
     }
 
     /// Serve one compiler wrapper from its request to its last message.
@@ -214,16 +385,18 @@ impl Server {
         }
         // What a compiler starts is part of that compiler's work, and is
         // already being recorded as such.
-        if tool && self.scopes.inside(pid) {
+        if let Mode::Watched { scopes, .. } = &self.mode
+            && tool
+            && scopes.inside(pid)
+        {
             return wire::send(&mut stream, &[DECLINE]).map_err(Into::into);
         }
         let cargo = !tool && self.started_by_cargo(pid);
         // The build script in whose doing a compiler was started that is
         // none of Cargo's own.
-        let under = if cargo {
-            0
-        } else {
-            self.scopes.under_program(pid)
+        let under = match &self.mode {
+            Mode::Watched { scopes, .. } if !cargo => scopes.under_program(pid),
+            _ => 0,
         };
         let request = Request {
             program,
@@ -266,136 +439,280 @@ impl Server {
         }
         if let Some((outcome, manifest)) = found {
             self.used(&job, &manifest, cargo, under);
-            store.flush();
-            self.stores
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(store);
+            self.return_store(store);
             return reply(&mut stream, &outcome).map_err(Into::into);
         }
-        // Inside a build that is recorded whole, every compilation is.
-        command::choose(&job, &mut store, &recipe, true);
-        let argv = job.argv();
-        let mut w = Writer(vec![RUN]);
-        w.number(argv.len() as u64);
-        for arg in &argv {
-            w.bytes(arg.as_bytes());
+        match &self.mode {
+            Mode::Watched { scopes, .. } => {
+                // Inside a build that is recorded whole, every compilation is.
+                command::choose(&job, &mut store, &recipe, true);
+                let argv = job.argv();
+                let mut w = Writer(vec![RUN]);
+                w.number(argv.len() as u64);
+                for arg in &argv {
+                    w.bytes(arg.as_bytes());
+                }
+                // Whether to wait for a processor before running it.
+                w.0.push((job.tool || job.facts.compiles()).into());
+                // And the directory to start it with on a descriptor, if any.
+                w.optional(job.held().map(|dir| dir.as_os_str().as_bytes()));
+                store.count(job.counter("miss"), 1);
+                scopes.begin(pid, job.observer(&store));
+                let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
+                let mut report = scopes.end(pid).unwrap_or_default();
+                let Ok(done) = done else {
+                    // The wrapper went away mid-compilation: the build was stopped.
+                    self.unusable("a compiler was interrupted");
+                    self.return_store(store);
+                    return Ok(());
+                };
+                let mut r = Reader(&done);
+                let ran = Ran {
+                    code: r.number()? as i32,
+                    success: r.byte()? != 0,
+                    stdout: r.optional()?.map(<[u8]>::to_vec),
+                    stderr: r.optional()?.map(<[u8]>::to_vec),
+                    millis: r.number()?,
+                };
+                command::waited(
+                    &job,
+                    &mut store,
+                    std::time::Duration::from_millis(r.number()?),
+                );
+                // For a successful rustc compilation started by Cargo itself
+                // (not by a build script probe, which may delete its temp
+                // output directory right after rustc exits), release Cargo
+                // immediately so downstream crates start with zero
+                // critical-path wait while we hash, stage, and commit the unit
+                // in the background (still tracked by `server.busy` before the
+                // whole build is recorded).
+                let async_record = cargo
+                    && ran.success
+                    && !job.tool
+                    && job.facts.compiles()
+                    && job.facts.emits_link
+                    && report.incomplete.is_none()
+                    && !report.network
+                    && std::env::var_os("JATO_ASYNC_RECORD").is_none_or(|v| v != "0");
+                if async_record {
+                    // Verify every absent path right at compiler exit before
+                    // waking Cargo, so files created by subsequently scheduled
+                    // crates cannot cause spurious "appeared while it ran"
+                    // rejections while this unit stages in the background.
+                    for (path, access) in &mut report.paths {
+                        if access.kind == crate::observe::Kind::Absent
+                            && !access.written
+                            && !access.removed
+                            && !access.created
+                            && !access.appeared
+                            && std::fs::metadata(path).is_ok()
+                        {
+                            access.appeared = true;
+                        }
+                    }
+                    report.absent_verified = true;
+                    let _ = wire::send(&mut stream, &[0]);
+                    drop(stream);
+                    let _slot = self.acquire_recorder();
+                    let recorded =
+                        match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
+                            Ok(manifest) => {
+                                self.used(&job, &manifest, cargo, under);
+                                Some(report)
+                            }
+                            Err(why) => {
+                                self.unusable(&format!("{}: {why}", job.name()));
+                                None
+                            }
+                        };
+                    drop(lock);
+                    if let Some(report) = recorded {
+                        let left = command::Left::Seen(&report.state);
+                        command::keep_state(&job, &mut store, &recipe, left);
+                    }
+                } else {
+                    let recorded =
+                        match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
+                            Ok(manifest) => {
+                                self.used(&job, &manifest, cargo, under);
+                                Some(report)
+                            }
+                            // A build goes on after a command that failed where
+                            // the failure was an answer: a build script asking
+                            // whether something compiles. And a build script's
+                            // compiler whose result cannot be kept did what it
+                            // did all the same. Either way it was the build's
+                            // doing, as it would have been without a record of
+                            // its own.
+                            Err(_) if job.tool || !ran.success => {
+                                scopes.absorb(report, under);
+                                None
+                            }
+                            // A Rust compilation that worked but cannot be
+                            // reused leaves nothing to say what it depended on.
+                            Err(why) => {
+                                self.unusable(&format!("{}: {why}", job.name()));
+                                None
+                            }
+                        };
+                    drop(lock);
+                    let _ = wire::send(&mut stream, &[0]);
+                    // Cargo has its answer and goes on. What the compiler
+                    // saved for a next time is kept meanwhile.
+                    if let Some(report) = recorded {
+                        let left = command::Left::Seen(&report.state);
+                        command::keep_state(&job, &mut store, &recipe, left);
+                    }
+                }
+            }
+            Mode::Unwatched { .. } => {
+                let run = command::choose(&job, &mut store, &recipe, false);
+                let argv = job.argv();
+                let compiles = job.tool || job.facts.compiles();
+                let held = job.held().map(|dir| dir.as_os_str().as_bytes());
+                match run {
+                    Run::Continued => {
+                        log(job.name(), "left to rustc, unwatched and unrecorded");
+                        store.count("continued", 1);
+                        drop(lock);
+                        let mut w = Writer(vec![CONTINUE]);
+                        w.number(argv.len() as u64);
+                        for arg in &argv {
+                            w.bytes(arg.as_bytes());
+                        }
+                        w.0.push(compiles.into());
+                        w.optional(held);
+                        let _ = wire::send(&mut stream, &w.0);
+                    }
+                    Run::Seeding => {
+                        log(
+                            job.name(),
+                            "left to rustc, unwatched and unrecorded; the state it saves is kept",
+                        );
+                        store.count("continued", 1);
+                        let since = std::time::SystemTime::now();
+                        let mut w = Writer(vec![SEED]);
+                        w.number(argv.len() as u64);
+                        for arg in &argv {
+                            w.bytes(arg.as_bytes());
+                        }
+                        w.0.push(compiles.into());
+                        w.optional(held);
+                        let done =
+                            wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
+                        drop(stream);
+                        if let Ok(done) = done {
+                            let mut r = Reader(&done);
+                            let success = r.byte().unwrap_or(0) != 0;
+                            if let Ok(waited_ms) = r.number() {
+                                command::waited(
+                                    &job,
+                                    &mut store,
+                                    std::time::Duration::from_millis(waited_ms),
+                                );
+                            }
+                            if success {
+                                let _slot = self.acquire_recorder();
+                                command::keep_state(
+                                    &job,
+                                    &mut store,
+                                    &recipe,
+                                    command::Left::Since(since),
+                                );
+                            }
+                        }
+                        drop(lock);
+                    }
+                    Run::Recorded => {
+                        store.count(job.counter("miss"), 1);
+                        let async_ok = cargo
+                            && !job.tool
+                            && job.facts.compiles()
+                            && job.facts.emits_link
+                            && std::env::var_os("JATO_ASYNC_RECORD").is_none_or(|v| v != "0");
+                        let obs = job.observer(&store);
+                        let mut w = Writer(vec![RUN_OWN]);
+                        w.number(argv.len() as u64);
+                        for arg in &argv {
+                            w.bytes(arg.as_bytes());
+                        }
+                        w.0.push(compiles.into());
+                        w.optional(held);
+                        w.0.push(async_ok.into());
+                        w.bytes(store.dir.as_os_str().as_bytes());
+                        w.number(obs.ignore.len() as u64);
+                        for p in &obs.ignore {
+                            w.bytes(p.as_os_str().as_bytes());
+                        }
+                        w.number(obs.unlisted.len() as u64);
+                        for p in &obs.unlisted {
+                            w.bytes(p.as_os_str().as_bytes());
+                        }
+                        w.optional(obs.state.as_deref().map(|p| p.as_os_str().as_bytes()));
+                        let done =
+                            wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
+                        let Ok(done) = done else {
+                            drop(lock);
+                            self.return_store(store);
+                            return Ok(());
+                        };
+                        let mut r = Reader(&done);
+                        let ran = Ran {
+                            code: r.number()? as i32,
+                            success: r.byte()? != 0,
+                            stdout: r.optional()?.map(<[u8]>::to_vec),
+                            stderr: r.optional()?.map(<[u8]>::to_vec),
+                            millis: r.number()?,
+                        };
+                        let waited_ms = r.number()?;
+                        let report = Report::decode(&mut r)?;
+                        command::waited(
+                            &job,
+                            &mut store,
+                            std::time::Duration::from_millis(waited_ms),
+                        );
+                        if async_ok
+                            && ran.success
+                            && report.incomplete.is_none()
+                            && !report.network
+                            && report.absent_verified
+                        {
+                            let _ = wire::send(&mut stream, &[0]);
+                            drop(stream);
+                            let _slot = self.acquire_recorder();
+                            if command::finish(&job, &mut store, &recipe, &ran, &report, None)
+                                .is_ok()
+                            {
+                                command::keep_state(
+                                    &job,
+                                    &mut store,
+                                    &recipe,
+                                    command::Left::Seen(&report.state),
+                                );
+                            }
+                            drop(lock);
+                        } else {
+                            let ok =
+                                command::finish(&job, &mut store, &recipe, &ran, &report, None)
+                                    .is_ok();
+                            drop(lock);
+                            let _ = wire::send(&mut stream, &[0]);
+                            drop(stream);
+                            if ok {
+                                let _slot = self.acquire_recorder();
+                                command::keep_state(
+                                    &job,
+                                    &mut store,
+                                    &recipe,
+                                    command::Left::Seen(&report.state),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
-        // Whether to wait for a processor before running it.
-        w.0.push((job.tool || job.facts.compiles()).into());
-        // And the directory to start it with on a descriptor, if any.
-        w.optional(job.held().map(|dir| dir.as_os_str().as_bytes()));
-        store.count(job.counter("miss"), 1);
-        self.scopes.begin(pid, job.observer(&store));
-        let done = wire::send(&mut stream, &w.0).and_then(|()| wire::receive(&mut stream));
-        let mut report = self.scopes.end(pid).unwrap_or_default();
-        let Ok(done) = done else {
-            // The wrapper went away mid-compilation: the build was stopped.
-            self.unusable("a compiler was interrupted");
-            return Ok(());
-        };
-        let mut r = Reader(&done);
-        let ran = Ran {
-            code: r.number()? as i32,
-            success: r.byte()? != 0,
-            stdout: r.optional()?.map(<[u8]>::to_vec),
-            stderr: r.optional()?.map(<[u8]>::to_vec),
-            millis: r.number()?,
-        };
-        command::waited(
-            &job,
-            &mut store,
-            std::time::Duration::from_millis(r.number()?),
-        );
-        // For a successful rustc compilation started by Cargo itself (not by a
-        // build script probe, which may delete its temp output directory right
-        // after rustc exits), release Cargo immediately so downstream crates
-        // start with zero critical-path wait while we hash, stage, and commit
-        // the unit in the background (still tracked by `server.busy` before
-        // the whole build is recorded).
-        let async_record = cargo
-            && ran.success
-            && !job.tool
-            && job.facts.compiles()
-            && job.facts.emits_link
-            && report.incomplete.is_none()
-            && !report.network
-            && std::env::var_os("JATO_ASYNC_RECORD").is_none_or(|v| v != "0");
-        if async_record {
-            // Verify every absent path right at compiler exit before waking
-            // Cargo, so files created by subsequently scheduled crates cannot
-            // cause spurious "appeared while it ran" rejections while this
-            // unit stages in the background.
-            for (path, access) in &mut report.paths {
-                if access.kind == crate::observe::Kind::Absent
-                    && !access.written
-                    && !access.removed
-                    && !access.created
-                    && !access.appeared
-                    && std::fs::metadata(path).is_ok()
-                {
-                    access.appeared = true;
-                }
-            }
-            report.absent_verified = true;
-            let _ = wire::send(&mut stream, &[0]);
-            drop(stream);
-            let _slot = self.acquire_recorder();
-            let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
-                Ok(manifest) => {
-                    self.used(&job, &manifest, cargo, under);
-                    Some(report)
-                }
-                Err(why) => {
-                    self.unusable(&format!("{}: {why}", job.name()));
-                    None
-                }
-            };
-            drop(lock);
-            store.flush();
-            if let Some(report) = recorded {
-                let left = command::Left::Seen(&report.state);
-                command::keep_state(&job, &mut store, &recipe, left);
-                store.flush();
-            }
-        } else {
-            let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
-                Ok(manifest) => {
-                    self.used(&job, &manifest, cargo, under);
-                    Some(report)
-                }
-                // A build goes on after a command that failed where the
-                // failure was an answer: a build script asking whether
-                // something compiles. And a build script's compiler whose
-                // result cannot be kept did what it did all the same. Either
-                // way it was the build's doing, as it would have been without
-                // a record of its own.
-                Err(_) if job.tool || !ran.success => {
-                    self.scopes.absorb(report, under);
-                    None
-                }
-                // A Rust compilation that worked but cannot be reused leaves
-                // nothing to say what it depended on.
-                Err(why) => {
-                    self.unusable(&format!("{}: {why}", job.name()));
-                    None
-                }
-            };
-            drop(lock);
-            store.flush();
-            let _ = wire::send(&mut stream, &[0]);
-            // Cargo has its answer and goes on. What the compiler saved for a
-            // next time is kept meanwhile.
-            if let Some(report) = recorded {
-                let left = command::Left::Seen(&report.state);
-                command::keep_state(&job, &mut store, &recipe, left);
-                store.flush();
-            }
-        }
-        self.stores
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(store);
+        self.return_store(store);
         Ok(())
     }
 }
@@ -699,7 +1016,8 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
     else {
         return command::passthrough(cmd);
     };
-    match command::reuse(&job, &mut store, &recipe, true) {
+    let mut cache = LookupCache::default();
+    match command::reuse_cached(&job, &mut store, &recipe, true, Some(&mut cache)) {
         Ok(Some((outcome, _))) => {
             // Cargo reports each artifact it did not have to rebuild.
             let fresh = String::from_utf8_lossy(&outcome.stdout)
@@ -714,25 +1032,114 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
         Ok(None) => (),
         Err(e) => log(name, format_args!("lookup failed: {e:#}")),
     }
-    // An edit in a target that is already built: Cargo will compile a few
-    // crates and find the rest up to date. Each compiler it starts is
-    // watched on its own. Watching Cargo check everything else as well
-    // would add more to this build than its record could save later.
-    if command::mostly_built(&job, &store, &recipe) {
+    // An edit in a target that is already built: Cargo runs unwatched and
+    // checks everything natively, while compiler wrappers talk to a
+    // lightweight supervisor sharing pooled SQLite stores, an in-memory stamp
+    // cache with per-inode singleflight deduplication, and bounded background
+    // recording.
+    if command::mostly_built_cached(&job, &store, &recipe, Some(&mut cache)) {
         log(
             name,
             "the target is already built: leaving this build to Cargo",
         );
         store.count("build_left_to_cargo", 1);
-        drop(store);
-        return command::passthrough(cmd);
+        return supervise_unwatched(cmd, job, store);
     }
     let prepared = Prepared { job, store, recipe };
-    match make(cmd, prepared, name, begun, true)? {
+    match make(cmd, prepared, name, begun, true, Some(&mut cache))? {
         Supervised::Ran(code) => Ok(code),
         Supervised::Unwatched(cmd) => command::passthrough(cmd),
         Supervised::Doubted => bail!("a build from nothing cannot be in doubt"),
     }
+}
+
+/// Run Cargo completely unwatched (for a target that is already mostly built)
+/// while serving compiler wrappers through a lightweight in-process supervisor
+/// that pools SQLite connections, deduplicates large-file hashing across
+/// concurrent crates, and runs unit recording asynchronously behind a bounded
+/// worker pool.
+fn supervise_unwatched(mut cmd: Command, job: Job, mut store: Store) -> Result<i32> {
+    let socket = format!(
+        "jato-{}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let listener =
+        match address(OsStr::new(&socket)).and_then(|addr| UnixListener::bind_addr(&addr)) {
+            Ok(listener) => listener,
+            Err(_) => {
+                drop(store);
+                return command::passthrough(cmd);
+            }
+        };
+    cmd.env("JATO_SESSION", &socket);
+    let tokens = crate::jobs::offer(&mut cmd, &store.dir);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            crate::jobs::withdraw(&mut cmd, tokens);
+            cmd.env_remove("JATO_SESSION");
+            drop(store);
+            return command::passthrough(cmd);
+        }
+    };
+    let pid = child.id();
+    let cargo_exe = exe_id(pid);
+    let shared_stamps = Arc::new(SharedStamps::new());
+    store.set_shared_stamps(shared_stamps.clone());
+    let recorder_limit =
+        (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).clamp(2, 8);
+    let server = Arc::new(Server {
+        mode: Mode::Unwatched { cargo_exe },
+        roots: job.roots.clone(),
+        cargo: pid,
+        stores: Mutex::new(Vec::new()),
+        shared_stamps,
+        stop: AtomicBool::new(false),
+        busy: std::sync::atomic::AtomicUsize::new(0),
+        recorders: (Mutex::new((0, recorder_limit)), Condvar::new()),
+    });
+    let accepting = server.clone();
+    let accept = std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if accepting.stop.load(Ordering::Acquire) {
+                break;
+            }
+            let server = accepting.clone();
+            server.busy.fetch_add(1, Ordering::AcqRel);
+            std::thread::spawn(move || {
+                let _ = server.serve(stream);
+                server.busy.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    });
+    let kill_pid = pid as i32;
+    let _ = ctrlc::set_handler(move || {
+        STOPPED.store(true, Ordering::Release);
+        unsafe { libc::kill(kill_pid, libc::SIGTERM) };
+    });
+    let status = child.wait().context("waiting for Cargo")?;
+    drop(tokens);
+    server.stop.store(true, Ordering::Release);
+    server.boost_recorders();
+    if let Ok(addr) = address(OsStr::new(&socket)) {
+        let _ = UnixStream::connect_addr(&addr);
+    }
+    let _ = accept.join();
+    let patience = Instant::now();
+    while server.busy.load(Ordering::Acquire) > 0 && patience.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    server
+        .stores
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    store.settle();
+    Ok(command::exit_code(status))
 }
 
 /// Have Cargo make a build that is not recorded, under one observer. If
@@ -746,13 +1153,14 @@ fn make(
     name: &str,
     begun: Instant,
     whole: bool,
+    cache: Option<&mut LookupCache>,
 ) -> Result<Supervised> {
     let Prepared {
         job,
         mut store,
         recipe,
     } = prepared;
-    let start = command::start_from(&job, &mut store, &recipe)
+    let start = command::start_from_cached(&job, &mut store, &recipe, cache)
         .or_else(|| command::rest_on(&job, &mut store, &recipe))
         .or_else(|| command::seed_from(&job, &mut store, &recipe));
     let again = start.is_some().then(|| copy_of(&cmd));
@@ -802,16 +1210,17 @@ pub fn ready(cmd: Command, name: &str) {
     else {
         return;
     };
-    match command::reuse(&job, &mut store, &recipe, true) {
+    let mut cache = LookupCache::default();
+    match command::reuse_cached(&job, &mut store, &recipe, true, Some(&mut cache)) {
         Ok(Some(_)) => return,
         Ok(None) => (),
         Err(e) => log(name, format_args!("lookup failed: {e:#}")),
     }
-    if command::mostly_built(&job, &store, &recipe) {
+    if command::mostly_built_cached(&job, &store, &recipe, Some(&mut cache)) {
         return;
     }
     let prepared = Prepared { job, store, recipe };
-    if let Err(e) = make(cmd, prepared, name, begun, false) {
+    if let Err(e) = make(cmd, prepared, name, begun, false, Some(&mut cache)) {
         log(
             name,
             format_args!("the build ahead of the command failed: {e:#}"),
@@ -915,18 +1324,22 @@ fn supervise(
     // here would hide its closing.
     let child_err = child.stderr.take();
     drop(cmd);
+    let shared_stamps = Arc::new(SharedStamps::new());
+    store.set_shared_stamps(shared_stamps.clone());
     let recorder_limit =
         (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).clamp(2, 8);
     let server = Arc::new(Server {
-        scopes: session.scopes(),
+        mode: Mode::Watched {
+            scopes: session.scopes(),
+            parts: Box::new(Mutex::new(Parts::starting_from(start))),
+        },
         roots: job.roots.clone(),
         cargo: child.id(),
-        parts: Mutex::new(Parts::starting_from(start)),
         stores: Mutex::new(Vec::new()),
+        shared_stamps,
         stop: AtomicBool::new(false),
         busy: std::sync::atomic::AtomicUsize::new(0),
-        recorders: (Mutex::new(0), Condvar::new()),
-        recorder_limit,
+        recorders: (Mutex::new((0, recorder_limit)), Condvar::new()),
     });
     let accepting = server.clone();
     let accept = std::thread::spawn(move || {
@@ -982,6 +1395,7 @@ fn supervise(
     let status = child.wait().context("waiting for Cargo")?;
     drop(tokens);
     server.stop.store(true, Ordering::Release);
+    server.boost_recorders();
     let _ = UnixStream::connect_addr(&address(OsStr::new(&socket))?);
     let _ = accept.join();
     // Cargo has gone, and so have the compilers. Whatever is still being
@@ -998,7 +1412,10 @@ fn supervise(
         stderr,
         millis: begun.elapsed().as_millis() as u64,
     };
-    let parts = server.parts.lock().unwrap_or_else(|e| e.into_inner());
+    let Mode::Watched { parts, .. } = &server.mode else {
+        unreachable!();
+    };
+    let parts = parts.lock().unwrap_or_else(|e| e.into_inner());
     log(
         name,
         format_args!(
@@ -1035,19 +1452,24 @@ fn supervise(
             start.undo(&job.roots, &report, &parts);
         }
         drop(parts);
+        server
+            .stores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         store.count("build_doubted", 1);
         store.settle();
         return Ok(Supervised::Doubted);
     }
-    let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
-    drop(parts);
-    // The stores that served the compilers are done with, and the index
-    // has taken a whole build's worth of writes.
+    // Flush all pooled compiler stores before recording the whole build so
+    // their learned stamps and counters are committed and visible.
     server
         .stores
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    let _ = command::finish(&job, &mut store, &recipe, &ran, &report, Some(&parts));
+    drop(parts);
     store.settle();
     Ok(Supervised::Ran(ran.code))
 }

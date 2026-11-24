@@ -10,6 +10,10 @@ pub type Digest = [u8; 32];
 
 const BLOCK: usize = 512 * 1024;
 
+thread_local! {
+    static DIGEST_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A byte that can continue a file name. A directory's path followed by one
 /// of these is the path of something else: `/a/src` does not occur in
 /// `/a/src-old/x`.
@@ -35,29 +39,44 @@ pub fn names_path(haystack: &[u8], needle: &[u8]) -> bool {
 /// The digest and length of an open file, and for each needle whether the
 /// file names that path. Memory use does not depend on the file's size.
 pub fn digest_open(file: &mut File, needles: &[&[u8]]) -> io::Result<(Digest, u64, Vec<bool>)> {
+    DIGEST_BUF.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        digest_open_with(file, needles, &mut guard)
+    })
+}
+
+pub fn digest_open_with(
+    file: &mut File,
+    needles: &[&[u8]],
+    buffer: &mut Vec<u8>,
+) -> io::Result<(Digest, u64, Vec<bool>)> {
     let finders: Vec<_> = needles.iter().map(Finder::new).collect();
     // Keep enough of the previous block to see a path that straddles two
     // blocks, and the byte that follows it.
     let keep = needles.iter().map(|n| n.len()).max().map_or(0, |n| n + 1);
     let mut found = vec![false; needles.len()];
-    let mut buffer = vec![0u8; keep + BLOCK];
+    let want = keep + BLOCK;
+    if buffer.len() < want {
+        buffer.resize(want, 0);
+    }
+    let buf = &mut buffer[..want];
     let mut hasher = blake3::Hasher::new();
     let mut carried = 0;
     let mut length = 0u64;
     loop {
         let mut filled = carried;
-        while filled < buffer.len() {
-            match file.read(&mut buffer[filled..]) {
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
                 Err(e) => return Err(e),
             }
         }
-        let end = filled < buffer.len();
-        hasher.update(&buffer[carried..filled]);
+        let end = filled < buf.len();
+        hasher.update(&buf[carried..filled]);
         length += (filled - carried) as u64;
-        let data = &buffer[..filled];
+        let data = &buf[..filled];
         for ((finder, needle), found) in finders.iter().zip(needles).zip(&mut found) {
             let mut from = 0;
             while !*found {
@@ -80,7 +99,7 @@ pub fn digest_open(file: &mut File, needles: &[&[u8]]) -> io::Result<(Digest, u6
             break;
         }
         carried = keep.min(filled);
-        buffer.copy_within(filled - carried..filled, 0);
+        buf.copy_within(filled - carried..filled, 0);
     }
     Ok((*hasher.finalize().as_bytes(), length, found))
 }
@@ -369,42 +388,49 @@ pub fn digest_rlib(path: &Path) -> io::Result<Option<(Digest, Stamp)>> {
     }
 
     let mut hasher = blake3::Hasher::new_derive_key("jato rlib v1");
-    let mut buf = vec![0u8; 256 * 1024];
-    for member in &members {
-        let label: &[u8] = renames
-            .iter()
-            .find(|(old, _)| old == &member.name)
-            .map_or(&member.name, |(_, new)| new);
-        hasher.update(&(label.len() as u64).to_le_bytes());
-        hasher.update(label);
-        file.seek(SeekFrom::Start(member.offset))?;
-        if member.name == b"lib.rmeta-link" && member.size <= MAX_AUX {
-            let mut raw = vec![0u8; member.size as usize];
-            file.read_exact(&mut raw)?;
-            if let Some(norm) = normalized_rmeta_link(&raw, &renames) {
-                hasher.update(&[1]);
-                hasher.update(&(norm.len() as u64).to_le_bytes());
-                hasher.update(&norm);
+    DIGEST_BUF.with(|cell| -> io::Result<()> {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < 256 * 1024 {
+            buf.resize(256 * 1024, 0);
+        }
+        let slice = &mut buf[..256 * 1024];
+        for member in &members {
+            let label: &[u8] = renames
+                .iter()
+                .find(|(old, _)| old == &member.name)
+                .map_or(&member.name, |(_, new)| new);
+            hasher.update(&(label.len() as u64).to_le_bytes());
+            hasher.update(label);
+            file.seek(SeekFrom::Start(member.offset))?;
+            if member.name == b"lib.rmeta-link" && member.size <= MAX_AUX {
+                let mut raw = vec![0u8; member.size as usize];
+                file.read_exact(&mut raw)?;
+                if let Some(norm) = normalized_rmeta_link(&raw, &renames) {
+                    hasher.update(&[1]);
+                    hasher.update(&(norm.len() as u64).to_le_bytes());
+                    hasher.update(&norm);
+                    continue;
+                }
+                hasher.update(&[0]);
+                hasher.update(&(raw.len() as u64).to_le_bytes());
+                hasher.update(&raw);
                 continue;
             }
             hasher.update(&[0]);
-            hasher.update(&(raw.len() as u64).to_le_bytes());
-            hasher.update(&raw);
-            continue;
-        }
-        hasher.update(&[0]);
-        hasher.update(&member.size.to_le_bytes());
-        let mut left = member.size;
-        while left > 0 {
-            let want = (left as usize).min(buf.len());
-            let n = file.read(&mut buf[..want])?;
-            if n == 0 {
-                return Err(io::Error::other("rlib truncated while hashing"));
+            hasher.update(&member.size.to_le_bytes());
+            let mut left = member.size;
+            while left > 0 {
+                let want = (left as usize).min(slice.len());
+                let n = file.read(&mut slice[..want])?;
+                if n == 0 {
+                    return Err(io::Error::other("rlib truncated while hashing"));
+                }
+                hasher.update(&slice[..n]);
+                left -= n as u64;
             }
-            hasher.update(&buf[..n]);
-            left -= n as u64;
         }
-    }
+        Ok(())
+    })?;
     let stamp = Stamp::of(&file.metadata()?);
     if !Stamp::of(&before).same_contents(&stamp) || file_len != stamp.size {
         return Err(io::Error::other("file changed while it was read"));

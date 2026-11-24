@@ -253,6 +253,234 @@ pub struct Report {
     pub absent_verified: bool,
 }
 
+impl Report {
+    /// Serialize this report to `w` for forwarding from a compiler wrapper to
+    /// an unwatched build supervisor.
+    pub fn encode(&self, w: &mut crate::wire::Writer) {
+        w.0.push(self.network.into());
+        w.0.push(self.survivors.into());
+        w.0.push(self.absent_verified.into());
+        w.number(self.events);
+        w.number(self.noted);
+        w.optional(self.incomplete.as_deref().map(str::as_bytes));
+        w.number(self.sockets.len() as u64);
+        for (path, caller) in &self.sockets {
+            w.bytes(path.as_os_str().as_bytes());
+            w.bytes(caller.as_bytes());
+        }
+        w.number(self.reported.len() as u64);
+        for (&call, &count) in &self.reported {
+            w.number(u64::from(call));
+            w.number(count);
+        }
+        w.number(self.state.len() as u64);
+        for name in &self.state {
+            w.bytes(name.as_bytes());
+        }
+        w.number(self.programs.len() as u64);
+        for prog in &self.programs {
+            w.bytes(prog.as_os_str().as_bytes());
+        }
+        w.number(self.paths.len() as u64);
+        for (path, a) in &self.paths {
+            w.bytes(path.as_os_str().as_bytes());
+            let kind_byte: u8 = match a.kind {
+                Kind::File => 0,
+                Kind::Dir => 1,
+                Kind::Other => 2,
+                Kind::Absent => 3,
+            };
+            w.0.push(kind_byte);
+            let mut flags: u16 = 0;
+            if a.read {
+                flags |= 1 << 0;
+            }
+            if a.probed {
+                flags |= 1 << 1;
+            }
+            if a.executed {
+                flags |= 1 << 2;
+            }
+            if a.written {
+                flags |= 1 << 3;
+            }
+            if a.created {
+                flags |= 1 << 4;
+            }
+            if a.updated {
+                flags |= 1 << 5;
+            }
+            if a.removed {
+                flags |= 1 << 6;
+            }
+            if a.appeared {
+                flags |= 1 << 7;
+            }
+            if a.others {
+                flags |= 1 << 8;
+            }
+            if a.listed_by_others {
+                flags |= 1 << 9;
+            }
+            if a.stray {
+                flags |= 1 << 10;
+            }
+            if a.own_read {
+                flags |= 1 << 11;
+            }
+            if a.own_wrote {
+                flags |= 1 << 12;
+            }
+            if a.stamp.is_some() {
+                flags |= 1 << 13;
+            }
+            if a.listing.is_some() {
+                flags |= 1 << 14;
+            }
+            w.number(u64::from(flags));
+            if let Some(s) = a.stamp {
+                w.number(s.dev);
+                w.number(s.ino);
+                w.number(s.size);
+                w.number(s.mtime as u64);
+                w.number(s.ctime as u64);
+            }
+            w.number(a.links);
+            w.optional(a.link.as_deref().map(|p| p.as_os_str().as_bytes()));
+            if let Some(names) = &a.listing {
+                w.number(names.len() as u64);
+                for n in names {
+                    w.bytes(n.as_bytes());
+                }
+            }
+            w.optional(a.origin.as_deref().map(|p| p.as_os_str().as_bytes()));
+            w.optional(a.writer.as_deref().map(str::as_bytes));
+            w.number(a.by.len() as u64);
+            for &b in &a.by {
+                w.number(u64::from(b));
+            }
+            w.number(u64::from(a.wrote));
+            w.number(a.first);
+            w.number(a.made);
+        }
+    }
+
+    pub fn decode(r: &mut crate::wire::Reader<'_>) -> anyhow::Result<Self> {
+        let mut rep = Self {
+            network: r.byte()? != 0,
+            survivors: r.byte()? != 0,
+            absent_verified: r.byte()? != 0,
+            events: r.number()?,
+            noted: r.number()?,
+            incomplete: r
+                .optional()?
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
+            ..Self::default()
+        };
+        let n_sockets = r.count()?;
+        rep.sockets.reserve(n_sockets.min(64));
+        for _ in 0..n_sockets {
+            let p = PathBuf::from(OsString::from_vec(r.bytes()?.to_vec()));
+            let c = String::from_utf8_lossy(r.bytes()?).into_owned();
+            rep.sockets.push((p, c));
+        }
+        for _ in 0..r.count()? {
+            let call = r.number()? as u32;
+            let count = r.number()?;
+            rep.reported.insert(call, count);
+        }
+        for _ in 0..r.count()? {
+            rep.state.insert(OsString::from_vec(r.bytes()?.to_vec()));
+        }
+        for _ in 0..r.count()? {
+            rep.programs
+                .push(PathBuf::from(OsString::from_vec(r.bytes()?.to_vec())));
+        }
+        let n_paths = r.count()?;
+        rep.paths.reserve(n_paths.min(400_000));
+        for _ in 0..n_paths {
+            let path = PathBuf::from(OsString::from_vec(r.bytes()?.to_vec()));
+            let kind = match r.byte()? {
+                0 => Kind::File,
+                1 => Kind::Dir,
+                2 => Kind::Other,
+                3 => Kind::Absent,
+                _ => anyhow::bail!("invalid access kind"),
+            };
+            let flags = r.number()? as u16;
+            let stamp = if flags & (1 << 13) != 0 {
+                Some(Stamp {
+                    dev: r.number()?,
+                    ino: r.number()?,
+                    size: r.number()?,
+                    mtime: r.number()? as i64,
+                    ctime: r.number()? as i64,
+                })
+            } else {
+                None
+            };
+            let links = r.number()?;
+            let link = r
+                .optional()?
+                .map(|b| PathBuf::from(OsString::from_vec(b.to_vec())));
+            let listing = if flags & (1 << 14) != 0 {
+                let n = r.count()?;
+                let mut names = Vec::with_capacity(n.min(100_000));
+                for _ in 0..n {
+                    names.push(OsString::from_vec(r.bytes()?.to_vec()));
+                }
+                Some(names)
+            } else {
+                None
+            };
+            let origin = r
+                .optional()?
+                .map(|b| PathBuf::from(OsString::from_vec(b.to_vec())));
+            let writer = r
+                .optional()?
+                .map(|b| String::from_utf8_lossy(b).into_owned().into_boxed_str());
+            let n_by = r.count()?;
+            let mut by = Vec::with_capacity(n_by.min(64));
+            for _ in 0..n_by {
+                by.push(r.number()? as u16);
+            }
+            let wrote = r.number()? as u16;
+            let first = r.number()?;
+            let made = r.number()?;
+            rep.paths.insert(
+                path,
+                Access {
+                    kind,
+                    stamp,
+                    links,
+                    link,
+                    read: flags & (1 << 0) != 0,
+                    probed: flags & (1 << 1) != 0,
+                    listing,
+                    executed: flags & (1 << 2) != 0,
+                    written: flags & (1 << 3) != 0,
+                    created: flags & (1 << 4) != 0,
+                    updated: flags & (1 << 5) != 0,
+                    removed: flags & (1 << 6) != 0,
+                    appeared: flags & (1 << 7) != 0,
+                    origin,
+                    writer,
+                    others: flags & (1 << 8) != 0,
+                    listed_by_others: flags & (1 << 9) != 0,
+                    by,
+                    stray: flags & (1 << 10) != 0,
+                    wrote,
+                    own_read: flags & (1 << 11) != 0,
+                    own_wrote: flags & (1 << 12) != 0,
+                    first,
+                    made,
+                },
+            );
+        }
+        Ok(rep)
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Config {
     /// Nothing at or beneath these paths is recorded.
@@ -293,10 +521,13 @@ pub fn fast_library(cache: &Path) -> Option<PathBuf> {
     if SHIM.is_empty() || std::env::var_os("JATO_NOTES").is_some_and(|v| v == "0") {
         return None;
     }
-    let name = format!(
-        "jato-fast-{}.so",
-        &blake3::hash(SHIM).to_hex().as_str()[..16]
-    );
+    static SHIM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let name = SHIM_NAME.get_or_init(|| {
+        format!(
+            "jato-fast-{}.so",
+            &blake3::hash(SHIM).to_hex().as_str()[..16]
+        )
+    });
     let path = cache.join("lib").join(name);
     if fs::metadata(&path).is_ok_and(|meta| meta.len() == SHIM.len() as u64) {
         return Some(path);
@@ -739,8 +970,9 @@ mod imp {
 
     /// `name` as a path from the directory `base`, which is empty for a
     /// name that starts at the root. `.` and empty components are dropped.
-    fn joined(base: &[u8], name: &[u8]) -> PathBuf {
-        let mut cleaned = Vec::with_capacity(base.len() + name.len() + 1);
+    fn joined_into(base: &[u8], name: &[u8], cleaned: &mut Vec<u8>) {
+        cleaned.clear();
+        cleaned.reserve(base.len() + name.len() + 1);
         cleaned.extend_from_slice(base);
         for part in name.split(|b| *b == b'/') {
             if part.is_empty() || part == b"." {
@@ -754,6 +986,11 @@ mod imp {
         if cleaned.is_empty() {
             cleaned.push(b'/');
         }
+    }
+
+    fn joined(base: &[u8], name: &[u8]) -> PathBuf {
+        let mut cleaned = Vec::with_capacity(base.len() + name.len() + 1);
+        joined_into(base, name, &mut cleaned);
         PathBuf::from(OsString::from_vec(cleaned))
     }
 
@@ -949,7 +1186,11 @@ mod imp {
         }
 
         fn touch(&mut self, path: PathBuf, how: Use) {
-            if self.ignored(&path) {
+            self.touch_ref(&path, how);
+        }
+
+        fn touch_ref(&mut self, path: &Path, mut how: Use) {
+            if self.ignored(path) {
                 if let Some(dir) = &self.config.state
                     && let Ok(rest) = path.strip_prefix(dir)
                     && let Some(first) = rest.components().next()
@@ -959,90 +1200,144 @@ mod imp {
                 }
                 return;
             }
-            // A directory is opened for reading in order to list it, and
-            // the listing itself is not reported: it names no path. What
-            // the directory held is taken down when it is opened.
-            let how = match how {
-                Use::Read
-                    if match self.report.paths.get(&path) {
-                        Some(known) => known.kind == Kind::Dir,
-                        None => fs::metadata(&path).is_ok_and(|meta| meta.is_dir()),
-                    } =>
-                {
-                    Use::List
+            // Fast path: path already seen (>95% of calls and notes). Single
+            // HashMap lookup, zero PathBuf allocations, zero metadata syscalls.
+            let mut need_listing = false;
+            if let Some(access) = self.report.paths.get_mut(path) {
+                if matches!(how, Use::Read) && access.kind == Kind::Dir {
+                    how = Use::List;
                 }
-                how => how,
-            };
-            let listing = matches!(how, Use::List)
-                && self
-                    .report
-                    .paths
-                    .get(&path)
-                    .is_none_or(|a| a.listing.is_none() && !a.created && a.kind == Kind::Dir)
-                && !self.config.unlisted.contains(&path);
-            let listing = listing.then(|| self.snapshot(&path)).flatten();
-            if !self.report.paths.contains_key(&path) {
-                if self.report.paths.len() >= MAX_PATHS {
-                    self.incomplete("more paths than can be recorded");
+                if matches!(how, Use::List)
+                    && access.listing.is_none()
+                    && !access.created
+                    && access.kind == Kind::Dir
+                    && !self.config.unlisted.iter().any(|p| p == path)
+                {
+                    need_listing = true;
+                } else {
+                    if matches!(how, Use::Execute) {
+                        self.starting = Some(path.to_path_buf());
+                    }
+                    Self::apply_use(
+                        access,
+                        path,
+                        how,
+                        None,
+                        self.caller,
+                        self.now,
+                        self.others,
+                        self.under,
+                    );
                     return;
                 }
-                // lstat tells a link from what it leads to. Only links cost a
-                // second call.
-                let (kind, stamp, links, link) = match fs::symlink_metadata(&path) {
-                    Ok(m) if m.file_type().is_symlink() => {
-                        let link = fs::read_link(&path).ok();
-                        match fs::metadata(&path) {
-                            Ok(m) => (kind_of(&m), Some(Stamp::of(&m)), m.nlink(), link),
-                            Err(_) => (Kind::Absent, None, 0, link),
-                        }
-                    }
-                    Ok(m) => (kind_of(&m), Some(Stamp::of(&m)), m.nlink(), None),
-                    Err(_) => (Kind::Absent, None, 0, None),
-                };
-                self.report.paths.insert(
-                    path.clone(),
-                    Access {
-                        kind,
-                        stamp,
-                        links,
-                        link,
-                        read: false,
-                        probed: false,
-                        listing: None,
-                        executed: false,
-                        written: false,
-                        created: false,
-                        updated: false,
-                        removed: false,
-                        appeared: false,
-                        origin: None,
-                        writer: None,
-                        others: false,
-                        listed_by_others: false,
-                        by: Vec::new(),
-                        stray: false,
-                        wrote: 0,
-                        own_read: false,
-                        own_wrote: false,
-                        first: self.now,
-                        made: 0,
-                    },
+            }
+            if need_listing {
+                let listing = self.snapshot(path);
+                let access = self.report.paths.get_mut(path).unwrap();
+                Self::apply_use(
+                    access,
+                    path,
+                    how,
+                    listing,
+                    self.caller,
+                    self.now,
+                    self.others,
+                    self.under,
                 );
+                return;
             }
+            if self.report.paths.len() >= MAX_PATHS {
+                self.incomplete("more paths than can be recorded");
+                return;
+            }
+            // lstat tells a link from what it leads to. Only links cost a
+            // second call. Also derive Use::List for a read of a directory
+            // from the metadata just obtained instead of calling stat twice.
+            let (kind, stamp, links, link) = match fs::symlink_metadata(path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    let link = fs::read_link(path).ok();
+                    match fs::metadata(path) {
+                        Ok(m) => (kind_of(&m), Some(Stamp::of(&m)), m.nlink(), link),
+                        Err(_) => (Kind::Absent, None, 0, link),
+                    }
+                }
+                Ok(m) => (kind_of(&m), Some(Stamp::of(&m)), m.nlink(), None),
+                Err(_) => (Kind::Absent, None, 0, None),
+            };
+            if matches!(how, Use::Read) && kind == Kind::Dir {
+                how = Use::List;
+            }
+            let listing = if matches!(how, Use::List)
+                && kind == Kind::Dir
+                && !self.config.unlisted.iter().any(|p| p == path)
+            {
+                self.snapshot(path)
+            } else {
+                None
+            };
             if matches!(how, Use::Execute) {
-                self.starting = Some(path.clone());
+                self.starting = Some(path.to_path_buf());
             }
-            let access = self.report.paths.get_mut(&path).unwrap();
-            access.others |= self.others;
-            access.listed_by_others |= self.others && matches!(how, Use::List);
-            if self.others {
-                match self.under {
+            let mut access = Access {
+                kind,
+                stamp,
+                links,
+                link,
+                read: false,
+                probed: false,
+                listing: None,
+                executed: false,
+                written: false,
+                created: false,
+                updated: false,
+                removed: false,
+                appeared: false,
+                origin: None,
+                writer: None,
+                others: false,
+                listed_by_others: false,
+                by: Vec::new(),
+                stray: false,
+                wrote: 0,
+                own_read: false,
+                own_wrote: false,
+                first: self.now,
+                made: 0,
+            };
+            Self::apply_use(
+                &mut access,
+                path,
+                how,
+                listing,
+                self.caller,
+                self.now,
+                self.others,
+                self.under,
+            );
+            self.report.paths.insert(path.to_path_buf(), access);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn apply_use(
+            access: &mut Access,
+            path: &Path,
+            how: Use,
+            listing: Option<Vec<OsString>>,
+            caller: u32,
+            now: u64,
+            others: bool,
+            under: u16,
+        ) {
+            access.others |= others;
+            access.listed_by_others |= others && matches!(how, Use::List);
+            if others {
+                match under {
                     0 => access.stray = true,
                     under if !access.by.contains(&under) => access.by.push(under),
                     _ => (),
                 }
                 if matches!(how, Use::Write { .. }) {
-                    access.wrote = self.under;
+                    access.wrote = under;
                 }
             } else if matches!(how, Use::Read | Use::List | Use::Execute) {
                 access.own_read = true;
@@ -1056,7 +1351,7 @@ mod imp {
                 Use::Read | Use::Execute if access.removed => access.probed = true,
                 Use::Read | Use::Execute if access.kind == Kind::Absent && !access.written => {
                     access.probed = true;
-                    access.appeared |= fs::symlink_metadata(&path).is_ok();
+                    access.appeared |= fs::symlink_metadata(path).is_ok();
                 }
                 Use::Read if !access.created => access.read = true,
                 Use::Probe if !access.created => access.probed = true,
@@ -1074,9 +1369,9 @@ mod imp {
                 Use::Write { replace, read } => {
                     access.written = true;
                     if !access.created {
-                        if replace || fs::symlink_metadata(&path).is_err() {
+                        if replace || fs::symlink_metadata(path).is_err() {
                             access.created = true;
-                            access.made = self.now;
+                            access.made = now;
                         } else {
                             access.updated = true;
                             access.read |= read;
@@ -1086,7 +1381,7 @@ mod imp {
                     // A result may be turned down for this, and which
                     // program it was is the first thing anyone asks.
                     if (access.read || access.updated) && access.writer.is_none() {
-                        access.writer = Some(command_line(self.caller).into());
+                        access.writer = Some(command_line(caller).into());
                     }
                 }
                 Use::Remove => access.removed = true,
@@ -1389,6 +1684,9 @@ mod imp {
         /// Where watched programs send notes of what they are about to
         /// read. See `fast/shim.rs`.
         notes: Option<OwnedFd>,
+        /// Reusable batch receive buffers for `recvmmsg` and path normalization.
+        note_bufs: Option<Box<[[u8; abi::LONGEST]; 64]>>,
+        path_scratch: Vec<u8>,
         /// The command's first process, which is the first to report.
         leader: Option<u32>,
         /// The programs the leader has been, after the one that started
@@ -1458,29 +1756,57 @@ mod imp {
         /// before each report is looked at keeps things in the order they
         /// happened.
         fn take_notes(&mut self) {
+            const BATCH: usize = 64;
             let Some(socket) = self.notes.as_ref().map(AsRawFd::as_raw_fd) else {
                 return;
             };
-            let mut note = [0u8; abi::LONGEST];
+            let mut bufs = self.note_bufs.take().unwrap_or_else(|| {
+                vec![[0u8; abi::LONGEST]; BATCH]
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap()
+            });
+            let mut scratch = std::mem::take(&mut self.path_scratch);
+            let mut iovs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: abi::LONGEST,
+            }; BATCH];
+            let mut hdrs: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
+            for i in 0..BATCH {
+                iovs[i].iov_base = bufs[i].as_mut_ptr().cast();
+                iovs[i].iov_len = abi::LONGEST;
+                hdrs[i].msg_hdr.msg_iov = &raw mut iovs[i];
+                hdrs[i].msg_hdr.msg_iovlen = 1;
+            }
             loop {
                 let n = unsafe {
-                    libc::recv(
+                    libc::recvmmsg(
                         socket,
-                        note.as_mut_ptr().cast(),
-                        note.len(),
+                        hdrs.as_mut_ptr(),
+                        BATCH as libc::c_uint,
                         libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
                     )
                 };
                 if n <= 0 {
-                    return;
+                    break;
                 }
-                self.noted(&note[..n as usize]);
+                let count = n as usize;
+                for i in 0..count {
+                    let len = (hdrs[i].msg_len as usize).min(abi::LONGEST);
+                    self.noted(&bufs[i][..len], &mut scratch);
+                }
+                if count < BATCH {
+                    break;
+                }
             }
+            self.path_scratch = scratch;
+            self.note_bufs = Some(bufs);
         }
 
         /// One note: a program is about to open a file for reading, or to
         /// ask about a path.
-        fn noted(&mut self, note: &[u8]) {
+        fn noted(&mut self, note: &[u8], scratch: &mut Vec<u8>) {
             let field = |at: usize| u16::from_le_bytes([note[at], note[at + 1]]) as usize;
             if note.len() < abi::HEADER
                 || field(0) != note.len()
@@ -1493,7 +1819,8 @@ mod imp {
             }
             let process = u32::from_le_bytes([note[4], note[5], note[6], note[7]]);
             let (directory, name) = note[abi::HEADER..].split_at(field(8));
-            let path = joined(directory, name);
+            joined_into(directory, name, scratch);
+            let path = Path::new(OsStr::from_bytes(scratch));
             let how = || {
                 if note[2] == abi::OPENED {
                     Use::Read
@@ -1523,7 +1850,7 @@ mod imp {
                 tracker.others = others;
                 tracker.under = under;
                 tracker.report.noted += 1;
-                tracker.touch(path.clone(), how());
+                tracker.touch_ref(path, how());
             };
             match scope {
                 Some(Some(root)) => match self.scopes.get_mut(&root) {
@@ -1944,6 +2271,8 @@ mod imp {
             owner: HashMap::new(),
             events: 0,
             notes: reading,
+            note_bufs: None,
+            path_scratch: Vec::with_capacity(256),
             leader: None,
             been: Vec::new(),
             became: 0,
@@ -2281,5 +2610,110 @@ mod tests {
         whole.absorb(part, 0);
         let shared = &whole.paths["/nowhere/shared".as_ref() as &Path];
         assert!(shared.stray && shared.by == [3]);
+    }
+
+    #[test]
+    fn report_wire_round_trip() {
+        let mut rep = Report {
+            network: true,
+            survivors: true,
+            absent_verified: true,
+            events: 42,
+            noted: 17,
+            incomplete: Some("test reason".into()),
+            ..Report::default()
+        };
+        rep.sockets.push((PathBuf::from("/tmp/s"), "prog".into()));
+        rep.reported.insert(257, 9);
+        rep.state.insert(OsString::from("crate-123"));
+        rep.programs.push(PathBuf::from("/w/target/build-script"));
+        rep.paths.insert(
+            PathBuf::from("/w/src/lib.rs"),
+            Access {
+                kind: Kind::File,
+                stamp: Some(Stamp {
+                    dev: 1,
+                    ino: 2,
+                    size: 3,
+                    mtime: -4,
+                    ctime: 5,
+                }),
+                links: 2,
+                link: Some(PathBuf::from("real.rs")),
+                read: true,
+                probed: true,
+                listing: Some(vec![OsString::from("a"), OsString::from("b")]),
+                executed: false,
+                written: true,
+                created: false,
+                updated: true,
+                removed: false,
+                appeared: true,
+                origin: Some(PathBuf::from("/w/old")),
+                writer: Some("rustc".into()),
+                others: true,
+                listed_by_others: true,
+                by: vec![1, 3],
+                stray: true,
+                wrote: 2,
+                own_read: true,
+                own_wrote: false,
+                first: 10,
+                made: 20,
+            },
+        );
+        let mut w = crate::wire::Writer(Vec::new());
+        rep.encode(&mut w);
+        let mut r = crate::wire::Reader(&w.0);
+        let dec = Report::decode(&mut r).unwrap();
+        assert!(r.0.is_empty());
+        assert_eq!(dec.network, rep.network);
+        assert_eq!(dec.survivors, rep.survivors);
+        assert_eq!(dec.absent_verified, rep.absent_verified);
+        assert_eq!(dec.events, rep.events);
+        assert_eq!(dec.noted, rep.noted);
+        assert_eq!(dec.incomplete, rep.incomplete);
+        assert_eq!(dec.sockets, rep.sockets);
+        assert_eq!(dec.reported, rep.reported);
+        assert_eq!(dec.state, rep.state);
+        assert_eq!(dec.programs, rep.programs);
+        let a = &dec.paths[Path::new("/w/src/lib.rs")];
+        let b = &rep.paths[Path::new("/w/src/lib.rs")];
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.stamp, b.stamp);
+        assert_eq!(a.links, b.links);
+        assert_eq!(a.link, b.link);
+        assert_eq!(a.listing, b.listing);
+        assert_eq!(a.origin, b.origin);
+        assert_eq!(a.writer, b.writer);
+        assert_eq!(a.by, b.by);
+        assert_eq!(a.wrote, b.wrote);
+        assert_eq!((a.first, a.made), (b.first, b.made));
+        assert_eq!(
+            (
+                a.read, a.probed, a.executed, a.written, a.created, a.updated, a.removed,
+                a.appeared
+            ),
+            (
+                b.read, b.probed, b.executed, b.written, b.created, b.updated, b.removed,
+                b.appeared
+            )
+        );
+        assert_eq!(
+            (
+                a.others,
+                a.listed_by_others,
+                a.stray,
+                a.own_read,
+                a.own_wrote
+            ),
+            (
+                b.others,
+                b.listed_by_others,
+                b.stray,
+                b.own_read,
+                b.own_wrote
+            )
+        );
     }
 }

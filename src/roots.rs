@@ -325,6 +325,24 @@ impl Roots {
         })
     }
 
+    /// Write the full path for `(id, rest)` into `buf`, reusing its allocation.
+    /// Returns `false` if `id` names a root this `Roots` lacks.
+    pub fn join_into(&self, id: u8, rest: &Path, buf: &mut PathBuf) -> bool {
+        buf.clear();
+        if id == ABSOLUTE {
+            buf.push(rest);
+            return true;
+        }
+        let Some(root) = self.root(id) else {
+            return false;
+        };
+        buf.push(&root.path);
+        if !rest.as_os_str().is_empty() {
+            buf.push(rest);
+        }
+        true
+    }
+
     pub fn path(&self, id: u8) -> Option<&Path> {
         self.root(id).map(|r| r.path.as_path())
     }

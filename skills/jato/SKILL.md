@@ -42,7 +42,7 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 ## On a build server
 
 - Keep the cache and the checkouts on a filesystem that clones files, Btrfs or XFS: a build is then put back without copying anything, and target directories share their room with the cache. `jato stats` says which the cache directory is on.
-- On a high-RAM server without reflinks (such as ext4), set a memory budget (`jato memory 64GiB` or `JATO_MEMORY=64GiB`) so hot objects stay uncompressed in the Linux page cache and restore via single-pass SIMD BLAKE3 at memory bandwidth (~1.8 s for 21 GiB on ext4) while scaling SQLite's index cache.
+- On a high-RAM server without reflinks (such as ext4), set a memory budget (`jato memory 64GiB` or `JATO_MEMORY=64GiB`) so hot objects stay uncompressed in the Linux page cache and restore via single-pass SIMD BLAKE3 at memory bandwidth (~0.7–1.3 s for 21 GiB on ext4) while scaling SQLite's index cache.
 
 ## Choose an edit loop
 
