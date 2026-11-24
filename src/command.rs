@@ -1060,14 +1060,36 @@ pub fn reuse_cached(
     store: &mut Store,
     recipe: &Digest,
     tree: bool,
-    cache: Option<&mut LookupCache>,
+    mut cache: Option<&mut LookupCache>,
 ) -> Result<Option<(Outcome, Manifest)>> {
     store.begin_read();
     let mut forget = Vec::new();
-    let found = search(job, store, recipe, tree, &mut forget, cache);
+    let mut found = search(job, store, recipe, tree, &mut forget, cache.as_deref_mut());
     store.end_read();
     for key in forget {
         store.forget(&key);
+    }
+    if matches!(&found, Ok(None)) && store.has_remote() {
+        let mut here = Here::new(
+            &job.roots,
+            &job.request.env,
+            &job.path,
+            job.facts.width,
+            job.facts.ansi,
+        );
+        if store.pull_remote(recipe, &mut here, &job.roots, true) {
+            if let Some(c) = cache.as_deref_mut() {
+                c.candidates = None;
+                c.manifests.clear();
+            }
+            store.begin_read();
+            let mut forget_remote = Vec::new();
+            found = search(job, store, recipe, tree, &mut forget_remote, cache);
+            store.end_read();
+            for key in forget_remote {
+                store.forget(&key);
+            }
+        }
     }
     if let Err(e) = &found
         && crate::cas::damaged_index(e)

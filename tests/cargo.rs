@@ -117,6 +117,11 @@ impl Project {
             .env_remove("JATO_SESSION")
             .env_remove("JATO_TEST_SESSION")
             .env_remove("JATO_REMOTE")
+            .env_remove("JATO_REMOTE_READONLY")
+            .env_remove("JATO_REMOTE_TOKEN")
+            .env_remove("JATO_CACHE_SCRIPTS")
+            .env_remove("JATO_RECORD_EDITS")
+            .env_remove("JATO_MOUNT")
             .env_remove("NO_COLOR")
             .env_remove("CLICOLOR")
             .env_remove("CLICOLOR_FORCE")
@@ -3119,10 +3124,12 @@ fn a_tool_given_another_path_by_its_build_script_does_not_hide_the_build() {
 }
 
 /// Whether watched programs tell of their own reads here: the library
-/// they load for that is built for one kind of machine.
+/// they load for that is built for Linux x86_64 and aarch64.
 fn notes() -> bool {
-    cfg!(all(target_os = "linux", target_arch = "x86_64"))
-        && std::env::var_os("JATO_NOTES").is_none_or(|v| v != "0")
+    cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) && std::env::var_os("JATO_NOTES").is_none_or(|v| v != "0")
 }
 
 #[test]
@@ -6181,4 +6188,203 @@ fn watcher_routes_through_jato_and_gets_whole_build_hit_on_undo() {
         libc::kill(child.0.id() as i32, libc::SIGINT);
     }
     let _ = child.0.wait();
+}
+
+#[test]
+fn remote_cache_shares_whole_builds_over_file_and_http_and_rejects_corruption() {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    if !observes() {
+        return;
+    }
+
+    // 1. `file://` shared remote + `jato remote` CLI + `JATO_REMOTE_READONLY=1`.
+    let shared = tempfile::tempdir().unwrap();
+    let shared_url = format!("file://{}", shared.path().display());
+    let cargo_home = shared.path().join("cargo-home");
+    fs::create_dir_all(&cargo_home).unwrap();
+
+    let p1 = Project::whole();
+    let set_out = success(p1.command().args(["remote", &shared_url]));
+    assert_eq!(String::from_utf8_lossy(&set_out.stdout).trim(), shared_url);
+    assert_eq!(
+        success(
+            p1.command()
+                .env("CARGO_HOME", &cargo_home)
+                .args(["run", "-q"])
+        )
+        .stdout,
+        b"one:none\n"
+    );
+    assert_eq!(p1.count("build_stored"), 1, "{}", p1.stats());
+    assert!(p1.count("remote_push") >= 1, "{}", p1.stats());
+
+    // Brand-new checkout with a completely empty local cache pulls the whole
+    // build from the `file://` remote with ZERO compilations!
+    let p2 = Project::whole();
+    let out2 = success(
+        p2.command()
+            .env("CARGO_HOME", &cargo_home)
+            .env("JATO_REMOTE", &shared_url)
+            .env("JATO_REMOTE_READONLY", "1")
+            .args(["run", "-q"]),
+    );
+    assert_eq!(out2.stdout, b"one:none\n");
+    assert_eq!(p2.count("build_hit"), 1, "{}", p2.stats());
+    assert_eq!(p2.count("remote_hit"), 1, "{}", p2.stats());
+    assert_eq!(p2.count("remote_push"), 0, "{}", p2.stats());
+    assert_eq!(p2.count("miss"), 0, "{}", p2.stats());
+
+    // `jato remote --unset` clears the stored URL.
+    let unset_out = success(p1.command().args(["remote", "--unset"]));
+    assert_eq!(String::from_utf8_lossy(&unset_out.stdout).trim(), "none");
+
+    // 2. Live HTTP/1.1 remote CAS server (PUT / HEAD / GET with Bearer token)
+    //    plus cryptographic rejection of corrupted remote objects!
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let blobs: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blobs_srv = blobs.clone();
+    let stop_srv = stop.clone();
+    let srv = std::thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        while !stop_srv.load(std::sync::atomic::Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            };
+            let _ = stream.set_nonblocking(false);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut parts = req_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_owned();
+            let path = parts.next().unwrap_or("").to_owned();
+            let mut len = 0usize;
+            let mut auth_ok = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        len = v.trim().parse().unwrap_or(0);
+                    } else if k.trim().eq_ignore_ascii_case("authorization")
+                        && v.trim() == "Bearer secret-token"
+                    {
+                        auth_ok = true;
+                    }
+                }
+            }
+            if !auth_ok {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            match method.as_str() {
+                "PUT" => {
+                    let mut body = vec![0u8; len];
+                    if reader.read_exact(&mut body).is_ok() {
+                        blobs_srv.lock().unwrap().insert(path, body);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                "HEAD" => {
+                    let exists = blobs_srv.lock().unwrap().contains_key(&path);
+                    let status = if exists { "200 OK" } else { "404 Not Found" };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+                "GET" => {
+                    if let Some(body) = blobs_srv.lock().unwrap().get(&path).cloned() {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(&body);
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                }
+                _ => {
+                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            }
+        }
+    });
+
+    let http_url = format!("http://127.0.0.1:{port}/cas");
+    let h1 = Project::whole();
+    assert_eq!(
+        success(
+            h1.command()
+                .env("CARGO_HOME", &cargo_home)
+                .env("JATO_REMOTE", &http_url)
+                .env("JATO_REMOTE_TOKEN", "secret-token")
+                .args(["run", "-q"]),
+        )
+        .stdout,
+        b"one:none\n"
+    );
+    assert!(h1.count("remote_push") >= 1, "{}", h1.stats());
+
+    // Empty local cache pulls the whole build over HTTP/1.1 with zero misses!
+    let h2 = Project::whole();
+    assert_eq!(
+        success(
+            h2.command()
+                .env("CARGO_HOME", &cargo_home)
+                .env("JATO_REMOTE", &http_url)
+                .env("JATO_REMOTE_TOKEN", "secret-token")
+                .args(["run", "-q"]),
+        )
+        .stdout,
+        b"one:none\n"
+    );
+    assert_eq!(h2.count("build_hit"), 1, "{}", h2.stats());
+    assert_eq!(h2.count("remote_hit"), 1, "{}", h2.stats());
+    assert_eq!(h2.count("miss"), 0, "{}", h2.stats());
+
+    // Corrupt a remote object blob and verify Jato rejects it cryptographically
+    // and falls back cleanly to compiling locally!
+    {
+        let mut map = blobs.lock().unwrap();
+        for (k, v) in map.iter_mut() {
+            if k.contains("/v1/objects/") {
+                *v = zstd::bulk::compress(b"corrupted-payload", 3).unwrap();
+            }
+        }
+    }
+    let h3 = Project::whole();
+    assert_eq!(
+        success(
+            h3.command()
+                .env("CARGO_HOME", &cargo_home)
+                .env("JATO_REMOTE", &http_url)
+                .env("JATO_REMOTE_TOKEN", "secret-token")
+                .env("JATO_REMOTE_READONLY", "1")
+                .args(["run", "-q"]),
+        )
+        .stdout,
+        b"one:none\n"
+    );
+    assert_eq!(h3.count("build_hit"), 0, "{}", h3.stats());
+    assert_eq!(h3.count("hit"), 0, "{}", h3.stats());
+    assert_eq!(h3.count("miss"), 2, "{}", h3.stats());
+    assert_eq!(h3.count("build_stored"), 1, "{}", h3.stats());
+
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = srv.join();
 }

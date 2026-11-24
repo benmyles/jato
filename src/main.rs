@@ -6,6 +6,7 @@ mod jobs;
 mod manifest;
 mod mount;
 mod observe;
+mod remote;
 mod roots;
 mod scan;
 #[cfg(target_os = "linux")]
@@ -79,6 +80,7 @@ Usage
   jato why                         Explain why the last build was not cached or relocated
   jato limit [SIZE|--unset]         Read or set this cache directory's budget
   jato memory [SIZE|--unset]       Set RAM budget for hot uncompressed tier & index cache
+  jato remote [URL|--unset]        Read or set shared/remote cache (file:// or http://)
   jato gc [SIZE]                   Evict least-recently-used results to SIZE
   jato --version
 
@@ -130,6 +132,10 @@ Environment
   JATO_MOUNT=0        Disable unprivileged mount-namespace target canonicalization
   JATO_STORAGE=packed Keep compressed copies even where files can be cloned
   JATO_VERIFY=1       Check restored bytes on filesystems that checksum them
+  JATO_REMOTE         Shared/remote cache URL (file:///path or http://host[:port][/prefix])
+  JATO_REMOTE_READONLY=1
+                      Pull from remote cache without pushing local results
+  JATO_REMOTE_TOKEN   Bearer token for HTTP remote cache Authorization header
   JATO_CACHE_TESTS=0  Run tests without caching their results
   JATO_CACHE_SCRIPTS=0
                       Run build scripts without caching their executions
@@ -706,6 +712,14 @@ fn report(stats: &cas::Stats) -> String {
             mib(stats.hot_bytes)
         );
     }
+    if let Some(remote) = &stats.remote {
+        let _ = writeln!(
+            out,
+            "Remote     {remote} ({} pulled, {} pushed)",
+            count("remote_hit"),
+            count("remote_push")
+        );
+    }
     let _ = writeln!(
         out,
         "Index      {}, {} file digests remembered",
@@ -740,6 +754,8 @@ fn report(stats: &cas::Stats) -> String {
         "test_miss",
         "test_stored",
         "test_uncacheable",
+        "remote_hit",
+        "remote_push",
     ];
     for (name, value) in &stats.counters {
         if !SHOWN.contains(&name.as_str()) {
@@ -856,6 +872,20 @@ fn run() -> Result<i32> {
                 )?))?,
             };
             println!("{size} bytes");
+        }
+        Some("remote") if args.len() <= 2 => {
+            let mut store = Store::open()?;
+            let url = match args.get(1) {
+                None => store.remote_url()?,
+                Some(arg) if arg == "--unset" => store.set_remote_url(None)?,
+                Some(arg) => {
+                    store.set_remote_url(Some(arg.to_str().context("remote URL must be UTF-8")?))?
+                }
+            };
+            match url {
+                Some(url) => println!("{url}"),
+                None => println!("none"),
+            }
         }
         Some("gc") if args.len() <= 2 => {
             let limit = args

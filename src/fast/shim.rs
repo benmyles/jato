@@ -32,11 +32,13 @@ unsafe extern "C" {
 }
 
 const ENOSYS: isize = 38;
+const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
 const AT_EACCESS: c_int = 0x200;
 
 // The parts of the compiler's own library that are linked in name this
 // for unwinding, which nothing here does. Defined out of sight, so that it
 // is not taken for the one a Rust program brings.
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     ".hidden rust_eh_personality",
     ".globl rust_eh_personality",
@@ -45,12 +47,22 @@ core::arch::global_asm!(
     "ud2",
 );
 
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    ".hidden rust_eh_personality",
+    ".globl rust_eh_personality",
+    ".type rust_eh_personality, @function",
+    "rust_eh_personality:",
+    "brk #0",
+);
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe { call(nr::EXIT_GROUP, [134, 0, 0, 0, 0, 0]) };
     loop {}
 }
 
+#[cfg(target_arch = "x86_64")]
 mod nr {
     pub const CLOSE: usize = 3;
     pub const STAT: usize = 4;
@@ -62,12 +74,30 @@ mod nr {
     pub const GETPID: usize = 39;
     pub const SENDTO: usize = 44;
     pub const GETCWD: usize = 79;
-    pub const READLINK: usize = 89;
     pub const EXIT_GROUP: usize = 231;
     pub const OPENAT: usize = 257;
     pub const NEWFSTATAT: usize = 262;
+    pub const READLINKAT: usize = 267;
     pub const FACCESSAT: usize = 269;
     pub const STATX: usize = 332;
+    pub const FACCESSAT2: usize = 439;
+}
+
+#[cfg(target_arch = "aarch64")]
+mod nr {
+    pub const GETCWD: usize = 17;
+    pub const FACCESSAT: usize = 48;
+    pub const OPENAT: usize = 56;
+    pub const CLOSE: usize = 57;
+    pub const READLINKAT: usize = 78;
+    pub const NEWFSTATAT: usize = 79;
+    pub const FSTAT: usize = 80;
+    pub const EXIT_GROUP: usize = 94;
+    pub const GETPID: usize = 172;
+    pub const SENDTO: usize = 206;
+    pub const MMAP: usize = 222;
+    pub const MPROTECT: usize = 226;
+    pub const STATX: usize = 291;
     pub const FACCESSAT2: usize = 439;
 }
 
@@ -91,6 +121,7 @@ static SOCKET_INODE: AtomicU64 = AtomicU64::new(0);
 
 /// A system call made here, where the filter reports it if it is one of
 /// those it reports.
+#[cfg(target_arch = "x86_64")]
 unsafe fn call(number: usize, a: [usize; 6]) -> isize {
     let result: isize;
     unsafe {
@@ -106,8 +137,25 @@ unsafe fn call(number: usize, a: [usize; 6]) -> isize {
     result
 }
 
+#[cfg(target_arch = "aarch64")]
+unsafe fn call(number: usize, a: [usize; 6]) -> isize {
+    let result: isize;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") number,
+            inlateout("x0") a[0] as isize => result,
+            in("x1") a[1], in("x2") a[2],
+            in("x3") a[3], in("x4") a[4], in("x5") a[5],
+            options(nostack),
+        );
+    }
+    result
+}
+
 /// The same call made from the fixed address, which the filter lets
 /// through for calls that only read.
+#[cfg(target_arch = "x86_64")]
 unsafe fn quiet(number: usize, a: [usize; 6]) -> isize {
     let result: isize;
     unsafe {
@@ -118,6 +166,24 @@ unsafe fn quiet(number: usize, a: [usize; 6]) -> isize {
             in("rdi") a[0], in("rsi") a[1], in("rdx") a[2],
             in("r10") a[3], in("r8") a[4], in("r9") a[5],
             lateout("rcx") _, lateout("r11") _,
+        );
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn quiet(number: usize, a: [usize; 6]) -> isize {
+    let result: isize;
+    unsafe {
+        asm!(
+            "blr {stub}",
+            stub = in(reg) STUB,
+            in("x8") number,
+            inlateout("x0") a[0] as isize => result,
+            in("x1") a[1], in("x2") a[2],
+            in("x3") a[3], in("x4") a[4], in("x5") a[5],
+            lateout("x30") _,
+            options(nostack),
         );
     }
     result
@@ -143,6 +209,7 @@ unsafe fn length(text: *const c_char) -> usize {
 }
 
 /// The kernel's `struct stat`, as far as the mode and inode.
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 struct Stat {
     dev: u64,
@@ -150,6 +217,16 @@ struct Stat {
     nlink: u64,
     mode: u32,
     rest: [u8; 116],
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct Stat {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    nlink: u32,
+    rest: [u8; 104],
 }
 
 /// Whether descriptor `fd` is still the socket this library was told of. A
@@ -210,8 +287,15 @@ unsafe fn note(kind: u8, dirfd: c_int, name: *const c_char) -> bool {
             }
             unsafe {
                 call(
-                    nr::READLINK,
-                    [link.as_ptr() as usize, buffer.as_mut_ptr().add(HEADER) as usize, room, 0, 0, 0],
+                    nr::READLINKAT,
+                    [
+                        AT_FDCWD as usize,
+                        link.as_ptr() as usize,
+                        buffer.as_mut_ptr().add(HEADER) as usize,
+                        room,
+                        0,
+                        0,
+                    ],
                 )
             }
         };
@@ -345,8 +429,15 @@ unsafe fn stat_at(dirfd: c_int, name: *const c_char, into: *mut c_void, flags: c
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(name: *const c_char, into: *mut c_void) -> c_int {
-    let a = [name as usize, into as usize, 0, 0, 0, 0];
-    unsafe { answer(reading(ASKED, AT_FDCWD, name, nr::STAT, a)) }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let a = [name as usize, into as usize, 0, 0, 0, 0];
+        unsafe { answer(reading(ASKED, AT_FDCWD, name, nr::STAT, a)) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        stat_at(AT_FDCWD, name, into, 0)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -356,8 +447,15 @@ pub unsafe extern "C" fn stat64(name: *const c_char, into: *mut c_void) -> c_int
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat(name: *const c_char, into: *mut c_void) -> c_int {
-    let a = [name as usize, into as usize, 0, 0, 0, 0];
-    unsafe { answer(reading(ASKED, AT_FDCWD, name, nr::LSTAT, a)) }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let a = [name as usize, into as usize, 0, 0, 0, 0];
+        unsafe { answer(reading(ASKED, AT_FDCWD, name, nr::LSTAT, a)) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        stat_at(AT_FDCWD, name, into, AT_SYMLINK_NOFOLLOW)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -437,8 +535,15 @@ pub unsafe extern "C" fn statx(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access(name: *const c_char, mode: c_int) -> c_int {
-    let a = [name as usize, mode as usize, 0, 0, 0, 0];
-    unsafe { answer(reading(ASKED, AT_FDCWD, name, nr::ACCESS, a)) }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let a = [name as usize, mode as usize, 0, 0, 0, 0];
+        unsafe { answer(reading(ASKED, AT_FDCWD, name, nr::ACCESS, a)) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        faccessat(AT_FDCWD, name, mode, 0)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -522,7 +627,7 @@ extern "C" fn start(_: c_int, _: *const *const c_char, handed: *const *const c_c
             nr::MMAP,
             [
                 STUB,
-                4096,
+                STUB_SIZE,
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                 usize::MAX,
@@ -532,13 +637,43 @@ extern "C" fn start(_: c_int, _: *const *const c_char, handed: *const *const c_c
         if page as usize != STUB {
             return;
         }
-        // syscall; ret
-        let code = STUB as *mut u8;
-        code.write(0x0f);
-        code.add(1).write(0x05);
-        code.add(2).write(0xc3);
-        if call(nr::MPROTECT, [STUB, 4096, PROT_READ | PROT_EXEC, 0, 0, 0]) != 0 {
-            return;
+        #[cfg(target_arch = "x86_64")]
+        {
+            // syscall; ret
+            let code = STUB as *mut u8;
+            code.write(0x0f);
+            code.add(1).write(0x05);
+            code.add(2).write(0xc3);
+            if call(
+                nr::MPROTECT,
+                [STUB, STUB_SIZE, PROT_READ | PROT_EXEC, 0, 0, 0],
+            ) != 0
+            {
+                return;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // svc #0; ret
+            let code = STUB as *mut u32;
+            code.write(0xd400_0001);
+            code.add(1).write(0xd65f_03c0);
+            if call(
+                nr::MPROTECT,
+                [STUB, STUB_SIZE, PROT_READ | PROT_EXEC, 0, 0, 0],
+            ) != 0
+            {
+                return;
+            }
+            asm!(
+                "dc cvau, {p}",
+                "dsb ish",
+                "ic ivau, {p}",
+                "dsb ish",
+                "isb",
+                p = in(reg) STUB,
+                options(nostack),
+            );
         }
         SOCKET_INODE.store(inode, Ordering::Relaxed);
         if still_the_socket(fd) {

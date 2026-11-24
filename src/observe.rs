@@ -507,9 +507,15 @@ pub struct Config {
 
 /// The library that watched programs load, as it was built with this
 /// program. Empty where there is none.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const SHIM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libjato_fast.so"));
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 const SHIM: &[u8] = &[];
 
 /// Whether a path names a copy of that library, wherever it is kept.
@@ -795,8 +801,9 @@ mod imp {
         // program calls from, of a kind that only reads, has been noted by
         // that library and goes ahead. An open is looked at again here:
         // it must not create, empty or write.
-        if cfg!(target_arch = "x86_64") {
-            let quiet = [
+        if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+            #[cfg(target_arch = "x86_64")]
+            let quiet: &[u32] = &[
                 nr::STAT,
                 nr::LSTAT,
                 nr::ACCESS,
@@ -805,6 +812,8 @@ mod imp {
                 nr::FACCESSAT,
                 nr::FACCESSAT2,
             ];
+            #[cfg(target_arch = "aarch64")]
+            let quiet: &[u32] = &[nr::NEWFSTATAT, nr::STATX, nr::FACCESSAT, nr::FACCESSAT2];
             let writes = (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC | libc::O_TMPFILE) as u32
                 & !(libc::O_DIRECTORY as u32);
             // The block's instructions: five to compare the address, one
@@ -823,7 +832,7 @@ mod imp {
                 (abi::STUB_RETURN >> 32) as u32,
             ));
             prog.push(insn(LD_ABS, 0, 0, 0)); // call number
-            for call in quiet {
+            for &call in quiet {
                 let here = prog.len();
                 prog.push(insn(JEQ, past(here) - 1, 0, call));
             }

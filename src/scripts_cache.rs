@@ -277,72 +277,77 @@ pub fn lookup(
     let Some(out_dir) = out_dir_of(req) else {
         return Ok(None);
     };
-    store.begin_read();
-    let candidates = store.candidates(recipe)?;
-    if candidates.is_empty() {
-        store.end_read();
-        return Ok(None);
-    }
     let path = path_dirs(&req.cwd, &req.env);
-    let mut here = Here::new(roots, &req.env, &path, None, false);
-    let mut forget = Vec::new();
-    let mut matched = None;
-    for candidate in &candidates {
-        let stored = store.record(candidate).unwrap_or_default();
-        let manifest = match Manifest::decode_verified(&stored, recipe, &candidate.key) {
-            Ok(m) => m,
-            _ => {
-                forget.push(candidate.key);
+    for attempt in 0..2 {
+        store.begin_read();
+        let candidates = store.candidates(recipe)?;
+        let mut here = Here::new(roots, &req.env, &path, None, false);
+        let mut forget = Vec::new();
+        let mut matched = None;
+        for candidate in &candidates {
+            let stored = store.record(candidate).unwrap_or_default();
+            let manifest = match Manifest::decode_verified(&stored, recipe, &candidate.key) {
+                Ok(m) => m,
+                _ => {
+                    forget.push(candidate.key);
+                    continue;
+                }
+            };
+            if manifest.placed(roots).is_err() || manifest.holds(&mut here, store).is_err() {
                 continue;
             }
-        };
-        if manifest.placed(roots).is_err() || manifest.holds(&mut here, store).is_err() {
-            continue;
+            let mut damaged = false;
+            let restored = store.restore(
+                candidate,
+                &manifest,
+                roots,
+                Placing::default(),
+                &mut damaged,
+            )?;
+            let Some(restored) = restored else {
+                if damaged {
+                    forget.push(candidate.key);
+                }
+                continue;
+            };
+            let Some((code, stdout, stderr)) = decode_detail(&restored.detail) else {
+                continue;
+            };
+            let (Some(stdout), Some(stderr)) = (roots.unmark(stdout), roots.unmark(stderr)) else {
+                continue;
+            };
+            let keep: HashSet<PathBuf> = manifest
+                .outputs
+                .iter()
+                .filter_map(|o| roots.join(o.root, &o.path))
+                .collect();
+            prune_out_dir(&out_dir, &keep);
+            store.count("script_hit", 1);
+            store.count("saved_ms", restored.cost_ms);
+            log(&script_label(req), "hit");
+            matched = Some((
+                Outcome {
+                    code,
+                    stdout: stdout.into_owned(),
+                    stderr: stderr.into_owned(),
+                },
+                manifest,
+            ));
+            break;
         }
-        let mut damaged = false;
-        let restored = store.restore(
-            candidate,
-            &manifest,
-            roots,
-            Placing::default(),
-            &mut damaged,
-        )?;
-        let Some(restored) = restored else {
-            if damaged {
-                forget.push(candidate.key);
-            }
-            continue;
-        };
-        let Some((code, stdout, stderr)) = decode_detail(&restored.detail) else {
-            continue;
-        };
-        let (Some(stdout), Some(stderr)) = (roots.unmark(stdout), roots.unmark(stderr)) else {
-            continue;
-        };
-        let keep: HashSet<PathBuf> = manifest
-            .outputs
-            .iter()
-            .filter_map(|o| roots.join(o.root, &o.path))
-            .collect();
-        prune_out_dir(&out_dir, &keep);
-        store.count("script_hit", 1);
-        store.count("saved_ms", restored.cost_ms);
-        log(&script_label(req), "hit");
-        matched = Some((
-            Outcome {
-                code,
-                stdout: stdout.into_owned(),
-                stderr: stderr.into_owned(),
-            },
-            manifest,
-        ));
-        break;
+        store.end_read();
+        for key in forget {
+            store.forget(&key);
+        }
+        if matched.is_some() || attempt > 0 || !store.has_remote() {
+            return Ok(matched);
+        }
+        let mut here = Here::new(roots, &req.env, &path, None, false);
+        if !store.pull_remote(recipe, &mut here, roots, true) {
+            return Ok(None);
+        }
     }
-    store.end_read();
-    for key in forget {
-        store.forget(&key);
-    }
-    Ok(matched)
+    Ok(None)
 }
 
 /// Record a passing, hermetic build-script execution whose surviving writes

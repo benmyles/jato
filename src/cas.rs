@@ -335,6 +335,8 @@ pub struct Stats {
     /// Whether the filesystem the cache is on can clone files, so that
     /// results are stored and put back without being copied.
     pub clones: bool,
+    /// Configured remote/shared cache URL, if any.
+    pub remote: Option<String>,
 }
 
 /// Whether one file in `dir` can be made a clone of another.
@@ -409,6 +411,7 @@ pub struct Store {
     counts: BTreeMap<String, i64>,
     used: Vec<Digest>,
     noted: Vec<Digest>,
+    remote: Option<crate::remote::Remote>,
 }
 
 /// Whether an error says the index file itself cannot be trusted.
@@ -459,7 +462,7 @@ fn hex(digest: &Digest) -> String {
     s
 }
 
-fn object_path(dir: &Path, digest: &Digest, packed: bool) -> PathBuf {
+pub(crate) fn object_path(dir: &Path, digest: &Digest, packed: bool) -> PathBuf {
     let name = hex(digest);
     let mut path = dir.join("objects");
     path.push(&name[..2]);
@@ -1183,6 +1186,7 @@ impl Store {
             Ok("0") => store.verify = false,
             _ => (),
         }
+        store.remote = store.configured_remote();
         Ok(store)
     }
 
@@ -1256,6 +1260,7 @@ impl Store {
             counts: BTreeMap::new(),
             used: Vec::new(),
             noted: Vec::new(),
+            remote: None,
         })
     }
 
@@ -1265,6 +1270,312 @@ impl Store {
 
     pub fn shared_stamps(&self) -> Option<&Arc<SharedStamps>> {
         self.shared.as_ref()
+    }
+
+    pub fn has_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    fn configured_remote(&self) -> Option<crate::remote::Remote> {
+        if let Ok(val) = env::var("JATO_REMOTE") {
+            let trimmed = val.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                return None;
+            }
+            return match crate::remote::Remote::parse(trimmed) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    crate::command::log("remote", format_args!("ignoring JATO_REMOTE: {e:#}"));
+                    None
+                }
+            };
+        }
+        let stored = self.remote_url().ok().flatten()?;
+        crate::remote::Remote::parse(&stored).ok()
+    }
+
+    /// Configured remote cache URL (from `JATO_REMOTE` or stored setting).
+    pub fn remote_url(&self) -> Result<Option<String>> {
+        if let Ok(val) = env::var("JATO_REMOTE") {
+            let trimmed = val.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                return Ok(None);
+            }
+            return Ok(Some(crate::remote::Remote::parse(trimmed)?.url));
+        }
+        let stored: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM settings WHERE name='remote'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(stored)
+    }
+
+    /// Persist or clear the remote cache URL in the local index.
+    pub fn set_remote_url(&mut self, url: Option<&str>) -> Result<Option<String>> {
+        match url {
+            Some(raw) => {
+                let parsed = crate::remote::Remote::parse(raw)?;
+                self.conn.execute(
+                    "INSERT INTO settings VALUES('remote',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                    [&parsed.url],
+                )?;
+                self.remote = Some(parsed.clone());
+                Ok(Some(parsed.url))
+            }
+            None => {
+                self.conn
+                    .execute("DELETE FROM settings WHERE name='remote'", [])?;
+                self.remote = None;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Pull a matching entry for `recipe` from the configured remote cache,
+    /// cryptographically verifying the manifest, detail, local inputs, and
+    /// every downloaded object before committing it into the local store.
+    /// Returns `true` if a matching verified entry was adopted locally.
+    pub fn pull_remote(
+        &mut self,
+        recipe: &Digest,
+        here: &mut crate::manifest::Here<'_>,
+        roots: &Roots,
+        check_placed: bool,
+    ) -> bool {
+        let Some(remote) = self.remote.clone() else {
+            return false;
+        };
+        let keys = match remote.recipe_keys(recipe) {
+            Ok(keys) if !keys.is_empty() => keys,
+            Ok(_) => return false,
+            Err(e) => {
+                crate::command::log("remote", format_args!("recipe lookup failed: {e:#}"));
+                return false;
+            }
+        };
+        let local_keys: HashSet<Digest> = self
+            .candidates(recipe)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        let dir = self.dir.clone();
+        let prefer_packed = !self.clone && !self.use_hot_tier();
+        for key in keys {
+            if local_keys.contains(&key) {
+                continue;
+            }
+            let entry = match remote.fetch_entry(&key) {
+                Ok(Some(e)) => e,
+                Ok(None) => continue,
+                Err(e) => {
+                    crate::command::log("remote", format_args!("entry fetch failed: {e:#}"));
+                    return false;
+                }
+            };
+            let Ok(manifest) = Manifest::decode_verified(&entry.manifest, recipe, &key) else {
+                crate::command::log(
+                    "remote",
+                    "rejected remote entry: manifest verification failed",
+                );
+                continue;
+            };
+            if blake3::hash(&entry.detail).as_bytes() != &manifest.detail {
+                crate::command::log("remote", "rejected remote entry: detail digest mismatch");
+                continue;
+            }
+            if check_placed && manifest.placed(roots).is_err() {
+                continue;
+            }
+            if manifest.holds(here, self).is_err() {
+                continue;
+            }
+            // Collect unique output/saved objects that are not already present locally.
+            let mut unique: Vec<(Digest, bool)> = Vec::new();
+            let mut seen: HashSet<Digest> = HashSet::new();
+            for out in manifest.outputs.iter().chain(&manifest.saved) {
+                if !seen.insert(out.digest) {
+                    continue;
+                }
+                let have_local = self
+                    .conn
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE digest=?1)")
+                    .and_then(|mut s| s.query_row([&out.digest], |r| r.get::<_, bool>(0)))
+                    .unwrap_or(false)
+                    && (object_path(&dir, &out.digest, false).is_file()
+                        || object_path(&dir, &out.digest, true).is_file());
+                if !have_local {
+                    let keep_packed =
+                        prefer_packed && out.encoding == Encoding::Raw && out.size >= CLONE_FLOOR;
+                    unique.push((out.digest, keep_packed));
+                }
+            }
+            // Fetch & verify missing objects in parallel into staging temp files.
+            type FetchedObj = (Digest, PathBuf, u64, u64, bool);
+            let fetched: Vec<FetchedObj> = if unique.is_empty() {
+                Vec::new()
+            } else {
+                let threads = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get())
+                    .clamp(1, 8)
+                    .min(unique.len());
+                let each = unique.len().div_ceil(threads);
+                let failed = std::sync::atomic::AtomicBool::new(false);
+                let serial = std::sync::atomic::AtomicU64::new(0);
+                let lanes: Vec<Vec<FetchedObj>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = unique
+                        .chunks(each)
+                        .map(|chunk| {
+                            let remote = &remote;
+                            let dir = &dir;
+                            let failed = &failed;
+                            let serial = &serial;
+                            scope.spawn(move || {
+                                let mut got = Vec::with_capacity(chunk.len());
+                                for &(digest, keep_packed) in chunk {
+                                    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return got;
+                                    }
+                                    let id =
+                                        serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let tmp = dir
+                                        .join("objects")
+                                        .join(format!("remote-{}-{id}", std::process::id()));
+                                    match remote.fetch_object_to(&digest, &tmp, keep_packed) {
+                                        Ok(Some((size, stored, packed))) => {
+                                            got.push((digest, tmp, size, stored, packed));
+                                        }
+                                        Ok(None) => {
+                                            let _ = fs::remove_file(&tmp);
+                                            failed
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            return got;
+                                        }
+                                        Err(e) => {
+                                            let _ = fs::remove_file(&tmp);
+                                            crate::command::log(
+                                                "remote",
+                                                format_args!("object fetch failed: {e:#}"),
+                                            );
+                                            failed
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            return got;
+                                        }
+                                    }
+                                }
+                                got
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_default())
+                        .collect()
+                });
+                let all: Vec<_> = lanes.into_iter().flatten().collect();
+                if failed.load(std::sync::atomic::Ordering::Relaxed) || all.len() != unique.len() {
+                    for (_, tmp, ..) in all {
+                        let _ = fs::remove_file(tmp);
+                    }
+                    continue;
+                }
+                all
+            };
+            // Adopt objects + entry transactionally into local SQLite.
+            let adopted = self.adopt_remote_entry(
+                recipe,
+                &key,
+                &manifest,
+                &entry.manifest,
+                &entry.detail,
+                entry.cost_ms,
+                fetched,
+            );
+            if adopted.is_ok_and(|ok| ok) {
+                self.count("remote_hit", 1);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_remote_entry(
+        &mut self,
+        recipe: &Digest,
+        key: &Digest,
+        record: &Manifest,
+        manifest_bytes: &[u8],
+        detail: &[u8],
+        cost_ms: u64,
+        mut fetched: Vec<(Digest, PathBuf, u64, u64, bool)>,
+    ) -> Result<bool> {
+        let limit = self.budget()?;
+        let new_bytes: u64 = fetched.iter().map(|(_, _, _, stored, _)| *stored).sum();
+        if new_bytes + (manifest_bytes.len() + detail.len()) as u64 > limit / 2 {
+            for (_, tmp, ..) in fetched {
+                let _ = fs::remove_file(tmp);
+            }
+            return Ok(false);
+        }
+        let dir = self.dir.clone();
+        let time = now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO entries(key,recipe,used,cost_ms,manifest,detail)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![key, recipe, time, cost_ms, manifest_bytes, detail],
+        )?;
+        if added == 0 {
+            for (_, tmp, ..) in fetched {
+                let _ = fs::remove_file(tmp);
+            }
+            tx.commit()?;
+            return Ok(true);
+        }
+        let entry_id = tx.last_insert_rowid();
+        let mut charge = ENTRY_OVERHEAD + (manifest_bytes.len() + detail.len()) as u64;
+        for (digest, tmp, size, stored, packed) in fetched.drain(..) {
+            let known: bool = tx
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE digest=?1)")?
+                .query_row([&digest], |r| r.get(0))?;
+            if !known {
+                let path = object_path(&dir, &digest, packed);
+                let moved = fs::create_dir(path.parent().unwrap())
+                    .or_else(|e| match e.kind() {
+                        io::ErrorKind::AlreadyExists => Ok(()),
+                        _ => Err(e),
+                    })
+                    .and_then(|()| fs::rename(&tmp, &path));
+                if let Err(e) = moved {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+                tx.execute(
+                    "INSERT INTO objects VALUES(?1,?2,?3,?4)",
+                    params![digest, size, stored, packed],
+                )?;
+                charge += stored;
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+        let mut linked: HashSet<Digest> = HashSet::new();
+        for output in record.outputs.iter().chain(&record.saved) {
+            if !linked.insert(output.digest) {
+                continue;
+            }
+            tx.prepare_cached("INSERT OR IGNORE INTO outputs VALUES(?1,?2)")?
+                .execute(params![entry_id, output.digest])?;
+        }
+        add(&tx, "bytes", charge as i64)?;
+        evict(&tx, &dir, limit, limit - limit / 10)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Configured RAM budget for accelerating builds (SQLite page cache / mmap
@@ -3143,6 +3454,15 @@ impl Store {
         self.counts.clear();
         self.used.clear();
         self.noted.clear();
+        if let Some(remote) = self.remote.clone()
+            && !remote.readonly
+        {
+            let digests: Vec<Digest> = linked.into_iter().collect();
+            match remote.push_entry(&dir, recipe, &key, &manifest, detail, cost_ms, &digests) {
+                Ok(()) => self.count("remote_push", 1),
+                Err(e) => crate::command::log("remote", format_args!("push failed: {e:#}")),
+            }
+        }
         Ok(Some(key))
     }
 
@@ -3245,6 +3565,7 @@ impl Store {
             unrecorded: self.noted("unrecorded"),
             only_there: self.noted("only_there"),
             clones: self.clone && clones(&self.dir.join("objects")),
+            remote: self.remote.as_ref().map(|r| r.url.clone()),
         })
     }
 
