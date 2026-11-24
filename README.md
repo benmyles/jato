@@ -250,7 +250,8 @@ Measured on a server with 32 processors, 125 GB of memory and a disk that writes
 | `check` from nothing | 82 s | 79 s |
 | `check` in a new worktree | 0.5 to 0.7 s | 1.0 to 1.3 s |
 | `check` in a new worktree, a function added to a crate 54 others use | 5.1 s | |
-| `check` in a new worktree, a manifest changed | 11 s | 11 s |
+| `check` in a new worktree, a manifest changed | 2.1 s | |
+| `check` in a new worktree one commit back, lock file and a manifest changed | 3.1 s | |
 | `build` from nothing, after the check | 194 s | 200 s |
 | `build` put back, 21,600 files and 21 GB | 2.7 to 4 s | 1.3 s |
 | `build` in a new worktree, one program compiled again for where it is | 8.5 to 10 s | 6.5 to 7 s |
@@ -258,6 +259,8 @@ Measured on a server with 32 processors, 125 GB of memory and a disk that writes
 | Room for the cache and three target directories | 8 GB and 22 GB each | 33 GB in all |
 
 Cargo alone takes 76 s for the check from nothing, whether its target directory is on the disk or in memory.
+
+Beside kache 2.3.0 on that server, the two started together (`bench/README.md` has every step): from nothing they take the same time, 170 s against 173 for the check and 513 s against 508 for the build. Putting the check back took Jato 0.7 to 1.0 s and kache 12 to 14; the build, 5 to 7 s and 28 to 135. A function added to a crate 54 others use, in a copy where nothing was built: 7 s against 17 for the check, 75 s against 95 for the build. kache was ahead for further edits in a built target directory, 3.1 s against 3.9, and for a build after a note added to the manifest of a crate whose procedural macro reads it, 16 s against 55: Jato compiles that crate again and links the 40 programs that use it, which Cargo and kache do not know to do.
 
 Put the cache and the checkouts on a filesystem that clones files where one is to be had. Nothing is copied when a build is put back there, and a target directory takes no room that the cache does not already take. `jato stats` says whether the cache's filesystem clones. A file on any filesystem can hold one:
 

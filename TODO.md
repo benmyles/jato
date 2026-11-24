@@ -71,6 +71,7 @@
 - [x] Leave to Cargo anything that only Cargo examined and that differs, its settings excepted: a directory that is new or gone, a file it asked about that is gone.
 - [x] Take out of the target directory what is no part of a build that started from another: what a compilation wrote that Cargo no longer asked about, what a build script wrote that has gone or ran again, what Cargo kept in a directory it no longer looks at. Forty commits back in Olo's history that was 2,035 files, and the target directory then held file for file what a build from nothing leaves.
 - [x] Say in the log why an input leaves nothing to start from, what a record holds for a later build to start by, and what was taken away.
+- [x] Compare with kache 2.3.0 on the build server, for the check and the dev build of all of Olo.
 
 ## Open
 
@@ -79,6 +80,9 @@
 - [ ] The `cc` crate names an object file after a hash of the directory its source is in. Source that a build script generates in its output directory is in another directory in every checkout, so 41 of Olo's C compilations are made again in each, 2.4 s for the longest. The result could be kept by what was compiled and given the name asked for.
 - [ ] A build script that writes something else every time it runs has everything above it compiled again wherever Cargo runs the script: `grammers-tl-types` generates its source in an order that changes, 3.7 s for the crate and seven more after it. Putting a build script's run back, as recorded, would do away with that and with the scripts' own time.
 
+- [ ] A library compiled again from the same source, with the state rustc saved, is not the file it was byte for byte, so every program that links it is linked again: 40 of Olo's for `olo-system`, 600 processor-seconds. The crates that only read its metadata are answered from the cache. Which bytes differ has not been looked at.
+- [ ] A procedural macro that reads its crate's `Cargo.toml` to look a dependency up has the crate compiled again for any change to that file, a note included. Cargo compiles it again only where the dependencies changed, which is all such a macro reads.
+- [ ] Further edits in a built target directory take kache 3.1 s and Jato 3.9 for a check of Olo, measured at different loads: each `jato check` first looks through the recorded builds for the edited sources, and every compiler Cargo starts is asked about alone.
 - [ ] Changed settings of Cargo's or a changed `rust-toolchain.toml` leave nothing to start from, and Cargo carries the build out with every compiler answered: 11 to 20 s for a check of all of Olo. Build scripts run again there, and two of Olo's write something else every time, which has eight crates compiled that need not be.
 - [ ] A build script that was itself changed is built and run again in the directory its earlier version wrote to, and such a build is not recorded. Now that the record says what each build script wrote, that could be left out first and the build kept.
 - [ ] A list of a program's sources that Cargo writes beside the program stays behind when the program is removed from a workspace and the build starts from an earlier one: Cargo shares that directory among all programs.
