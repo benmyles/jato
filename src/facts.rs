@@ -23,6 +23,9 @@ pub struct Facts {
     /// The command produces something other than a Rust library: a
     /// program, a test, or a library with other crates' code in it.
     pub links: bool,
+    /// Whether `--emit` includes `link` (code generation / archive / binary)
+    /// rather than metadata-only `cargo check` / `clippy`.
+    pub emits_link: bool,
     /// Arguments left out of the command's identity, and the one whose
     /// colour setting is.
     pub skipped: Vec<usize>,
@@ -114,6 +117,11 @@ impl Facts {
             match flag {
                 "--crate-name" => facts.name = value.to_owned(),
                 "--crate-type" => facts.links |= !matches!(value, "lib" | "rlib"),
+                "--emit" => {
+                    facts.emits_link |= value
+                        .split(',')
+                        .any(|item| item == "link" || item.starts_with("link="));
+                }
                 "--extern" => {
                     if let Some((_, path)) = value.split_once('=') {
                         facts.externs.push(cwd.join(path));

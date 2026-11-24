@@ -317,6 +317,7 @@ impl Server {
             && ran.success
             && !job.tool
             && job.facts.compiles()
+            && job.facts.emits_link
             && report.incomplete.is_none()
             && !report.network
             && std::env::var_os("JATO_ASYNC_RECORD").is_none_or(|v| v != "0");
