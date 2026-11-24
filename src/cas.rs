@@ -25,7 +25,14 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_BUILDS: &str = "
+CREATE TABLE IF NOT EXISTS builds(
+    recipe BLOB PRIMARY KEY, key BLOB NOT NULL, used INTEGER NOT NULL,
+    outputs INTEGER NOT NULL, env_tag BLOB NOT NULL, kind INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS builds_by_tag ON builds(env_tag, used DESC);
+";
 const SCHEMA: &str = "
 CREATE TABLE settings(name TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE counters(name TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
@@ -48,6 +55,11 @@ CREATE TABLE stamps(
     dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
     ctime INTEGER NOT NULL, digest BLOB NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY(dev, ino)
 ) WITHOUT ROWID;
+CREATE TABLE builds(
+    recipe BLOB PRIMARY KEY, key BLOB NOT NULL, used INTEGER NOT NULL,
+    outputs INTEGER NOT NULL, env_tag BLOB NOT NULL, kind INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX builds_by_tag ON builds(env_tag, used DESC);
 ";
 
 /// Results kept for one command line. Older source states of a crate under
@@ -220,7 +232,7 @@ fn clones(dir: &Path) -> bool {
 /// A record that may stand for a command, before it has been read.
 pub struct Candidate {
     pub key: Digest,
-    used: i64,
+    pub used: i64,
 }
 
 /// One output of a command, copied into the cache directory but not yet
@@ -730,6 +742,10 @@ impl Store {
                         .mode(0o700)
                         .create(dir.join(sub))?;
                 }
+            } else if version < 2 {
+                conn.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; {SCHEMA_BUILDS} PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
+                ))?;
             }
         }
         // Btrfs checksums every block it returns. Elsewhere a damaged
@@ -1349,6 +1365,51 @@ impl Store {
         placed
     }
 
+    /// Record a whole build in the cross-command index so other commands
+    /// sharing this toolchain/profile can seed an empty target directory.
+    pub fn note_whole_build(
+        &mut self,
+        recipe: &Digest,
+        key: &Digest,
+        outputs: usize,
+        env_tag: &Digest,
+        kind: u8,
+    ) {
+        let _ = self.conn.execute(
+            "INSERT OR REPLACE INTO builds(recipe,key,used,outputs,env_tag,kind)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![recipe, key, now(), outputs as i64, env_tag, i64::from(kind)],
+        );
+    }
+
+    /// Recent whole builds recorded under the same toolchain/profile bucket
+    /// as `env_tag`, excluding `exclude_recipe`.
+    pub fn whole_builds(
+        &self,
+        env_tag: &Digest,
+        exclude_recipe: &Digest,
+    ) -> Result<Vec<(Digest, Candidate, u8, usize)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT b.recipe, b.key, e.used, b.kind, b.outputs
+             FROM builds b
+             INNER JOIN entries e ON e.key = b.key
+             WHERE b.env_tag=?1 AND b.recipe!=?2
+             ORDER BY b.used DESC LIMIT 16",
+        )?;
+        let rows = stmt.query_map(params![env_tag, exclude_recipe], |r| {
+            Ok((
+                r.get::<_, Digest>(0)?,
+                Candidate {
+                    key: r.get(1)?,
+                    used: r.get(2)?,
+                },
+                r.get::<_, i64>(3)? as u8,
+                r.get::<_, i64>(4)?.max(0) as usize,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The record with this key, if it is kept.
     pub fn entry(&self, key: &Digest) -> Result<Option<Candidate>> {
         let mut stmt = self
@@ -1669,6 +1730,10 @@ impl Store {
         tx.execute(
             "DELETE FROM ran WHERE at < ?1",
             [now() - 45 * 86_400_000_000i64],
+        )?;
+        tx.execute(
+            "DELETE FROM builds WHERE key NOT IN (SELECT key FROM entries)",
+            [],
         )?;
         let after: u64 = tx.query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;
         sweep_strays(&tx, &dir)?;

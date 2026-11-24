@@ -5284,3 +5284,186 @@ fn downstream_binary_hits_cache_across_recompiled_incremental_rlib() {
         p.stats()
     );
 }
+
+#[test]
+fn an_empty_target_is_seeded_from_another_command_s_build_and_unused_parts_are_pruned() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    add_side(&p.root);
+    // Give `leaf` a build script and add a doctest + unit test to `leaf`.
+    let setup = |root: &Path| {
+        write(
+            root.join("leaf/build.rs"),
+            r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/gen.rs"), "pub fn extra() -> u32 { 7 }\n").unwrap();
+}
+"#,
+        );
+        write(
+            root.join("leaf/src/lib.rs"),
+            r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+/// ```
+/// assert_eq!(leaf::extra(), 7);
+/// ```
+pub fn value() -> &'static str { include_str!("text file").trim() }
+#[test]
+fn unit_ok() { assert_eq!(extra(), 7); }
+"#,
+        );
+    };
+    setup(&p.root);
+    success(
+        Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&p.root),
+    );
+
+    // 1. Record `jato build --workspace` in `c1`.
+    let c1 = checkout(&p, "c1");
+    setup(&c1);
+    success(p.command_in(&c1).args(["build", "--workspace", "-q"]));
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+
+    // 2. In a brand-new checkout `c2` (empty target), run `jato test -p leaf --no-run`.
+    // It MUST seed from `c1`'s `build --workspace` without rerunning `leaf`'s build script!
+    let c2 = checkout(&p, "c2");
+    setup(&c2);
+    let log2 = p.temp.path().join("c2.log");
+    success(
+        p.command_in(&c2)
+            .env("JATO_LOG", &log2)
+            .args(["test", "-p", "leaf", "--no-run", "-q"]),
+    );
+    let log2_text = fs::read_to_string(&log2).unwrap();
+    assert_eq!(p.count("build_seeded"), 1, "{log2_text}\n{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{log2_text}\n{}", p.stats());
+    assert!(
+        !log2_text.contains("[build_script_build]"),
+        "seeded target should reuse leaf's build script without compiling/running it:\n{log2_text}"
+    );
+    assert!(
+        !c2.join("target/debug/app").exists(),
+        "unused app binary from seed build should be pruned"
+    );
+
+    // 3. In a third checkout `c3`, `jato test -p leaf --no-run` hits whole-build cache!
+    let c3 = checkout(&p, "c3");
+    setup(&c3);
+    let hits = p.count("build_hit");
+    success(
+        p.command_in(&c3)
+            .args(["test", "-p", "leaf", "--no-run", "-q"]),
+    );
+    assert_eq!(p.count("build_hit"), hits + 1, "{}", p.stats());
+
+    // 4. In a fourth checkout `c4` (empty target), `jato test --doc -p leaf`
+    // warms/seeds the library ahead of Cargo and passes without rerunning build.rs!
+    let c4 = checkout(&p, "c4");
+    setup(&c4);
+    let log4 = p.temp.path().join("c4.log");
+    let doc_out = success(
+        p.command_in(&c4)
+            .env("JATO_LOG", &log4)
+            .args(["test", "--doc", "-p", "leaf"]),
+    );
+    let log4_text = fs::read_to_string(&log4).unwrap();
+    assert!(
+        String::from_utf8_lossy(&doc_out.stdout).contains("1 passed"),
+        "{}",
+        String::from_utf8_lossy(&doc_out.stdout)
+    );
+    assert!(
+        !log4_text.contains("[build_script_build]"),
+        "test --doc should seed leaf's build script from the workspace build:\n{log4_text}"
+    );
+
+    // 5. In a fifth checkout `c5` with an edited `leaf`, `jato run -p app`
+    // seeds `side` & `leaf`'s build script, recompiles only `leaf` + `app`.
+    let c5 = checkout(&p, "c5");
+    setup(&c5);
+    write(c5.join("leaf/src/text file"), "updated");
+    let log5 = p.temp.path().join("c5.log");
+    let seeded_before = p.count("build_seeded");
+    assert_eq!(
+        success(
+            p.command_in(&c5)
+                .env("JATO_LOG", &log5)
+                .args(["run", "-p", "app", "-q"]),
+        )
+        .stdout,
+        b"updated 5\n"
+    );
+    let log5_text = fs::read_to_string(&log5).unwrap();
+    assert!(
+        p.count("build_seeded") > seeded_before,
+        "expected run -p app to seed from workspace build:\n{log5_text}\n{}",
+        p.stats()
+    );
+    assert!(
+        !log5_text.contains("[side]") && !log5_text.contains("[build_script_build]"),
+        "expected side and build script to be reused from seed:\n{log5_text}"
+    );
+}
+
+#[test]
+fn a_build_script_writing_a_pinned_output_still_lets_another_checkout_start_from_it() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    add_side(&p.root);
+    let setup = |root: &Path| {
+        write(
+            root.join("leaf/build.rs"),
+            r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    // Write a binary file embedding OUT_DIR (like jemalloc's libjemalloc.a)
+    // and read a generated header via `sub/../gen.h`.
+    let sub = format!("{out}/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(format!("{out}/gen.h"), "42").unwrap();
+    let val = std::fs::read_to_string(format!("{sub}/../gen.h")).unwrap();
+    let mut bin = vec![0u8, 1, 2, 3];
+    bin.extend_from_slice(out.as_bytes());
+    std::fs::write(format!("{out}/pinned.bin"), bin).unwrap();
+    std::fs::write(format!("{out}/val.rs"), format!("pub const V: u32 = {val};\n")).unwrap();
+}
+"#,
+        );
+        write(
+            root.join("leaf/src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/val.rs\"));\npub fn value() -> u32 { V }\n",
+        );
+        write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"{} {}\", leaf::value(), side::side()); }\n",
+        );
+    };
+    setup(&p.root);
+    success(
+        Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&p.root),
+    );
+    let c1 = checkout(&p, "c1");
+    setup(&c1);
+    assert_eq!(
+        success(p.command_in(&c1).args(["run", "-q"])).stdout,
+        b"42 5\n"
+    );
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+
+    // In `c2`, the build MUST start from `c1` (`build_near == 1`), rerunning only
+    // `leaf`'s build script rather than falling back to a full cold build!
+    let c2 = checkout(&p, "c2");
+    setup(&c2);
+    assert_eq!(
+        success(p.command_in(&c2).args(["run", "-q"])).stdout,
+        b"42 5\n"
+    );
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+}

@@ -418,8 +418,9 @@ const ALONE: &[&str] = &[
 fn build_only(args: &[OsString], at: usize) -> Option<Vec<OsString>> {
     let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
     let run = matches!(args[at].to_str(), Some("run" | "r"));
+    let doc = !run && args[at + 1..end].iter().any(|a| a == "--doc");
     let mut build: Vec<OsString> = args[..at].to_vec();
-    build.push(if run {
+    build.push(if run || doc {
         "build".into()
     } else {
         args[at].clone()
@@ -431,8 +432,10 @@ fn build_only(args: &[OsString], at: usize) -> Option<Vec<OsString>> {
         let arg = &args[i];
         let text = arg.to_str()?;
         if text == "--doc" {
-            // Documentation tests are compiled as they are run.
-            return None;
+            // Documentation tests compile against the package library:
+            // build/restore the library and build scripts ahead of Cargo.
+            i += 1;
+            continue;
         }
         if text.starts_with('-') {
             build.push(arg.clone());
@@ -460,7 +463,9 @@ fn build_only(args: &[OsString], at: usize) -> Option<Vec<OsString>> {
         }
         i += 1;
     }
-    if !run {
+    if doc {
+        build.push("--lib".into());
+    } else if !run {
         build.push("--no-run".into());
     }
     Some(build)
@@ -531,6 +536,13 @@ fn report(stats: &cas::Stats) -> String {
             let _ = writeln!(
                 out,
                 "           {near} of those made started from an earlier build of other sources"
+            );
+        }
+        let seeded = count("build_seeded");
+        if seeded > 0 {
+            let _ = writeln!(
+                out,
+                "           {seeded} of those made seeded an empty target from another command's build"
             );
         }
     }
@@ -787,8 +799,13 @@ mod tests {
             build("test --strange word name"),
             is("test --strange word --no-run")
         );
-        // Not one build: documentation tests, and a command Cargo rejects.
-        assert_eq!(build("test --doc"), None);
+        // Documentation tests restore/build the library ahead of Cargo;
+        // a command Cargo rejects is left alone.
+        assert_eq!(build("test --doc"), is("build --lib"));
+        assert_eq!(
+            build("test --doc -p leaf doc_name"),
+            is("build -p leaf --lib")
+        );
         assert_eq!(build("test one two"), None);
         assert_eq!(build("test -p"), None);
     }

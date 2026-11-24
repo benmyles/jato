@@ -1407,9 +1407,9 @@ pub struct Parts {
     /// command that Cargo cannot be had to run again by itself.
     unplaced: bool,
     /// The commands a build script started, each by the number of the
-    /// script, the numbers of the places it examined, and the places it
-    /// wrote to.
-    scripted: Vec<(u16, Vec<u32>, Vec<Place>)>,
+    /// script, the numbers of the places it examined, the places it wrote
+    /// to, and whether what it wrote names where the build is.
+    scripted: Vec<(u16, Vec<u32>, Vec<Place>, bool)>,
     /// The numbers of the places examined by commands that neither Cargo
     /// started as compilers nor a build script started.
     strayed: HashSet<u32>,
@@ -1540,11 +1540,10 @@ impl Parts {
         }
         if apart {
             self.units.push((examined, wrote, names));
+        } else if !cargo && under != 0 {
+            self.scripted.push((under, examined, wrote, names));
         } else {
             self.unplaced |= names;
-            if !cargo && under != 0 {
-                self.scripted.push((under, examined, wrote));
-            }
         }
         for (root, path) in &manifest.removed {
             match place(*root, path) {
@@ -1574,8 +1573,12 @@ pub struct Start {
     /// build this one rests on, is left out when its inputs have changed
     /// and made again only if this command needs it.
     owed: Vec<bool>,
-    /// The build is another command's, found in the target directory.
+    /// The build is another command's, found in the target directory or
+    /// seeded into an empty one.
     other: bool,
+    /// The build was seeded into an empty target from another command, so
+    /// parts of it that Cargo never asked about are pruned after the build.
+    prune_unused: bool,
     /// What the files hold now that Cargo had asked about and that have
     /// changed since, by their positions among the inputs.
     now: HashMap<u32, State>,
@@ -1635,19 +1638,44 @@ impl Start {
     }
 
     /// Which of the earlier build's compilations, among those not made
-    /// again, are no longer part of a build that Cargo planned anew: the
-    /// ones none of whose files Cargo asked about.
-    fn dropped(&self, roots: &Roots, report: &Report) -> Vec<bool> {
-        let asked = |output: &u32| {
-            let output = &self.manifest.outputs[*output as usize];
-            roots
-                .join(output.root, &output.path)
-                .is_some_and(|path| report.paths.contains_key(&path))
+    /// again, are no longer part of a build that Cargo planned anew or
+    /// seeded from another command: the ones none of whose files Cargo or
+    /// its compilers asked about.
+    fn dropped(&self, roots: &Roots, report: &Report, parts: Option<&Parts>) -> Vec<bool> {
+        if self.replanned.is_empty() && !self.prune_unused {
+            return vec![false; self.manifest.parts.len()];
+        }
+        let touched = |output: u32| {
+            let output = &self.manifest.outputs[output as usize];
+            let place = (output.root, output.path.clone());
+            parts.is_some_and(|p| p.inputs.contains_key(&place))
+                || roots
+                    .join(output.root, &output.path)
+                    .is_some_and(|path| report.paths.contains_key(&path))
         };
+        // Any build script whose program or outputs were touched keeps the
+        // part that built its program.
+        let mut keep_digests: HashSet<Digest> = HashSet::new();
+        let mut keep_outputs: HashSet<u32> = HashSet::new();
+        for script in &self.manifest.scripts {
+            if touched(script.program) || script.outputs.iter().any(|&out| touched(out)) {
+                keep_outputs.insert(script.program);
+                let prog = &self.manifest.outputs[script.program as usize];
+                if prog.size > 0 {
+                    keep_digests.insert(prog.digest);
+                }
+            }
+        }
         self.manifest
             .parts
             .iter()
-            .map(|part| !self.replanned.is_empty() && !part.outputs.iter().any(asked))
+            .map(|part| {
+                !part.outputs.iter().any(|&out| {
+                    touched(out)
+                        || keep_outputs.contains(&out)
+                        || keep_digests.contains(&self.manifest.outputs[out as usize].digest)
+                })
+            })
             .collect()
     }
 
@@ -1959,6 +1987,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         placed: leave.iter().map(|left| !left).collect(),
         owed,
         other: false,
+        prune_unused: false,
         manifest,
         again,
         now,
@@ -2104,6 +2133,7 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
             again: vec![false; manifest.parts.len()],
             owed: vec![false; placed.len()],
             other: true,
+            prune_unused: false,
             placed,
             manifest,
             now: HashMap::new(),
@@ -2113,6 +2143,338 @@ pub fn rest_on(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
         });
     }
     None
+}
+
+/// Identifies the toolchain/profile/target/rustflags compatibility bucket
+/// of a whole Cargo build, together with a coarse command kind:
+/// 0 = check, 1 = clippy, 2 = build/run, 3 = test/bench.
+fn build_profile_tag(job: &Job) -> (Digest, u8) {
+    let mut hash = blake3::Hasher::new_derive_key("jato build profile v1");
+    field(&mut hash, &job.roots.mark_os(&job.request.program));
+    let end = job
+        .request
+        .args
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(job.request.args.len());
+    let args = &job.request.args[..end];
+    let mut kind: u8 = 2;
+    let mut profile: Option<OsString> = None;
+    let mut targets: Vec<OsString> = Vec::new();
+    let mut toolchain: Option<OsString> = None;
+    let mut extras: Vec<OsString> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].to_str();
+        match a {
+            Some(s) if s.starts_with('+') && toolchain.is_none() => {
+                toolchain = Some(args[i].clone());
+            }
+            Some("check" | "c") => kind = 0,
+            Some("clippy") => kind = 1,
+            Some("build" | "b" | "run" | "r") => kind = 2,
+            Some("test" | "t" | "bench") => kind = 3,
+            Some("--release" | "-r") => profile = Some("release".into()),
+            Some("--profile") if i + 1 < args.len() => {
+                profile = Some(args[i + 1].clone());
+                i += 1;
+            }
+            Some(s) if s.starts_with("--profile=") => {
+                profile = Some(OsString::from(&s["--profile=".len()..]));
+            }
+            Some("--target") if i + 1 < args.len() => {
+                targets.push(args[i + 1].clone());
+                i += 1;
+            }
+            Some(s) if s.starts_with("--target=") => {
+                targets.push(OsString::from(&s["--target=".len()..]));
+            }
+            Some("--config" | "-Z" | "-j" | "--jobs") if i + 1 < args.len() => {
+                extras.push(args[i].clone());
+                extras.push(args[i + 1].clone());
+                i += 1;
+            }
+            Some(s)
+                if s.starts_with("--config=")
+                    || s.starts_with("-Z")
+                    || s.starts_with("-j")
+                    || s.starts_with("--jobs=") =>
+            {
+                extras.push(args[i].clone());
+            }
+            _ => (),
+        }
+        i += 1;
+    }
+    field(
+        &mut hash,
+        profile.as_deref().unwrap_or(OsStr::new("dev")).as_bytes(),
+    );
+    field(
+        &mut hash,
+        toolchain.as_deref().unwrap_or(OsStr::new("")).as_bytes(),
+    );
+    targets.sort();
+    for target in &targets {
+        field(&mut hash, target.as_bytes());
+    }
+    for extra in &extras {
+        field(&mut hash, &job.roots.mark_os(extra));
+    }
+    for (name, value) in &job.request.env {
+        let bytes = name.as_bytes();
+        let affects = matches!(
+            bytes,
+            b"RUSTUP_TOOLCHAIN"
+                | b"RUSTC"
+                | b"RUSTFLAGS"
+                | b"CARGO_ENCODED_RUSTFLAGS"
+                | b"CARGO_BUILD_RUSTFLAGS"
+                | b"CARGO_BUILD_TARGET"
+                | b"CARGO_BUILD_JOBS"
+                | b"RUSTC_WORKSPACE_WRAPPER"
+        ) || bytes.starts_with(b"CARGO_PROFILE_");
+        if affects {
+            field(&mut hash, bytes);
+            field(&mut hash, &job.roots.mark_os(value));
+        }
+    }
+    (*hash.finalize().as_bytes(), kind)
+}
+
+/// Whether the target directory does not yet exist or holds nothing beyond
+/// Jato/Cargo marker files.
+fn target_is_empty(roots: &Roots) -> bool {
+    let Some(target) = roots.path(roots::TARGET) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(target) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        if bytes == TARGET_TAG.as_bytes()
+            || bytes == b".rustc_info.json"
+            || bytes.starts_with(b".jato-")
+            || bytes.starts_with(b".cargo-lock")
+        {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Seed an empty target directory from another compatible recorded whole
+/// build of this workspace (for example, seeding `test -p foo`, `clippy`,
+/// or `build` from an earlier `check --workspace` or `build --workspace`).
+/// Unused parts are pruned after Cargo finishes so the resulting target
+/// directory and recorded manifest match a build from nothing.
+pub fn seed_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start> {
+    if env::var_os("JATO_NEAR").is_some_and(|v| v == "0")
+        || env::var_os("JATO_SEED").is_some_and(|v| v == "0")
+        || !target_is_empty(&job.roots)
+    {
+        return None;
+    }
+    let begun = Instant::now();
+    let (env_tag, my_kind) = build_profile_tag(job);
+    store.begin_read();
+    let mut candidates = store.whole_builds(&env_tag, recipe).unwrap_or_default();
+    if candidates.is_empty() {
+        store.end_read();
+        return None;
+    }
+    // Prefer matching command class (check/clippy prefer check/clippy to
+    // avoid restoring gigabytes of binaries; build/test prefer build/test
+    // so compiled .rlibs are present), then larger coverage, then recency.
+    candidates.sort_by_key(|(_, cand, kind, outputs)| {
+        let same_class = (*kind <= 1) == (my_kind <= 1);
+        (
+            std::cmp::Reverse(same_class),
+            std::cmp::Reverse(*outputs),
+            std::cmp::Reverse(cand.used),
+        )
+    });
+    let mut here = Here::new(
+        &job.roots,
+        &job.request.env,
+        &job.path,
+        job.facts.width,
+        job.facts.ansi,
+    );
+    struct Seed {
+        at: usize,
+        count: usize,
+        manifest: Manifest,
+        again: Vec<bool>,
+        differences: Vec<Difference>,
+        replanned: Vec<u32>,
+        scripts: Vec<bool>,
+    }
+    let mut best: Option<Seed> = None;
+    let time = time_before(&job.roots);
+    for (at, (cand_recipe, candidate, _, _)) in candidates.iter().enumerate().take(6) {
+        let stored = store.record(candidate).unwrap_or_default();
+        let manifest = match Manifest::decode(&stored) {
+            Ok(manifest) if manifest.key(cand_recipe) == candidate.key => manifest,
+            _ => continue,
+        };
+        if manifest.parts.is_empty() {
+            continue;
+        }
+        // Quick workspace-identity filter: require at least one recorded
+        // workspace file to exist at the same relative path here.
+        let mut probes = manifest
+            .inputs
+            .iter()
+            .filter(|i| i.root == roots::WORK && matches!(i.state, State::File(_)))
+            .take(4)
+            .peekable();
+        if probes.peek().is_some()
+            && !probes.any(|i| job.roots.join(i.root, &i.path).is_some_and(|p| p.exists()))
+        {
+            continue;
+        }
+        let elsewhere = manifest.placed(&job.roots).err();
+        if elsewhere.is_some() && manifest.pinned.is_empty() {
+            continue;
+        }
+        let Ok(differences) = manifest.differences(&mut here, store, MOST) else {
+            continue;
+        };
+        let Ok(Stale {
+            mut again,
+            scripts,
+            replanned,
+        }) = manifest.stale_parts(&differences)
+        else {
+            continue;
+        };
+        if elsewhere.is_some() {
+            for &part in &manifest.pinned {
+                again[part as usize] = true;
+            }
+        }
+        let count = again.iter().filter(|a| **a).count();
+        // Only seed when at least half of the recorded build's parts hold.
+        if count * 2 > manifest.parts.len() {
+            continue;
+        }
+        best = Some(Seed {
+            at,
+            count,
+            manifest,
+            again,
+            differences,
+            replanned,
+            scripts,
+        });
+        break;
+    }
+    let Some(Seed {
+        at,
+        count,
+        manifest,
+        again,
+        differences,
+        replanned,
+        scripts,
+    }) = best
+    else {
+        store.end_read();
+        return None;
+    };
+    let candidate = &candidates[at].1;
+    let mut leave = vec![false; manifest.outputs.len()];
+    let mut kept: HashSet<u32> = HashSet::new();
+    let mut gone: HashSet<Digest> = HashSet::new();
+    for (part, again) in manifest.parts.iter().zip(&again) {
+        for &output in &part.outputs {
+            if *again {
+                leave[output as usize] = true;
+                gone.insert(manifest.outputs[output as usize].digest);
+            } else {
+                kept.insert(output);
+            }
+        }
+    }
+    for (at, output) in manifest.outputs.iter().enumerate() {
+        // Never write files outside the target directory when seeding.
+        if output.root != roots::TARGET {
+            leave[at] = true;
+            continue;
+        }
+        if output.size > 0 && !kept.contains(&(at as u32)) && gone.contains(&output.digest) {
+            leave[at] = true;
+        }
+    }
+    let mut rerun: Vec<u32> = Vec::new();
+    for (script, again) in manifest.scripts.iter().zip(&scripts) {
+        if *again || leave[script.program as usize] {
+            rerun.push(script.program);
+            for &output in &script.outputs {
+                leave[output as usize] = true;
+            }
+        }
+    }
+    let mut damaged = false;
+    let how = crate::cas::Placing {
+        tree: true,
+        leave: Some(&leave),
+        time,
+        remap_out: None,
+    };
+    let restored = store.restore(candidate, &manifest, &job.roots, how, &mut damaged);
+    store.end_read();
+    let restored = match restored {
+        Ok(Some(restored)) => restored,
+        Ok(None) => {
+            if damaged {
+                store.forget(&candidate.key);
+            }
+            return None;
+        }
+        Err(e) => {
+            log(job.name(), format_args!("could not seed target: {e:#}"));
+            return None;
+        }
+    };
+    let now = differences
+        .iter()
+        .filter(|difference| manifest.asked.binary_search(&difference.input).is_ok())
+        .filter_map(|difference| {
+            Some((difference.input, manifest.now(difference.input, &mut here)?))
+        })
+        .collect();
+    store.count("build_seeded", 1);
+    store.count("restored_bytes", restored.bytes);
+    log(
+        job.name(),
+        format_args!(
+            "seeding empty target from another command's build in {} ms: {} of {} files placed, {} of {} compilations left out",
+            begun.elapsed().as_millis(),
+            restored.files,
+            manifest.outputs.len(),
+            count,
+            manifest.parts.len(),
+        ),
+    );
+    let placed: Vec<bool> = leave.iter().map(|left| !left).collect();
+    let owed = vec![false; manifest.outputs.len()];
+    Some(Start {
+        placed,
+        owed,
+        other: true,
+        prune_unused: true,
+        manifest,
+        again,
+        now,
+        replanned,
+        rerun,
+        cost_ms: restored.cost_ms,
+    })
 }
 
 /// The directories in which git keeps the repositories a command looked
@@ -2281,8 +2643,10 @@ pub fn record(
     // again: what it had written before and did not write now. All of it
     // is taken out of the target directory, as a build from nothing
     // would not have it.
-    let dropped: Vec<bool> = start.map_or_else(Vec::new, |start| start.dropped(roots, report));
+    let dropped: Vec<bool> =
+        start.map_or_else(Vec::new, |start| start.dropped(roots, report, parts));
     let mut gone: HashSet<Place> = HashSet::new();
+    let mut dropped_scripts: Vec<bool> = Vec::new();
     if let Some(start) = start {
         let base = &start.manifest;
         let mut theirs: HashSet<u32> = HashSet::new();
@@ -2308,7 +2672,7 @@ pub fn record(
                 gone.insert((output.root, output.path.clone()));
             }
         }
-        if !start.replanned.is_empty() {
+        if !start.replanned.is_empty() || start.prune_unused {
             let touched: HashSet<&Path> = report
                 .paths
                 .keys()
@@ -2338,10 +2702,12 @@ pub fn record(
                     report.paths.get(&path).is_some_and(|access| access.written)
                 })
         };
-        for script in &base.scripts {
+        dropped_scripts = vec![false; base.scripts.len()];
+        for (i, script) in base.scripts.iter().enumerate() {
             let program = start.place(script.program);
             let outputs = script.outputs.iter().map(|at| start.place(*at));
             if gone.contains(&program) {
+                dropped_scripts[i] = true;
                 gone.extend(outputs);
             } else if ran.contains(&program) {
                 gone.extend(outputs.filter(|place| !written_now(place)));
@@ -2534,8 +2900,18 @@ pub fn record(
         }
         // What was there before and has been replaced by a part of this
         // command is state the command brought up to date, like a file it
-        // rewrote itself.
-        if access.created || made.contains(&(root, rel.to_owned())) {
+        // rewrote itself. Inside the target directory, also match paths
+        // traversed via `..` (such as `include/internal/../jemalloc.h`).
+        let made_here = made.contains(&(root, rel.to_owned()))
+            || (root == roots::TARGET
+                && rel
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                && fs::canonicalize(path).is_ok_and(|canon| {
+                    let (cr, crel) = roots.split(&canon);
+                    cr == roots::TARGET && made.contains(&(cr, crel.to_owned()))
+                }));
+        if access.created || made_here {
             continue;
         }
         if job.scope == Scope::Build && root == roots::TARGET {
@@ -2839,16 +3215,31 @@ pub fn record(
                 outputs.push((place.0, place.1.clone(), path));
             }
         }
+        let was_made = |place: &Place| -> bool {
+            made.contains(place)
+                || (place.0 == roots::TARGET
+                    && place
+                        .1
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir)
+                    && roots
+                        .join(place.0, &place.1)
+                        .and_then(|p| fs::canonicalize(p).ok())
+                        .is_some_and(|canon| {
+                            let (cr, crel) = roots.split(&canon);
+                            cr == roots::TARGET && made.contains(&(cr, crel.to_owned()))
+                        }))
+        };
         manifest
             .inputs
-            .retain(|i| !made.contains(&(i.root, i.path.clone())));
+            .retain(|i| !was_made(&(i.root, i.path.clone())));
         let have: HashSet<Place> = manifest
             .inputs
             .iter()
             .map(|i| (i.root, i.path.clone()))
             .collect();
         for (place, (link, state)) in &parts.inputs {
-            if !made.contains(place) && !have.contains(place) {
+            if !was_made(place) && !have.contains(place) {
                 manifest.inputs.push(Input {
                     root: place.0,
                     path: place.1.clone(),
@@ -2928,16 +3319,38 @@ pub fn record(
             for &position in &base.asked {
                 asked.insert(carry(position, &mut manifest));
             }
+            let mut dropped_script_only: HashSet<u32> = HashSet::new();
+            for (script, &is_dropped) in base.scripts.iter().zip(&dropped_scripts) {
+                if is_dropped {
+                    dropped_script_only.extend(&script.inputs);
+                }
+            }
+            if !dropped_script_only.is_empty() {
+                for (script, &is_dropped) in base.scripts.iter().zip(&dropped_scripts) {
+                    if !is_dropped {
+                        for at in &script.inputs {
+                            dropped_script_only.remove(at);
+                        }
+                    }
+                }
+            }
             for position in 0..base.inputs.len() as u32 {
                 let listed = base.own.binary_search(&position).is_ok();
                 let nowhere =
                     !apart[position as usize] && base.asked.binary_search(&position).is_err();
                 if listed || nowhere {
+                    let was = |list: &[u32]| list.binary_search(&position).is_ok();
+                    if dropped_script_only.contains(&position)
+                        && !was(&base.cargos)
+                        && !was(&base.read)
+                        && !was(&base.strays)
+                    {
+                        continue;
+                    }
                     let place = carry(position, &mut manifest);
                     // Who examined it then still stands, unless it was
                     // examined this time.
                     if !examined_now.contains(&place) {
-                        let was = |list: &[u32]| list.binary_search(&position).is_ok();
                         if was(&base.cargos) {
                             cargos.insert(place.clone());
                         }
@@ -2960,7 +3373,9 @@ pub fn record(
             let here = |(root, path): &&(u8, PathBuf)| roots.path(*root) == Some(path.as_path());
             manifest.pins.extend(base.pins.iter().filter(here).cloned());
             unplaced |= base.pinned.is_empty() && base.pins.iter().any(|pin| here(&pin));
-            manifest.removed.extend(base.removed.iter().cloned());
+            if !start.prune_unused {
+                manifest.removed.extend(base.removed.iter().cloned());
+            }
             for (place, output) in &carried {
                 known.insert(output.digest, output);
                 if !listed.contains(place)
@@ -3452,18 +3867,6 @@ pub fn record(
             }
         }
         manifest.theirs = borrowed;
-        // A copy of such output under another name, as Cargo makes of a
-        // program, is left out with the compiler's own. Anything else
-        // that names the place nobody could be had to write again.
-        let theirs_to_write: HashSet<Digest> = pinned
-            .iter()
-            .flat_map(|at| &apart[*at as usize].outputs)
-            .map(|at| manifest.outputs[*at as usize].digest)
-            .collect();
-        unplaced |= named_here
-            .iter()
-            .any(|digest| !theirs_to_write.contains(digest));
-        manifest.pinned = if unplaced { Vec::new() } else { pinned };
         theirs.extend(own.iter().filter_map(input_at));
         let theirs = ordered(theirs);
         let asked = ordered(asked.iter().filter_map(input_at).collect());
@@ -3488,6 +3891,7 @@ pub fn record(
                 .filter(of_own),
         );
         let mut scripts: BTreeMap<u32, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
+        let mut pinned_scripts: HashSet<u32> = HashSet::new();
         let mut ran_now: HashSet<Place> = HashSet::new();
         for (number, program) in report.programs.iter().enumerate() {
             let number = number as u16 + 1;
@@ -3496,13 +3900,15 @@ pub fn record(
             let (examined, wrote) = &scripts_did[number as usize - 1];
             let mut inputs: Vec<u32> = examined.iter().filter_map(own_at).collect();
             let mut outputs: Vec<u32> = wrote.iter().filter_map(output_at).collect();
-            for (under, numbers, wrote) in &parts.scripted {
+            let mut script_names = false;
+            for (under, numbers, wrote, names) in &parts.scripted {
                 if *under == number {
                     let at = numbers
                         .iter()
                         .flat_map(|n| position[*n as usize].iter().copied());
                     inputs.extend(at.filter(of_own));
                     outputs.extend(wrote.iter().filter_map(output_at));
+                    script_names |= *names;
                 }
             }
             match output_at(&place) {
@@ -3510,18 +3916,25 @@ pub fn record(
                     let script = scripts.entry(program).or_default();
                     script.0.extend(inputs);
                     script.1.extend(outputs);
+                    if script_names {
+                        pinned_scripts.insert(program);
+                    }
                 }
-                None => strays.extend(inputs),
+                None => {
+                    strays.extend(inputs);
+                    unplaced |= script_names;
+                }
             }
             ran_now.insert(place);
         }
         // A compiler said to be some script's whose number nobody has.
-        for (under, numbers, _) in &parts.scripted {
+        for (under, numbers, _, names) in &parts.scripted {
             if *under as usize > report.programs.len() {
                 let at = numbers
                     .iter()
                     .flat_map(|n| position[*n as usize].iter().copied());
                 strays.extend(at.filter(of_own));
+                unplaced |= *names;
             }
         }
         // The scripts of the build this one started from that did not run
@@ -3553,13 +3966,62 @@ pub fn record(
                 outputs: ordered(outputs),
             })
             .collect();
+        // A copy of such output under another name, as Cargo makes of a
+        // program, is left out with the compiler's own. An output written
+        // by a build script that names the place is left out with the
+        // compiler that made that script's program (so Cargo runs the
+        // script again in another checkout). Anything else that names the
+        // place nobody could be had to write again.
+        let mut theirs_to_write: HashSet<Digest> = pinned
+            .iter()
+            .flat_map(|at| &apart[*at as usize].outputs)
+            .map(|at| manifest.outputs[*at as usize].digest)
+            .collect();
+        let script_part = |program: u32| -> Option<u32> {
+            let prog = &manifest.outputs[program as usize];
+            apart
+                .iter()
+                .position(|part| {
+                    part.outputs.contains(&program)
+                        || (prog.size > 0
+                            && part
+                                .outputs
+                                .iter()
+                                .any(|&at| manifest.outputs[at as usize].digest == prog.digest))
+                })
+                .map(|idx| idx as u32)
+        };
+        for script in &manifest.scripts {
+            let has_pinned_output = pinned_scripts.contains(&script.program)
+                || script
+                    .outputs
+                    .iter()
+                    .any(|&at| named_here.contains(&manifest.outputs[at as usize].digest));
+            if has_pinned_output {
+                match script_part(script.program) {
+                    Some(part_idx) => {
+                        pinned.push(part_idx);
+                        for &at in &script.outputs {
+                            theirs_to_write.insert(manifest.outputs[at as usize].digest);
+                        }
+                    }
+                    None => unplaced = true,
+                }
+            }
+        }
+        let pinned = ordered(pinned);
+        unplaced |= named_here
+            .iter()
+            .any(|digest| !theirs_to_write.contains(digest));
+        manifest.pinned = if unplaced { Vec::new() } else { pinned };
         manifest.strays = ordered(strays);
         // What Cargo kept for itself, this time or before.
         if let Some(start) = start {
             let base = &start.manifest;
             for &at in &base.ours {
                 let place = start.place(at);
-                if start.placed[at as usize] && !made_now.contains(&place) {
+                if start.placed[at as usize] && !gone.contains(&place) && !made_now.contains(&place)
+                {
                     ours.insert(place);
                 }
             }
@@ -3568,7 +4030,15 @@ pub fn record(
         manifest.own = theirs;
         manifest.parts = apart;
     }
-    let cost = ran.millis + start.map_or(0, |start| start.cost_ms);
+    let carried_cost = start.map_or(0, |start| {
+        if start.prune_unused {
+            let total = start.manifest.parts.len().max(1) as u64;
+            start.cost_ms.saturating_mul(kept.len() as u64) / total
+        } else {
+            start.cost_ms
+        }
+    });
+    let cost = ran.millis + carried_cost;
     let stored = store.commit(recipe, &manifest, &detail, cost, &mut staged);
     match stored {
         Ok(true) => {
@@ -3576,7 +4046,10 @@ pub fn record(
                 store.count("pinned", 1);
             }
             if job.scope == Scope::Build {
-                note_build(roots, recipe, &manifest.key(recipe));
+                let key = manifest.key(recipe);
+                note_build(roots, recipe, &key);
+                let (env_tag, kind) = build_profile_tag(job);
+                store.note_whole_build(recipe, &key, manifest.outputs.len(), &env_tag, kind);
             }
             Ok(manifest)
         }

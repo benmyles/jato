@@ -674,7 +674,8 @@ fn make(
         recipe,
     } = prepared;
     let start = command::start_from(&job, &mut store, &recipe)
-        .or_else(|| command::rest_on(&job, &mut store, &recipe));
+        .or_else(|| command::rest_on(&job, &mut store, &recipe))
+        .or_else(|| command::seed_from(&job, &mut store, &recipe));
     let again = start.is_some().then(|| copy_of(&cmd));
     let prepared = Prepared { job, store, recipe };
     match supervise(cmd, prepared, name, begun, whole, start)? {
