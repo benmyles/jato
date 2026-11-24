@@ -198,6 +198,8 @@ fn fine_grained_times() -> bool {
 pub struct Stats {
     pub directory: PathBuf,
     pub limit_bytes: u64,
+    pub memory_bytes: u64,
+    pub hot_bytes: u64,
     pub stored_bytes: u64,
     pub artifact_bytes: u64,
     pub database_bytes: u64,
@@ -273,11 +275,15 @@ pub struct Store {
     conn: Connection,
     pub dir: PathBuf,
     env_limit: Option<u64>,
+    env_memory: Option<u64>,
     /// Whether restored bytes are read back and compared with their digest.
     verify: bool,
     /// Whether to try sharing extents with the files commands write.
     clone: bool,
+    /// Whether `JATO_STORAGE=packed` explicitly disables uncompressed objects.
+    force_packed: bool,
     known: HashMap<(u64, u64), (Stamp, Digest)>,
+    stamps_loaded: bool,
     learned: Vec<(Stamp, Digest)>,
     counts: BTreeMap<String, i64>,
     used: Vec<Digest>,
@@ -465,17 +471,37 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
             if source.metadata()?.len() != output.size {
                 return Ok(Some(false));
             }
-            if !how.clone || clone_file(&source, &out).is_err() {
-                let copied = io::copy(&mut source, &mut out)?;
-                ensure!(copied == output.size, "short copy of a cached object");
-            }
-            if how.verify {
-                use std::io::Seek;
-                out.rewind()?;
-                let (digest, length, _) = scan::digest_open(&mut out, &[])?;
-                if length != output.size || digest != output.digest {
+            let cloned = how.clone && clone_file(&source, &out).is_ok();
+            if cloned {
+                if how.verify {
+                    use std::io::Seek;
+                    out.rewind()?;
+                    let (digest, length, _) = scan::digest_open(&mut out, &[])?;
+                    if length != output.size || digest != output.digest {
+                        return Ok(Some(false));
+                    }
+                }
+            } else if how.verify {
+                // Single-pass verified copy: hash with SIMD BLAKE3 while
+                // writing, avoiding a second read pass.
+                let mut hasher = blake3::Hasher::new();
+                let mut buffer = vec![0u8; 256 * 1024];
+                let mut written = 0u64;
+                loop {
+                    let n = source.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..n]);
+                    out.write_all(&buffer[..n])?;
+                    written += n as u64;
+                }
+                if written != output.size || hasher.finalize().as_bytes() != &output.digest {
                     return Ok(Some(false));
                 }
+            } else {
+                let copied = io::copy(&mut source, &mut out)?;
+                ensure!(copied == output.size, "short copy of a cached object");
             }
         }
         // The umask applied at creation. Outputs keep their mode.
@@ -497,22 +523,36 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
     (Some(staging), written)
 }
 
+/// Whether `meta` still reflects the same file contents as `before` (taking
+/// into account that Cargo hardlinking a finished artifact bumps `ctime` and
+/// `nlink` without changing the file's bytes).
+fn unchanged_since(before: Stamp, before_nlink: u64, meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let after = Stamp::of(meta);
+    after == before || (before.same_contents(&after) && meta.nlink() != before_nlink)
+}
+
 /// Copy one output into the cache directory `dir` and learn its digest and
 /// which of `roots`' spellings its bytes name; `clone` says whether to try
-/// sharing its extents. With it comes what the file looked like while it
-/// held those bytes, if it was at rest, to know it by later.
+/// sharing its extents, and `hot` says whether to store uncompressed in the
+/// hot memory tier when cloning is unavailable. With it comes what the file
+/// looked like while it held those bytes, if it was at rest, to know it by
+/// later.
 fn stage_file(
     dir: &Path,
     clone: bool,
+    hot: bool,
     file: &Path,
     roots: &Roots,
 ) -> Result<(Staged, Option<(Stamp, Digest)>)> {
+    use std::os::unix::fs::MetadataExt;
     let spellings = roots.spellings();
     let needles: Vec<&[u8]> = spellings.iter().map(|(_, s)| *s).collect();
     let mut source = File::open(file).with_context(|| format!("opening {}", file.display()))?;
     let meta = source.metadata()?;
     ensure!(meta.is_file(), "{} is not a regular file", file.display());
     let before = Stamp::of(&meta);
+    let before_nlink = meta.nlink();
     let mode = meta.permissions().mode() & 0o777;
     // One process can hold several stores, each staging at once.
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -581,8 +621,9 @@ fn stage_file(
             } else {
                 names
             };
+            let after_meta = source.metadata()?;
             ensure!(
-                Stamp::of(&source.metadata()?) == before,
+                unchanged_since(before, before_nlink, &after_meta),
                 "{} changed while it was stored",
                 file.display()
             );
@@ -591,7 +632,7 @@ fn stage_file(
             // command that reads them there learns that it would not learn
             // anywhere.
             let digest = staged.digest;
-            return Ok((staged, Some((before, digest))));
+            return Ok((staged, Some((Stamp::of(&after_meta), digest))));
         }
         use std::io::Seek;
         source.rewind()?;
@@ -604,6 +645,55 @@ fn stage_file(
         ensure!(length == before.size, "{} changed size", file.display());
         staged.digest = digest;
         staged.names = names;
+    } else if hot {
+        // High-RAM hot tier on a non-cloning filesystem: store uncompressed in
+        // a single read+hash+scan+write pass so objects stay page-cached and
+        // restore at full SIMD BLAKE3 memory bandwidth with zero zstd cost.
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut tail: Vec<u8> = Vec::new();
+        let keep = needles.iter().map(|n| n.len() + 1).max().unwrap_or(0);
+        let mut length = 0u64;
+        loop {
+            let n = source.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+            out.write_all(&buffer[..n])?;
+            length += n as u64;
+            if keep > 0 {
+                tail.extend_from_slice(&buffer[..n]);
+                for (needle, found) in needles.iter().zip(&mut staged.names) {
+                    *found = *found || scan::names_path(&tail, needle);
+                }
+                let drop = tail.len().saturating_sub(keep);
+                tail.drain(..drop);
+            }
+        }
+        ensure!(length == before.size, "{} changed size", file.display());
+        let after_meta = source.metadata()?;
+        ensure!(
+            unchanged_since(before, before_nlink, &after_meta),
+            "{} changed while it was stored",
+            file.display()
+        );
+        let digest = *hasher.finalize().as_bytes();
+        staged.digest = digest;
+        for packed in [false, true] {
+            if let Ok(meta) = fs::metadata(object_path(dir, &digest, packed))
+                && meta.is_file()
+            {
+                drop(out);
+                let _ = fs::remove_file(&temp);
+                staged.temp = None;
+                staged.packed = packed;
+                staged.stored = meta.len();
+                return Ok((staged, Some((Stamp::of(&after_meta), digest))));
+            }
+        }
+        staged.packed = false;
+        staged.stored = before.size;
     } else {
         // No shared extents here: a copy is kept, compressed. Look
         // first at whether the cache has the file already. Most of
@@ -616,8 +706,9 @@ fn stage_file(
             if let Ok(meta) = fs::metadata(object_path(dir, &digest, packed))
                 && meta.is_file()
             {
+                let after_meta = source.metadata()?;
                 ensure!(
-                    Stamp::of(&source.metadata()?) == before,
+                    unchanged_since(before, before_nlink, &after_meta),
                     "{} changed while it was stored",
                     file.display()
                 );
@@ -628,7 +719,7 @@ fn stage_file(
                 staged.temp = None;
                 staged.packed = packed;
                 staged.stored = meta.len();
-                return Ok((staged, Some((before, digest))));
+                return Ok((staged, Some((Stamp::of(&after_meta), digest))));
             }
         }
         source.rewind()?;
@@ -666,7 +757,9 @@ fn stage_file(
         staged.stored = out.metadata()?.len();
     }
     out.set_permissions(fs::Permissions::from_mode(0o444))?;
-    let learned = (Stamp::of(&source.metadata()?) == before).then_some((before, staged.digest));
+    let after_meta = source.metadata()?;
+    let learned = unchanged_since(before, before_nlink, &after_meta)
+        .then_some((Stamp::of(&after_meta), staged.digest));
     Ok((staged, learned))
 }
 
@@ -674,6 +767,11 @@ impl Store {
     pub fn open() -> Result<Self> {
         let env_limit = env::var("JATO_MAX_SIZE")
             .ok()
+            .map(|s| parse_size(&s))
+            .transpose()?;
+        let env_memory = env::var("JATO_MEMORY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
             .map(|s| parse_size(&s))
             .transpose()?;
         let dir = cache_dir()?;
@@ -685,8 +783,13 @@ impl Store {
             other => other?,
         };
         store.env_limit = env_limit;
+        store.env_memory = env_memory;
+        store.tune_memory();
         match env::var("JATO_STORAGE").as_deref() {
-            Ok("packed") => store.clone = false,
+            Ok("packed") => {
+                store.clone = false;
+                store.force_packed = true;
+            }
             Ok("auto") | Err(_) => (),
             Ok(other) => bail!("JATO_STORAGE must be auto or packed, not {other:?}"),
         }
@@ -757,14 +860,128 @@ impl Store {
             conn,
             dir,
             env_limit: None,
+            env_memory: None,
             verify,
             clone: true,
+            force_packed: false,
             known: HashMap::new(),
+            stamps_loaded: false,
             learned: Vec::new(),
             counts: BTreeMap::new(),
             used: Vec::new(),
             noted: Vec::new(),
         })
+    }
+
+    /// Configured RAM budget for accelerating builds (SQLite page cache / mmap
+    /// and uncompressed hot object storage on non-cloning filesystems).
+    pub fn memory_budget(&self) -> Result<u64> {
+        let stored: Option<u64> = self
+            .conn
+            .query_row("SELECT value FROM settings WHERE name='memory'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(self.env_memory.or(stored).unwrap_or(0))
+    }
+
+    pub fn set_memory_budget(&mut self, size: Option<u64>) -> Result<u64> {
+        match size {
+            Some(size) if size > 0 => self.conn.execute(
+                "INSERT INTO settings VALUES('memory',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                [size],
+            )?,
+            _ => self
+                .conn
+                .execute("DELETE FROM settings WHERE name='memory'", [])?,
+        };
+        self.tune_memory();
+        self.memory_budget()
+    }
+
+    /// Scale SQLite's page cache and memory-mapped I/O when a memory budget
+    /// is configured so the entire index stays resident in RAM.
+    fn tune_memory(&self) {
+        let Ok(mem) = self.memory_budget() else {
+            return;
+        };
+        if mem == 0 {
+            return;
+        }
+        let cache_kib = (mem / 64 / 1024).clamp(4096, 512 * 1024);
+        let mmap = (mem / 8).clamp(256 << 20, 2 << 30);
+        let _ = self.conn.execute_batch(&format!(
+            "PRAGMA cache_size=-{cache_kib}; PRAGMA mmap_size={mmap};"
+        ));
+    }
+
+    /// Whether newly staged objects on a non-cloning filesystem should be kept
+    /// uncompressed in the hot memory tier (staying page-cached in RAM for
+    /// single-pass SIMD BLAKE3 restores without zstd compression overhead).
+    fn use_hot_tier(&self) -> bool {
+        if self.force_packed {
+            return false;
+        }
+        let Ok(mem) = self.memory_budget() else {
+            return false;
+        };
+        if mem == 0 {
+            return false;
+        }
+        let current: u64 = self
+            .conn
+            .prepare_cached("SELECT COALESCE(sum(stored), 0) FROM objects WHERE packed=0")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .unwrap_or(0)
+            .max(0) as u64;
+        current < mem
+    }
+
+    /// Bulk-load remembered file stamps into memory in one sequential scan so
+    /// parallel manifest checks need zero SQLite queries per input.
+    pub fn preload_stamps(&mut self) {
+        if self.stamps_loaded {
+            return;
+        }
+        self.stamps_loaded = true;
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT dev,ino,size,mtime,ctime,digest FROM stamps")
+        else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                Stamp {
+                    dev: r.get::<_, i64>(0)? as u64,
+                    ino: r.get::<_, i64>(1)? as u64,
+                    size: r.get::<_, i64>(2)? as u64,
+                    mtime: r.get(3)?,
+                    ctime: r.get(4)?,
+                },
+                r.get::<_, Digest>(5)?,
+            ))
+        }) else {
+            return;
+        };
+        for (stamp, digest) in rows.flatten() {
+            self.known
+                .entry((stamp.dev, stamp.ino))
+                .or_insert((stamp, digest));
+        }
+    }
+
+    pub fn known_stamps(&self) -> &HashMap<(u64, u64), (Stamp, Digest)> {
+        &self.known
+    }
+
+    pub fn remember_many(&mut self, learned: Vec<(Stamp, Digest)>, hashed_bytes: u64) {
+        for (stamp, digest) in learned {
+            self.remember(stamp, digest);
+        }
+        if hashed_bytes > 0 {
+            self.count("hashed_bytes", hashed_bytes);
+        }
     }
 
     pub fn budget(&self) -> Result<u64> {
@@ -950,7 +1167,102 @@ impl Store {
         }
         self.digest_seen(path, stamp)
     }
+}
 
+/// Result of a lock-free file digest check: the digest, an optional stamp to
+/// remember, and the number of file bytes newly hashed.
+pub type CheckDigest = (Digest, Option<(Stamp, Digest)>, u64);
+
+/// Lock-free file digest lookup for parallel manifest checking. Uses `known`
+/// stamps first and returns `(digest, Option<(stamp_to_remember, digest)>, hashed_bytes)`.
+pub fn digest_for_check(
+    path: &Path,
+    stamp: Stamp,
+    in_target: bool,
+    roots: &Roots,
+    known: &HashMap<(u64, u64), (Stamp, Digest)>,
+) -> io::Result<CheckDigest> {
+    const RLIB_STAMP_BIT: u64 = 1 << 62;
+    let recall = |s: &Stamp| -> Option<Digest> {
+        known
+            .get(&(s.dev, s.ino))
+            .filter(|(k, _)| k == s)
+            .map(|(_, d)| *d)
+    };
+    if in_target {
+        if path.extension() == Some(std::ffi::OsStr::new("rlib")) && stamp.dev & RLIB_STAMP_BIT == 0
+        {
+            let tagged = Stamp {
+                dev: stamp.dev | RLIB_STAMP_BIT,
+                ..stamp
+            };
+            if let Some(digest) = recall(&tagged) {
+                return Ok((digest, None, 0));
+            }
+            if let Some((digest, read)) = scan::digest_rlib(path)? {
+                if !stamp.same_contents(&read) {
+                    return Err(io::Error::other("file changed while it was read"));
+                }
+                let learned = Stamp {
+                    dev: read.dev | RLIB_STAMP_BIT,
+                    ..read
+                };
+                return Ok((digest, Some((learned, digest)), stamp.size));
+            }
+        }
+        if let Some(digest) = recall(&stamp) {
+            return Ok((digest, None, 0));
+        }
+        if stamp.size <= TEXT_LIMIT
+            && let Ok(bytes) = fs::read(path)
+        {
+            let spellings = roots.spellings();
+            let names = spellings
+                .iter()
+                .any(|(_, spelling)| scan::names_path(&bytes, spelling));
+            if names {
+                let marked = if memchr::memchr(0, &bytes).is_none() {
+                    Some(roots.mark(&bytes))
+                } else if path
+                    .file_name()
+                    .is_some_and(|n| n.as_bytes().starts_with(b"dep-"))
+                {
+                    crate::roots::mark_cargo_dep(&bytes, roots).map(std::borrow::Cow::Owned)
+                } else {
+                    None
+                };
+                if let Some(marked) = marked {
+                    let read = fs::metadata(path).map(|meta| Stamp::of(&meta))?;
+                    if !stamp.same_contents(&read) {
+                        return Err(io::Error::other("file changed while it was read"));
+                    }
+                    let digest = *blake3::hash(&marked).as_bytes();
+                    return Ok((digest, Some((read, digest)), 0));
+                }
+            }
+        }
+    }
+    if let Some(digest) = recall(&stamp) {
+        return Ok((digest, None, 0));
+    }
+    match scan::digest_file(path, &[]) {
+        Ok((digest, read, _)) => {
+            if !stamp.same_contents(&read) {
+                return Err(io::Error::other("file changed while it was read"));
+            }
+            Ok((digest, Some((read, digest)), stamp.size))
+        }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            let mut hash = blake3::Hasher::new_derive_key("jato file that may not be read v1");
+            hash.update(&stamp.size.to_le_bytes());
+            hash.update(&stamp.mtime.to_le_bytes());
+            Ok((*hash.finalize().as_bytes(), None, 0))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+impl Store {
     // ---- lookups ----------------------------------------------------------
 
     /// Read from one consistent state of the index until `end_read`,
@@ -1490,7 +1802,8 @@ impl Store {
     /// Copy one output into the cache directory and learn its digest and
     /// which of `roots`' spellings its bytes name.
     pub fn stage(&mut self, file: &Path, roots: &Roots) -> Result<Staged> {
-        let (staged, learned) = stage_file(&self.dir, self.clone, file, roots)?;
+        let hot = self.use_hot_tier();
+        let (staged, learned) = stage_file(&self.dir, self.clone, hot, file, roots)?;
         if let Some((stamp, digest)) = learned {
             self.remember(stamp, digest);
         }
@@ -1504,7 +1817,7 @@ impl Store {
         type Done = Result<(Staged, Option<(Stamp, Digest)>)>;
         let most = std::thread::available_parallelism().map_or(4, |n| n.get());
         let threads = most.clamp(1, 16).min(files.len() / 4 + 1);
-        let (dir, clone) = (self.dir.clone(), self.clone);
+        let (dir, clone, hot) = (self.dir.clone(), self.clone, self.use_hot_tier());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = || -> Vec<(usize, Done)> {
             let mut done = Vec::new();
@@ -1513,7 +1826,7 @@ impl Store {
                 let Some(file) = files.get(at) else {
                     return done;
                 };
-                done.push((at, stage_file(&dir, clone, file, roots)));
+                done.push((at, stage_file(&dir, clone, hot, file, roots)));
             }
         };
         let mut all: Vec<(usize, Done)> = if threads == 1 {
@@ -1764,6 +2077,8 @@ impl Store {
         Ok(Stats {
             directory: self.dir.clone(),
             limit_bytes: self.budget()?,
+            memory_bytes: self.memory_budget()?,
+            hot_bytes: one("SELECT sum(stored) FROM objects WHERE packed=0")?,
             stored_bytes: counters.remove("bytes").unwrap_or(0),
             artifact_bytes: one("SELECT sum(size) FROM objects")?,
             database_bytes,
@@ -1873,18 +2188,26 @@ fn usage(tx: &Transaction<'_>) -> Result<u64> {
         .max(0) as u64)
 }
 
-/// When more than `limit` is stored, remove the least recently used entries
-/// until no more than `target` is.
+/// When more than `limit` is stored, remove the least valuable older entries
+/// until no more than `target` is. Entries used within the last minute follow
+/// strict recency; older entries receive up to one hour of protection scaled
+/// by the build time they saved (`cost_ms`).
 fn evict(tx: &Transaction<'_>, dir: &Path, limit: u64, target: u64) -> Result<()> {
     let mut used = usage(tx)?;
     if used <= limit {
         return Ok(());
     }
     let mut evicted = 0i64;
+    let cutoff = now() - 60_000_000;
     while used > target {
         let batch: Vec<i64> = tx
-            .prepare_cached("SELECT id FROM entries ORDER BY used LIMIT 32")?
-            .query_map([], |r| r.get(0))?
+            .prepare_cached(
+                "SELECT id FROM entries
+                 ORDER BY CASE WHEN used >= ?1 THEN used
+                               ELSE used + MIN(cost_ms * 10000, 3600000000) END
+                 LIMIT 32",
+            )?
+            .query_map([cutoff], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         if batch.is_empty() {
             break;

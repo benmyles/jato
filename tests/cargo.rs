@@ -5505,7 +5505,14 @@ mod tests {
             root.join("tests/runs_app.rs"),
             r#"#[test]
 fn integration_runs_binary() {
-    let bin = std::env::var("CARGO_BIN_EXE_app").unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let bin = exe
+        .ancestors()
+        .find_map(|d| {
+            let p = d.join("app");
+            p.is_file().then_some(p)
+        })
+        .unwrap();
     let out = std::process::Command::new(bin).output().unwrap();
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "one 5");
@@ -5693,4 +5700,116 @@ fn par_ok_{i}() {{
     }
     assert_eq!(p.count("test_miss"), misses_before, "{}", p.stats());
     assert_eq!(p.count("test_hit"), hits_before + 4, "{}", p.stats());
+}
+
+#[test]
+fn memory_hot_tier_parallel_verification_and_why_command_work() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    add_side(&p.root);
+    // Create 600 included files so the build manifest exceeds 512 inputs and
+    // exercises parallel `holds_parallel` and `differences_parallel`.
+    let mut includes = String::from("pub fn sum() -> usize {\n    0");
+    for i in 0..600 {
+        write(p.root.join(format!("leaf/src/f_{i}.txt")), &format!("{i}"));
+        includes.push_str(&format!(" + include_str!(\"f_{i}.txt\").len()"));
+    }
+    includes
+        .push_str("\n}\npub fn value() -> &'static str { include_str!(\"text file\").trim() }\n");
+    write(p.root.join("leaf/src/lib.rs"), &includes);
+    write(
+        p.root.join("src/main.rs"),
+        "fn main() { println!(\"{} {} {}\", leaf::value(), leaf::sum(), side::side()); }\n",
+    );
+    success(
+        Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&p.root),
+    );
+
+    // Configure the RAM hot tier via `jato memory`.
+    let mem_out = success(p.command().args(["memory", "1GiB"]));
+    assert_eq!(
+        String::from_utf8_lossy(&mem_out.stdout).trim(),
+        format!("{} bytes", 1u64 << 30)
+    );
+    let stats = p.stats();
+    assert_eq!(stats["memory_bytes"].as_u64(), Some(1 << 30), "{stats}");
+
+    // Build with `JATO_VERIFY=1`: stores uncompressed hot objects and verifies
+    // single-pass restored bytes in a second checkout (exercising `holds_parallel`).
+    let out1 = success(p.command().env("JATO_VERIFY", "1").args(["run", "-q"]));
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    let stats_after = p.stats();
+    assert!(
+        stats_after["hot_bytes"].as_u64().unwrap_or(0) > 0,
+        "expected uncompressed hot objects: {stats_after}"
+    );
+
+    // Copy checkout with all 600 files so `holds_parallel` gets an exact hit.
+    let c2 = p.temp.path().join("c2");
+    fs::create_dir_all(c2.join("leaf/src")).unwrap();
+    fs::create_dir_all(c2.join("side/src")).unwrap();
+    fs::create_dir_all(c2.join("src")).unwrap();
+    for rel in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/main.rs",
+        "leaf/Cargo.toml",
+        "leaf/src/lib.rs",
+        "leaf/src/text file",
+        "side/Cargo.toml",
+        "side/src/lib.rs",
+    ] {
+        fs::copy(p.root.join(rel), c2.join(rel)).unwrap();
+    }
+    for i in 0..600 {
+        let rel = format!("leaf/src/f_{i}.txt");
+        fs::copy(p.root.join(&rel), c2.join(&rel)).unwrap();
+    }
+    let out2 = success(
+        p.command_in(&c2)
+            .env("JATO_VERIFY", "1")
+            .args(["run", "-q"]),
+    );
+    assert_eq!(out2.stdout, out1.stdout);
+    assert_eq!(p.count("build_hit"), 1, "{}", p.stats());
+
+    // Edit one of the 600 files in a third checkout -> exercises `differences_parallel`!
+    let c3 = p.temp.path().join("c3");
+    fs::create_dir_all(c3.join("leaf/src")).unwrap();
+    fs::create_dir_all(c3.join("side/src")).unwrap();
+    fs::create_dir_all(c3.join("src")).unwrap();
+    for rel in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/main.rs",
+        "leaf/Cargo.toml",
+        "leaf/src/lib.rs",
+        "leaf/src/text file",
+        "side/Cargo.toml",
+        "side/src/lib.rs",
+    ] {
+        fs::copy(p.root.join(rel), c3.join(rel)).unwrap();
+    }
+    for i in 0..600 {
+        let rel = format!("leaf/src/f_{i}.txt");
+        fs::copy(p.root.join(&rel), c3.join(&rel)).unwrap();
+    }
+    write(c3.join("leaf/src/f_321.txt"), "edited-longer");
+    let out3 = success(p.command_in(&c3).args(["run", "-q"]));
+    assert_ne!(out3.stdout, out1.stdout);
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+
+    // `jato why` and `jato memory --unset` work cleanly.
+    let why = success(p.command().arg("why"));
+    assert!(
+        String::from_utf8_lossy(&why.stdout).contains("Last build recorded cleanly"),
+        "{}",
+        String::from_utf8_lossy(&why.stdout)
+    );
+    let unset = success(p.command().args(["memory", "--unset"]));
+    assert_eq!(String::from_utf8_lossy(&unset.stdout).trim(), "0 bytes");
 }

@@ -60,7 +60,9 @@ Usage
   jato dev [ACTION] [ARGS...]       Use the fast development profile (default build)
   jato watch [OPTIONS]             Check on save, with changed packages first
   jato stats [--json]              Show cache contents and counters
+  jato why                         Explain why the last build was not cached or relocated
   jato limit [SIZE|--unset]         Read or set this cache directory's budget
+  jato memory [SIZE|--unset]       Set RAM budget for hot uncompressed tier & index cache
   jato gc [SIZE]                   Evict least-recently-used results to SIZE
   jato --version
 
@@ -79,6 +81,8 @@ recorded and restored only by the commands above.
 Environment
   JATO_CACHE_DIR      Private local cache, default $XDG_CACHE_HOME/jato
   JATO_MAX_SIZE       Cache budget when none is stored with `jato limit`
+  JATO_MEMORY         RAM budget for hot uncompressed objects & SQLite cache
+                      (e.g. 64GiB on a 128GiB server); also `jato memory`
   JATO_JOBS           Compilers running at once across all builds using this
                       cache; default is the number of processors, 0 any number
   JATO_LOG=debug      Explain each decision on stderr; an absolute path
@@ -93,6 +97,8 @@ Environment
   JATO_WHOLE_BUILDS=0 Reuse single compilations only
   JATO_NEAR=0         Never start a build from an earlier one whose sources
                       differ; have Cargo carry out the whole of it
+  JATO_SEED=0         Never seed an empty target from another command's build
+  JATO_ASYNC_RECORD=0 Wait for compiler output staging before waking Cargo
   JATO_TOOLS=0        Leave the C compilers and assemblers that build scripts
                       start to themselves
   JATO_SAVED_STATE=0  Leave rustc's incremental state out of the cache
@@ -644,6 +650,14 @@ fn report(stats: &cas::Stats) -> String {
         mib(stats.limit_bytes),
         mib(stats.artifact_bytes)
     );
+    if stats.memory_bytes > 0 {
+        let _ = writeln!(
+            out,
+            "Memory     {} budget ({} uncompressed hot objects in page cache)",
+            mib(stats.memory_bytes),
+            mib(stats.hot_bytes)
+        );
+    }
     let _ = writeln!(
         out,
         "Index      {}, {} file digests remembered",
@@ -736,6 +750,44 @@ fn run() -> Result<i32> {
                 return say(&format!("{}\n", serde_json::to_string_pretty(&stats)?));
             }
             return say(&report(&stats));
+        }
+        Some("why") if args.len() == 1 => {
+            let stats = Store::open()?.stats()?;
+            let mut out = String::new();
+            use std::fmt::Write;
+            let _ = writeln!(out, "Cache: {}", stats.directory.display());
+            match &stats.unrecorded {
+                Some((ago, why)) => {
+                    let _ = writeln!(out, "Last build not recorded ({ago} s ago): {why}");
+                }
+                None => {
+                    let _ = writeln!(out, "Last build recorded cleanly.");
+                }
+            }
+            if let Some((ago, why)) = &stats.only_there {
+                let _ = writeln!(
+                    out,
+                    "Last recorded build pinned to its target ({ago} s ago): {why}"
+                );
+            }
+            if !stats.clones && stats.memory_bytes == 0 {
+                let _ = writeln!(
+                    out,
+                    "Tip: this filesystem does not clone files. On high-RAM machines, set `jato memory 64GiB` (or use Btrfs/XFS) for near-instant restores."
+                );
+            }
+            return say(&out);
+        }
+        Some("memory") if args.len() <= 2 => {
+            let mut store = Store::open()?;
+            let size = match args.get(1) {
+                None => store.memory_budget()?,
+                Some(arg) if arg == "--unset" || arg == "0" => store.set_memory_budget(None)?,
+                Some(arg) => store.set_memory_budget(Some(parse_size(
+                    arg.to_str().context("size must be UTF-8")?,
+                )?))?,
+            };
+            println!("{size} bytes");
         }
         Some("limit") if args.len() <= 2 => {
             let mut store = Store::open()?;

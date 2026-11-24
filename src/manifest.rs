@@ -725,6 +725,9 @@ impl Manifest {
     /// what does not.
     pub fn holds(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
         self.settled(here)?;
+        if self.inputs.len() >= 512 {
+            return self.holds_parallel(here, store);
+        }
         // What is in the workspace changes most often, and what is outside
         // both roots least. Looking in that order finds a change soonest.
         let by_root = |root: u8| self.inputs.iter().filter(move |input| input.root == root);
@@ -738,6 +741,112 @@ impl Manifest {
         Ok(())
     }
 
+    /// Parallel input check for large whole-build manifests (tens of thousands
+    /// of inputs), using a single bulk stamp scan and lock-free worker threads.
+    fn holds_parallel(&self, here: &mut Here<'_>, store: &mut Store) -> Result<(), String> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        store.preload_stamps();
+        let known = store.known_stamps();
+        let mut order: Vec<usize> = Vec::with_capacity(self.inputs.len());
+        for root in [
+            crate::roots::WORK,
+            crate::roots::TARGET,
+            crate::roots::ABSOLUTE,
+        ] {
+            for (i, input) in self.inputs.iter().enumerate() {
+                if input.root == root {
+                    order.push(i);
+                }
+            }
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(2, 8);
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let chunk = 64usize;
+        let prior_seen = &here.seen;
+        let roots = here.roots;
+        type Lane = (
+            Option<(usize, String)>,
+            Vec<(PathBuf, Seen)>,
+            Vec<(Stamp, Digest)>,
+            u64,
+        );
+        let lanes: Vec<Lane> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut err: Option<(usize, String)> = None;
+                        let mut seen_local: Vec<(PathBuf, Seen)> = Vec::new();
+                        let mut learned_local: Vec<(Stamp, Digest)> = Vec::new();
+                        let mut hashed = 0u64;
+                        loop {
+                            if failed.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let start = next.fetch_add(chunk, Ordering::Relaxed);
+                            if start >= order.len() {
+                                break;
+                            }
+                            let end = (start + chunk).min(order.len());
+                            for (pos, &idx) in order[start..end].iter().enumerate() {
+                                if failed.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let input = &self.inputs[idx];
+                                match self.check_readonly(
+                                    input,
+                                    roots,
+                                    prior_seen,
+                                    known,
+                                    &mut seen_local,
+                                    &mut learned_local,
+                                    &mut hashed,
+                                ) {
+                                    Ok(()) => (),
+                                    Err((why, _)) => {
+                                        failed.store(true, Ordering::Relaxed);
+                                        err = Some((start + pos, why));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        (err, seen_local, learned_local, hashed)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| (None, Vec::new(), Vec::new(), 0))
+                })
+                .collect()
+        });
+        let mut first_err: Option<(usize, String)> = None;
+        let mut learned = Vec::new();
+        let mut hashed_bytes = 0u64;
+        for (err, seen_local, learned_local, hashed) in lanes {
+            for (path, seen) in seen_local {
+                here.seen.entry(path).or_insert(seen);
+            }
+            learned.extend(learned_local);
+            hashed_bytes += hashed;
+            if let Some((pos, why)) = err
+                && first_err.as_ref().is_none_or(|(p, _)| pos < *p)
+            {
+                first_err = Some((pos, why));
+            }
+        }
+        store.remember_many(learned, hashed_bytes);
+        match first_err {
+            Some((_, why)) => Err(why),
+            None => Ok(()),
+        }
+    }
+
     /// Every input that is not as it was recorded, where everything else
     /// the manifest records holds, but for where it was made. An error
     /// says what else does not, or that more than `most` inputs differ.
@@ -748,6 +857,9 @@ impl Manifest {
         most: usize,
     ) -> Result<Vec<Difference>, String> {
         self.settled_anywhere(here)?;
+        if self.inputs.len() >= 512 {
+            return self.differences_parallel(here, store, most);
+        }
         let mut found = Vec::new();
         for (at, input) in self.inputs.iter().enumerate() {
             if let Err((why, changed)) = self.as_recorded(input, here, store) {
@@ -762,6 +874,258 @@ impl Manifest {
             }
         }
         Ok(found)
+    }
+
+    fn differences_parallel(
+        &self,
+        here: &mut Here<'_>,
+        store: &mut Store,
+        most: usize,
+    ) -> Result<Vec<Difference>, String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        store.preload_stamps();
+        let known = store.known_stamps();
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(2, 8);
+        let next = AtomicUsize::new(0);
+        let diff_count = AtomicUsize::new(0);
+        let chunk = 64usize;
+        let prior_seen = &here.seen;
+        let roots = here.roots;
+        type Lane = (
+            Vec<(Difference, String)>,
+            Vec<(PathBuf, Seen)>,
+            Vec<(Stamp, Digest)>,
+            u64,
+        );
+        let lanes: Vec<Lane> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut diffs: Vec<(Difference, String)> = Vec::new();
+                        let mut seen_local: Vec<(PathBuf, Seen)> = Vec::new();
+                        let mut learned_local: Vec<(Stamp, Digest)> = Vec::new();
+                        let mut hashed = 0u64;
+                        loop {
+                            if diff_count.load(Ordering::Relaxed) > most {
+                                break;
+                            }
+                            let start = next.fetch_add(chunk, Ordering::Relaxed);
+                            if start >= self.inputs.len() {
+                                break;
+                            }
+                            let end = (start + chunk).min(self.inputs.len());
+                            for at in start..end {
+                                if diff_count.load(Ordering::Relaxed) > most {
+                                    break;
+                                }
+                                let input = &self.inputs[at];
+                                if let Err((why, changed)) = self.check_readonly(
+                                    input,
+                                    roots,
+                                    prior_seen,
+                                    known,
+                                    &mut seen_local,
+                                    &mut learned_local,
+                                    &mut hashed,
+                                ) {
+                                    diff_count.fetch_add(1, Ordering::Relaxed);
+                                    diffs.push((
+                                        Difference {
+                                            input: at as u32,
+                                            contents: changed == Changed::Contents,
+                                            entries: changed == Changed::Entries,
+                                        },
+                                        why,
+                                    ));
+                                }
+                            }
+                        }
+                        (diffs, seen_local, learned_local, hashed)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| (Vec::new(), Vec::new(), Vec::new(), 0))
+                })
+                .collect()
+        });
+        let mut all_diffs: Vec<(Difference, String)> = Vec::new();
+        let mut learned = Vec::new();
+        let mut hashed_bytes = 0u64;
+        for (diffs, seen_local, learned_local, hashed) in lanes {
+            all_diffs.extend(diffs);
+            for (path, seen) in seen_local {
+                here.seen.entry(path).or_insert(seen);
+            }
+            learned.extend(learned_local);
+            hashed_bytes += hashed;
+        }
+        store.remember_many(learned, hashed_bytes);
+        all_diffs.sort_by_key(|(d, _)| d.input);
+        if all_diffs.len() > most {
+            let why = &all_diffs[most].1;
+            return Err(format!("{why}, and more than {most} other files"));
+        }
+        Ok(all_diffs.into_iter().map(|(d, _)| d).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_readonly(
+        &self,
+        input: &Input,
+        roots: &Roots,
+        prior_seen: &HashMap<PathBuf, Seen>,
+        known: &HashMap<(u64, u64), (Stamp, Digest)>,
+        seen_local: &mut Vec<(PathBuf, Seen)>,
+        learned_local: &mut Vec<(Stamp, Digest)>,
+        hashed: &mut u64,
+    ) -> Result<(), (String, Changed)> {
+        let other = |why: String| Err((why, Changed::Otherwise));
+        let Some(path) = roots.join(input.root, &input.path) else {
+            return other("it was recorded with a target directory this command lacks".into());
+        };
+        let mut from_prior = false;
+        let mut seen = if let Some(s) = prior_seen.get(&path) {
+            from_prior = true;
+            s.clone()
+        } else {
+            let absent = |e: &io::Error| {
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                )
+            };
+            match fs::symlink_metadata(&path) {
+                Err(e) if absent(&e) => Seen {
+                    link: None,
+                    kind: Kind::Absent,
+                    stamp: None,
+                    digest: None,
+                },
+                Err(e) => return other(format!("{} cannot be examined: {e}", path.display())),
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let target = match fs::read_link(&path) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return other(format!("{} cannot be examined: {e}", path.display()));
+                        }
+                    };
+                    let link = Some(roots.mark_os(target.as_os_str()).into_owned());
+                    match fs::metadata(&path) {
+                        Ok(meta) => Seen {
+                            link,
+                            kind: kind_of(&meta),
+                            stamp: Some(Stamp::of(&meta)),
+                            digest: None,
+                        },
+                        Err(e) if absent(&e) => Seen {
+                            link,
+                            kind: Kind::Absent,
+                            stamp: None,
+                            digest: None,
+                        },
+                        Err(e) => {
+                            return other(format!("{} cannot be examined: {e}", path.display()));
+                        }
+                    }
+                }
+                Ok(meta) => Seen {
+                    link: None,
+                    kind: kind_of(&meta),
+                    stamp: Some(Stamp::of(&meta)),
+                    digest: None,
+                },
+            }
+        };
+        let mut push_seen = |s: Seen| {
+            if !from_prior || s.digest.is_some() {
+                seen_local.push((path.clone(), s));
+            }
+        };
+        if seen.link != input.link {
+            push_seen(seen);
+            return other(format!("{} is a different link", path.display()));
+        }
+        let changed = || format!("{} changed", path.display());
+        match (&input.state, seen.kind) {
+            (State::Absent, Kind::Absent) => {
+                push_seen(seen);
+                Ok(())
+            }
+            (State::Absent, _) => {
+                push_seen(seen);
+                other(format!("{} now exists", path.display()))
+            }
+            (_, Kind::Absent) => {
+                push_seen(seen);
+                other(format!("{} is gone", path.display()))
+            }
+            (State::Dir(None), Kind::Dir) => {
+                push_seen(seen);
+                Ok(())
+            }
+            (State::Dir(Some(recorded)), Kind::Dir) => {
+                push_seen(seen);
+                let outputs = self
+                    .outputs
+                    .iter()
+                    .map(|out| (out.root, out.path.as_path()));
+                let own = own_names((input.root, &input.path), &path, outputs, roots);
+                match list(&path, &own) {
+                    Ok(names) if names == *recorded => Ok(()),
+                    Ok(_) => Err((
+                        format!("the entries of {} changed", path.display()),
+                        Changed::Entries,
+                    )),
+                    Err(e) => other(format!("{}: {e}", path.display())),
+                }
+            }
+            (State::File(recorded), Kind::File) => {
+                let digest = match seen.digest {
+                    Some(digest) => digest,
+                    None => {
+                        let stamp = seen.stamp.unwrap();
+                        let res = crate::cas::digest_for_check(
+                            &path,
+                            stamp,
+                            input.root == crate::roots::TARGET,
+                            roots,
+                            known,
+                        );
+                        let (digest, learned, bytes) = match res {
+                            Ok(v) => v,
+                            Err(e) => {
+                                push_seen(seen);
+                                return other(format!("{}: {e}", path.display()));
+                            }
+                        };
+                        if let Some(pair) = learned {
+                            learned_local.push(pair);
+                        }
+                        *hashed += bytes;
+                        seen.digest = Some(digest);
+                        digest
+                    }
+                };
+                push_seen(seen);
+                if digest == *recorded {
+                    Ok(())
+                } else {
+                    Err((changed(), Changed::Contents))
+                }
+            }
+            _ => {
+                push_seen(seen);
+                other(changed())
+            }
+        }
     }
 
     /// Which parts a build that starts from this one has to make again,

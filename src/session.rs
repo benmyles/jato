@@ -24,7 +24,7 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 const HIT: u8 = 0;
@@ -132,9 +132,35 @@ struct Server {
     /// Requests still being served, some past the point where their
     /// compiler was told it is done.
     busy: std::sync::atomic::AtomicUsize,
+    /// Caps concurrent asynchronous unit recording so background hashing and
+    /// compression never starve active compilations.
+    recorders: (Mutex<usize>, Condvar),
+    recorder_limit: usize,
+}
+
+struct RecorderSlot<'a>(&'a Server);
+
+impl Drop for RecorderSlot<'_> {
+    fn drop(&mut self) {
+        let mut active = self.0.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.0.recorders.1.notify_one();
+    }
 }
 
 impl Server {
+    fn acquire_recorder(&self) -> RecorderSlot<'_> {
+        let mut active = self.recorders.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.recorder_limit {
+            active = self
+                .recorders
+                .1
+                .wait(active)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        RecorderSlot(self)
+    }
     fn store(&self) -> Result<Store> {
         let spare = self.stores.lock().unwrap_or_else(|e| e.into_inner()).pop();
         match spare {
@@ -281,37 +307,72 @@ impl Server {
             &mut store,
             std::time::Duration::from_millis(r.number()?),
         );
-        let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
-            Ok(manifest) => {
-                self.used(&job, &manifest, cargo, under);
-                Some(report)
-            }
-            // A build goes on after a command that failed where the
-            // failure was an answer: a build script asking whether
-            // something compiles. And a build script's compiler whose
-            // result cannot be kept did what it did all the same. Either
-            // way it was the build's doing, as it would have been without
-            // a record of its own.
-            Err(_) if job.tool || !ran.success => {
-                self.scopes.absorb(report, under);
-                None
-            }
-            // A Rust compilation that worked but cannot be reused leaves
-            // nothing to say what it depended on.
-            Err(why) => {
-                self.unusable(&format!("{}: {why}", job.name()));
-                None
-            }
-        };
-        drop(lock);
-        store.flush();
-        let _ = wire::send(&mut stream, &[0]);
-        // Cargo has its answer and goes on. What the compiler saved for a
-        // next time is kept meanwhile.
-        if let Some(report) = recorded {
-            let left = command::Left::Seen(&report.state);
-            command::keep_state(&job, &mut store, &recipe, left);
+        // For a successful rustc compilation, release Cargo immediately so
+        // downstream crates start with zero critical-path wait while we hash,
+        // stage, and commit the unit in the background (still tracked by
+        // `server.busy` before the whole build is recorded). Build-script C
+        // tools stay synchronous because build scripts may archive or delete
+        // their `.o` files right after the tool exits.
+        let async_record = ran.success
+            && !job.tool
+            && job.facts.compiles()
+            && report.incomplete.is_none()
+            && !report.network
+            && std::env::var_os("JATO_ASYNC_RECORD").is_none_or(|v| v != "0");
+        if async_record {
+            let _ = wire::send(&mut stream, &[0]);
+            drop(stream);
+            let _slot = self.acquire_recorder();
+            let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
+                Ok(manifest) => {
+                    self.used(&job, &manifest, cargo, under);
+                    Some(report)
+                }
+                Err(why) => {
+                    self.unusable(&format!("{}: {why}", job.name()));
+                    None
+                }
+            };
+            drop(lock);
             store.flush();
+            if let Some(report) = recorded {
+                let left = command::Left::Seen(&report.state);
+                command::keep_state(&job, &mut store, &recipe, left);
+                store.flush();
+            }
+        } else {
+            let recorded = match command::finish(&job, &mut store, &recipe, &ran, &report, None) {
+                Ok(manifest) => {
+                    self.used(&job, &manifest, cargo, under);
+                    Some(report)
+                }
+                // A build goes on after a command that failed where the
+                // failure was an answer: a build script asking whether
+                // something compiles. And a build script's compiler whose
+                // result cannot be kept did what it did all the same. Either
+                // way it was the build's doing, as it would have been without
+                // a record of its own.
+                Err(_) if job.tool || !ran.success => {
+                    self.scopes.absorb(report, under);
+                    None
+                }
+                // A Rust compilation that worked but cannot be reused leaves
+                // nothing to say what it depended on.
+                Err(why) => {
+                    self.unusable(&format!("{}: {why}", job.name()));
+                    None
+                }
+            };
+            drop(lock);
+            store.flush();
+            let _ = wire::send(&mut stream, &[0]);
+            // Cargo has its answer and goes on. What the compiler saved for a
+            // next time is kept meanwhile.
+            if let Some(report) = recorded {
+                let left = command::Left::Seen(&report.state);
+                command::keep_state(&job, &mut store, &recipe, left);
+                store.flush();
+            }
         }
         self.stores
             .lock()
@@ -836,6 +897,8 @@ fn supervise(
     // here would hide its closing.
     let child_err = child.stderr.take();
     drop(cmd);
+    let recorder_limit =
+        (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).clamp(2, 8);
     let server = Arc::new(Server {
         scopes: session.scopes(),
         roots: job.roots.clone(),
@@ -844,6 +907,8 @@ fn supervise(
         stores: Mutex::new(Vec::new()),
         stop: AtomicBool::new(false),
         busy: std::sync::atomic::AtomicUsize::new(0),
+        recorders: (Mutex::new(0), Condvar::new()),
+        recorder_limit,
     });
     let accepting = server.clone();
     let accept = std::thread::spawn(move || {
