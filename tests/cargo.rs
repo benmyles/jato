@@ -122,6 +122,8 @@ impl Project {
             .env_remove("JATO_CACHE_SCRIPTS")
             .env_remove("JATO_RECORD_EDITS")
             .env_remove("JATO_MOUNT")
+            .env_remove("CI")
+            .env_remove("CARGO_INCREMENTAL")
             .env_remove("NO_COLOR")
             .env_remove("CLICOLOR")
             .env_remove("CLICOLOR_FORCE")
@@ -2225,6 +2227,9 @@ fn cargo_is_given_its_tokens_by_name_unless_something_says_how_many() {
         success(
             p.command()
                 .env("JATO_JOBSERVER", "1")
+                // The test script inspects CARGO_MAKEFLAGS itself, which build-script
+                // caching intentionally excludes so jobserver pipes never bust the cache.
+                .env("JATO_CACHE_SCRIPTS", "0")
                 .env("CARGO_TARGET_DIR", target)
                 .arg("build")
                 .args(more),
@@ -2341,6 +2346,17 @@ fn a_recorded_build_gives_way_to_anything_that_changed() {
     p.run(&["build"]);
     success(p.command().env("UNRELATED", "x").args(["build"]));
     assert_eq!(builds(), (before.0 + 2, before.1), "{}", p.stats());
+
+    // CI changes Cargo 1.100+'s default incremental setting, so it has its own
+    // whole-build recipe and never collides with a local build.
+    p.clean();
+    let before = builds();
+    success(p.command().env("CI", "true").args(["build"]));
+    assert_eq!(builds(), (before.0, before.1 + 1), "{}", p.stats());
+    success(p.command().env("CI", "true").args(["build"]));
+    assert_eq!(builds(), (before.0 + 1, before.1 + 1), "{}", p.stats());
+    p.run(&["build"]);
+    assert_eq!(p.stale_for_cargo(&p.root, &p.root.join("target")), 0);
 
     // A manifest.
     let manifest = fs::read_to_string(p.root.join("leaf/Cargo.toml")).unwrap();

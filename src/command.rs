@@ -27,7 +27,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v10";
+const EPOCH: &str = "jato command v11";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -606,7 +606,7 @@ impl Job {
                     || name.starts_with(b"RUST")
                     || matches!(
                         name,
-                        b"TERM" | b"NO_COLOR" | b"CLICOLOR" | b"CLICOLOR_FORCE"
+                        b"CI" | b"TERM" | b"NO_COLOR" | b"CLICOLOR" | b"CLICOLOR_FORCE"
                     )
                     || name == crate::manifest::LIBRARY_PATH)
             }
@@ -2744,6 +2744,8 @@ fn build_profile_tag(job: &Job) -> (Digest, u8) {
                 | b"CARGO_BUILD_RUSTFLAGS"
                 | b"CARGO_BUILD_TARGET"
                 | b"CARGO_BUILD_JOBS"
+                | b"CARGO_INCREMENTAL"
+                | b"CI"
                 | b"RUSTC_WORKSPACE_WRAPPER"
         ) || bytes.starts_with(b"CARGO_PROFILE_");
         if affects {
