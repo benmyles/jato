@@ -307,13 +307,14 @@ impl Server {
             &mut store,
             std::time::Duration::from_millis(r.number()?),
         );
-        // For a successful rustc compilation, release Cargo immediately so
-        // downstream crates start with zero critical-path wait while we hash,
-        // stage, and commit the unit in the background (still tracked by
-        // `server.busy` before the whole build is recorded). Build-script C
-        // tools stay synchronous because build scripts may archive or delete
-        // their `.o` files right after the tool exits.
-        let async_record = ran.success
+        // For a successful rustc compilation started by Cargo itself (not by a
+        // build script probe, which may delete its temp output directory right
+        // after rustc exits), release Cargo immediately so downstream crates
+        // start with zero critical-path wait while we hash, stage, and commit
+        // the unit in the background (still tracked by `server.busy` before
+        // the whole build is recorded).
+        let async_record = cargo
+            && ran.success
             && !job.tool
             && job.facts.compiles()
             && report.incomplete.is_none()
