@@ -418,6 +418,106 @@ fn replace_path(text: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Rewrite root paths inside Cargo's binary `dep-*` fingerprint file,
+/// replacing each root with its mark and adjusting the length prefixes.
+/// Returns `None` if `bytes` is not in Cargo's `dep-*` format or contains
+/// no root path.
+pub fn mark_cargo_dep(bytes: &[u8], roots: &Roots) -> Option<Vec<u8>> {
+    transform_cargo_dep(bytes, |field| {
+        let marked = roots.mark(field);
+        let changed = matches!(marked, Cow::Owned(_));
+        Some((marked.into_owned(), changed))
+    })
+}
+
+/// Inverse of `mark_cargo_dep`: restore real root paths for this checkout
+/// and adjust the length prefixes. Returns `None` if `bytes` is not valid
+/// or references a root this command lacks.
+pub fn unmark_cargo_dep(bytes: &[u8], roots: &Roots) -> Option<Vec<u8>> {
+    let mut changed_any = false;
+    let out = transform_cargo_dep(bytes, |field| {
+        let unmarked = roots.unmark(field)?;
+        let changed = matches!(unmarked, Cow::Owned(_));
+        changed_any |= changed;
+        Some((unmarked.into_owned(), true))
+    })?;
+    let _ = changed_any;
+    Some(out)
+}
+
+fn transform_cargo_dep(
+    bytes: &[u8],
+    mut rewrite: impl FnMut(&[u8]) -> Option<(Vec<u8>, bool)>,
+) -> Option<Vec<u8>> {
+    struct Bytes<'a>(&'a [u8]);
+    impl<'a> Bytes<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let (head, rest) = self.0.split_at_checked(n)?;
+            self.0 = rest;
+            Some(head)
+        }
+        fn count(&mut self) -> Option<usize> {
+            let n = u32::from_le_bytes(self.take(4)?.try_into().ok()?) as usize;
+            (n <= self.0.len()).then_some(n)
+        }
+        fn text(&mut self) -> Option<&'a [u8]> {
+            let n = self.count()?;
+            self.take(n)
+        }
+    }
+    let mut b = Bytes(bytes);
+    let mut out = Vec::with_capacity(bytes.len() + 32);
+    let mut changed = false;
+    let first = b.take(4)?;
+    out.extend_from_slice(first);
+    let mut files = u32::from_le_bytes(first.try_into().ok()?) as usize;
+    let checksums = b.0.first() == Some(&0xff);
+    if checksums {
+        out.extend_from_slice(b.take(2)?);
+        let count_bytes = b.take(4)?;
+        out.extend_from_slice(count_bytes);
+        files = u32::from_le_bytes(count_bytes.try_into().ok()?) as usize;
+    }
+    if files > b.0.len() {
+        return None;
+    }
+    for _ in 0..files {
+        out.extend_from_slice(b.take(1)?);
+        let path = b.text()?;
+        let (new_path, did) = rewrite(path)?;
+        changed |= did;
+        out.extend_from_slice(&u32::try_from(new_path.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(&new_path);
+        if checksums {
+            let has = b.take(1)?;
+            out.extend_from_slice(has);
+            if has != [0] {
+                out.extend_from_slice(b.take(8)?);
+                let csum = b.text()?;
+                out.extend_from_slice(&(csum.len() as u32).to_le_bytes());
+                out.extend_from_slice(csum);
+            }
+        }
+    }
+    let env_count = b.count()?;
+    out.extend_from_slice(&(env_count as u32).to_le_bytes());
+    for _ in 0..env_count {
+        let name = b.text()?;
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name);
+        let has = b.take(1)?;
+        out.extend_from_slice(has);
+        if has != [0] {
+            let val = b.text()?;
+            let (new_val, did) = rewrite(val)?;
+            changed |= did;
+            out.extend_from_slice(&u32::try_from(new_val.len()).ok()?.to_le_bytes());
+            out.extend_from_slice(&new_val);
+        }
+    }
+    (b.0.is_empty() && changed).then_some(out)
+}
+
 #[cfg(test)]
 mod surroundings {
     use super::*;
@@ -622,5 +722,50 @@ mod tests {
         assert!(!plain(Path::new("/")));
         assert!(!plain(Path::new("/a/../b")));
         assert!(!plain(Path::new("relative/dir")));
+    }
+
+    #[test]
+    fn cargo_dep_files_relocate_root_paths_in_both_layouts() {
+        let a = roots("/checkouts/first", "/checkouts/first/target");
+        let b = roots("/other/second", "/other/second/target");
+        // New checksum layout (Cargo 1.100): one absolute path under WORK and one env value under TARGET.
+        let mut dep = b"\x01\0\0\0\xff\x01\x01\0\0\0\x02".to_vec();
+        let p = b"/checkouts/first/data/input.txt";
+        dep.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        dep.extend_from_slice(p);
+        dep.push(0); // no checksum
+        dep.extend_from_slice(&1u32.to_le_bytes()); // 1 env
+        dep.extend_from_slice(&3u32.to_le_bytes());
+        dep.extend_from_slice(b"DIR");
+        dep.push(1);
+        let v = b"/checkouts/first/target/out";
+        dep.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        dep.extend_from_slice(v);
+
+        let marked = mark_cargo_dep(&dep, &a).expect("should mark");
+        assert!(!names(&marked, b"/checkouts/first"));
+        let restored = unmark_cargo_dep(&marked, &b).expect("should unmark");
+        assert!(names(&restored, b"/other/second/data/input.txt"));
+        assert!(names(&restored, b"/other/second/target/out"));
+        // Round-trip back to `a` matches byte for byte.
+        assert_eq!(unmark_cargo_dep(&marked, &a).unwrap(), dep);
+
+        // Old layout (Cargo 1.89) without checksum marker.
+        let mut old = b"\x01\0\0\0\x00".to_vec();
+        old.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        old.extend_from_slice(p);
+        old.extend_from_slice(&0u32.to_le_bytes());
+        let marked_old = mark_cargo_dep(&old, &a).expect("should mark old");
+        assert_eq!(unmark_cargo_dep(&marked_old, &a).unwrap(), old);
+        assert!(names(
+            &unmark_cargo_dep(&marked_old, &b).unwrap(),
+            b"/other/second/data/input.txt"
+        ));
+
+        // Relative-only dep file returns None (no root to mark).
+        let rel = b"\x01\0\0\0\xff\x01\x01\0\0\0\0\x0a\0\0\0src/lib.rs\0\0\0\0\0";
+        assert_eq!(mark_cargo_dep(rel, &a), None);
+        // Malformed bytes return None.
+        assert_eq!(mark_cargo_dep(b"not a dep file", &a), None);
     }
 }

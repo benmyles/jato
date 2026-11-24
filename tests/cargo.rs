@@ -1503,10 +1503,9 @@ fn what_a_build_script_reads_has_it_run_again_and_settings_leave_nothing_to_star
     assert_eq!(out.stdout, b"1 one:set 5\n");
     assert_eq!(p.count("build_near"), 3, "{}", p.stats());
     // The build script itself differs. Its compiler is one of Cargo's, so
-    // the build starts from the first, and Cargo builds the script again
-    // and runs it. What it then leaves in a directory the first script
-    // wrote to is not what a build from nothing would leave, so that
-    // build is not kept to be put back elsewhere.
+    // the build starts from the first, leaves out the earlier script's
+    // outputs so the new version runs in a clean directory, and records
+    // the finished build for other checkouts.
     let fifth = copy("fifth", "1");
     let script = fs::read_to_string(fifth.join("build.rs")).unwrap();
     write(
@@ -1518,7 +1517,18 @@ fn what_a_build_script_reads_has_it_run_again_and_settings_leave_nothing_to_star
     let out = success(p.command_in(&fifth).args(["run", "-q"]));
     assert_eq!(out.stdout, b"11 one:none 5\n");
     assert_eq!(p.count("build_near"), 4, "{}", p.stats());
-    assert_eq!(p.count("build_stored"), stored, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), stored + 1, "{}", p.stats());
+    // A copy of `fifth` gets that recorded build whole.
+    let seventh = checkout(&p, "seventh");
+    ready(&seventh, "1");
+    write(
+        seventh.join("build.rs"),
+        &script.replace("number.trim()", "number.trim().repeat(2)"),
+    );
+    let hits = p.count("build_hit");
+    let out = success(p.command_in(&seventh).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"11 one:none 5\n");
+    assert_eq!(p.count("build_hit"), hits + 1, "{}", p.stats());
 }
 
 /// Every file under a target directory but the compiler's saved state,
@@ -4972,4 +4982,305 @@ fn nightly_split_metadata_and_unstable_options_are_ordinary_commands() {
     let (hits, misses) =
         p.during(|| assert_eq!(build("-Zthreads=4 -Zmacro-backtrace").stdout, b"one:none\n"));
     assert_eq!((hits, misses), (2, 0), "{}", p.stats());
+}
+
+/// Real-world build script cases across checkouts:
+/// 1. A build script invoking `git rev-parse HEAD` (like ripgrep/cargo/rust-analyzer/nushell)
+///    still starts from an earlier build in a new git worktree (rerunning only that script).
+/// 2. A build script printing `cargo:rerun-if-changed=<abs path>` relocates Cargo's binary
+///    `dep-*` fingerprint so Cargo does not rerun the script after a restore in another checkout.
+/// 3. A build script rewriting `conftest.c` between `cc -c` runs (like autoconf/jemalloc)
+///    is still recorded as a whole build.
+/// 4. A `cc`-style hashed object name (`<16-hex>-foo.o`) hits cache under a different hash.
+#[test]
+fn real_world_build_scripts_work_across_worktrees() {
+    if !observes() {
+        return;
+    }
+    // 1. Build script calling git rev-parse HEAD + absolute rerun-if-changed path.
+    let p = Project::whole();
+    write(p.root.join("data.txt"), "hello");
+    write(
+        p.root.join("build.rs"),
+        r#"use std::process::Command;
+fn main() {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let abs = format!("{dir}/data.txt");
+    println!("cargo:rerun-if-changed={abs}");
+    let data = std::fs::read_to_string(&abs).unwrap();
+    let rev = Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=GIT_REV={rev}");
+    println!("cargo:rustc-env=DATA_VAL={}", data.trim());
+}
+"#,
+    );
+    write(
+        p.root.join("src/main.rs"),
+        r#"fn main() { println!("{} {} {}", env!("GIT_REV"), env!("DATA_VAL"), leaf::value()); }"#,
+    );
+    write(p.root.join(".gitignore"), "/target\n");
+    p.run(&["cargo", "generate-lockfile"]);
+    git(&p.root, &["init", "-q", "-b", "main"]);
+    git(&p.root, &["config", "user.email", "t@example.com"]);
+    git(&p.root, &["config", "user.name", "t"]);
+    git(&p.root, &["add", "."]);
+    git(&p.root, &["commit", "-q", "-m", "init"]);
+
+    let rev1 = String::from_utf8(
+        success(
+            Command::new("git")
+                .current_dir(&p.root)
+                .args(["rev-parse", "--short=8", "HEAD"]),
+        )
+        .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let out1 = p.run(&["run", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out1.stdout),
+        format!("{rev1} hello one:none\n")
+    );
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+
+    // A new worktree at the same commit: `.git` is a file pointing to `a/.git/worktrees/wt1`.
+    // The build MUST start from `p.root`'s recorded build (`build_near == 1`) instead of cold.
+    let wt1 = p.temp.path().join("wt1");
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt1.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let out_wt1 = success(p.command_in(&wt1).args(["run", "-q"]));
+    assert_eq!(
+        String::from_utf8_lossy(&out_wt1.stdout),
+        format!("{rev1} hello one:none\n")
+    );
+    assert_eq!(p.count("build_near"), 1, "{}", p.stats());
+    assert_eq!(p.count("build_stored"), 2, "{}", p.stats());
+
+    // A third worktree with an edit to `leaf`: MUST also start from a recorded build.
+    let wt2 = p.temp.path().join("wt2");
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt2.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    write(wt2.join("leaf/src/text file"), "edited");
+    let out_wt2 = success(p.command_in(&wt2).args(["run", "-q"]));
+    assert_eq!(
+        String::from_utf8_lossy(&out_wt2.stdout),
+        format!("{rev1} hello edited:none\n")
+    );
+    assert_eq!(p.count("build_near"), 2, "{}", p.stats());
+
+    // 2. Absolute `rerun-if-changed`: build in `c1`, restore in `c2`, remove `c1`,
+    // and verify Cargo alone sees 0 stale crates in `c2`!
+    let q = Project::whole();
+    add_side(&q.root);
+    success(
+        Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&q.root),
+    );
+    let setup_abs = |root: &Path| {
+        write(root.join("data.txt"), "v1");
+        write(
+            root.join("build.rs"),
+            r#"fn main() {
+    let abs = format!("{}/data.txt", std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed={abs}");
+    let v = std::fs::read_to_string(&abs).unwrap();
+    println!("cargo:rustc-env=DATA_VAL={}", v.trim());
+}
+"#,
+        );
+        write(
+            root.join("src/main.rs"),
+            r#"fn main() { println!("{}", env!("DATA_VAL")); }"#,
+        );
+    };
+    let c1 = checkout(&q, "c1");
+    setup_abs(&c1);
+    assert_eq!(
+        success(q.command_in(&c1).args(["run", "-q"])).stdout,
+        b"v1\n"
+    );
+    let c2 = checkout(&q, "c2");
+    setup_abs(&c2);
+    let hits = q.count("build_hit");
+    assert_eq!(
+        success(q.command_in(&c2).args(["run", "-q"])).stdout,
+        b"v1\n"
+    );
+    assert_eq!(q.count("build_hit"), hits + 1, "{}", q.stats());
+    fs::remove_dir_all(&c1).unwrap();
+    assert_eq!(
+        q.stale_for_cargo(&c2, &c2.join("target")),
+        0,
+        "absolute rerun-if-changed should be relocated in dep-*"
+    );
+
+    // 3 & 4. Build script rewriting `conftest.c` + compiling a hashed `-o <16-hex>-foo.o`.
+    let r = Project::whole();
+    add_side(&r.root);
+    success(
+        Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&r.root),
+    );
+    let setup_c = |root: &Path, hash_hex: &str| {
+        write(
+            root.join("build.rs"),
+            &format!(
+                r#"use std::process::Command;
+fn main() {{
+    let out = std::env::var("OUT_DIR").unwrap();
+    // Simulate autoconf rewriting conftest.c between two cc calls.
+    let conf = format!("{{out}}/conftest.c");
+    std::fs::write(&conf, "int f(void) {{ return 1; }}\n").unwrap();
+    let st1 = Command::new("cc").args(["-c", &conf, "-o", &format!("{{out}}/c1.o")]).status().unwrap();
+    assert!(st1.success());
+    std::fs::write(&conf, "int g(void) {{ return 2; }}\n").unwrap();
+    let st2 = Command::new("cc").args(["-c", &conf, "-o", &format!("{{out}}/c2.o")]).status().unwrap();
+    assert!(st2.success());
+    let _ = std::fs::remove_file(&conf);
+    // Simulate cc crate hashing OUT_DIR into the .o filename.
+    let gen = format!("{{out}}/gen.c");
+    std::fs::write(&gen, "int answer(void) {{ return 42; }}\n").unwrap();
+    let obj = format!("{{out}}/{hash_hex}-gen.o");
+    let st3 = Command::new("cc").args(["-c", &gen, "-o", &obj]).status().unwrap();
+    assert!(st3.success());
+    let lib = format!("{{out}}/libgen.a");
+    let st4 = Command::new("ar").args(["crs", &lib, &obj]).status().unwrap();
+    assert!(st4.success());
+    println!("cargo:rustc-link-search=native={{out}}");
+    println!("cargo:rustc-link-lib=static=gen");
+}}
+"#
+            ),
+        );
+        write(
+            root.join("src/main.rs"),
+            "unsafe extern \"C\" { fn answer() -> i32; }\nfn main() { println!(\"{}\", unsafe { answer() }); }\n",
+        );
+    };
+    let s1 = checkout(&r, "s1");
+    setup_c(&s1, "1111222233334444");
+    assert_eq!(
+        success(r.command_in(&s1).args(["run", "-q"])).stdout,
+        b"42\n"
+    );
+    assert_eq!(r.count("build_stored"), 1, "{}", r.stats());
+    // In a second checkout with a DIFFERENT 16-hex hash prefix, compiling `gen.c` MUST hit cache!
+    let s2 = checkout(&r, "s2");
+    setup_c(&s2, "aaaabbbbccccdddd");
+    let tool_hits_before = r.count("tool_hit");
+    let mut cmd = r.command_in(&s2);
+    cmd.env("JATO_WHOLE_BUILDS", "0").args(["run", "-q"]);
+    assert_eq!(success(&mut cmd).stdout, b"42\n");
+    assert!(
+        r.count("tool_hit") > tool_hits_before,
+        "hashed cc -o should hit cache under another 16-hex prefix: {}",
+        r.stats()
+    );
+}
+
+/// Recompiling an incremental library from identical sources produces a
+/// different `.rlib` byte-for-byte on rustc (random CGU session suffix),
+/// yet downstream linking must still hit the cache without relinking.
+#[test]
+fn downstream_binary_hits_cache_across_recompiled_incremental_rlib() {
+    let Some(rustc) = std::env::var_os("JATO_TEST_NIGHTLY") else {
+        return;
+    };
+    if !observes() {
+        return;
+    }
+    let cargo = Path::new(&rustc).with_file_name("cargo");
+    let p = Project::new();
+    let run_in = |target: &Path, extra_env: Option<(&str, &str)>| {
+        let mut cmd = p.command();
+        cmd.env("CARGO", &cargo)
+            .env("RUSTC", &rustc)
+            .env("CARGO_TARGET_DIR", target)
+            .env("CARGO_INCREMENTAL", "1")
+            .env_remove("RUSTUP_TOOLCHAIN");
+        if let Some((k, v)) = extra_env {
+            cmd.env(k, v);
+        }
+        cmd.args(["run", "-q"]);
+        success(&mut cmd)
+    };
+    // Build once with Jato into `t1` (records `leaf` and `app`).
+    let t1 = p.temp.path().join("t1");
+    assert_eq!(run_in(&t1, None).stdout, b"one:none\n");
+
+    // Build `leaf` fresh into `t2` with a separate empty cache so rustc
+    // runs with the same `--remap-path-prefix` flags and generates a fresh
+    // random incremental CGU session suffix inside `libleaf-*.rlib`.
+    let t2 = p.temp.path().join("t2");
+    let mut fresh = p.command();
+    fresh
+        .env("CARGO", &cargo)
+        .env("RUSTC", &rustc)
+        .env("CARGO_TARGET_DIR", &t2)
+        .env("JATO_CACHE_DIR", p.temp.path().join("other-cache"))
+        .env("CARGO_INCREMENTAL", "1")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .args(["build", "-p", "leaf", "-q"]);
+    success(&mut fresh);
+
+    // Confirm rustc actually wrote different raw bytes for `libleaf-*.rlib`.
+    let find_rlib = |dir: &Path| -> Vec<u8> {
+        let mut stack = vec![dir.to_owned()];
+        while let Some(d) = stack.pop() {
+            for entry in fs::read_dir(d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|n| n.starts_with("libleaf-") && n.ends_with(".rlib"))
+                {
+                    return fs::read(&path).unwrap();
+                }
+            }
+        }
+        panic!("no libleaf rlib in {}", dir.display());
+    };
+    assert_ne!(
+        find_rlib(&t1),
+        find_rlib(&t2),
+        "rustc incremental builds should produce distinct raw .rlib bytes"
+    );
+
+    // Now build `app` in `t2` WITH Jato's original cache: `app` links against
+    // the freshly compiled `libleaf-*.rlib` and MUST get a cache hit!
+    let (hits, misses) = p.during(|| {
+        assert_eq!(run_in(&t2, None).stdout, b"one:none\n");
+    });
+    assert!(
+        hits >= 1 && misses == 0,
+        "expected app to hit cache across recompiled incremental rlib: hits={hits} misses={misses} {}",
+        p.stats()
+    );
 }

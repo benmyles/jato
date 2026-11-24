@@ -7,8 +7,8 @@
 use crate::cas::{Staged, Store};
 use crate::facts::{Facts, keyed};
 use crate::manifest::{
-    Difference, Env, Here, Input, Manifest, Output, Part, Place, Script, Stale, State, Walk,
-    path_dirs, which,
+    Difference, Encoding, Env, Here, Input, Manifest, Output, Part, Place, Script, Stale, State,
+    Walk, path_dirs, which,
 };
 use crate::observe::{self, Kind, Report, Stamp};
 use crate::roots::{self, Roots, Surroundings};
@@ -27,7 +27,7 @@ use std::time::Instant;
 
 /// Changes whenever a result recorded by an earlier version could be wrong
 /// or unreadable for this one.
-const EPOCH: &str = "jato command v9";
+const EPOCH: &str = "jato command v10";
 /// Where the workspace and target directory appear to be in compiled output.
 /// A debugger started in the workspace resolves these to the real files.
 const WORK_ALIAS: &str = "/proc/self/cwd";
@@ -348,6 +348,84 @@ pub enum Scope {
     Build,
 }
 
+/// A C/C++/asm compilation whose `-o` output filename starts with the
+/// `cc` crate's 16-hex path hash (`<16-hex>-<stem>.o`), which varies per
+/// checkout when the source was generated in `OUT_DIR`. The result is
+/// keyed without that hash and restored directly to the requested path.
+struct ToolOut {
+    arg_at: usize,
+    attached: bool,
+    path: PathBuf,
+    rel: PathBuf,
+    rel_parent: PathBuf,
+    hash_prefix: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+fn parse_tool_out(args: &[OsString], cwd: &Path, roots: &Roots) -> Option<ToolOut> {
+    let mut has_md = false;
+    let mut has_mf = false;
+    let mut found: Option<(usize, bool, PathBuf)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_bytes();
+        if arg == b"-save-temps" || arg == b"--save-temps" || arg.starts_with(b"-save-temps=") {
+            return None;
+        }
+        if arg == b"-MD" || arg == b"-MMD" {
+            has_md = true;
+        } else if arg == b"-MF" || arg.starts_with(b"-MF") {
+            has_mf = true;
+        } else if arg == b"-o" {
+            let next = args.get(i + 1)?;
+            if found.is_some() {
+                return None;
+            }
+            found = Some((i + 1, false, cwd.join(next)));
+            i += 1;
+        } else if let Some(rest) = arg.strip_prefix(b"-o")
+            && !rest.is_empty()
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((i, true, cwd.join(OsStr::from_bytes(rest))));
+        }
+        i += 1;
+    }
+    if has_md && !has_mf {
+        return None;
+    }
+    let (arg_at, attached, path) = found?;
+    let (root, rel) = roots.split(&path);
+    if root != roots::TARGET {
+        return None;
+    }
+    let name = rel.file_name()?.as_bytes();
+    // Match `<16 lowercase hex>-<tail>.(o|obj|s)`.
+    if name.len() < 20
+        || name[16] != b'-'
+        || !name[..16]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return None;
+    }
+    let tail = &name[17..];
+    if !(tail.ends_with(b".o") || tail.ends_with(b".obj") || tail.ends_with(b".s")) {
+        return None;
+    }
+    Some(ToolOut {
+        arg_at,
+        attached,
+        path: path.clone(),
+        rel: rel.to_owned(),
+        rel_parent: rel.parent().unwrap_or(Path::new("")).to_owned(),
+        hash_prefix: name[..16].to_vec(),
+        tail: tail.to_vec(),
+    })
+}
+
 pub struct Job {
     pub request: Request,
     pub facts: Facts,
@@ -362,6 +440,8 @@ pub struct Job {
     descriptor: bool,
     /// A compiler other than rustc, started by a build script.
     pub tool: bool,
+    /// Output filename remapping for `cc`-crate hashed object outputs.
+    tool_out: Option<ToolOut>,
     path: Vec<PathBuf>,
     /// Further facts that tell this command from others like it.
     pub salt: Vec<u8>,
@@ -403,6 +483,7 @@ impl Job {
             remap,
             descriptor: true,
             tool: false,
+            tool_out: None,
             salt: Vec::new(),
         };
         // Asked only of a compilation that would be given one.
@@ -452,6 +533,7 @@ impl Job {
             && env::var_os("JATO_REMAP").is_none_or(|v| v != "0")
             && (roots.work.is_some() || roots.target.is_some())
             && maps_prefixes(&request);
+        let tool_out = parse_tool_out(&request.args, &request.cwd, &roots);
         Self {
             path: path_dirs(&request.cwd, &request.env),
             facts: Facts {
@@ -464,6 +546,7 @@ impl Job {
             remap,
             descriptor: false,
             tool: true,
+            tool_out,
             salt: Vec::new(),
         }
     }
@@ -483,6 +566,7 @@ impl Job {
             remap: false,
             descriptor: false,
             tool: false,
+            tool_out: None,
             salt,
         }
     }
@@ -556,6 +640,20 @@ impl Job {
                     .to_string_lossy()
                     .replace("diagnostic-rendered-ansi", "");
                 field(&mut hash, plain.as_bytes());
+                continue;
+            }
+            if let Some(out) = &self.tool_out
+                && out.arg_at == i
+            {
+                let mut norm = Vec::new();
+                if out.attached {
+                    norm.extend_from_slice(b"-o");
+                }
+                norm.extend_from_slice(b"\0jato:target\0/");
+                norm.extend_from_slice(out.rel_parent.as_os_str().as_bytes());
+                norm.extend_from_slice(b"/*-");
+                norm.extend_from_slice(&out.tail);
+                field(&mut hash, &norm);
                 continue;
             }
             field(&mut hash, &roots.mark_os(arg));
@@ -932,7 +1030,7 @@ fn search(
     let time = if tree { time_before(&job.roots) } else { None };
     for candidate in &candidates {
         let stored = store.record(candidate).unwrap_or_default();
-        let manifest = match Manifest::decode(&stored) {
+        let mut manifest = match Manifest::decode(&stored) {
             // The index said this result belongs to this command. Only a
             // record that says so itself is believed.
             Ok(manifest) if manifest.key(recipe) == candidate.key => manifest,
@@ -941,6 +1039,24 @@ fn search(
                 forget.push(candidate.key);
                 continue;
             }
+        };
+        let remap_out = if let Some(out) = &job.tool_out {
+            if manifest.outputs.len() == 1
+                && manifest.outputs[0].root == roots::TARGET
+                && manifest.outputs[0].path.parent() == Some(out.rel_parent.as_path())
+            {
+                Some(out.path.as_path())
+            } else if manifest
+                .outputs
+                .iter()
+                .any(|o| o.root == roots::TARGET && o.path == out.rel)
+            {
+                None
+            } else {
+                continue;
+            }
+        } else {
+            None
         };
         let asked = Instant::now();
         if let Err(why) = manifest.holds(&mut here, store) {
@@ -953,6 +1069,7 @@ fn search(
             tree,
             leave: None,
             time,
+            remap_out,
         };
         let restored = store.restore(candidate, &manifest, &job.roots, how, &mut damaged)?;
         let Some(restored) = restored else {
@@ -962,6 +1079,11 @@ fn search(
             nearest.get_or_insert("its files are no longer in the cache".into());
             continue;
         };
+        if remap_out.is_some()
+            && let Some(out) = &job.tool_out
+        {
+            manifest.outputs[0].path = out.rel.clone();
+        }
         let Some((code, stdout, stderr)) = decode_detail(&restored.detail) else {
             continue;
         };
@@ -1745,12 +1867,13 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
             owed[at] = false;
         }
     }
-    // What a build script wrote that has to run again is left out with
-    // its program: the script writes what it writes this time where
-    // nothing of the last time is.
+    // What a build script wrote that has to run again — either because an
+    // input it examined differs or because its own program is being rebuilt —
+    // is left out with its program: the script writes what it writes this
+    // time where nothing of the last time is.
     let mut rerun: Vec<u32> = Vec::new();
     for (script, again) in manifest.scripts.iter().zip(&scripts) {
-        if *again {
+        if *again || leave[script.program as usize] {
             rerun.push(script.program);
             for &output in &script.outputs {
                 if !leave[output as usize] {
@@ -1765,6 +1888,7 @@ pub fn start_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start
         tree: true,
         leave: Some(&leave),
         time,
+        remap_out: None,
     };
     let restored = store.restore(candidate, &manifest, &job.roots, how, &mut damaged);
     store.end_read();
@@ -2096,10 +2220,15 @@ pub fn record(
         return Err(why.clone());
     }
     if let Some(parts) = parts
-        && let Some(place) = parts
-            .differing
-            .iter()
-            .find(|place| !parts.outputs.contains_key(place))
+        && let Some(place) = parts.differing.iter().find(|place| {
+            let made_by_build = parts.outputs.contains_key(place)
+                || job.roots.join(place.0, &place.1).is_some_and(|path| {
+                    report.paths.get(&path).is_some_and(|access| {
+                        access.written && (access.created || place.0 == roots::TARGET)
+                    })
+                });
+            !made_by_build
+        })
     {
         return Err(format!(
             "{} changed while the build ran",
@@ -2323,11 +2452,10 @@ pub fn record(
         // that a look at it says unless it was listed.
         let passed =
             examined && access.kind == Kind::Dir && listing.is_none() && access.link.is_none();
-        if job.scope == Scope::Build
+        let git_cargo = job.scope == Scope::Build
             && examined
-            && !access.others
-            && (of_git(path, &repositories) || (passed && leads_to(path, &repositories)))
-        {
+            && (of_git(path, &repositories) || (passed && leads_to(path, &repositories)));
+        if git_cargo && !access.others {
             continue;
         }
         // The directories a workspace or a target directory is inside were
@@ -2516,7 +2644,10 @@ pub fn record(
             if job.scope == Scope::Build && !access.others {
                 cargos.insert((root, rel.to_owned()));
             }
-            if access.own_read {
+            // What Cargo itself reads in `.git` is never an input to Cargo;
+            // only other programs (such as build scripts) that examined it
+            // depend on it.
+            if access.own_read && !git_cargo {
                 read_own.insert((root, rel.to_owned()));
             }
             if access.stray {
@@ -2840,20 +2971,31 @@ pub fn record(
                     outputs.push((place.0, place.1.clone(), path));
                 }
             }
-            // A build script that was built again ran in the directory the
-            // earlier one had written to, and may have left there what a
-            // build from nothing would not have. The build is right as
-            // Cargo sees it, and is not one to put back somewhere else.
+            // A build script that was built again ran in a clean output
+            // directory if all of its earlier outputs were left out before
+            // Cargo ran; otherwise it ran where the earlier version had
+            // written, and the build is not one to put back somewhere else.
             for (place, path) in &started {
                 let was = base
                     .outputs
                     .binary_search_by(|o| (o.root, &o.path).cmp(&(place.0, &place.1)))
                     .ok()
-                    .map(|at| &base.outputs[at]);
+                    .map(|at| (at as u32, &base.outputs[at]));
                 let same = match (was, fs::metadata(path)) {
-                    (Some(was), Ok(meta)) if !was.marked => store
-                        .digest_known(path, Stamp::of(&meta))
-                        .is_ok_and(|digest| digest == was.digest),
+                    (Some((prog_at, was)), Ok(meta)) => {
+                        let unchanged = !was.encoding.is_marked()
+                            && store
+                                .digest_known(path, Stamp::of(&meta))
+                                .is_ok_and(|digest| digest == was.digest);
+                        let cleared = base
+                            .scripts
+                            .iter()
+                            .find(|s| s.program == prog_at)
+                            .is_some_and(|s| {
+                                s.outputs.iter().all(|&out| !start.placed[out as usize])
+                            });
+                        unchanged || cleared
+                    }
                     // One the earlier build never had ran where none had.
                     (None, _) => true,
                     _ => false,
@@ -2892,6 +3034,7 @@ pub fn record(
         manifest.pins.extend(parts.pins.iter().cloned());
         manifest.removed.extend(parts.removed.iter().cloned());
     }
+    let mut input_twins: Vec<(Place, Place)> = Vec::new();
     if let Some(work) = roots.path(roots::WORK) {
         let around = Surroundings::of(work, &job.request.env);
         let (walks, again) = {
@@ -2961,7 +3104,7 @@ pub fn record(
                             .any(|dir| path.strip_prefix(dir) == Ok(walk.name.as_path()))
                 })
             };
-            let again: Vec<Input> = outside
+            let again: Vec<(Place, Input)> = outside
                 .iter()
                 .filter(|input| {
                     around.beside(&input.path)
@@ -2971,19 +3114,47 @@ pub fn record(
                 })
                 .map(|input| {
                     let (up, rest) = around.above(&input.path);
-                    Input {
-                        root: roots::WORK,
-                        path: Surroundings::from_inside(up, rest),
-                        link: input.link.clone(),
-                        state: input.state.clone(),
-                    }
+                    let way = Surroundings::from_inside(up, rest);
+                    (
+                        (roots::ABSOLUTE, input.path.clone()),
+                        Input {
+                            root: roots::WORK,
+                            path: way,
+                            link: input.link.clone(),
+                            state: input.state.clone(),
+                        },
+                    )
                 })
                 .collect();
             let walks = walks.into_iter().map(|(walk, _)| walk).collect();
             (walks, again)
         };
         manifest.walks = walks;
-        manifest.inputs.extend(again);
+        for (orig, input) in again {
+            let twin = (input.root, input.path.clone());
+            if own.contains(&orig) {
+                own.insert(twin.clone());
+            }
+            if asked.contains(&orig) {
+                asked.insert(twin.clone());
+            }
+            if cargos.contains(&orig) {
+                cargos.insert(twin.clone());
+            }
+            if read_own.contains(&orig) {
+                read_own.insert(twin.clone());
+            }
+            if strayed.contains(&orig) {
+                strayed.insert(twin.clone());
+            }
+            for (examined, _) in &mut scripts_did {
+                if examined.contains(&orig) {
+                    examined.push(twin.clone());
+                }
+            }
+            input_twins.push((orig, twin));
+            manifest.inputs.push(input);
+        }
         // What was written there was written beside this workspace, and
         // would be again nowhere else.
         let pin = (roots::WORK, work.to_owned());
@@ -3088,7 +3259,7 @@ pub fn record(
             .as_ref()
             .and_then(|meta| store.recall(&Stamp::of(meta)))
             .and_then(|digest| known.get(&digest))
-            .filter(|output| !output.marked);
+            .filter(|output| !output.encoding.is_marked());
         if let (Some(output), Some(meta)) = (adopted, &meta) {
             let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777;
             from.push(From::Part(output, mode));
@@ -3152,13 +3323,24 @@ pub fn record(
         if output.names.contains(&true) {
             named_here.push(output.digest);
         }
+        if let Some(out) = &job.tool_out
+            && outputs.len() == 1
+            && outputs[0].2 == out.path
+            && crate::scan::digest_file(&out.path, &[&out.hash_prefix])
+                .is_ok_and(|(_, _, found)| found[0])
+        {
+            return Err(format!(
+                "{} names its own hashed object file",
+                out.path.display()
+            ));
+        }
         manifest.outputs.push(Output {
             root: *root,
             path: rel.clone(),
             digest: output.digest,
             size: output.size,
             mode: output.mode,
-            marked: output.marked,
+            encoding: output.encoding,
         });
         staged.push(output);
     }
@@ -3186,20 +3368,36 @@ pub fn record(
             list.dedup();
             list
         };
-        let mut position = vec![None; parts.numbers.len()];
+        let mut position: Vec<Vec<u32>> = vec![Vec::new(); parts.numbers.len()];
+        let mut twins_by_orig: HashMap<&Place, Vec<&Place>> = HashMap::new();
+        for (orig, twin) in &input_twins {
+            twins_by_orig.entry(orig).or_default().push(twin);
+        }
         for (place, number) in &parts.numbers {
-            position[*number as usize] = input_at(place);
+            let slot = &mut position[*number as usize];
+            if let Some(at) = input_at(place) {
+                slot.push(at);
+            }
+            if let Some(twins) = twins_by_orig.get(place) {
+                for twin in twins {
+                    if let Some(at) = input_at(twin) {
+                        slot.push(at);
+                    }
+                }
+            }
         }
         let mut apart: Vec<Part> = Vec::with_capacity(parts.units.len() + kept.len());
         let mut theirs: Vec<u32> = parts
             .loose
             .iter()
-            .filter_map(|number| position[*number as usize])
+            .flat_map(|number| position[*number as usize].iter().copied())
             .collect();
         let mut pinned: Vec<u32> = Vec::new();
         unplaced |= parts.unplaced;
         for (examined, wrote, names) in &parts.units {
-            let inputs = examined.iter().filter_map(|n| position[*n as usize]);
+            let inputs = examined
+                .iter()
+                .flat_map(|n| position[*n as usize].iter().copied());
             let inputs = ordered(inputs.collect());
             let outputs = ordered(wrote.iter().filter_map(output_at).collect());
             // With nothing left of what it wrote there is nothing Cargo
@@ -3222,10 +3420,23 @@ pub fn record(
                     let input = &base.inputs[*position as usize];
                     (input.root, input.path.clone())
                 };
-                let inputs = part.inputs.iter().filter_map(|at| input_at(&place(at)));
+                let mut inputs = Vec::new();
+                for at in &part.inputs {
+                    let p = place(at);
+                    if let Some(idx) = input_at(&p) {
+                        inputs.push(idx);
+                    }
+                    if let Some(twins) = twins_by_orig.get(&p) {
+                        for twin in twins {
+                            if let Some(idx) = input_at(twin) {
+                                inputs.push(idx);
+                            }
+                        }
+                    }
+                }
                 let outputs = part.outputs.iter().map(|at| start.place(*at));
                 let outputs = ordered(outputs.filter_map(|place| output_at(&place)).collect());
-                let inputs = ordered(inputs.collect());
+                let inputs = ordered(inputs);
                 if outputs.is_empty() {
                     theirs.extend(inputs);
                     unplaced |= *names;
@@ -3273,7 +3484,7 @@ pub fn record(
             parts
                 .strayed
                 .iter()
-                .filter_map(|number| position[*number as usize])
+                .flat_map(|number| position[*number as usize].iter().copied())
                 .filter(of_own),
         );
         let mut scripts: BTreeMap<u32, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
@@ -3287,7 +3498,9 @@ pub fn record(
             let mut outputs: Vec<u32> = wrote.iter().filter_map(output_at).collect();
             for (under, numbers, wrote) in &parts.scripted {
                 if *under == number {
-                    let at = numbers.iter().filter_map(|n| position[*n as usize]);
+                    let at = numbers
+                        .iter()
+                        .flat_map(|n| position[*n as usize].iter().copied());
                     inputs.extend(at.filter(of_own));
                     outputs.extend(wrote.iter().filter_map(output_at));
                 }
@@ -3305,7 +3518,9 @@ pub fn record(
         // A compiler said to be some script's whose number nobody has.
         for (under, numbers, _) in &parts.scripted {
             if *under as usize > report.programs.len() {
-                let at = numbers.iter().filter_map(|n| position[*n as usize]);
+                let at = numbers
+                    .iter()
+                    .flat_map(|n| position[*n as usize].iter().copied());
                 strays.extend(at.filter(of_own));
             }
         }
@@ -3368,14 +3583,18 @@ pub fn record(
         Ok(false) => {
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             let files: u64 = manifest.outputs.iter().map(|output| output.size).sum();
-            Err(match store.budget() {
+            let msg = match store.budget() {
                 Ok(budget) => format!(
                     "it is larger than half the cache: its files take {:.1} GiB and the budget is {:.1} GiB, which `jato limit` sets",
                     gib(files),
                     gib(budget)
                 ),
                 Err(_) => "it is larger than half the cache".into(),
-            })
+            };
+            if job.scope == Scope::Build {
+                eprintln!("jato: build not recorded: {msg}");
+            }
+            Err(msg)
         }
         Err(e) => Err(format!("{e:#}")),
     }
@@ -3522,7 +3741,7 @@ pub fn keep_state(job: &Job, store: &mut Store, recipe: &Digest, left: Left<'_>)
                 digest: file.digest,
                 size: file.size,
                 mode: 0o644,
-                marked: false,
+                encoding: Encoding::Raw,
             });
             staged.push(file);
         }

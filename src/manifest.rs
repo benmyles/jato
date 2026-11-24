@@ -196,6 +196,34 @@ pub struct Manifest {
     pub ours: Vec<u32>,
 }
 
+/// How an output's stored bytes relate to what is written on restore.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Encoding {
+    /// Verbatim bytes.
+    #[default]
+    Raw = 0,
+    /// Text in which marks stand for the roots.
+    Text = 1,
+    /// Cargo's binary `dep-*` file in which length-prefixed root paths are
+    /// replaced by marks.
+    CargoDep = 2,
+}
+
+impl Encoding {
+    pub fn is_marked(self) -> bool {
+        self != Self::Raw
+    }
+
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            0 => Ok(Self::Raw),
+            1 => Ok(Self::Text),
+            2 => Ok(Self::CargoDep),
+            _ => bail!("unknown output encoding {byte}"),
+        }
+    }
+}
+
 /// A file a command wrote, and the object that holds its bytes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Output {
@@ -204,8 +232,8 @@ pub struct Output {
     pub digest: Digest,
     pub size: u64,
     pub mode: u32,
-    /// The object is text in which marks stand for the roots.
-    pub marked: bool,
+    /// Whether and how marks stand for the roots in the stored bytes.
+    pub encoding: Encoding,
 }
 
 const MAX_MANIFEST: usize = 64 << 20;
@@ -318,7 +346,7 @@ impl Manifest {
             w.0.extend_from_slice(&output.digest);
             w.number(output.size);
             w.number(output.mode.into());
-            w.0.push(output.marked.into());
+            w.0.push(output.encoding as u8);
         }
         w.number(self.removed.len() as u64);
         for (root, path) in &self.removed {
@@ -428,7 +456,7 @@ impl Manifest {
                 digest: r.digest()?,
                 size: r.number()?,
                 mode: u32::try_from(r.number()?)?,
-                marked: r.byte()? != 0,
+                encoding: Encoding::from_byte(r.byte()?)?,
             });
         }
         for _ in 0..r.count()? {
@@ -443,7 +471,7 @@ impl Manifest {
                 digest: r.digest()?,
                 size: r.number()?,
                 mode: 0o644,
-                marked: false,
+                encoding: Encoding::Raw,
             });
         }
         m.saved_in = r.digest()?;
@@ -1335,7 +1363,7 @@ mod tests {
                 digest: [3; 32],
                 size: 1 << 33,
                 mode: 0o755,
-                marked: true,
+                encoding: Encoding::Text,
             }],
             removed: vec![(2, "debug/old".into())],
             detail: [5; 32],
@@ -1345,7 +1373,7 @@ mod tests {
                 digest: [4; 32],
                 size: 77,
                 mode: 0o644,
-                marked: false,
+                encoding: Encoding::Raw,
             }],
             saved_in: [6; 32],
             saved_for: [8; 32],
@@ -1523,7 +1551,7 @@ mod tests {
                 digest: [7; 32],
                 size: 9,
                 mode: 0o755,
-                marked: false,
+                encoding: Encoding::Raw,
             },
             Output {
                 root: 2,
@@ -1531,7 +1559,7 @@ mod tests {
                 digest: [8; 32],
                 size: 9,
                 mode: 0o644,
-                marked: false,
+                encoding: Encoding::Raw,
             },
         ];
         scripted.scripts = vec![Script {

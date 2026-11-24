@@ -8,7 +8,7 @@
 //!
 //! Object files are renamed into place and unlinked only while this process
 //! holds SQLite's writer lock, so the index and the directory agree.
-use crate::manifest::Manifest;
+use crate::manifest::{Encoding, Manifest};
 use crate::observe::Stamp;
 use crate::roots::Roots;
 use crate::scan::{self, Digest};
@@ -229,8 +229,8 @@ pub struct Staged {
     pub digest: Digest,
     pub size: u64,
     pub mode: u32,
-    /// Text whose roots were replaced by marks.
-    pub marked: bool,
+    /// Whether and how the roots were replaced by marks in the stored bytes.
+    pub encoding: Encoding,
     /// For each root spelling asked about, whether these bytes name it.
     pub names: Vec<bool>,
     temp: Option<PathBuf>,
@@ -342,6 +342,9 @@ pub struct Placing<'a> {
     pub leave: Option<&'a [bool]>,
     /// The time to give every file of a whole build.
     pub time: Option<libc::timespec>,
+    /// Override the destination path of a single-output result (for C
+    /// compilations whose `-o` filename carries a per-checkout hash).
+    pub remap_out: Option<&'a Path>,
 }
 
 /// One output to put in place.
@@ -410,17 +413,24 @@ fn place(work: Work<'_>, how: &How<'_>) -> (Option<PathBuf>, Result<Option<bool>
         Err(e) => return (None, Err(e.into())),
     };
     let written = (|| -> Result<Option<bool>> {
-        if output.marked {
-            ensure!(output.size <= TEXT_LIMIT * 4, "oversized text object");
-            let mut text = Vec::with_capacity(output.size as usize);
-            source.read_to_end(&mut text)?;
-            if blake3::hash(&text).as_bytes() != &output.digest {
+        if output.encoding.is_marked() {
+            ensure!(output.size <= TEXT_LIMIT * 4, "oversized marked object");
+            let mut raw = Vec::with_capacity(output.size as usize);
+            source.read_to_end(&mut raw)?;
+            if blake3::hash(&raw).as_bytes() != &output.digest {
                 return Ok(Some(false));
             }
-            let Some(text) = how.roots.unmark(&text) else {
+            let restored = match output.encoding {
+                Encoding::Text => how.roots.unmark(&raw),
+                Encoding::CargoDep => {
+                    crate::roots::unmark_cargo_dep(&raw, how.roots).map(std::borrow::Cow::Owned)
+                }
+                Encoding::Raw => unreachable!(),
+            };
+            let Some(restored) = restored else {
                 return Ok(None);
             };
-            out.write_all(&text)?;
+            out.write_all(&restored)?;
         } else if packed {
             let mut hasher = blake3::Hasher::new();
             let mut decoder = zstd::stream::read::Decoder::new(&mut source)?;
@@ -502,7 +512,7 @@ fn stage_file(
         digest: [0; 32],
         size: before.size,
         mode,
-        marked: false,
+        encoding: Encoding::Raw,
         names: vec![false; needles.len()],
         temp: Some(temp.clone()),
         packed: false,
@@ -523,12 +533,25 @@ fn stage_file(
             .iter()
             .map(|n| scan::names_path(&bytes, n))
             .collect();
-        let text = names.contains(&true) && memchr::memchr(0, &bytes).is_none();
-        if text || before.size < CLONE_FLOOR {
-            let stored = if text {
-                roots.mark(&bytes)
+        let has_root = names.contains(&true);
+        let text = has_root && memchr::memchr(0, &bytes).is_none();
+        let cargo_dep = if !text
+            && has_root
+            && file
+                .file_name()
+                .is_some_and(|n| n.as_bytes().starts_with(b"dep-"))
+        {
+            crate::roots::mark_cargo_dep(&bytes, roots)
+        } else {
+            None
+        };
+        if text || cargo_dep.is_some() || before.size < CLONE_FLOOR {
+            let (encoding, stored): (Encoding, std::borrow::Cow<'_, [u8]>) = if text {
+                (Encoding::Text, roots.mark(&bytes))
+            } else if let Some(marked) = cargo_dep {
+                (Encoding::CargoDep, std::borrow::Cow::Owned(marked))
             } else {
-                (&bytes[..]).into()
+                (Encoding::Raw, (&bytes[..]).into())
             };
             staged.digest = *blake3::hash(&stored).as_bytes();
             if object_path(dir, &staged.digest, false).is_file() {
@@ -540,8 +563,8 @@ fn stage_file(
             }
             staged.size = stored.len() as u64;
             staged.stored = stored.len() as u64;
-            staged.marked = text;
-            staged.names = if text {
+            staged.encoding = encoding;
+            staged.names = if encoding.is_marked() {
                 vec![false; needles.len()]
             } else {
                 names
@@ -551,9 +574,10 @@ fn stage_file(
                 "{} changed while it was stored",
                 file.display()
             );
-            // For text that names a root this is what it says with
-            // the roots' names taken out, which is all a command that
-            // reads it there learns that it would not learn anywhere.
+            // For text or Cargo dep files that name a root this is what
+            // they say with the roots' names taken out, which is all a
+            // command that reads them there learns that it would not learn
+            // anywhere.
             let digest = staged.digest;
             return Ok((staged, Some((before, digest))));
         }
@@ -597,7 +621,7 @@ fn stage_file(
         }
         source.rewind()?;
         let mut hasher = blake3::Hasher::new();
-        let mut encoder = zstd::stream::write::Encoder::new(&mut out, 3)?;
+        let mut encoder = zstd::stream::write::Encoder::new(&mut out, 1)?;
         let mut buffer = vec![0u8; 256 * 1024];
         let mut tail: Vec<u8> = Vec::new();
         let keep = needles.iter().map(|n| n.len() + 1).max().unwrap_or(0);
@@ -837,16 +861,45 @@ impl Store {
 
     /// What a command learned from a file it read inside one of its
     /// roots that the build itself may have written: a generated source
-    /// file, something Cargo keeps about a build script. Text that names
-    /// a root is known by what it says with the roots' names taken out,
-    /// as it is stored when it is a command's output, so that it is the
-    /// same file in every checkout.
+    /// file, something Cargo keeps about a build script, or a Rust library
+    /// archive. Text and Cargo `dep-*` files that name a root are known by
+    /// what they say with the roots' names taken out. Incremental `.rlib`
+    /// archives are known by their symbol table, metadata, and object
+    /// payloads without the per-compilation random CGU session suffix.
     pub fn digest_placed(
         &mut self,
         path: &Path,
         stamp: Stamp,
         roots: &Roots,
     ) -> io::Result<Digest> {
+        // Incremental `.rlib` archives get a session-independent digest
+        // cached under a distinct virtual device-id bit so it never
+        // collides with the raw file digest used for object storage.
+        const RLIB_STAMP_BIT: u64 = 1 << 62;
+        if path.extension() == Some(std::ffi::OsStr::new("rlib")) && stamp.dev & RLIB_STAMP_BIT == 0
+        {
+            let tagged = Stamp {
+                dev: stamp.dev | RLIB_STAMP_BIT,
+                ..stamp
+            };
+            if let Some(digest) = self.recall(&tagged) {
+                return Ok(digest);
+            }
+            if let Some((digest, read)) = scan::digest_rlib(path)? {
+                if !stamp.same_contents(&read) {
+                    return Err(io::Error::other("file changed while it was read"));
+                }
+                self.remember(
+                    Stamp {
+                        dev: read.dev | RLIB_STAMP_BIT,
+                        ..read
+                    },
+                    digest,
+                );
+                self.count("hashed_bytes", stamp.size);
+                return Ok(digest);
+            }
+        }
         if let Some(digest) = self.recall(&stamp) {
             return Ok(digest);
         }
@@ -857,14 +910,26 @@ impl Store {
             let names = spellings
                 .iter()
                 .any(|(_, spelling)| scan::names_path(&bytes, spelling));
-            if names && memchr::memchr(0, &bytes).is_none() {
-                let read = fs::metadata(path).map(|meta| Stamp::of(&meta))?;
-                if !stamp.same_contents(&read) {
-                    return Err(io::Error::other("file changed while it was read"));
+            if names {
+                let marked = if memchr::memchr(0, &bytes).is_none() {
+                    Some(roots.mark(&bytes))
+                } else if path
+                    .file_name()
+                    .is_some_and(|n| n.as_bytes().starts_with(b"dep-"))
+                {
+                    crate::roots::mark_cargo_dep(&bytes, roots).map(std::borrow::Cow::Owned)
+                } else {
+                    None
+                };
+                if let Some(marked) = marked {
+                    let read = fs::metadata(path).map(|meta| Stamp::of(&meta))?;
+                    if !stamp.same_contents(&read) {
+                        return Err(io::Error::other("file changed while it was read"));
+                    }
+                    let digest = *blake3::hash(&marked).as_bytes();
+                    self.remember(read, digest);
+                    return Ok(digest);
                 }
-                let digest = *blake3::hash(&roots.mark(&bytes)).as_bytes();
-                self.remember(read, digest);
-                return Ok(digest);
             }
         }
         self.digest_seen(path, stamp)
@@ -945,14 +1010,25 @@ impl Store {
         how: Placing<'_>,
         damaged: &mut bool,
     ) -> Result<Option<Restored>> {
-        let Placing { tree, leave, time } = how;
+        let Placing {
+            tree,
+            leave,
+            time,
+            remap_out,
+        } = how;
         let left = |i: usize| leave.is_some_and(|leave| leave[i]);
         let begun = std::time::Instant::now();
         let mut dests = Vec::with_capacity(manifest.outputs.len());
-        for output in &manifest.outputs {
-            match roots.join(output.root, &output.path) {
-                Some(dest) => dests.push(dest),
-                None => return Ok(None),
+        if let Some(dest) = remap_out
+            && manifest.outputs.len() == 1
+        {
+            dests.push(dest.to_owned());
+        } else {
+            for output in &manifest.outputs {
+                match roots.join(output.root, &output.path) {
+                    Some(dest) => dests.push(dest),
+                    None => return Ok(None),
+                }
             }
         }
         let mut todo = Vec::with_capacity(dests.len());
@@ -1295,12 +1371,23 @@ impl Store {
         if !meta.is_file() || meta.permissions().mode() & 0o777 != output.mode & 0o777 {
             return false;
         }
-        if output.marked {
-            // Text is stored with marks for the roots. Compare it that way.
-            return meta.len() <= TEXT_LIMIT * 4
-                && fs::read(dest).is_ok_and(|text| {
-                    blake3::hash(&roots.mark(&text)).as_bytes() == &output.digest
-                });
+        match output.encoding {
+            Encoding::Text => {
+                // Text is stored with marks for the roots. Compare it that way.
+                return meta.len() <= TEXT_LIMIT * 4
+                    && fs::read(dest).is_ok_and(|text| {
+                        blake3::hash(&roots.mark(&text)).as_bytes() == &output.digest
+                    });
+            }
+            Encoding::CargoDep => {
+                return meta.len() <= TEXT_LIMIT * 4
+                    && fs::read(dest).is_ok_and(|bytes| {
+                        crate::roots::mark_cargo_dep(&bytes, roots).is_some_and(|marked| {
+                            blake3::hash(&marked).as_bytes() == &output.digest
+                        })
+                    });
+            }
+            Encoding::Raw => (),
         }
         meta.len() == output.size
             && self
@@ -1411,8 +1498,15 @@ impl Store {
         let key = record.key(recipe);
         let manifest = record.encode()?;
         let limit = self.budget()?;
-        let total: u64 = staged.iter().map(|s| s.stored).sum();
-        if total + (manifest.len() + detail.len()) as u64 > limit / 2 {
+        // Count only bytes not already kept in `objects/`: a whole build
+        // whose compilers already stored their outputs adds only its
+        // manifest and Cargo's small bookkeeping files.
+        let new_bytes: u64 = staged
+            .iter()
+            .filter(|s| s.temp.is_some())
+            .map(|s| s.stored)
+            .sum();
+        if new_bytes + (manifest.len() + detail.len()) as u64 > limit / 2 {
             return Ok(false);
         }
         let dir = self.dir.clone();
