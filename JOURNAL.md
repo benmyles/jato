@@ -1,5 +1,12 @@
 # Work journal
 
+## 2026-11-25 — per-project and per-run test concurrency caps
+
+- Added per-project and per-run concurrency overrides for `jato test` (`src/tests_cache.rs`, `src/main.rs`) while keeping full parallel workspace test execution by default:
+  - Projects can set `parallel-tests` (max concurrent test binaries; `0`/`1`/`false` runs serially; bounded by `JATO_JOBS`/CPUs) and `test-threads` (default `RUST_TEST_THREADS` per binary) under `[workspace.metadata.jato]` or `[package.metadata.jato]` in `Cargo.toml` (honoring member overrides, `-C`, and `--manifest-path`, and accepting both `kebab-case` and `snake_case`, inline tables, and dotted keys).
+  - Per-run overrides via `JATO_PARALLEL_TESTS=<N>` (`0`/`1` serial, `N >= 2` up to `N` concurrent binaries) and `JATO_TEST_THREADS=<N>` (`0` unsets project `test-threads`), preserving standard `RUST_TEST_THREADS` and CLI `-- --test-threads` / `--nocapture` precedence.
+  - Added unit tests for manifest parsing, discovery, and precedence plus a real Cargo workspace integration test (`test_concurrency_can_be_configured_per_project_and_per_run`) measuring actual peak simultaneous test binaries and inherited `RUST_TEST_THREADS`.
+
 ## 2026-11-24 — build-script caching, in-place whole builds, mount namespace, shared jobserver, aarch64 shim, and remote cache (0.20)
 
 - Completed a public-readiness audit of the repository and full git history (verified zero secrets/credentials, permissive MIT-compatible dependency licenses, clean `Cargo.toml` metadata, and MIT `LICENSE`), and hardened multi-user security by checking `SO_PEERCRED` peer UID equality (`wire::same_user`) on every abstract Unix domain socket accepted by `session.rs` and `tests_cache.rs`. Also fixed `supervise` fallback command cloning, nested-seccomp test fallback, and `tools::after()` wrapper loop prevention so Jato cleanly builds, checks, and tests itself.

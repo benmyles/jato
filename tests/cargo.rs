@@ -110,6 +110,8 @@ impl Project {
             .env_remove("JATO_PATH")
             .env_remove("JATO_CACHE_TESTS")
             .env_remove("JATO_PARALLEL_TESTS")
+            .env_remove("JATO_TEST_THREADS")
+            .env_remove("RUST_TEST_THREADS")
             .env_remove("JATO_SEED")
             .env_remove("JATO_NEAR")
             .env_remove("JATO_ASYNC_RECORD")
@@ -6403,4 +6405,168 @@ fn remote_cache_shares_whole_builds_over_file_and_http_and_rejects_corruption() 
 
     stop.store(true, std::sync::atomic::Ordering::Release);
     let _ = srv.join();
+}
+
+#[test]
+fn test_concurrency_can_be_configured_per_project_and_per_run() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    write(
+        p.root.join("Cargo.toml"),
+        r#"[workspace]
+members = [".", "leaf"]
+
+[workspace.metadata.jato]
+parallel-tests = 2
+test-threads = 3
+
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+leaf = { path = "leaf" }
+"#,
+    );
+    write(
+        p.root.join("leaf/src/lib.rs"),
+        r#"mod value;
+pub use value::value;
+
+#[test]
+fn checks_inherited_threads() {
+    if let Ok(expected) = std::env::var("EXPECT_THREADS") {
+        let actual = std::env::var("RUST_TEST_THREADS").unwrap_or_else(|_| "unset".into());
+        assert_eq!(actual, expected);
+    }
+}
+"#,
+    );
+    // Four integration test binaries that track real simultaneous binary
+    // execution via a shared lock file (which also keeps them uncacheable so
+    // every concurrency setting exercises fresh execution).
+    for i in 1..=4 {
+        write(
+            p.root.join(format!("tests/slot_{i}.rs")),
+            &format!(
+                r#"#[test]
+fn slot_test_{i}() {{
+    if let Ok(expected) = std::env::var("EXPECT_THREADS") {{
+        let actual = std::env::var("RUST_TEST_THREADS").unwrap_or_else(|_| "unset".into());
+        assert_eq!(actual, expected);
+    }}
+    let dir = std::path::PathBuf::from(std::env::var("CONCURRENCY_DIR").unwrap());
+    let lock_path = dir.join("lock");
+    let state_path = dir.join("state");
+    let bump = |delta: isize| {{
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        f.lock().unwrap();
+        let text = std::fs::read_to_string(&state_path).unwrap_or_else(|_| "0 0".into());
+        let mut parts = text.split_whitespace();
+        let active: isize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let peak: isize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let next = active + delta;
+        let next_peak = peak.max(next);
+        std::fs::write(&state_path, format!("{{next}} {{next_peak}}")).unwrap();
+    }};
+    bump(1);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    bump(-1);
+}}
+"#
+            ),
+        );
+    }
+    // A hermetic test binary to confirm test caching still works with metadata set.
+    write(
+        p.root.join("tests/hermetic.rs"),
+        r#"#[test]
+fn hermetic_ok() {
+    assert_eq!(std::env::var("RUST_TEST_THREADS").as_deref(), Ok("3"));
+}
+"#,
+    );
+
+    let slot_args = [
+        "test", "--test", "slot_1", "--test", "slot_2", "--test", "slot_3", "--test", "slot_4",
+    ];
+    let run_slots = |extra: &[(&str, &str)]| -> usize {
+        let track = tempfile::tempdir_in(p.temp.path()).unwrap();
+        let mut cmd = p.command();
+        cmd.env("JATO_JOBS", "4")
+            .env("CONCURRENCY_DIR", track.path())
+            .args(slot_args);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        success(&mut cmd);
+        let text = fs::read_to_string(track.path().join("state")).unwrap();
+        text.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    };
+
+    // 1. [workspace.metadata.jato] caps binaries at 2 and sets RUST_TEST_THREADS=3.
+    let peak = run_slots(&[("EXPECT_THREADS", "3")]);
+    assert_eq!(peak, 2, "expected parallel-tests = 2 cap, got peak {peak}");
+
+    // 2. JATO_PARALLEL_TESTS=1 forces serial execution; JATO_TEST_THREADS=2 overrides threads.
+    let peak = run_slots(&[
+        ("JATO_PARALLEL_TESTS", "1"),
+        ("JATO_TEST_THREADS", "2"),
+        ("EXPECT_THREADS", "2"),
+    ]);
+    assert_eq!(peak, 1, "expected serial execution, got peak {peak}");
+
+    // 3. JATO_PARALLEL_TESTS=4 overrides project cap upward; JATO_TEST_THREADS=0 unsets threads.
+    let peak = run_slots(&[
+        ("JATO_PARALLEL_TESTS", "4"),
+        ("JATO_TEST_THREADS", "0"),
+        ("EXPECT_THREADS", "unset"),
+    ]);
+    assert!(
+        (3..=4).contains(&peak),
+        "expected JATO_PARALLEL_TESTS=4 to exceed project cap of 2, got peak {peak}"
+    );
+
+    // 4. Standard RUST_TEST_THREADS overrides Cargo.toml test-threads when JATO_TEST_THREADS is unset.
+    let peak = run_slots(&[("RUST_TEST_THREADS", "5"), ("EXPECT_THREADS", "5")]);
+    assert_eq!(peak, 2, "expected parallel-tests = 2 cap, got peak {peak}");
+
+    // 5. Running from member directory `leaf/` inherits [workspace.metadata.jato].
+    success(
+        p.command_in(&p.root.join("leaf"))
+            .env("EXPECT_THREADS", "3")
+            .args(["test", "--lib"]),
+    );
+
+    // 6. Member [package.metadata.jato] overrides workspace settings when run in `leaf/`.
+    write(
+        p.root.join("leaf/Cargo.toml"),
+        "[package]\nname='leaf'\nversion='0.1.0'\nedition='2021'\n\n[package.metadata.jato]\ntest-threads = 2\n",
+    );
+    success(
+        p.command_in(&p.root.join("leaf"))
+            .env("EXPECT_THREADS", "2")
+            .args(["test", "--lib"]),
+    );
+
+    // 7. Hermetic tests still cache cleanly under project concurrency metadata.
+    let m0 = p.count("test_miss");
+    let h0 = p.count("test_hit");
+    success(p.command().args(["test", "--test", "hermetic"]));
+    assert_eq!(p.count("test_miss"), m0 + 1, "{}", p.stats());
+    success(p.command().args(["test", "--test", "hermetic"]));
+    assert_eq!(p.count("test_hit"), h0 + 1, "{}", p.stats());
+    assert_eq!(p.count("test_miss"), m0 + 1, "{}", p.stats());
 }

@@ -184,25 +184,497 @@ fn has_list_flag(args: &[OsString]) -> bool {
     args[dash + 1..].iter().any(|a| a == "--list")
 }
 
-/// True if the user asked for live streaming or strictly serial execution.
-fn wants_sync(args: &[OsString]) -> bool {
-    if env::var_os("JATO_PARALLEL_TESTS").is_some_and(|v| v == "0") {
-        return true;
+/// Per-project test concurrency settings read from `Cargo.toml`
+/// (`[workspace.metadata.jato]` or `[package.metadata.jato]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProjectTestConfig {
+    /// Maximum test binaries to run at once (`0` or `1` runs one at a time).
+    parallel_tests: Option<usize>,
+    /// Default `RUST_TEST_THREADS` per test binary (`0` leaves libtest's default).
+    test_threads: Option<usize>,
+}
+
+impl ProjectTestConfig {
+    fn or(self, fallback: Self) -> Self {
+        Self {
+            parallel_tests: self.parallel_tests.or(fallback.parallel_tests),
+            test_threads: self.test_threads.or(fallback.test_threads),
+        }
     }
+}
+
+/// Effective concurrency settings for a `jato test` invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TestConcurrency {
+    /// `Some(n)` (`n >= 2`) runs up to `n` test binaries concurrently;
+    /// `None` runs test binaries synchronously one at a time.
+    parallel_workers: Option<usize>,
+    /// `Some(n)` (`n >= 1`) sets `RUST_TEST_THREADS=n` for test execution;
+    /// `None` leaves `RUST_TEST_THREADS` untouched.
+    rust_test_threads: Option<usize>,
+}
+
+const MAX_EXPLICIT_PARALLEL_TESTS: usize = 64;
+
+/// Locate an explicit `--manifest-path` (if passed) and the starting directory
+/// for Cargo manifest discovery (honoring `-C` and `--manifest-path`).
+fn manifest_location(args: &[OsString], cwd: &Path) -> (Option<PathBuf>, PathBuf) {
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut base = cwd.to_path_buf();
+    let mut manifest = None;
+    let mut i = 0;
+    while i < end {
+        match args[i].to_str() {
+            Some("-C") if i + 1 < end => {
+                base = base.join(&args[i + 1]);
+                i += 2;
+                continue;
+            }
+            Some("--manifest-path") if i + 1 < end => {
+                manifest = Some(base.join(&args[i + 1]));
+                i += 2;
+                continue;
+            }
+            Some(s) if s.starts_with("--manifest-path=") => {
+                manifest = Some(base.join(&s["--manifest-path=".len()..]));
+            }
+            _ => (),
+        }
+        i += 1;
+    }
+    let start_dir = manifest
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or(base);
+    let start_dir = fs::canonicalize(&start_dir).unwrap_or(start_dir);
+    (manifest, start_dir)
+}
+
+/// Strip a `#` comment outside quotes while tracking multi-line TOML strings
+/// (`"""` and `'''`) across lines.
+fn strip_toml_line(line: &str, multiline: &mut Option<u8>) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        if let Some(m) = *multiline {
+            if m == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if i + 2 < bytes.len() && bytes[i] == m && bytes[i + 1] == m && bytes[i + 2] == m {
+                *multiline = None;
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            if q == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                let next = line[i + 1..].chars().next().unwrap();
+                out.push(next);
+                i += 1 + next.len_utf8();
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        match bytes[i] {
+            b'#' => break,
+            b'"' | b'\''
+                if i + 2 < bytes.len() && bytes[i + 1] == bytes[i] && bytes[i + 2] == bytes[i] =>
+            {
+                *multiline = Some(bytes[i]);
+                i += 3;
+            }
+            b'"' | b'\'' => {
+                quote = Some(bytes[i]);
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            _ => {
+                let ch = line[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// Normalize a dotted TOML key path (`a . "b" . 'c'` -> `a.b.c`).
+fn normalize_toml_path(raw: &str) -> String {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if let Some(q) = quote {
+            if escaped {
+                cur.push(ch);
+                escaped = false;
+            } else if q == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '.' => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_owned());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        parts.push(t.to_owned());
+    }
+    parts.join(".")
+}
+
+/// Split `s` at the first `=` outside quotes and braces.
+fn split_key_value(s: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if q == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '=' => return Some((s[..idx].trim(), s[idx + 1..].trim())),
+            _ => (),
+        }
+    }
+    None
+}
+
+/// Split top-level comma-separated entries inside an inline TOML table `{ ... }`.
+fn split_inline_entries(body: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in body.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if q == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let item = body[start..idx].trim();
+                if !item.is_empty() {
+                    entries.push(item);
+                }
+                start = idx + 1;
+            }
+            _ => (),
+        }
+    }
+    let last = body[start..].trim();
+    if !last.is_empty() {
+        entries.push(last);
+    }
+    entries
+}
+
+/// Parse a non-negative TOML integer (accepting optional `_` separators and,
+/// when `allow_false` is true, `false` as `0`).
+fn parse_toml_usize(raw: &str, allow_false: bool) -> Option<usize> {
+    let v = raw.trim();
+    if allow_false && v == "false" {
+        return Some(0);
+    }
+    if v.is_empty() || v.starts_with('-') {
+        return None;
+    }
+    let digits = v.strip_prefix('+').unwrap_or(v);
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+        || !digits.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+    cleaned.parse().ok()
+}
+
+fn apply_toml_entry(
+    full_key: &str,
+    value: &str,
+    workspace: &mut ProjectTestConfig,
+    package: &mut ProjectTestConfig,
+) {
+    let val = value.trim();
+    if let Some(inner) = val.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        for item in split_inline_entries(inner) {
+            if let Some((k, v)) = split_key_value(item) {
+                let sub = normalize_toml_path(k);
+                if !sub.is_empty() {
+                    let nested = format!("{full_key}.{sub}");
+                    apply_toml_entry(&nested, v, workspace, package);
+                }
+            }
+        }
+        return;
+    }
+    let (target, field) = if let Some(rest) = full_key.strip_prefix("workspace.metadata.jato.") {
+        (workspace, rest)
+    } else if let Some(rest) = full_key.strip_prefix("package.metadata.jato.") {
+        (package, rest)
+    } else {
+        return;
+    };
+    match field {
+        "parallel-tests" | "parallel_tests" => {
+            if let Some(n) = parse_toml_usize(val, true) {
+                target.parallel_tests = Some(n);
+            } else {
+                eprintln!(
+                    "jato: ignoring invalid {full_key} = {val} (expected a non-negative integer)"
+                );
+            }
+        }
+        "test-threads" | "test_threads" => {
+            if let Some(n) = parse_toml_usize(val, false) {
+                target.test_threads = Some(n);
+            } else {
+                eprintln!(
+                    "jato: ignoring invalid {full_key} = {val} (expected a non-negative integer)"
+                );
+            }
+        }
+        _ => (),
+    }
+}
+
+/// Extract `(workspace, package)` Jato test concurrency settings from a
+/// `Cargo.toml` file's text.
+fn parse_manifest_test_config(text: &str) -> (ProjectTestConfig, ProjectTestConfig) {
+    let mut workspace = ProjectTestConfig::default();
+    let mut package = ProjectTestConfig::default();
+    let mut section = String::new();
+    let mut multiline = None;
+    for raw_line in text.lines() {
+        let stripped = strip_toml_line(raw_line, &mut multiline);
+        let line = stripped.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("[[") {
+            let header = rest.split("]]").next().unwrap_or_default();
+            section = format!("[[{}]]", normalize_toml_path(header));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let header = rest.split(']').next().unwrap_or_default();
+            section = normalize_toml_path(header);
+            continue;
+        }
+        if section.starts_with("[[") {
+            continue;
+        }
+        if let Some((k, v)) = split_key_value(line) {
+            let key = normalize_toml_path(k);
+            if key.is_empty() {
+                continue;
+            }
+            let full_key = if section.is_empty() {
+                key
+            } else {
+                format!("{section}.{key}")
+            };
+            apply_toml_entry(&full_key, v, &mut workspace, &mut package);
+        }
+    }
+    (workspace, package)
+}
+
+/// Load project test concurrency configuration from the targeted package and
+/// enclosing workspace `Cargo.toml`.
+///
+/// Precedence: member `[package.metadata.jato]` > workspace
+/// `[workspace.metadata.jato]` > workspace `[package.metadata.jato]`.
+fn load_project_test_config(args: &[OsString], cwd: &Path) -> ProjectTestConfig {
+    let (explicit_manifest, start_dir) = manifest_location(args, cwd);
+    let nearest_manifest = explicit_manifest.filter(|p| p.is_file()).or_else(|| {
+        start_dir
+            .ancestors()
+            .map(|dir| dir.join("Cargo.toml"))
+            .find(|p| p.is_file())
+    });
+    let workspace_manifest = roots::workspace_above(&start_dir).map(|dir| dir.join("Cargo.toml"));
+
+    let mut member_cfg = ProjectTestConfig::default();
+    let mut workspace_cfg = ProjectTestConfig::default();
+
+    let same_file = |a: &Path, b: &Path| {
+        a == b
+            || fs::canonicalize(a)
+                .ok()
+                .zip(fs::canonicalize(b).ok())
+                .is_some_and(|(ca, cb)| ca == cb)
+    };
+
+    if let Some(ws_path) = workspace_manifest.as_deref()
+        && let Ok(text) = fs::read_to_string(ws_path)
+    {
+        let (ws, pkg) = parse_manifest_test_config(&text);
+        workspace_cfg = ws.or(pkg);
+    }
+
+    if let Some(pkg_path) = nearest_manifest.as_deref()
+        && workspace_manifest
+            .as_deref()
+            .is_none_or(|ws_path| !same_file(pkg_path, ws_path))
+        && let Ok(text) = fs::read_to_string(pkg_path)
+    {
+        let (ws, pkg) = parse_manifest_test_config(&text);
+        member_cfg = pkg.or(ws);
+    }
+
+    member_cfg.or(workspace_cfg)
+}
+
+fn parse_env_usize(name: &str, raw: Option<&OsStr>) -> Option<usize> {
+    let raw = raw?;
+    let text = raw.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            eprintln!(
+                "jato: ignoring invalid {name}={trimmed:?} (expected a non-negative integer)"
+            );
+            None
+        }
+    }
+}
+
+/// Inspect test-binary flags after `--` for streaming (`--nocapture`) and
+/// explicit `--test-threads` settings.
+fn cli_test_flags(args: &[OsString]) -> (bool, bool, bool) {
     let Some(dash) = args.iter().position(|a| a == "--") else {
-        return false;
+        return (false, false, false);
     };
     let tail = &args[dash + 1..];
+    let mut nocapture = false;
+    let mut has_test_threads = false;
+    let mut single_thread = false;
     for (i, arg) in tail.iter().enumerate() {
         let s = arg.to_str().unwrap_or_default();
-        if s == "--nocapture" || s == "--no-capture" || s == "--test-threads=1" {
-            return true;
-        }
-        if s == "--test-threads" && tail.get(i + 1).is_some_and(|v| v == "1") {
-            return true;
+        if s == "--nocapture" || s == "--no-capture" {
+            nocapture = true;
+        } else if let Some(val) = s.strip_prefix("--test-threads=") {
+            has_test_threads = true;
+            if val == "1" {
+                single_thread = true;
+            }
+        } else if s == "--test-threads" {
+            has_test_threads = true;
+            if tail.get(i + 1).is_some_and(|v| v == "1") {
+                single_thread = true;
+            }
         }
     }
-    false
+    (nocapture, has_test_threads, single_thread)
+}
+
+fn default_test_workers() -> usize {
+    let workers = crate::jobs::limit();
+    if workers == 0 {
+        std::thread::available_parallelism().map_or(8, |n| n.get())
+    } else {
+        workers
+    }
+    .clamp(1, 32)
+}
+
+/// Resolve effective parallel binary count and per-binary `RUST_TEST_THREADS`
+/// from CLI args, environment variables, and `Cargo.toml` metadata.
+fn resolve_test_concurrency(
+    args: &[OsString],
+    project: ProjectTestConfig,
+    env_parallel: Option<&OsStr>,
+    env_threads: Option<&OsStr>,
+    env_rust_test_threads: Option<&OsStr>,
+    default_workers: usize,
+) -> TestConcurrency {
+    let (nocapture, cli_has_threads, cli_single_thread) = cli_test_flags(args);
+
+    let parsed_env_threads = parse_env_usize("JATO_TEST_THREADS", env_threads);
+    let rust_test_threads = if cli_has_threads {
+        None
+    } else if let Some(n) = parsed_env_threads {
+        (n > 0).then_some(n)
+    } else if env_rust_test_threads.is_some_and(|v| !v.to_string_lossy().trim().is_empty()) {
+        None
+    } else {
+        project.test_threads.filter(|&n| n > 0)
+    };
+
+    let parsed_env_parallel = parse_env_usize("JATO_PARALLEL_TESTS", env_parallel);
+    let parallel_workers = if nocapture {
+        None
+    } else if let Some(n) = parsed_env_parallel {
+        if n <= 1 {
+            None
+        } else {
+            Some(n.min(MAX_EXPLICIT_PARALLEL_TESTS))
+        }
+    } else if cli_single_thread {
+        None
+    } else if let Some(cap) = project.parallel_tests {
+        let w = default_workers.min(cap);
+        (w > 1).then_some(w)
+    } else {
+        (default_workers > 1).then_some(default_workers)
+    };
+
+    TestConcurrency {
+        parallel_workers,
+        rust_test_threads,
+    }
 }
 
 // ---- test request, recipe, lookup, execution, recording -------------------
@@ -957,13 +1429,35 @@ fn plain_trimmed(line: &[u8]) -> String {
 /// parallel workspace test binary execution.
 pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
     command::started();
+    if env::var_os("JATO_DISABLE").is_some_and(|v| v == "1") || has_list_flag(args) {
+        return command::passthrough(cmd);
+    }
+    let cwd = env::current_dir()?;
+    let project_cfg = load_project_test_config(args, &cwd);
+    let concurrency = resolve_test_concurrency(
+        args,
+        project_cfg,
+        env::var_os("JATO_PARALLEL_TESTS").as_deref(),
+        env::var_os("JATO_TEST_THREADS").as_deref(),
+        env::var_os("RUST_TEST_THREADS").as_deref(),
+        default_test_workers(),
+    );
+    if let Some(threads) = concurrency.rust_test_threads {
+        cmd.env("RUST_TEST_THREADS", threads.to_string());
+    }
+    log(
+        "test",
+        format_args!(
+            "concurrency: binaries={}, test_threads={}",
+            concurrency.parallel_workers.unwrap_or(1),
+            concurrency
+                .rust_test_threads
+                .map_or_else(|| "default".to_owned(), |n| n.to_string()),
+        ),
+    );
     let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
     let is_doc = args[..end].iter().any(|a| a == "--doc");
-    if is_doc
-        || env::var_os("JATO_DISABLE").is_some_and(|v| v == "1")
-        || env::var_os("JATO_CACHE_TESTS").is_some_and(|v| v == "0")
-        || !observe::available()
-        || has_list_flag(args)
+    if is_doc || env::var_os("JATO_CACHE_TESTS").is_some_and(|v| v == "0") || !observe::available()
     {
         return command::passthrough(cmd);
     }
@@ -980,12 +1474,10 @@ pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
         return command::passthrough(cmd);
     };
     let runner_var = runner_env_name(&triple);
-    let cwd = env::current_dir()?;
     if has_custom_runner(&triple, &runner_var, &cwd) {
         return command::passthrough(cmd);
     }
 
-    let parallel = !wants_sync(args);
     let fail_fast = !args[..end].iter().any(|a| a == "--no-fail-fast");
     let socket = format!(
         "jato-test-{}-{:x}",
@@ -1001,7 +1493,7 @@ pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
     cmd.env(&runner_var, runner_val)
         .env("JATO_TEST_SESSION", &socket);
 
-    if !parallel {
+    let Some(workers) = concurrency.parallel_workers else {
         // Synchronous mode: Cargo owns stdout/stderr directly; supervisor
         // serves instant cache hits and hands misses back for live streaming.
         let stop = Arc::new(AtomicBool::new(false));
@@ -1046,17 +1538,10 @@ pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
         let _ = UnixStream::connect_addr(&address(OsStr::new(&socket))?);
         let _ = accept.join();
         return Ok(exit_code(status));
-    }
+    };
 
     // Parallel mode: Cargo dispatches every test binary rapidly via `__test`
     // while our worker pool executes cache hits & observed misses across cores.
-    let workers = crate::jobs::limit();
-    let workers = if workers == 0 {
-        std::thread::available_parallelism().map_or(8, |n| n.get())
-    } else {
-        workers
-    }
-    .clamp(1, 32);
 
     let pool = Arc::new(Pool {
         queue: Mutex::new(PoolState {
@@ -1216,4 +1701,281 @@ pub fn run(mut cmd: Command, args: &[OsString]) -> Result<i32> {
         return Ok(code);
     }
     Ok(exit_code(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(s: &str) -> Vec<OsString> {
+        s.split_whitespace().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_jato_test_metadata_in_all_toml_forms() {
+        let standard = r#"
+[workspace]
+members = ["a", "b"]
+
+[workspace.metadata.jato]
+parallel-tests = 4 # keep Postgres connections bounded
+test-threads = 2
+"#;
+        let (ws, pkg) = parse_manifest_test_config(standard);
+        assert_eq!(
+            ws,
+            ProjectTestConfig {
+                parallel_tests: Some(4),
+                test_threads: Some(2),
+            }
+        );
+        assert_eq!(pkg, ProjectTestConfig::default());
+
+        // Snake-case aliases, inline tables, dotted keys, and false (= 0 / serial).
+        let inline = r#"
+[package]
+name = "demo"
+description = """
+[workspace.metadata.jato]
+parallel-tests = 99
+"""
+
+[package.metadata]
+jato = { parallel_tests = false, test_threads = 3 }
+
+[[bin]]
+name = "ignored"
+parallel-tests = 99
+"#;
+        let (ws, pkg) = parse_manifest_test_config(inline);
+        assert_eq!(ws, ProjectTestConfig::default());
+        assert_eq!(
+            pkg,
+            ProjectTestConfig {
+                parallel_tests: Some(0),
+                test_threads: Some(3),
+            }
+        );
+
+        let dotted = r#"
+[workspace.metadata]
+jato.parallel-tests = 1_6
+jato.test-threads = 4
+"#;
+        let (ws, _) = parse_manifest_test_config(dotted);
+        assert_eq!(
+            ws,
+            ProjectTestConfig {
+                parallel_tests: Some(16),
+                test_threads: Some(4),
+            }
+        );
+    }
+
+    #[test]
+    fn loads_workspace_and_member_metadata_with_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("crates/a")).unwrap();
+        fs::create_dir_all(root.join("crates/b")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/a", "crates/b"]
+
+[workspace.metadata.jato]
+parallel-tests = 4
+test-threads = 3
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[package.metadata.jato]\ntest-threads = 1\n",
+        )
+        .unwrap();
+
+        // Workspace root uses [workspace.metadata.jato].
+        assert_eq!(
+            load_project_test_config(&words("test --workspace"), root),
+            ProjectTestConfig {
+                parallel_tests: Some(4),
+                test_threads: Some(3),
+            }
+        );
+        // Member without override inherits workspace settings.
+        assert_eq!(
+            load_project_test_config(&words("test"), &root.join("crates/a")),
+            ProjectTestConfig {
+                parallel_tests: Some(4),
+                test_threads: Some(3),
+            }
+        );
+        // Member with [package.metadata.jato] overrides only its specified key.
+        assert_eq!(
+            load_project_test_config(&words("test"), &root.join("crates/b")),
+            ProjectTestConfig {
+                parallel_tests: Some(4),
+                test_threads: Some(1),
+            }
+        );
+        // Explicit --manifest-path resolves to that member + its enclosing workspace.
+        let mf = root.join("crates/b/Cargo.toml");
+        let args = vec![
+            OsString::from("test"),
+            OsString::from("--manifest-path"),
+            mf.into_os_string(),
+        ];
+        assert_eq!(
+            load_project_test_config(&args, dir.path()),
+            ProjectTestConfig {
+                parallel_tests: Some(4),
+                test_threads: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn resolves_test_concurrency_precedence_and_caps() {
+        let project = ProjectTestConfig {
+            parallel_tests: Some(4),
+            test_threads: Some(3),
+        };
+        let os = OsStr::new;
+
+        // Default with no config preserves full machine workers.
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test --workspace"),
+                ProjectTestConfig::default(),
+                None,
+                None,
+                None,
+                32,
+            ),
+            TestConcurrency {
+                parallel_workers: Some(32),
+                rust_test_threads: None,
+            }
+        );
+
+        // Project cap bounds workers on larger machines and respects smaller machines.
+        assert_eq!(
+            resolve_test_concurrency(&words("test"), project, None, None, None, 32),
+            TestConcurrency {
+                parallel_workers: Some(4),
+                rust_test_threads: Some(3),
+            }
+        );
+        assert_eq!(
+            resolve_test_concurrency(&words("test"), project, None, None, None, 2),
+            TestConcurrency {
+                parallel_workers: Some(2),
+                rust_test_threads: Some(3),
+            }
+        );
+
+        // Env vars override Cargo.toml in both directions (including 0/1 -> serial and 0 -> unset threads).
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test"),
+                project,
+                Some(os("1")),
+                Some(os("0")),
+                None,
+                32
+            ),
+            TestConcurrency {
+                parallel_workers: None,
+                rust_test_threads: None,
+            }
+        );
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test"),
+                project,
+                Some(os("0")),
+                Some(os("2")),
+                None,
+                32
+            ),
+            TestConcurrency {
+                parallel_workers: None,
+                rust_test_threads: Some(2),
+            }
+        );
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test"),
+                project,
+                Some(os("8")),
+                Some(os("2")),
+                Some(os("6")),
+                32,
+            ),
+            TestConcurrency {
+                parallel_workers: Some(8),
+                rust_test_threads: Some(2),
+            }
+        );
+
+        // RUST_TEST_THREADS overrides Cargo.toml when JATO_TEST_THREADS is unset.
+        assert_eq!(
+            resolve_test_concurrency(&words("test"), project, None, None, Some(os("6")), 32),
+            TestConcurrency {
+                parallel_workers: Some(4),
+                rust_test_threads: None,
+            }
+        );
+
+        // --nocapture always runs synchronously; --test-threads on CLI skips injecting RUST_TEST_THREADS.
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test -- --nocapture"),
+                project,
+                Some(os("8")),
+                None,
+                None,
+                32,
+            ),
+            TestConcurrency {
+                parallel_workers: None,
+                rust_test_threads: Some(3),
+            }
+        );
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test -- --test-threads=1"),
+                project,
+                None,
+                None,
+                None,
+                32,
+            ),
+            TestConcurrency {
+                parallel_workers: None,
+                rust_test_threads: None,
+            }
+        );
+        assert_eq!(
+            resolve_test_concurrency(
+                &words("test -- --test-threads=1"),
+                project,
+                Some(os("4")),
+                None,
+                None,
+                32,
+            ),
+            TestConcurrency {
+                parallel_workers: Some(4),
+                rust_test_threads: None,
+            }
+        );
+    }
 }

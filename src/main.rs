@@ -139,8 +139,10 @@ Environment
   JATO_CACHE_TESTS=0  Run tests without caching their results
   JATO_CACHE_SCRIPTS=0
                       Run build scripts without caching their executions
-  JATO_PARALLEL_TESTS=0
-                      Run workspace test binaries one at a time
+  JATO_PARALLEL_TESTS Max test binaries run at once (0 or 1 runs serially;
+                      overrides [workspace.metadata.jato] parallel-tests)
+  JATO_TEST_THREADS   Default RUST_TEST_THREADS per test binary (0 unsets;
+                      overrides [workspace.metadata.jato] test-threads)
   JATO_DISABLE=1      Run Cargo and the compiler directly
 ";
 

@@ -181,12 +181,22 @@ Remote fetches verify manifest keys, local inputs *before* downloading blobs, an
 | Command or variable | Default / Purpose |
 | --- | --- |
 | `JATO_CACHE_DIR` | Cache directory (`$XDG_CACHE_HOME/jato` or `~/.cache/jato`). Builds sharing it share results and CPU slots. |
-| `JATO_JOBS` | Max concurrent compilers / parallel test binaries across all builds sharing the cache (default: CPU count; `0` disables). |
+| `JATO_JOBS` | Max concurrent compilers / default parallel test binaries across builds sharing the cache (default: CPU count; `0` disables). |
+| `JATO_PARALLEL_TESTS` | Max test binaries `jato test` runs at once (`0` or `1` runs serially; overrides `Cargo.toml`). |
+| `JATO_TEST_THREADS` | Default `RUST_TEST_THREADS` per test binary (`0` unsets `Cargo.toml`'s value). |
 | `JATO_KEY_ENV=A,B` | Extra environment variables read by procedural macros via `std::env::var`. |
 | `JATO_REMOTE` / `JATO_REMOTE_READONLY=1` / `JATO_REMOTE_TOKEN` | Override configured remote cache URL (`0` disables), pull-only mode, or HTTP Bearer token. |
 | `JATO_MEMORY` / `JATO_MAX_SIZE` | Per-process override for `jato memory` / `jato limit`. |
 | `JATO_LOG=debug` | Print hit/miss reasons, changed inputs, and restore timings (or pass an absolute file path to append). |
 | `JATO_DISABLE=1` | Bypass Jato completely and invoke Cargo / compilers directly. |
+
+Per-project test concurrency (for suites sharing a database or external service) can be set in `[workspace.metadata.jato]` (or `[package.metadata.jato]`) in `Cargo.toml`:
+
+```toml
+[workspace.metadata.jato]
+parallel-tests = 4   # max test binaries at once (0 or 1 = serial; capped by JATO_JOBS/CPUs)
+test-threads = 4     # default RUST_TEST_THREADS per binary (overridden by CLI --test-threads, JATO_TEST_THREADS, or RUST_TEST_THREADS)
+```
 
 <details>
 <summary>All feature toggles & diagnostic environment variables</summary>
@@ -200,7 +210,8 @@ Remote fetches verify manifest keys, local inputs *before* downloading blobs, an
 | `JATO_CACHE_SCRIPTS=0` | Disable `build.rs` execution caching. |
 | `JATO_TOOLS=0` | Disable caching C/C++/asm compilers invoked by build scripts. |
 | `JATO_CACHE_TESTS=0` | Disable `jato test` binary result caching. |
-| `JATO_PARALLEL_TESTS=0` | Run workspace test binaries serially instead of in parallel. |
+| `JATO_PARALLEL_TESTS=<N>` | Cap concurrent workspace test binaries at `N` (`0` or `1` runs serially; overrides `[workspace.metadata.jato] parallel-tests`). |
+| `JATO_TEST_THREADS=<N>` | Set default `RUST_TEST_THREADS=N` per test binary (`0` unsets `[workspace.metadata.jato] test-threads`). |
 | `JATO_SAVED_STATE=0` | Do not save or hand on `rustc` incremental state across checkouts. |
 | `JATO_MOUNT=0` | Disable optional unprivileged mount-namespace target canonicalization. |
 | `JATO_REMAP=0` | Keep real workspace/target paths in compiler outputs (results stay local to checkout). |
