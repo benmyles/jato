@@ -9,7 +9,7 @@ Jato remembers whole Cargo builds, individual `rustc` / C / C++ / assembly compi
 - **Soundness by observation**: Uses Linux `seccomp_unotify` + a minimal read-note preload shim to observe every file, directory, symlink, and subprocess actually read — catching procedural macros, build scripts, linkers, and C headers automatically.
 - **Incremental `rustc` state across checkouts**: Saves and relocates `rustc` incremental state so your *first* edit in a brand-new worktree compiles incrementally instead of from scratch.
 - **Cached build scripts, C/C++, and parallel tests**: Caches hermetic `build.rs` executions (`OUT_DIR` + directives), C/C++/asm compilations started by build scripts, and passing hermetic test binaries, while running workspace test binaries in parallel.
-- **Built for multi-worktree & coding agents**: Zero idle daemon RAM, shared machine-wide jobserver FIFO so parallel builds don't thrash cores, Btrfs/XFS reflinks, optional RAM hot tier on ext4, and a zero-dependency `file://` / `http://` remote cache.
+- **Built for multi-worktree & coding agents**: Zero idle daemon RAM, shared machine-wide jobserver FIFO so parallel builds don't thrash cores, Btrfs/XFS reflinks, optional RAM hot tier on ext4, a zero-dependency `file://` / `http://` remote cache, and a shared `jato rust-analyzer` LSP multiplexer & transparent shim so dozens of agent sessions across worktrees share one `rust-analyzer` per repo instead of consuming 100+ GiB RAM.
 
 > **Platform**: Linux (`x86_64` and `aarch64`, kernel 5.5+). On macOS and Windows, `jato` passes commands straight through to Cargo.
 
@@ -49,6 +49,19 @@ Coding agents working in separate git worktrees share one cache and one CPU budg
 ```
 
 Installs to `~/.claude/skills/jato/` (honors `CLAUDE_CONFIG_DIR`), `~/.agents/skills/jato/`, and `~/.gemini/antigravity-cli/skills/jato/`.
+
+### Shared `rust-analyzer` across sessions & worktrees
+
+Running many coding-agent sessions or editors across worktrees normally spawns one 4–6 GiB `rust-analyzer` process per session (>100 GiB across 20+ worktrees). `jato rust-analyzer` multiplexes LSP clients into one shared, tuned `rust-analyzer` backend per repository (sharing `sysroot`, dependencies, proc-macro server, and a per-repo `cargo.targetDir` across sibling git worktrees), starts lazily (`0 B` until the first `.rs` file open or query), filters worktree URIs per client, hibernates idle backends transparently (auto-waking with unsaved buffers intact), and enforces a total RSS budget with LRU eviction:
+
+```sh
+jato rust-analyzer shim install    # transparently intercept `rust-analyzer` on PATH
+jato rust-analyzer status          # inspect shared backends, worktrees, and RSS
+jato rust-analyzer stop            # stop the shared daemon and all backends
+jato rust-analyzer shim uninstall  # remove shim and restore any previous rustup link
+```
+
+Non-LSP invocations (`rust-analyzer --version`, `analysis-stats`, `parse`, etc.) pass straight through to the real binary. You can also point an editor/LSP client directly at `jato rust-analyzer` without installing the shim.
 
 ### Plain Cargo / `RUSTC_WRAPPER`
 
@@ -224,6 +237,13 @@ test-threads = 4     # default RUST_TEST_THREADS per binary (overridden by CLI -
 | `JATO_STORAGE=packed` | Store zstd-compressed blobs even on reflink-capable filesystems. |
 | `JATO_VERIFY=1` | Verify BLAKE3 digests on restore even on checksumming filesystems (Btrfs). |
 | `JATO_RECIPES=/dir` | Dump normalized command recipes per unit to diff why two runs missed. |
+| `JATO_RA_MEMORY` | Total RSS budget across shared `rust-analyzer` backends (default: 25% RAM, 4–32 GiB; `0` disables). |
+| `JATO_RA_MAX_BACKENDS` | Max concurrent shared `rust-analyzer` backends (default `8`; `0` unlimited). |
+| `JATO_RA_IDLE_SECS` | Idle seconds before hibernating a worktree/backend (default `600`; `0` disables). |
+| `JATO_RA_SHARE_WORKTREES` | `1` (default) shares one backend across git worktrees of a repo; `0` isolates each worktree. |
+| `JATO_RA_LAZY` | `1` (default) defers spawning `rust-analyzer` until first file open/query; `0` spawns on `initialize`. |
+| `JATO_RA_THREADS` / `JATO_RA_PRIME` / `JATO_RA_PROC_MACROS` / `JATO_RA_LRU` | Tune per-backend worker threads (`4–8`), eager cache priming (`0`), `proc-macro-srv` count (`1`), and syntax-tree LRU (`64`). |
+| `JATO_RA_TARGET_DIR` / `JATO_RA_CHECK_ON_SAVE` / `JATO_RA_PASSTHROUGH=1` | Override shared per-repo `cargo.targetDir` (`1`/`0`/path), `checkOnSave` (`0`/`1`), or bypass multiplexing. |
 
 </details>
 

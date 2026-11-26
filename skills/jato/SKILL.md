@@ -45,6 +45,7 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 - On a high-RAM server without reflinks (such as ext4), set a memory budget (`jato memory 64GiB` or `JATO_MEMORY=64GiB`) so hot objects stay uncompressed in the Linux page cache and restore via single-pass SIMD BLAKE3 at memory bandwidth (~0.7–1.3 s for 21 GiB on ext4) while scaling SQLite's index cache.
 
 - To share verified builds and tests across machines or CI runners, set `JATO_REMOTE=file:///shared/dir` or `JATO_REMOTE=http://host:port/prefix` (or persist with `jato remote <URL>`); use `JATO_REMOTE_READONLY=1` for read-only pulls and `JATO_REMOTE_TOKEN` for Bearer auth.
+- To avoid dozens of agent sessions spawning separate 4–6 GiB `rust-analyzer` processes across worktrees, run `jato rust-analyzer shim install` (or point LSP clients at `jato rust-analyzer`). Sibling git worktrees and concurrent sessions share one tuned `rust-analyzer` backend per repository with lazy startup, worktree-scoped URI filtering, idle hibernation with seamless auto-wake, and an RSS budget (`jato rust-analyzer status`, `jato rust-analyzer stop`, `JATO_RA_MEMORY`, `JATO_RA_IDLE_SECS`).
 
 ## Choose an edit loop
 

@@ -6570,3 +6570,352 @@ fn hermetic_ok() {
     assert_eq!(p.count("test_hit"), h0 + 1, "{}", p.stats());
     assert_eq!(p.count("test_miss"), m0 + 1, "{}", p.stats());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rust_analyzer_shares_backends_across_worktrees_hibernates_and_shims() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Child, Stdio};
+
+    // Skip gracefully on machines without rust-analyzer installed.
+    let has_ra = Command::new(env!("CARGO_BIN_EXE_jato"))
+        .args(["rust-analyzer", "--version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_ra {
+        return;
+    }
+
+    struct Lsp {
+        child: Child,
+        stdin: std::process::ChildStdin,
+        stdout: BufReader<std::process::ChildStdout>,
+        next_id: u64,
+    }
+    impl Lsp {
+        fn spawn(bin: &Path, cwd: &Path, cache: &Path, path_env: &OsStr, idle_secs: &str) -> Self {
+            let mut cmd = Command::new(bin);
+            cmd.current_dir(cwd)
+                .env("JATO_CACHE_DIR", cache)
+                .env("PATH", path_env)
+                .env("JATO_RA_CHECK_ON_SAVE", "0")
+                .env("JATO_RA_IDLE_SECS", idle_secs)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut child = cmd.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+            Self {
+                child,
+                stdin,
+                stdout,
+                next_id: 1,
+            }
+        }
+        fn send(&mut self, msg: &Value) {
+            let body = serde_json::to_vec(msg).unwrap();
+            write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+            self.stdin.write_all(&body).unwrap();
+            self.stdin.flush().unwrap();
+        }
+        fn recv(&mut self) -> Option<Value> {
+            let mut len = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = self.stdout.read_line(&mut line).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let t = line.trim_end_matches(['\r', '\n']);
+                if t.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = t.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    len = v.trim().parse::<usize>().ok();
+                }
+            }
+            let mut buf = vec![0u8; len?];
+            self.stdout.read_exact(&mut buf).ok()?;
+            serde_json::from_slice(&buf).ok()
+        }
+        fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }));
+            while let Some(m) = self.recv() {
+                if m.get("id").and_then(Value::as_u64) == Some(id) {
+                    return m;
+                }
+            }
+            panic!("EOF waiting for {method}");
+        }
+        fn init(&mut self, root: &Path) {
+            let uri = format!("file://{}", root.display());
+            let name = root.file_name().unwrap().to_string_lossy().into_owned();
+            let res = self.request(
+                "initialize",
+                serde_json::json!({
+                    "processId": std::process::id(),
+                    "rootUri": uri,
+                    "workspaceFolders": [{ "uri": uri, "name": name }],
+                    "capabilities": { "workspace": { "workspaceFolders": true, "configuration": true } }
+                }),
+            );
+            assert!(
+                res.pointer("/result/capabilities").is_some(),
+                "bad initialize: {res}"
+            );
+            self.send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {}
+            }));
+        }
+        fn did_open(&mut self, file: &Path, text: &str) {
+            self.send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": format!("file://{}", file.display()),
+                        "languageId": "rust",
+                        "version": 1,
+                        "text": text
+                    }
+                }
+            }));
+        }
+        fn close(mut self) {
+            let _ = self.request("shutdown", Value::Null);
+            self.send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "exit",
+                "params": null
+            }));
+            drop(self.stdin);
+            let _ = self.child.wait();
+        }
+    }
+
+    let tmp = scratch();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let cache = base.join("cache");
+    let shim_dir = base.join("bin");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let jato = Path::new(env!("CARGO_BIN_EXE_jato"));
+    let path_env = {
+        let mut entries = vec![shim_dir.clone()];
+        if let Some(p) = std::env::var_os("PATH") {
+            entries.extend(std::env::split_paths(&p));
+        }
+        std::env::join_paths(entries).unwrap()
+    };
+
+    // Build a real 2-worktree git repo so worktree grouping is exercised end-to-end.
+    let wt1 = base.join("repo");
+    let wt2 = base.join("wt2");
+    write(
+        wt1.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(wt1.join("src/helper.rs"), "pub fn answer() -> u32 { 42 }\n");
+    write(
+        wt1.join("src/lib.rs"),
+        "mod helper;\npub fn run() -> u32 { helper::answer() }\n",
+    );
+    success(Command::new("git").args(["init", "-q"]).current_dir(&wt1));
+    success(
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&wt1),
+    );
+    success(
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&wt1),
+    );
+    success(Command::new("git").args(["add", "."]).current_dir(&wt1));
+    success(
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&wt1),
+    );
+    success(
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                wt2.to_str().unwrap(),
+                "HEAD",
+            ])
+            .current_dir(&wt1),
+    );
+
+    // 1. Install transparent shim and verify non-LSP passthrough (`--version`, `parse`).
+    success(
+        Command::new(jato)
+            .env("JATO_CACHE_DIR", &cache)
+            .env("PATH", &path_env)
+            .args([
+                "rust-analyzer",
+                "shim",
+                "install",
+                "--dir",
+                shim_dir.to_str().unwrap(),
+            ]),
+    );
+    let shim_bin = shim_dir.join("rust-analyzer");
+    let ver = success(
+        Command::new(&shim_bin)
+            .env("JATO_CACHE_DIR", &cache)
+            .env("PATH", &path_env)
+            .arg("--version"),
+    );
+    assert!(
+        String::from_utf8_lossy(&ver.stdout).contains("rust-analyzer"),
+        "{}",
+        String::from_utf8_lossy(&ver.stdout)
+    );
+
+    let ra_status = |cache: &Path| -> Value {
+        let out = success(Command::new(jato).env("JATO_CACHE_DIR", cache).args([
+            "rust-analyzer",
+            "status",
+            "--json",
+        ]));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // 2. Connect 3 clients (2 in wt1, 1 in wt2) lazily -> 0 backends, 0 B RSS.
+    let mut c1 = Lsp::spawn(&shim_bin, &wt1, &cache, &path_env, "3");
+    let mut c2 = Lsp::spawn(&shim_bin, &wt1, &cache, &path_env, "3");
+    let mut c3 = Lsp::spawn(&shim_bin, &wt2, &cache, &path_env, "3");
+    c1.init(&wt1);
+    c2.init(&wt1);
+    c3.init(&wt2);
+    let st_lazy = ra_status(&cache);
+    assert_eq!(st_lazy["clients_connected"].as_u64(), Some(3), "{st_lazy}");
+    assert_eq!(st_lazy["clients_dormant"].as_u64(), Some(3), "{st_lazy}");
+    assert_eq!(
+        st_lazy["backends"].as_array().unwrap().len(),
+        0,
+        "{st_lazy}"
+    );
+    assert_eq!(st_lazy["total_rss_bytes"].as_u64(), Some(0), "{st_lazy}");
+
+    // 3. Open files and query hover + definition across all 3 clients -> 1 shared backend!
+    let f1 = wt1.join("src/lib.rs");
+    let f2 = wt2.join("src/lib.rs");
+    let text_wt1 = "mod helper;\npub fn run() -> u32 { helper::answer() }\npub fn only_in_wt1() -> u32 { 7 }\nfn use_wt1() -> u32 { only_in_wt1() }\n";
+    let text_wt2 = fs::read_to_string(&f2).unwrap();
+    c1.did_open(&f1, text_wt1);
+    c2.did_open(&f1, text_wt1);
+    c3.did_open(&f2, &text_wt2);
+
+    for (client, file, root) in [
+        (&mut c1, &f1, &wt1),
+        (&mut c2, &f1, &wt1),
+        (&mut c3, &f2, &wt2),
+    ] {
+        let def = client.request(
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": format!("file://{}", file.display()) },
+                "position": { "line": 1, "character": 32 }
+            }),
+        );
+        let s = def.to_string();
+        assert!(
+            s.contains(&format!("file://{}/src/helper.rs", root.display())),
+            "definition should resolve inside own worktree {}: {s}",
+            root.display()
+        );
+    }
+    let st_shared = ra_status(&cache);
+    assert_eq!(
+        st_shared["backends"].as_array().unwrap().len(),
+        1,
+        "all 3 clients across 2 worktrees must share 1 backend: {st_shared}"
+    );
+    assert_eq!(
+        st_shared["backends"][0]["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{st_shared}"
+    );
+    assert!(
+        st_shared["backends_reused"].as_u64().unwrap_or(0) >= 2,
+        "{st_shared}"
+    );
+
+    // Closing c1 keeps c2's shared document & backend intact; closing c3 leaves c2 working.
+    c1.close();
+    c3.close();
+    let hov_before = c2.request(
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": format!("file://{}", f1.display()) },
+            "position": { "line": 3, "character": 25 }
+        }),
+    );
+    assert!(
+        hov_before.to_string().contains("only_in_wt1"),
+        "c2 hover after c1 closed: {hov_before}"
+    );
+
+    // 4. Wait for idle hibernation (idle=3s) -> 0 backends, 0 B RSS, then seamlessly auto-wake!
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let st_hib = ra_status(&cache);
+    assert_eq!(st_hib["backends"].as_array().unwrap().len(), 0, "{st_hib}");
+    assert_eq!(st_hib["total_rss_bytes"].as_u64(), Some(0), "{st_hib}");
+    assert!(
+        st_hib["backends_hibernated"].as_u64().unwrap_or(0) >= 1,
+        "{st_hib}"
+    );
+
+    let hov_wake = c2.request(
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": format!("file://{}", f1.display()) },
+            "position": { "line": 3, "character": 25 }
+        }),
+    );
+    assert!(
+        hov_wake.to_string().contains("only_in_wt1"),
+        "seamless wake must replay unsaved buffer: {hov_wake}"
+    );
+    c2.close();
+
+    // 5. Stop daemon synchronously and uninstall shim cleanly.
+    success(
+        Command::new(jato)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["rust-analyzer", "stop"]),
+    );
+    success(
+        Command::new(jato)
+            .env("JATO_CACHE_DIR", &cache)
+            .env("PATH", &path_env)
+            .args([
+                "rust-analyzer",
+                "shim",
+                "uninstall",
+                "--dir",
+                shim_dir.to_str().unwrap(),
+            ]),
+    );
+    assert!(!shim_bin.exists());
+}

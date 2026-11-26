@@ -6,6 +6,21 @@ mod jobs;
 mod manifest;
 mod mount;
 mod observe;
+#[cfg(target_os = "linux")]
+mod ra;
+#[cfg(not(target_os = "linux"))]
+mod ra {
+    use anyhow::Result;
+    use std::ffi::OsString;
+    pub fn shim_main(args: &[OsString]) -> Result<i32> {
+        let mut cmd = std::process::Command::new("rust-analyzer");
+        cmd.args(args);
+        crate::command::passthrough(cmd)
+    }
+    pub fn main(args: &[OsString]) -> Result<i32> {
+        shim_main(args)
+    }
+}
 mod remote;
 mod roots;
 mod scan;
@@ -76,6 +91,7 @@ Usage
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
   jato dev [ACTION] [ARGS...]       Use the fast development profile (default build)
   jato watch [OPTIONS]             Check on save, with changed packages first
+  jato rust-analyzer [CMD]         Share rust-analyzer across sessions & worktrees
   jato stats [--json]              Show cache contents and counters
   jato why                         Explain why the last build was not cached or relocated
   jato limit [SIZE|--unset]         Read or set this cache directory's budget
@@ -353,6 +369,17 @@ fn main() {
                 127
             }
         };
+        std::process::exit(code);
+    }
+    if env::args_os()
+        .next()
+        .is_some_and(|own| Path::new(&own).file_name() == Some(OsStr::new("rust-analyzer")))
+    {
+        let args: Vec<_> = env::args_os().skip(1).collect();
+        let code = ra::shim_main(&args).unwrap_or_else(|e| {
+            eprintln!("jato rust-analyzer: {e:#}");
+            1
+        });
         std::process::exit(code);
     }
     // Once per build: what this process starts inherits the result.
@@ -805,6 +832,7 @@ fn run() -> Result<i32> {
             return cargo(args, options);
         }
         Some("watch") => return watch::run(&args[1..], options),
+        Some("rust-analyzer") => return ra::main(&args[1..]),
         Some("cargo") => return cargo(&args[1..], options),
         // Started by this program to see a command's stragglers out.
         Some("__answer") if args.len() == 2 => {

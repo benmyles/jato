@@ -105,6 +105,7 @@
 - [x] Share one crash-safe machine-wide jobserver FIFO (`tokens-shared`) across concurrent builds sharing a cache (`src/jobs.rs`) and route `jato watch` (`src/watch/mod.rs`) through `jato` itself for whole-build undo hits, in-place whole-build recording, seeding, and test caching.
 - [x] Add `aarch64` Linux read-note shim support (`src/fast/abi.rs`, `src/fast/shim.rs`, `src/observe.rs`, `build.rs`, 64 KiB page-aligned stub + icache coherence) and an optional zero-dependency remote/shared cache (`src/remote.rs`, `jato remote`, `JATO_REMOTE`, `JATO_REMOTE_READONLY`, `JATO_REMOTE_TOKEN`) supporting `file://` and HTTP/1.1 CAS with cryptographic manifest, detail, input, and streaming BLAKE3 object verification.
 - [x] Support per-project (`[workspace.metadata.jato]` / `[package.metadata.jato]` `parallel-tests` and `test-threads`) and per-run (`JATO_PARALLEL_TESTS=<N>`, `JATO_TEST_THREADS=<N>`) test concurrency caps for `jato test` while keeping full parallel workspace test execution by default.
+- [x] Add shared `jato rust-analyzer` LSP multiplexer daemon and optional transparent `rust-analyzer` PATH shim (`src/ra.rs`, `jato rust-analyzer [status|stop|shim install|uninstall|status]`): shares one tuned `rust-analyzer` backend across concurrent sessions and sibling git worktrees of a repository with lazy startup, worktree-scoped URI filtering, document refcounting, shared per-repo `cargo.targetDir`, idle hibernation with seamless auto-wake, process-group cleanup, and RSS/count LRU eviction.
 
 ## Open
 
