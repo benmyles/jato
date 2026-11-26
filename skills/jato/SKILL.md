@@ -1,6 +1,6 @@
 ---
 name: jato
-description: Use Jato in Rust Cargo projects to restore builds that were made before (in this checkout, another worktree or after a clean), keep several builds from overloading the machine, check edits on save, or find out why something was compiled again. Use when setting up Jato or when building, testing or running a Cargo project where Jato is available.
+description: Use Jato in Rust Cargo projects to restore builds that were made before (in this checkout, another worktree or after a clean), keep several builds from overloading the machine, share rust-analyzer across sessions and worktrees to save RAM and speed up LSP queries, check edits on save, or find out why something was compiled again. Use when setting up Jato or when building, testing, running, or using rust-analyzer in a Cargo project where Jato is available.
 ---
 
 # Use Jato in a Cargo project
@@ -45,7 +45,14 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 - On a high-RAM server without reflinks (such as ext4), set a memory budget (`jato memory 64GiB` or `JATO_MEMORY=64GiB`) so hot objects stay uncompressed in the Linux page cache and restore via single-pass SIMD BLAKE3 at memory bandwidth (~0.7–1.3 s for 21 GiB on ext4) while scaling SQLite's index cache.
 
 - To share verified builds and tests across machines or CI runners, set `JATO_REMOTE=file:///shared/dir` or `JATO_REMOTE=http://host:port/prefix` (or persist with `jato remote <URL>`); use `JATO_REMOTE_READONLY=1` for read-only pulls and `JATO_REMOTE_TOKEN` for Bearer auth.
-- To avoid dozens of agent sessions spawning separate 4–6 GiB `rust-analyzer` processes across worktrees, run `jato rust-analyzer shim install` (or point LSP clients at `jato rust-analyzer`). Sibling git worktrees and concurrent sessions share one tuned `rust-analyzer` backend per repository with lazy startup, worktree-scoped URI filtering, idle hibernation with seamless auto-wake, and an RSS budget (`jato rust-analyzer status`, `jato rust-analyzer stop`, `JATO_RA_MEMORY`, `JATO_RA_IDLE_SECS`).
+
+## Share `rust-analyzer` across sessions and worktrees
+
+To stop dozens of agent sessions or worktrees from spawning separate 4–6 GiB `rust-analyzer` processes (and to speed up warm attaches and repeat queries):
+
+- Run `jato rust-analyzer shim install` once to transparently intercept `rust-analyzer` on `PATH` (or configure an editor/LSP client to invoke `jato rust-analyzer` directly). Non-LSP flags and subcommands (`--version`, `analysis-stats`, `parse`, etc.) pass straight through to the real binary; `jato rust-analyzer shim uninstall` restores any previous `rustup` symlink.
+- Concurrent sessions and sibling git worktrees of the same repository share one tuned `rust-analyzer` backend (`sysroot`, dependencies, proc-macro server, and a shared per-repo `cargo.targetDir`), with lazy startup (`0 B` RAM and ~1.5 ms warm `initialize` until the first `.rs` file open or query), batched worktree loading, singleflight coalescing of concurrent identical queries, a sound content/stat-fingerprinted cache for single-file syntax requests (`documentSymbol`, `foldingRange`, `selectionRange`), strict per-worktree URI filtering, automatic hibernation with seamless buffer-preserving auto-wake, and crash recovery.
+- Inspect live sharing, cache hits, coalescing, and RSS with `jato rust-analyzer status` (or `--json`), stop all shared backends cleanly with `jato rust-analyzer stop`, and tune or bypass with `JATO_RA_MEMORY`, `JATO_RA_MAX_BACKENDS`, `JATO_RA_IDLE_SECS`, `JATO_RA_SHARE_WORKTREES=0`, `JATO_RA_LAZY=0`, or `JATO_RA_PASSTHROUGH=1`.
 
 ## Choose an edit loop
 

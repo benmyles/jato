@@ -42,6 +42,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -67,7 +68,7 @@ Environment
   JATO_RA_THREADS         Worker threads per backend (default: 4–8)
   JATO_RA_PRIME           0 (default) disables eager cache priming; 1 enables it
   JATO_RA_PROC_MACROS     proc-macro-srv processes per backend (default: 1)
-  JATO_RA_LRU             Syntax tree LRU capacity per backend (default: 64)
+  JATO_RA_LRU             Syntax tree LRU capacity per backend (default: 128)
   JATO_RA_TARGET_DIR      1 (default) shares per-repo cargo.targetDir; 0 disables; or custom path
   JATO_RA_CHECK_ON_SAVE   0 or 1 to override rust-analyzer checkOnSave
   JATO_RUST_ANALYZER      Explicit path to the real rust-analyzer binary
@@ -79,9 +80,17 @@ const RSS_REFRESH_TICKS: u64 = 5;
 const RETRY_DELAY: Duration = Duration::from_millis(300);
 const MAX_CONTENT_MODIFIED_RETRIES: u8 = 12;
 const WORKSPACE_READY_WAIT: Duration = Duration::from_secs(25);
+const WORKSPACE_BUSY_READY_WAIT: Duration = Duration::from_secs(120);
+const FOLDER_BATCH_DELAY: Duration = Duration::from_millis(60);
+const TOOLCHAIN_CACHE_TTL: Duration = Duration::from_secs(60);
 const ORPHAN_BACKEND_GRACE: Duration = Duration::from_secs(60);
 const EMPTY_DAEMON_GRACE: Duration = Duration::from_secs(30);
 const MAX_LSP_MESSAGE: usize = 64 << 20;
+const MAX_LSP_HEADERS: usize = 32;
+const MAX_LSP_HEADER_LINE: usize = 8192;
+const MAX_CLIENT_NOTIFS: usize = 256;
+const MAX_CLIENT_RESPONSES: usize = 8192;
+const SYNTAX_CACHE_MAX: usize = 512;
 
 // ---- CLI entrypoints -------------------------------------------------------
 
@@ -617,6 +626,10 @@ struct DaemonStatus {
     backends_reused: u64,
     backends_hibernated: u64,
     backends_evicted: u64,
+    #[serde(default)]
+    requests_coalesced: u64,
+    #[serde(default)]
+    cache_hits: u64,
     backends: Vec<BackendStatus>,
 }
 
@@ -733,8 +746,10 @@ fn cmd_status(json_out: bool) -> Result<i32> {
         }
     );
     println!(
-        "Sharing    {} shared attaches, {} hibernated, {} budget-evicted (idle {} s)",
+        "Sharing    {} shared attaches, {} coalesced, {} cache hits, {} hibernated, {} evicted (idle {} s)",
         status.backends_reused,
+        status.requests_coalesced,
+        status.cache_hits,
         status.backends_hibernated,
         status.backends_evicted,
         status.idle_secs
@@ -775,21 +790,41 @@ fn cmd_stop() -> Result<i32> {
 
 fn run_proxy(_args: &[OsString]) -> Result<i32> {
     let cache = cache_dir()?;
-    let mut stream = connect_or_start_daemon(&cache)?;
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let handshake = Handshake::Lsp {
         cwd,
         pid: std::process::id(),
         overrides: ClientEnvOverrides::from_env(),
     };
-    wire::send(&mut stream, &serde_json::to_vec(&handshake)?)?;
+    let hs_bytes = serde_json::to_vec(&handshake)?;
+
+    // Retry briefly if the daemon was shutting down right as we connected.
+    let mut stream = None;
+    let mut last_err = None;
+    for _ in 0..10 {
+        match connect_or_start_daemon(&cache) {
+            Ok(mut s) => {
+                if wire::send(&mut s, &hs_bytes).is_ok() && wire::receive(&mut s).is_ok() {
+                    stream = Some(s);
+                    break;
+                }
+                last_err = Some(anyhow::anyhow!("daemon closed before handshake ack"));
+            }
+            Err(e) => last_err = Some(e),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let stream = match stream {
+        Some(s) => s,
+        None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("connect failed"))),
+    };
 
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
     let stdin_to_sock = thread::spawn(move || {
         let mut stdin = io::stdin().lock();
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; 32 * 1024];
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -804,7 +839,7 @@ fn run_proxy(_args: &[OsString]) -> Result<i32> {
     });
 
     let mut stdout = io::stdout().lock();
-    let mut buf = [0u8; 16 * 1024];
+    let mut buf = [0u8; 32 * 1024];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -815,19 +850,57 @@ fn run_proxy(_args: &[OsString]) -> Result<i32> {
             }
         }
     }
-    let _ = stdin_to_sock.join();
+    // Do not block forever on `stdin_to_sock.join()`: if the daemon stopped
+    // while the client's stdin pipe is still open, exiting promptly lets the
+    // editor/agent detect EOF and respawn cleanly.
+    drop(stdin_to_sock);
     Ok(0)
 }
 
 // ---- LSP framing, URI helpers, git common dir, and document sync -----------
 
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<usize> {
+    buf.clear();
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            return Ok(buf.len());
+        }
+        if let Some(pos) = memchr::memchr(b'\n', avail) {
+            let take = pos + 1;
+            if buf.len() + take > limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "LSP header line exceeds limit",
+                ));
+            }
+            buf.extend_from_slice(&avail[..take]);
+            reader.consume(take);
+            return Ok(buf.len());
+        }
+        let take = avail.len();
+        if buf.len() + take > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LSP header line exceeds limit",
+            ));
+        }
+        buf.extend_from_slice(avail);
+        reader.consume(take);
+    }
+}
+
 fn read_lsp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
     let mut content_length: Option<usize> = None;
-    let mut line = String::new();
+    let mut raw_line = Vec::with_capacity(128);
     let mut saw_header = false;
+    let mut header_count = 0usize;
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
+        let n = read_bounded_line(reader, &mut raw_line, MAX_LSP_HEADER_LINE)?;
         if n == 0 {
             return if saw_header {
                 Err(io::Error::new(
@@ -839,14 +912,31 @@ fn read_lsp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
             };
         }
         saw_header = true;
+        let line = std::str::from_utf8(&raw_line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
+        header_count += 1;
+        if header_count > MAX_LSP_HEADERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many LSP headers",
+            ));
+        }
         if let Some((k, v)) = trimmed.split_once(':')
             && k.trim().eq_ignore_ascii_case("content-length")
         {
-            content_length = v.trim().parse::<usize>().ok();
+            let v = v.trim();
+            content_length = if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+                v.parse::<usize>().ok()
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Content-Length header",
+                ));
+            };
         }
     }
     let len = content_length
@@ -858,6 +948,12 @@ fn read_lsp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
     reader.read_exact(&mut body)?;
     let msg: Value =
         serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if !msg.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LSP JSON-RPC payload must be an object",
+        ));
+    }
     Ok(Some(msg))
 }
 
@@ -884,11 +980,22 @@ fn path_to_uri(path: &Path) -> String {
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
+    let rest = rest
+        .strip_prefix("localhost")
+        .filter(|r| r.starts_with('/'))
+        .unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
             if let Ok(val) = u8::from_str_radix(hex, 16) {
                 out.push(val);
@@ -903,9 +1010,31 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 }
 
 fn uri_in_root(uri: &str, root_uri: &str) -> bool {
-    let root = root_uri.trim_end_matches('/');
-    uri == root
-        || (uri.starts_with(root) && uri.as_bytes().get(root.len()).is_some_and(|&b| b == b'/'))
+    let root = if root_uri.len() > "file:///".len() {
+        root_uri.trim_end_matches('/')
+    } else {
+        root_uri
+    };
+    if !uri.contains('%')
+        && !root.contains('%')
+        && !uri.starts_with("file://localhost/")
+        && !root.starts_with("file://localhost/")
+    {
+        if root == "file:///" {
+            return uri.starts_with("file:///");
+        }
+        return uri == root
+            || (uri.starts_with(root)
+                && uri.as_bytes().get(root.len()).is_some_and(|&b| b == b'/'));
+    }
+    match (uri_to_path(uri), uri_to_path(root)) {
+        (Some(p), Some(r)) => p.starts_with(r),
+        _ => {
+            uri == root
+                || (uri.starts_with(root)
+                    && uri.as_bytes().get(root.len()).is_some_and(|&b| b == b'/'))
+        }
+    }
 }
 
 /// Find the git common directory shared by a repo and all its git worktrees.
@@ -953,7 +1082,8 @@ fn lsp_pos_to_byte(text: &str, target_line: u64, target_utf16: u64) -> usize {
     let mut offset = 0usize;
     for (line, chunk) in text.split_inclusive('\n').enumerate() {
         if line as u64 == target_line {
-            let line_str = chunk.trim_end_matches(['\r', '\n']);
+            let without_lf = chunk.strip_suffix('\n').unwrap_or(chunk);
+            let line_str = without_lf.strip_suffix('\r').unwrap_or(without_lf);
             let mut utf16 = 0u64;
             for (byte_idx, ch) in line_str.char_indices() {
                 if utf16 >= target_utf16 {
@@ -1224,8 +1354,10 @@ fn probe_ra_capabilities(cache: &Path, ra_bin: &Path, probe_id: u64) -> Result<V
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("probing capabilities from {}", ra_bin.display()))?;
+    let pgrp = child.id() as libc::pid_t;
 
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -1263,16 +1395,26 @@ fn probe_ra_capabilities(cache: &Path, ra_bin: &Path, probe_id: u64) -> Result<V
     })));
     let _ = stdin.flush();
     drop(stdin);
+    unsafe {
+        libc::kill(-pgrp, libc::SIGKILL);
+    }
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&empty);
 
     let result = result.context("rust-analyzer did not return InitializeResult during probe")?;
-    let tmp = cache_path.with_extension("tmp");
-    if fs::write(&tmp, serde_json::to_vec(&result)?).is_ok() {
-        let _ = fs::rename(&tmp, &cache_path);
-    }
+    write_caps_cache(&cache_path, &result, probe_id);
     Ok(result)
+}
+
+fn write_caps_cache(cache_path: &Path, result: &Value, salt: u64) {
+    let tmp = cache_path.with_extension(format!("{}-{salt}.tmp", std::process::id()));
+    if let Ok(bytes) = serde_json::to_vec(result)
+        && fs::write(&tmp, bytes).is_ok()
+        && fs::rename(&tmp, cache_path).is_err()
+    {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 // ---- daemon configuration --------------------------------------------------
@@ -1354,7 +1496,7 @@ impl DaemonConfig {
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .filter(|&n| n > 0)
-                .unwrap_or(64),
+                .unwrap_or(128),
             shared_target_dir: env::var("JATO_RA_TARGET_DIR")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -1462,13 +1604,114 @@ struct ClientDoc {
     text: String,
 }
 
+struct ClientOutQueue {
+    responses: VecDeque<Vec<u8>>,
+    notifications: VecDeque<Vec<u8>>,
+    closed: bool,
+}
+
+/// Non-blocking, two-lane outbound writer for one LSP client.
+///
+/// RPC responses (`id` present) take priority and are never crowded out by
+/// unsolicited server notifications (`publishDiagnostics`, `$/progress`),
+/// while notifications are capped to keep memory bounded even if a client is
+/// `SIGSTOP`ped or slow to read stdout.
+struct ClientWriter {
+    inner: Arc<(Mutex<ClientOutQueue>, Condvar)>,
+}
+
+impl ClientWriter {
+    fn spawn(mut stream: UnixStream) -> Self {
+        let inner = Arc::new((
+            Mutex::new(ClientOutQueue {
+                responses: VecDeque::new(),
+                notifications: VecDeque::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker = Arc::clone(&inner);
+        thread::spawn(move || {
+            let (lock, cv) = &*worker;
+            loop {
+                let frame = {
+                    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if let Some(f) = q.responses.pop_front() {
+                            break Some(f);
+                        }
+                        if q.closed {
+                            break None;
+                        }
+                        if let Some(f) = q.notifications.pop_front() {
+                            break Some(f);
+                        }
+                        q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                let Some(bytes) = frame else {
+                    break;
+                };
+                if stream.write_all(&bytes).is_err() || stream.flush().is_err() {
+                    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    q.closed = true;
+                    q.responses.clear();
+                    q.notifications.clear();
+                    break;
+                }
+            }
+        });
+        Self { inner }
+    }
+
+    fn send(&self, msg: &Value) {
+        let is_response = msg.get("id").is_some();
+        let frame = encode_lsp_message(msg);
+        let (lock, cv) = &*self.inner;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if q.closed {
+            return;
+        }
+        if is_response {
+            if q.responses.len() >= MAX_CLIENT_RESPONSES {
+                q.closed = true;
+                q.responses.clear();
+                q.notifications.clear();
+                cv.notify_one();
+                return;
+            }
+            q.responses.push_back(frame);
+        } else {
+            while q.notifications.len() >= MAX_CLIENT_NOTIFS {
+                q.notifications.pop_front();
+            }
+            q.notifications.push_back(frame);
+        }
+        cv.notify_one();
+    }
+
+    fn close(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.closed = true;
+        cv.notify_one();
+    }
+}
+
+impl Drop for ClientWriter {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 struct ClientState {
     id: ClientId,
     cwd: PathBuf,
     overrides: ClientEnvOverrides,
-    tx: Sender<Vec<u8>>,
+    tx: ClientWriter,
     workspace_root: Option<PathBuf>,
     workspace_uri: Option<String>,
+    extra_folders: HashMap<PathBuf, String>,
     backend_key: Option<BackendKey>,
     backend_id: Option<BackendId>,
     init_options: Value,
@@ -1485,7 +1728,23 @@ struct ClientState {
 
 impl ClientState {
     fn send(&self, msg: &Value) {
-        let _ = self.tx.send(encode_lsp_message(msg));
+        self.tx.send(msg);
+    }
+
+    fn owns_folder(&self, path: &Path) -> bool {
+        self.workspace_root.as_deref() == Some(path) || self.extra_folders.contains_key(path)
+    }
+
+    fn matches_uri(&self, uri: &str) -> bool {
+        self.open_docs.contains_key(uri)
+            || self
+                .workspace_uri
+                .as_deref()
+                .is_some_and(|root| uri_in_root(uri, root))
+            || self
+                .extra_folders
+                .values()
+                .any(|root| uri_in_root(uri, root))
     }
 }
 
@@ -1493,15 +1752,62 @@ struct BackendDoc {
     holders: HashSet<ClientId>,
     version: i64,
     text: String,
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CoalesceKey {
+    workspace_root: Option<PathBuf>,
+    method: String,
+    params_json: String,
+    target_fp: Option<FileFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum FileFingerprint {
+    Open([u8; 32]),
+    Disk {
+        mtime_ns: i128,
+        ctime_ns: i128,
+        len: u64,
+        ino: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SyntaxCacheKey {
+    method: String,
+    uri: String,
+    params_json: String,
+    fingerprint: FileFingerprint,
+}
+
+struct RequestWaiter {
+    client_id: ClientId,
+    client_req_id: Value,
+    cancelled: bool,
 }
 
 struct InFlightRequest {
-    client_id: ClientId,
-    client_req_id: Value,
     method: String,
     original_msg: Value,
     retries_left: u8,
-    cancelled: bool,
+    generation: u64,
+    coalesce_key: Option<CoalesceKey>,
+    syntax_key: Option<SyntaxCacheKey>,
+    waiters: Vec<RequestWaiter>,
+}
+
+impl InFlightRequest {
+    fn all_cancelled(&self) -> bool {
+        self.waiters.iter().all(|w| w.cancelled)
+    }
+
+    fn has_active_client(&self, cid: ClientId) -> bool {
+        self.waiters
+            .iter()
+            .any(|w| w.client_id == cid && !w.cancelled)
+    }
 }
 
 struct QueuedReadyMsg {
@@ -1521,10 +1827,22 @@ struct BackendState {
     init_result: Option<Value>,
     ready: bool,
     quiescent: bool,
+    generation: u64,
     loaded_folders: HashMap<PathBuf, FolderState>,
+    /// Sibling worktree folders queued so startup and warm bursts send
+    /// one coalesced `workspace/didChangeWorkspaceFolders` notification.
+    pending_added_folders: Vec<(PathBuf, String)>,
+    folder_flush_scheduled: bool,
     open_docs: HashMap<String, BackendDoc>,
     next_req_id: u64,
+    next_retry_token: u64,
     in_flight: HashMap<u64, InFlightRequest>,
+    /// Requests waiting for a `-32801` backoff retry (visible to cancel/evict/exit).
+    retrying: HashMap<u64, InFlightRequest>,
+    /// Bounded 100%-sound single-file syntax response cache (`documentSymbol`,
+    /// `foldingRange`, `selectionRange`) keyed by content/stat fingerprint.
+    syntax_cache: HashMap<SyntaxCacheKey, Value>,
+    syntax_cache_order: VecDeque<SyntaxCacheKey>,
     /// Raw already-transformed frames (didOpen/didChange/didClose/didChangeWorkspaceFolders)
     /// queued while waiting for the backend's `initialize` response.
     pending_raw: VecDeque<Value>,
@@ -1539,9 +1857,28 @@ struct BackendState {
 struct FolderState {
     uri: String,
     added_at: Instant,
+    /// False while queued in `pending_added_folders` awaiting batched send.
+    sent: bool,
     saw_busy: bool,
     ready: bool,
     last_active: Instant,
+}
+
+impl FolderState {
+    fn is_ready_or_timed_out(&self) -> bool {
+        if self.ready {
+            return true;
+        }
+        if !self.sent {
+            return false;
+        }
+        let limit = if self.saw_busy {
+            WORKSPACE_BUSY_READY_WAIT
+        } else {
+            WORKSPACE_READY_WAIT
+        };
+        self.added_at.elapsed() >= limit
+    }
 }
 
 impl BackendState {
@@ -1549,13 +1886,82 @@ impl BackendState {
         let _ = self.tx.send(encode_lsp_message(msg));
     }
 
-    fn other_root_uris(&self, client_root: Option<&Path>) -> Vec<String> {
+    fn other_root_uris(&self, client: Option<&ClientState>) -> Vec<String> {
         self.loaded_folders
             .iter()
-            .filter(|(p, _)| client_root.is_none_or(|c| c != p.as_path()))
+            .filter(|(p, _)| !client.is_some_and(|c| c.owns_folder(p)))
             .map(|(_, f)| f.uri.clone())
             .collect()
     }
+
+    fn file_fingerprint(&self, uri: &str) -> Option<FileFingerprint> {
+        if let Some(doc) = self.open_docs.get(uri) {
+            return Some(FileFingerprint::Open(doc.digest));
+        }
+        let path = uri_to_path(uri)?;
+        let meta = fs::metadata(&path).ok()?;
+        use std::os::unix::fs::MetadataExt;
+        Some(FileFingerprint::Disk {
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+            len: meta.len(),
+            ino: meta.ino(),
+        })
+    }
+
+    fn syntax_cache_key(&self, method: &str, msg: &Value) -> Option<SyntaxCacheKey> {
+        if !matches!(
+            method,
+            "textDocument/documentSymbol"
+                | "textDocument/foldingRange"
+                | "textDocument/selectionRange"
+        ) {
+            return None;
+        }
+        let uri = msg
+            .pointer("/params/textDocument/uri")
+            .and_then(Value::as_str)?;
+        let fingerprint = self.file_fingerprint(uri)?;
+        let params_json = serde_json::to_string(msg.get("params").unwrap_or(&Value::Null)).ok()?;
+        Some(SyntaxCacheKey {
+            method: method.to_owned(),
+            uri: uri.to_owned(),
+            params_json,
+            fingerprint,
+        })
+    }
+
+    fn insert_syntax_cache(&mut self, key: SyntaxCacheKey, result: Value) {
+        if let Some(slot) = self.syntax_cache.get_mut(&key) {
+            *slot = result;
+            return;
+        }
+        while self.syntax_cache.len() >= SYNTAX_CACHE_MAX {
+            if let Some(oldest) = self.syntax_cache_order.pop_front() {
+                self.syntax_cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.syntax_cache_order.push_back(key.clone());
+        self.syntax_cache.insert(key, result);
+    }
+}
+
+fn is_coalesceable_read_method(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/hover"
+            | "textDocument/definition"
+            | "textDocument/typeDefinition"
+            | "textDocument/declaration"
+            | "textDocument/implementation"
+            | "textDocument/references"
+            | "textDocument/documentSymbol"
+            | "textDocument/foldingRange"
+            | "textDocument/selectionRange"
+            | "workspace/symbol"
+    )
 }
 
 enum DaemonEvent {
@@ -1569,15 +1975,47 @@ enum DaemonEvent {
     ClientMessage(ClientId, Value),
     ClientDisconnected(ClientId),
     CapsProbed {
-        client_id: ClientId,
         ra_bin: PathBuf,
         result: Result<Value, String>,
     },
     BackendMessage(BackendId, Value),
     BackendExited(BackendId),
-    RetryRequest(BackendId, InFlightRequest),
+    FireRetry(BackendId, u64),
+    FlushAddedFolders(BackendId),
     Tick,
     SignalStop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ToolchainCacheKey {
+    workspace_root: PathBuf,
+    rustup_toolchain: Option<String>,
+    explicit_ra: Option<PathBuf>,
+}
+
+struct CachedToolchain {
+    ra_bin: PathBuf,
+    rustc_bin: PathBuf,
+    stamp: (Option<FileFingerprint>, Option<FileFingerprint>),
+    cached_at: Instant,
+}
+
+fn path_stat_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let meta = fs::metadata(path).ok()?;
+    use std::os::unix::fs::MetadataExt;
+    Some(FileFingerprint::Disk {
+        mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+        len: meta.len(),
+        ino: meta.ino(),
+    })
+}
+
+fn toolchain_file_stamp(ws: &Path) -> (Option<FileFingerprint>, Option<FileFingerprint>) {
+    (
+        path_stat_fingerprint(&ws.join("rust-toolchain.toml")),
+        path_stat_fingerprint(&ws.join("rust-toolchain")),
+    )
 }
 
 struct Daemon {
@@ -1590,10 +2028,16 @@ struct Daemon {
     backends: HashMap<BackendId, BackendState>,
     backend_by_key: HashMap<BackendKey, BackendId>,
     caps_cache: HashMap<PathBuf, Value>,
+    /// Coalesces concurrent cold capability probes per `rust-analyzer` binary.
+    probing_caps: HashMap<PathBuf, Vec<ClientId>>,
+    /// Avoids spawning `rustup which` on every client `initialize`.
+    toolchain_cache: HashMap<ToolchainCacheKey, CachedToolchain>,
     empty_since: Option<Instant>,
     backends_reused: u64,
     backends_hibernated: u64,
     backends_evicted: u64,
+    requests_coalesced: u64,
+    cache_hits: u64,
     tick_count: u64,
     shutdown: bool,
 }
@@ -1610,10 +2054,14 @@ impl Daemon {
             backends: HashMap::new(),
             backend_by_key: HashMap::new(),
             caps_cache: HashMap::new(),
+            probing_caps: HashMap::new(),
+            toolchain_cache: HashMap::new(),
             empty_since: None,
             backends_reused: 0,
             backends_hibernated: 0,
             backends_evicted: 0,
+            requests_coalesced: 0,
+            cache_hits: 0,
             tick_count: 0,
             shutdown: false,
         }
@@ -1634,14 +2082,11 @@ impl Daemon {
             }
             DaemonEvent::ClientMessage(cid, msg) => self.on_client_message(cid, msg),
             DaemonEvent::ClientDisconnected(cid) => self.on_client_disconnected(cid),
-            DaemonEvent::CapsProbed {
-                client_id,
-                ra_bin,
-                result,
-            } => self.on_caps_probed(client_id, ra_bin, result),
+            DaemonEvent::CapsProbed { ra_bin, result } => self.on_caps_probed(ra_bin, result),
             DaemonEvent::BackendMessage(bid, msg) => self.on_backend_message(bid, msg),
             DaemonEvent::BackendExited(bid) => self.on_backend_exited(bid),
-            DaemonEvent::RetryRequest(bid, req) => self.on_retry_request(bid, req),
+            DaemonEvent::FireRetry(bid, token) => self.on_fire_retry(bid, token),
+            DaemonEvent::FlushAddedFolders(bid) => self.flush_added_folders(bid),
             DaemonEvent::Tick => self.on_tick(),
             DaemonEvent::SignalStop => {
                 self.shutdown_all_backends();
@@ -1650,7 +2095,52 @@ impl Daemon {
         }
     }
 
-    fn on_new_client(&mut self, cwd: PathBuf, overrides: ClientEnvOverrides, stream: UnixStream) {
+    fn resolve_toolchain(
+        &mut self,
+        workspace_root: &Path,
+        overrides: &ClientEnvOverrides,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let key = ToolchainCacheKey {
+            workspace_root: workspace_root.to_path_buf(),
+            rustup_toolchain: overrides.rustup_toolchain.clone(),
+            explicit_ra: overrides.rust_analyzer_bin.clone(),
+        };
+        let stamp = toolchain_file_stamp(workspace_root);
+        if let Some(entry) = self.toolchain_cache.get(&key)
+            && entry.stamp == stamp
+            && entry.cached_at.elapsed() < TOOLCHAIN_CACHE_TTL
+        {
+            return Ok((entry.ra_bin.clone(), entry.rustc_bin.clone()));
+        }
+        let ra_bin = if let Some(explicit) = overrides.rust_analyzer_bin.as_deref() {
+            fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf())
+        } else {
+            resolve_real_ra(workspace_root)?
+        };
+        let rustc_bin = resolve_rustc(workspace_root);
+        self.toolchain_cache.insert(
+            key,
+            CachedToolchain {
+                ra_bin: ra_bin.clone(),
+                rustc_bin: rustc_bin.clone(),
+                stamp,
+                cached_at: Instant::now(),
+            },
+        );
+        Ok((ra_bin, rustc_bin))
+    }
+
+    fn on_new_client(
+        &mut self,
+        cwd: PathBuf,
+        overrides: ClientEnvOverrides,
+        mut stream: UnixStream,
+    ) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        if wire::send(&mut stream, br#"{"ok":true}"#).is_err() {
+            return;
+        }
+        let _ = stream.set_write_timeout(None);
         self.empty_since = None;
         let id = self.next_client_id;
         self.next_client_id += 1;
@@ -1658,15 +2148,7 @@ impl Daemon {
         let Ok(read_stream) = stream.try_clone() else {
             return;
         };
-        let mut write_stream = stream;
-        let (out_tx, out_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-        thread::spawn(move || {
-            for bytes in out_rx {
-                if write_stream.write_all(&bytes).is_err() || write_stream.flush().is_err() {
-                    break;
-                }
-            }
-        });
+        let out_tx = ClientWriter::spawn(stream);
 
         let ev_tx = self.tx.clone();
         thread::spawn(move || {
@@ -1688,6 +2170,7 @@ impl Daemon {
                 tx: out_tx,
                 workspace_root: None,
                 workspace_uri: None,
+                extra_folders: HashMap::new(),
                 backend_key: None,
                 backend_id: None,
                 init_options: Value::Object(Map::new()),
@@ -1744,6 +2227,8 @@ impl Daemon {
             backends_reused: self.backends_reused,
             backends_hibernated: self.backends_hibernated,
             backends_evicted: self.backends_evicted,
+            requests_coalesced: self.requests_coalesced,
+            cache_hits: self.cache_hits,
             backends,
         };
         if let Ok(bytes) = serde_json::to_vec(&status) {
@@ -1795,6 +2280,24 @@ impl Daemon {
             _ => (),
         }
 
+        // Reject requests sent before `initialize` per LSP spec (-32002).
+        if self
+            .clients
+            .get(&cid)
+            .is_some_and(|c| c.backend_key.is_none())
+        {
+            if let Some(req_id) = msg.get("id").cloned()
+                && let Some(c) = self.clients.get(&cid)
+            {
+                c.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": { "code": -32002, "message": "server not initialized" }
+                }));
+            }
+            return;
+        }
+
         // Update client's open document shadow state before forwarding so
         // hibernation/wake and multi-client refcounting always stay accurate.
         self.update_client_doc_shadow(cid, method.as_deref(), &msg);
@@ -1807,7 +2310,7 @@ impl Daemon {
         }
 
         // Ensure backend is running and this client's workspace is attached.
-        let Some(bid) = self.ensure_client_active(cid) else {
+        let Some((bid, just_woke)) = self.ensure_client_active(cid) else {
             if let Some(req_id) = msg.get("id").cloned()
                 && let Some(c) = self.clients.get(&cid)
             {
@@ -1820,6 +2323,18 @@ impl Daemon {
             return;
         };
 
+        // When waking a dormant client, `replay_client_docs` has already synced
+        // the up-to-date `didOpen`/`didChange` buffer to the backend — do not
+        // double-apply incremental edits.
+        if just_woke
+            && matches!(
+                method.as_deref(),
+                Some("textDocument/didOpen" | "textDocument/didChange")
+            )
+        {
+            return;
+        }
+
         self.dispatch_to_backend(bid, cid, msg);
     }
 
@@ -1827,6 +2342,20 @@ impl Daemon {
         let Some(req_id) = msg.get("id").cloned() else {
             return;
         };
+        if self
+            .clients
+            .get(&cid)
+            .is_some_and(|c| c.backend_key.is_some())
+        {
+            if let Some(c) = self.clients.get(&cid) {
+                c.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": { "code": -32600, "message": "server already initialized" }
+                }));
+            }
+            return;
+        }
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         let (cwd, overrides) = {
             let Some(c) = self.clients.get(&cid) else {
@@ -1859,13 +2388,8 @@ impl Daemon {
             .unwrap_or(canon_root);
         let workspace_uri = path_to_uri(&workspace_root);
 
-        let ra_bin = if let Some(explicit) = overrides.rust_analyzer_bin.as_deref() {
-            Ok(fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf()))
-        } else {
-            resolve_real_ra(&workspace_root)
-        };
-        let ra_bin = match ra_bin {
-            Ok(p) => p,
+        let (ra_bin, rustc_bin) = match self.resolve_toolchain(&workspace_root, &overrides) {
+            Ok(pair) => pair,
             Err(e) => {
                 if let Some(c) = self.clients.get(&cid) {
                     c.send(&json!({
@@ -1877,7 +2401,6 @@ impl Daemon {
                 return;
             }
         };
-        let rustc_bin = resolve_rustc(&workspace_root);
         let share_worktrees = overrides
             .share_worktrees
             .unwrap_or(self.cfg.share_worktrees);
@@ -1902,9 +2425,26 @@ impl Daemon {
             .unwrap_or(false);
         let lazy = overrides.lazy.unwrap_or(self.cfg.lazy);
 
+        let mut extra_folders = HashMap::new();
+        if let Some(folders) = params.get("workspaceFolders").and_then(Value::as_array) {
+            for f in folders.iter().skip(1) {
+                if let Some(p) = f.get("uri").and_then(Value::as_str).and_then(uri_to_path) {
+                    let canon = fs::canonicalize(&p).unwrap_or(p);
+                    let root = roots::workspace_above(&canon)
+                        .and_then(|r| fs::canonicalize(&r).ok().or(Some(r)))
+                        .unwrap_or(canon);
+                    if root != workspace_root {
+                        let uri = path_to_uri(&root);
+                        extra_folders.insert(root, uri);
+                    }
+                }
+            }
+        }
+
         if let Some(c) = self.clients.get_mut(&cid) {
             c.workspace_root = Some(workspace_root);
             c.workspace_uri = Some(workspace_uri);
+            c.extra_folders = extra_folders;
             c.backend_key = Some(key.clone());
             c.init_options = init_options;
             c.supports_progress = supports_progress;
@@ -1936,17 +2476,22 @@ impl Daemon {
             if let Some(c) = self.clients.get_mut(&cid) {
                 c.waiting_init_req = Some(req_id);
             }
-            let cache = self.cfg.cache_dir.clone();
-            let tx = self.tx.clone();
-            thread::spawn(move || {
-                let result =
-                    probe_ra_capabilities(&cache, &ra_bin, cid).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(DaemonEvent::CapsProbed {
-                    client_id: cid,
-                    ra_bin,
-                    result,
+            let already_probing = if let Some(waiters) = self.probing_caps.get_mut(&ra_bin) {
+                waiters.push(cid);
+                true
+            } else {
+                self.probing_caps.insert(ra_bin.clone(), vec![cid]);
+                false
+            };
+            if !already_probing {
+                let cache = self.cfg.cache_dir.clone();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let result =
+                        probe_ra_capabilities(&cache, &ra_bin, cid).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(DaemonEvent::CapsProbed { ra_bin, result });
                 });
-            });
+            }
             return;
         }
 
@@ -1966,25 +2511,30 @@ impl Daemon {
         }
     }
 
-    fn on_caps_probed(&mut self, cid: ClientId, ra_bin: PathBuf, result: Result<Value, String>) {
+    fn on_caps_probed(&mut self, ra_bin: PathBuf, result: Result<Value, String>) {
+        let waiters = self.probing_caps.remove(&ra_bin).unwrap_or_default();
         match result {
             Ok(caps) => {
                 self.caps_cache.insert(ra_bin, caps.clone());
-                if let Some(c) = self.clients.get_mut(&cid)
-                    && let Some(req_id) = c.waiting_init_req.take()
-                {
-                    c.send(&json!({ "jsonrpc": "2.0", "id": req_id, "result": caps }));
+                for cid in waiters {
+                    if let Some(c) = self.clients.get_mut(&cid)
+                        && let Some(req_id) = c.waiting_init_req.take()
+                    {
+                        c.send(&json!({ "jsonrpc": "2.0", "id": req_id, "result": caps }));
+                    }
                 }
             }
             Err(err) => {
-                if let Some(c) = self.clients.get_mut(&cid)
-                    && let Some(req_id) = c.waiting_init_req.take()
-                {
-                    c.send(&json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": { "code": -32603, "message": err }
-                    }));
+                for cid in waiters {
+                    if let Some(c) = self.clients.get_mut(&cid)
+                        && let Some(req_id) = c.waiting_init_req.take()
+                    {
+                        c.send(&json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": { "code": -32603, "message": err }
+                        }));
+                    }
                 }
             }
         }
@@ -2039,13 +2589,14 @@ impl Daemon {
         }
     }
 
-    fn ensure_client_active(&mut self, cid: ClientId) -> Option<BackendId> {
-        let (key, ws_root, ws_uri, init_opts, overrides, was_active, existing_bid) = {
+    fn ensure_client_active(&mut self, cid: ClientId) -> Option<(BackendId, bool)> {
+        let (key, ws_root, ws_uri, extra_folders, init_opts, overrides, was_active, existing_bid) = {
             let c = self.clients.get(&cid)?;
             (
                 c.backend_key.clone()?,
                 c.workspace_root.clone()?,
                 c.workspace_uri.clone()?,
+                c.extra_folders.clone(),
                 c.init_options.clone(),
                 c.overrides.clone(),
                 c.active,
@@ -2057,12 +2608,18 @@ impl Daemon {
             && self.backends.contains_key(&bid)
         {
             if let Some(b) = self.backends.get_mut(&bid) {
-                b.last_activity = Instant::now();
+                let now = Instant::now();
+                b.last_activity = now;
                 if let Some(f) = b.loaded_folders.get_mut(&ws_root) {
-                    f.last_active = Instant::now();
+                    f.last_active = now;
+                }
+                for ef in extra_folders.keys() {
+                    if let Some(f) = b.loaded_folders.get_mut(ef) {
+                        f.last_active = now;
+                    }
                 }
             }
-            return Some(bid);
+            return Some((bid, false));
         }
 
         // Reuse existing backend for this repo group, or spawn a new one.
@@ -2080,51 +2637,93 @@ impl Daemon {
             c.active = true;
         }
 
+        // Ensure this client's primary workspace (when reusing) and any extra
+        // workspace folders are loaded in the shared backend.
+        let mut folders_to_ensure: Vec<(PathBuf, String)> = Vec::new();
         if !spawned {
-            // Attach this client's worktree folder if not already loaded in the shared backend.
-            let need_add = self
-                .backends
-                .get(&bid)
-                .is_some_and(|b| !b.loaded_folders.contains_key(&ws_root));
-            if need_add && let Some(b) = self.backends.get_mut(&bid) {
-                let now = Instant::now();
-                b.loaded_folders.insert(
-                    ws_root.clone(),
-                    FolderState {
-                        uri: ws_uri.clone(),
-                        added_at: now,
-                        saw_busy: false,
-                        ready: false,
-                        last_active: now,
-                    },
-                );
-                b.quiescent = false;
-                b.last_activity = now;
-                let name = ws_root
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("workspace");
-                let add_notif = json!({
-                    "jsonrpc": "2.0",
-                    "method": "workspace/didChangeWorkspaceFolders",
-                    "params": {
-                        "event": {
-                            "added": [{ "uri": ws_uri, "name": name }],
-                            "removed": []
-                        }
-                    }
-                });
-                if b.ready {
-                    b.send(&add_notif);
-                } else {
-                    b.pending_raw.push_back(add_notif);
-                }
-            }
+            folders_to_ensure.push((ws_root, ws_uri));
         }
+        folders_to_ensure.extend(extra_folders);
+        self.queue_backend_folders(bid, folders_to_ensure);
+
         // Replay any open documents this dormant/hibernated client already holds
         // (both when attaching to an existing backend and when waking a fresh one).
         self.replay_client_docs(bid, cid);
-        Some(bid)
+        Some((bid, true))
+    }
+
+    fn queue_backend_folders(&mut self, bid: BackendId, folders: Vec<(PathBuf, String)>) {
+        let schedule_flush = {
+            let Some(b) = self.backends.get_mut(&bid) else {
+                return;
+            };
+            let now = Instant::now();
+            let mut added_any = false;
+            for (path, uri) in folders {
+                if !b.loaded_folders.contains_key(&path) {
+                    b.loaded_folders.insert(
+                        path.clone(),
+                        FolderState {
+                            uri: uri.clone(),
+                            added_at: now,
+                            sent: false,
+                            saw_busy: false,
+                            ready: false,
+                            last_active: now,
+                        },
+                    );
+                    b.pending_added_folders.push((path, uri));
+                    b.generation += 1;
+                    b.quiescent = false;
+                    b.last_activity = now;
+                    added_any = true;
+                }
+            }
+            if added_any && b.ready && !b.folder_flush_scheduled {
+                b.folder_flush_scheduled = true;
+                true
+            } else {
+                false
+            }
+        };
+        if schedule_flush {
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                thread::sleep(FOLDER_BATCH_DELAY);
+                let _ = tx.send(DaemonEvent::FlushAddedFolders(bid));
+            });
+        }
+    }
+
+    fn flush_added_folders(&mut self, bid: BackendId) {
+        let Some(b) = self.backends.get_mut(&bid) else {
+            return;
+        };
+        b.folder_flush_scheduled = false;
+        if !b.ready || b.pending_added_folders.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let added: Vec<Value> = b
+            .pending_added_folders
+            .drain(..)
+            .map(|(p, u)| {
+                if let Some(f) = b.loaded_folders.get_mut(&p) {
+                    f.sent = true;
+                    f.added_at = now;
+                    f.saw_busy = false;
+                    f.ready = false;
+                }
+                let name = p.file_name().and_then(OsStr::to_str).unwrap_or("workspace");
+                json!({ "uri": u, "name": name })
+            })
+            .collect();
+        b.quiescent = false;
+        b.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": { "event": { "added": added, "removed": [] } }
+        }));
     }
 
     fn spawn_backend(
@@ -2203,6 +2802,7 @@ impl Daemon {
             FolderState {
                 uri: initial_uri.to_owned(),
                 added_at: now,
+                sent: true,
                 saw_busy: false,
                 ready: false,
                 last_active: now,
@@ -2256,10 +2856,17 @@ impl Daemon {
             init_result: None,
             ready: false,
             quiescent: false,
+            generation: 0,
             loaded_folders,
+            pending_added_folders: Vec::new(),
+            folder_flush_scheduled: false,
             open_docs: HashMap::new(),
             next_req_id: 2,
+            next_retry_token: 1,
             in_flight: HashMap::new(),
+            retrying: HashMap::new(),
+            syntax_cache: HashMap::new(),
+            syntax_cache_order: VecDeque::new(),
             pending_raw: VecDeque::new(),
             pending_init: VecDeque::new(),
             pending_folder_ready: VecDeque::new(),
@@ -2304,6 +2911,8 @@ impl Daemon {
             if existing.text != text {
                 existing.version += 1;
                 existing.text = text.to_owned();
+                existing.digest = *blake3::hash(text.as_bytes()).as_bytes();
+                b.generation += 1;
                 let change = json!({
                     "jsonrpc": "2.0",
                     "method": "textDocument/didChange",
@@ -2322,12 +2931,14 @@ impl Daemon {
         }
         let mut holders = HashSet::new();
         holders.insert(cid);
+        b.generation += 1;
         b.open_docs.insert(
             uri.to_owned(),
             BackendDoc {
                 holders,
                 version: 1,
                 text: text.to_owned(),
+                digest: *blake3::hash(text.as_bytes()).as_bytes(),
             },
         );
         let open = json!({
@@ -2393,6 +3004,7 @@ impl Daemon {
                     && let Some(doc) = b.open_docs.get_mut(&uri)
                 {
                     doc.version += 1;
+                    b.generation += 1;
                     let shared = doc.holders.len() > 1;
                     if let Some(full) = full_text {
                         doc.text = full;
@@ -2402,6 +3014,7 @@ impl Daemon {
                     {
                         apply_content_changes(&mut doc.text, changes);
                     }
+                    doc.digest = *blake3::hash(doc.text.as_bytes()).as_bytes();
                     let forward = if shared {
                         json!({
                             "jsonrpc": "2.0",
@@ -2435,6 +3048,52 @@ impl Daemon {
                 }
                 return;
             }
+            Some("workspace/didChangeWorkspaceFolders") => {
+                // Never allow a single client to unload a folder still used by
+                // other clients on the same shared backend; track per-client
+                // extra folders and only add new folders safely.
+                if let Some(removed) = msg
+                    .pointer("/params/event/removed")
+                    .and_then(Value::as_array)
+                    && let Some(c) = self.clients.get_mut(&cid)
+                {
+                    for f in removed {
+                        if let Some(p) = f.get("uri").and_then(Value::as_str).and_then(uri_to_path)
+                        {
+                            let canon = fs::canonicalize(&p).unwrap_or(p);
+                            c.extra_folders.remove(&canon);
+                        }
+                    }
+                }
+                if let Some(added) = msg.pointer("/params/event/added").and_then(Value::as_array) {
+                    let mut to_add = Vec::new();
+                    for f in added {
+                        let Some(uri) = f.get("uri").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let Some(p) = uri_to_path(uri) else {
+                            continue;
+                        };
+                        let canon = fs::canonicalize(&p).unwrap_or(p);
+                        let norm_uri = path_to_uri(&canon);
+                        if let Some(c) = self.clients.get_mut(&cid) {
+                            c.extra_folders.insert(canon.clone(), norm_uri.clone());
+                        }
+                        to_add.push((canon, norm_uri));
+                    }
+                    self.queue_backend_folders(bid, to_add);
+                }
+                return;
+            }
+            Some(
+                "textDocument/didSave"
+                | "workspace/didChangeWatchedFiles"
+                | "workspace/didChangeConfiguration",
+            ) => {
+                if let Some(b) = self.backends.get_mut(&bid) {
+                    b.generation += 1;
+                }
+            }
             _ => (),
         }
 
@@ -2459,8 +3118,7 @@ impl Daemon {
         if msg.get("id").is_some()
             && let Some(ws) = client_root.as_ref()
             && let Some(folder) = b.loaded_folders.get(ws)
-            && !folder.ready
-            && folder.added_at.elapsed() < WORKSPACE_READY_WAIT
+            && !folder.is_ready_or_timed_out()
         {
             b.pending_folder_ready.push_back(QueuedReadyMsg {
                 client_id: cid,
@@ -2470,59 +3128,178 @@ impl Daemon {
             return;
         }
 
-        Self::send_request_or_notif(b, cid, msg);
+        self.send_request_or_notif(bid, cid, msg);
     }
 
-    fn send_request_or_notif(b: &mut BackendState, cid: ClientId, mut msg: Value) {
-        if let Some(client_req_id) = msg.get("id").cloned() {
-            let backend_id = b.next_req_id;
-            b.next_req_id += 1;
-            let method = msg
-                .get("method")
+    fn send_request_or_notif(&mut self, bid: BackendId, cid: ClientId, mut msg: Value) {
+        let Some(client_req_id) = msg.get("id").cloned() else {
+            if let Some(b) = self.backends.get(&bid) {
+                b.send(&msg);
+            }
+            return;
+        };
+        let method = msg
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let workspace_root = self
+            .clients
+            .get(&cid)
+            .and_then(|c| c.workspace_root.clone());
+
+        // Fast path 1: 100%-sound single-file syntax cache (keyed by content
+        // digest for open buffers or mtime/ctime/len/ino for on-disk files).
+        let syntax_key = self
+            .backends
+            .get(&bid)
+            .and_then(|b| b.syntax_cache_key(&method, &msg));
+        if let Some(ref sk) = syntax_key
+            && let Some(cached) = self
+                .backends
+                .get(&bid)
+                .and_then(|b| b.syntax_cache.get(sk))
+                .cloned()
+        {
+            self.cache_hits += 1;
+            let now = Instant::now();
+            if let Some(b) = self.backends.get_mut(&bid) {
+                b.last_activity = now;
+            }
+            if let Some(c) = self.clients.get_mut(&cid) {
+                c.last_activity = now;
+                c.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": client_req_id,
+                    "result": cached
+                }));
+            }
+            return;
+        }
+
+        // Fast path 2: Singleflight coalescing of concurrent identical
+        // read-only requests on the same backend generation and file fingerprint.
+        let coalesce_key = is_coalesceable_read_method(&method).then(|| {
+            let params_json = serde_json::to_string(msg.get("params").unwrap_or(&Value::Null))
+                .unwrap_or_default();
+            let target_fp = msg
+                .pointer("/params/textDocument/uri")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let original_msg = msg.clone();
-            msg["id"] = json!(backend_id);
-            b.in_flight.insert(
-                backend_id,
-                InFlightRequest {
+                .and_then(|u| self.backends.get(&bid).and_then(|b| b.file_fingerprint(u)));
+            CoalesceKey {
+                workspace_root,
+                method: method.clone(),
+                params_json,
+                target_fp,
+            }
+        });
+        if let Some(ref ck) = coalesce_key
+            && let Some(b) = self.backends.get_mut(&bid)
+        {
+            let cur_gen = b.generation;
+            let attached = b
+                .in_flight
+                .values_mut()
+                .chain(b.retrying.values_mut())
+                .find(|req| {
+                    req.generation == cur_gen
+                        && !req.all_cancelled()
+                        && req.coalesce_key.as_ref() == Some(ck)
+                });
+            if let Some(existing) = attached {
+                existing.waiters.push(RequestWaiter {
                     client_id: cid,
                     client_req_id,
-                    method,
-                    original_msg,
-                    retries_left: MAX_CONTENT_MODIFIED_RETRIES,
                     cancelled: false,
-                },
-            );
-            b.send(&msg);
-        } else {
-            b.send(&msg);
+                });
+                self.requests_coalesced += 1;
+                return;
+            }
         }
-    }
 
-    fn release_doc_holder(&mut self, bid: BackendId, cid: ClientId, uri: &str) {
         let Some(b) = self.backends.get_mut(&bid) else {
             return;
         };
-        let should_close = match b.open_docs.get_mut(uri) {
-            Some(doc) => {
-                doc.holders.remove(&cid);
-                doc.holders.is_empty()
+        let backend_id = b.next_req_id;
+        b.next_req_id += 1;
+        let original_msg = msg.clone();
+        msg["id"] = json!(backend_id);
+        let generation = b.generation;
+        b.in_flight.insert(
+            backend_id,
+            InFlightRequest {
+                method,
+                original_msg,
+                retries_left: MAX_CONTENT_MODIFIED_RETRIES,
+                generation,
+                coalesce_key,
+                syntax_key,
+                waiters: vec![RequestWaiter {
+                    client_id: cid,
+                    client_req_id,
+                    cancelled: false,
+                }],
+            },
+        );
+        b.send(&msg);
+    }
+
+    fn release_doc_holder(&mut self, bid: BackendId, cid: ClientId, uri: &str) {
+        let remaining_holder = {
+            let Some(b) = self.backends.get_mut(&bid) else {
+                return;
+            };
+            match b.open_docs.get_mut(uri) {
+                Some(doc) => {
+                    doc.holders.remove(&cid);
+                    if doc.holders.is_empty() {
+                        b.open_docs.remove(uri);
+                        b.generation += 1;
+                        let close = json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/didClose",
+                            "params": { "textDocument": { "uri": uri } }
+                        });
+                        if b.ready {
+                            b.send(&close);
+                        } else {
+                            b.pending_raw.push_back(close);
+                        }
+                        return;
+                    }
+                    doc.holders.iter().copied().next()
+                }
+                None => return,
             }
-            None => false,
         };
-        if should_close {
-            b.open_docs.remove(uri);
-            let close = json!({
+        // If another client still holds this document open with different buffer
+        // text, restore that remaining client's buffer to the backend.
+        if let Some(other_cid) = remaining_holder
+            && let Some(other_text) = self
+                .clients
+                .get(&other_cid)
+                .and_then(|c| c.open_docs.get(uri))
+                .map(|d| d.text.clone())
+            && let Some(b) = self.backends.get_mut(&bid)
+            && let Some(doc) = b.open_docs.get_mut(uri)
+            && doc.text != other_text
+        {
+            doc.version += 1;
+            doc.text = other_text.clone();
+            doc.digest = *blake3::hash(other_text.as_bytes()).as_bytes();
+            b.generation += 1;
+            let restore = json!({
                 "jsonrpc": "2.0",
-                "method": "textDocument/didClose",
-                "params": { "textDocument": { "uri": uri } }
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": { "uri": uri, "version": doc.version },
+                    "contentChanges": [{ "text": other_text }]
+                }
             });
             if b.ready {
-                b.send(&close);
+                b.send(&restore);
             } else {
-                b.pending_raw.push_back(close);
+                b.pending_raw.push_back(restore);
             }
         }
     }
@@ -2537,15 +3314,28 @@ impl Daemon {
         let Some(b) = self.backends.get_mut(&bid) else {
             return;
         };
-        let found = b.in_flight.iter_mut().find_map(|(&backend_id, req)| {
-            if req.client_id == cid && &req.client_req_id == cancel_id {
-                req.cancelled = true;
-                Some(backend_id)
-            } else {
-                None
+        let mut to_cancel_backend = Vec::new();
+        for (&backend_id, req) in &mut b.in_flight {
+            for w in &mut req.waiters {
+                if w.client_id == cid && &w.client_req_id == cancel_id {
+                    w.cancelled = true;
+                }
             }
-        });
-        if let Some(backend_id) = found {
+            if req.all_cancelled() {
+                to_cancel_backend.push(backend_id);
+            }
+        }
+        for req in b.retrying.values_mut() {
+            for w in &mut req.waiters {
+                if w.client_id == cid && &w.client_req_id == cancel_id {
+                    w.cancelled = true;
+                }
+            }
+        }
+        b.retrying.retain(|_, req| !req.all_cancelled());
+        b.pending_folder_ready
+            .retain(|q| !(q.client_id == cid && q.msg.get("id") == Some(cancel_id)));
+        for backend_id in to_cancel_backend {
             b.send(&json!({
                 "jsonrpc": "2.0",
                 "method": "$/cancelRequest",
@@ -2570,6 +3360,14 @@ impl Daemon {
             }
             if let Some(b) = self.backends.get_mut(&bid) {
                 b.pending_folder_ready.retain(|q| q.client_id != cid);
+                for req in b.in_flight.values_mut().chain(b.retrying.values_mut()) {
+                    for w in &mut req.waiters {
+                        if w.client_id == cid {
+                            w.cancelled = true;
+                        }
+                    }
+                }
+                b.retrying.retain(|_, req| !req.all_cancelled());
             }
         }
     }
@@ -2582,7 +3380,7 @@ impl Daemon {
         }
     }
 
-    fn on_backend_message(&mut self, bid: BackendId, mut msg: Value) {
+    fn on_backend_message(&mut self, bid: BackendId, msg: Value) {
         let has_id = msg.get("id").is_some();
         let method = msg.get("method").and_then(Value::as_str).map(str::to_owned);
 
@@ -2602,42 +3400,59 @@ impl Daemon {
             else {
                 return;
             };
-            if req.cancelled || !self.clients.contains_key(&req.client_id) {
+            req.waiters
+                .retain(|w| !w.cancelled && self.clients.contains_key(&w.client_id));
+            if req.waiters.is_empty() {
                 return;
             }
             // Retry transient `ContentModified` (-32801) caused by sibling worktree reload.
             let err_code = msg.pointer("/error/code").and_then(Value::as_i64);
             if matches!(err_code, Some(-32801)) && req.retries_left > 0 {
                 req.retries_left -= 1;
-                let tx = self.tx.clone();
-                thread::spawn(move || {
-                    thread::sleep(RETRY_DELAY);
-                    let _ = tx.send(DaemonEvent::RetryRequest(bid, req));
-                });
+                if let Some(b) = self.backends.get_mut(&bid) {
+                    let token = b.next_retry_token;
+                    b.next_retry_token += 1;
+                    b.retrying.insert(token, req);
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        thread::sleep(RETRY_DELAY);
+                        let _ = tx.send(DaemonEvent::FireRetry(bid, token));
+                    });
+                }
                 return;
             }
-            let other_roots = self
-                .backends
-                .get(&bid)
-                .map(|b| {
-                    let ws = self
-                        .clients
-                        .get(&req.client_id)
-                        .and_then(|c| c.workspace_root.as_deref());
-                    b.other_root_uris(ws)
-                })
-                .unwrap_or_default();
-            if let Some(res) = msg.get_mut("result") {
-                filter_response_for_workspace(&req.method, res, &other_roots);
+            // Cache 100%-sound single-file syntax results when non-empty, no
+            // error occurred, and the file fingerprint is unchanged.
+            if msg.get("error").is_none()
+                && let Some(ref sk) = req.syntax_key
+                && let Some(res) = msg.get("result")
+                && !res.is_null()
+                && !res.as_array().is_some_and(Vec::is_empty)
+                && let Some(b) = self.backends.get_mut(&bid)
+                && b.file_fingerprint(&sk.uri).as_ref() == Some(&sk.fingerprint)
+            {
+                b.insert_syntax_cache(sk.clone(), res.clone());
             }
-            msg["id"] = req.client_req_id;
+
             let now = Instant::now();
             if let Some(b) = self.backends.get_mut(&bid) {
                 b.last_activity = now;
             }
-            if let Some(c) = self.clients.get_mut(&req.client_id) {
-                c.last_activity = now;
-                c.send(&msg);
+            for w in req.waiters {
+                let mut reply = msg.clone();
+                let other_roots = self
+                    .backends
+                    .get(&bid)
+                    .map(|b| b.other_root_uris(self.clients.get(&w.client_id)))
+                    .unwrap_or_default();
+                if let Some(res) = reply.get_mut("result") {
+                    filter_response_for_workspace(&req.method, res, &other_roots);
+                }
+                reply["id"] = w.client_req_id;
+                if let Some(c) = self.clients.get_mut(&w.client_id) {
+                    c.last_activity = now;
+                    c.send(&reply);
+                }
             }
             return;
         }
@@ -2679,16 +3494,22 @@ impl Daemon {
                     .unwrap_or(false);
                 let mut became_ready = false;
                 if let Some(b) = self.backends.get_mut(&bid) {
+                    let was_busy = !b.quiescent;
                     b.quiescent = quiescent;
                     if !quiescent {
                         for folder in b.loaded_folders.values_mut() {
-                            if !folder.ready {
+                            if folder.sent && !folder.ready {
                                 folder.saw_busy = true;
                             }
                         }
                     } else {
                         for folder in b.loaded_folders.values_mut() {
-                            if !folder.ready && folder.saw_busy {
+                            if folder.sent
+                                && !folder.ready
+                                && (folder.saw_busy
+                                    || (was_busy
+                                        && folder.added_at.elapsed() >= Duration::from_millis(250)))
+                            {
                                 folder.ready = true;
                                 became_ready = true;
                             }
@@ -2708,11 +3529,7 @@ impl Daemon {
                     if !c.active || c.backend_id != Some(bid) {
                         continue;
                     }
-                    let matches = c.open_docs.contains_key(uri)
-                        || c.workspace_uri
-                            .as_deref()
-                            .is_some_and(|root| uri_in_root(uri, root));
-                    if matches {
+                    if c.matches_uri(uri) {
                         c.send(&msg);
                     }
                 }
@@ -2722,7 +3539,7 @@ impl Daemon {
                     && let Some(b) = self.backends.get_mut(&bid)
                 {
                     for folder in b.loaded_folders.values_mut() {
-                        if !folder.ready {
+                        if folder.sent && !folder.ready {
                             folder.saw_busy = true;
                         }
                     }
@@ -2745,9 +3562,32 @@ impl Daemon {
 
     fn on_backend_initialized(&mut self, bid: BackendId, msg: Value) {
         let Some(res) = msg.get("result").cloned() else {
+            let err = msg.get("error").cloned().unwrap_or_else(|| {
+                json!({ "code": -32603, "message": "rust-analyzer backend failed to initialize" })
+            });
+            let pending = self
+                .backends
+                .get_mut(&bid)
+                .map(|b| b.pending_init.drain(..).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for (cid, q) in pending {
+                if let Some(req_id) = q.get("id").cloned()
+                    && let Some(c) = self.clients.get(&cid)
+                {
+                    c.send(&json!({ "jsonrpc": "2.0", "id": req_id, "error": err }));
+                }
+            }
+            for c in self.clients.values_mut() {
+                if c.backend_id == Some(bid)
+                    && let Some(req_id) = c.waiting_init_req.take()
+                {
+                    c.send(&json!({ "jsonrpc": "2.0", "id": req_id, "error": err }));
+                }
+            }
+            self.stop_backend(bid, false);
             return;
         };
-        let (ra_bin, pending) = {
+        let (ra_bin, pending_raw, pending) = {
             let Some(b) = self.backends.get_mut(&bid) else {
                 return;
             };
@@ -2759,12 +3599,19 @@ impl Daemon {
                 "params": {}
             }));
             let pending_raw: Vec<_> = b.pending_raw.drain(..).collect();
+            let pending: Vec<_> = b.pending_init.drain(..).collect();
+            (b.key.ra_bin.clone(), pending_raw, pending)
+        };
+        // Coalesce all worktree folders attached during backend startup
+        // into ONE `workspace/didChangeWorkspaceFolders` notification before
+        // replaying queued `didOpen` frames!
+        self.flush_added_folders(bid);
+        if let Some(b) = self.backends.get(&bid) {
             for raw in pending_raw {
                 b.send(&raw);
             }
-            let pending: Vec<_> = b.pending_init.drain(..).collect();
-            (b.key.ra_bin.clone(), pending)
-        };
+        }
+        write_caps_cache(&caps_cache_path(&self.cfg.cache_dir, &ra_bin), &res, bid);
         self.caps_cache.insert(ra_bin, res.clone());
 
         // Reply to any eager clients waiting for `initialize`.
@@ -2801,7 +3648,7 @@ impl Daemon {
                 let is_ready = b
                     .loaded_folders
                     .get(&item.workspace_root)
-                    .is_none_or(|f| f.ready || f.added_at.elapsed() >= WORKSPACE_READY_WAIT);
+                    .is_none_or(FolderState::is_ready_or_timed_out);
                 if is_ready {
                     ready.push(item);
                 } else {
@@ -2812,28 +3659,31 @@ impl Daemon {
             ready
         };
         for item in queued {
-            if let Some(b) = self.backends.get_mut(&bid) {
-                Self::send_request_or_notif(b, item.client_id, item.msg);
+            if self.clients.contains_key(&item.client_id) {
+                self.send_request_or_notif(bid, item.client_id, item.msg);
             }
         }
     }
 
-    fn on_retry_request(&mut self, bid: BackendId, req: InFlightRequest) {
-        if req.cancelled || !self.clients.contains_key(&req.client_id) {
+    fn on_fire_retry(&mut self, bid: BackendId, token: u64) {
+        let Some(mut req) = self
+            .backends
+            .get_mut(&bid)
+            .and_then(|b| b.retrying.remove(&token))
+        else {
+            return;
+        };
+        req.waiters
+            .retain(|w| !w.cancelled && self.clients.contains_key(&w.client_id));
+        if req.waiters.is_empty() {
             return;
         }
         let Some(b) = self.backends.get_mut(&bid) else {
-            if let Some(c) = self.clients.get(&req.client_id) {
-                c.send(&json!({
-                    "jsonrpc": "2.0",
-                    "id": req.client_req_id,
-                    "error": { "code": -32603, "message": "rust-analyzer backend exited" }
-                }));
-            }
             return;
         };
         let backend_id = b.next_req_id;
         b.next_req_id += 1;
+        req.generation = b.generation;
         let mut msg = req.original_msg.clone();
         msg["id"] = json!(backend_id);
         b.in_flight.insert(backend_id, req);
@@ -2847,21 +3697,43 @@ impl Daemon {
         if self.backend_by_key.get(&b.key) == Some(&bid) {
             self.backend_by_key.remove(&b.key);
         }
+        // Reap any orphaned proc-macro-srv / cargo children in the crashed
+        // backend's process group BEFORE `wait()` reaps `b.pid` (so the PGID
+        // cannot be reused and shared `target_dir` locks release immediately).
+        let pgrp = b.pid as libc::pid_t;
+        unsafe {
+            libc::kill(-pgrp, libc::SIGKILL);
+        }
         let _ = b.child.wait();
 
-        // Fail any in-flight requests cleanly so clients never hang.
-        for (_, req) in b.in_flight {
-            if let Some(c) = self.clients.get(&req.client_id) {
-                c.send(&json!({
-                    "jsonrpc": "2.0",
-                    "id": req.client_req_id,
-                    "error": { "code": -32603, "message": "rust-analyzer backend exited unexpectedly" }
-                }));
+        // Fail any in-flight or retrying requests cleanly so clients never hang.
+        for req in b.in_flight.into_values().chain(b.retrying.into_values()) {
+            for w in req.waiters {
+                if !w.cancelled
+                    && let Some(c) = self.clients.get(&w.client_id)
+                {
+                    c.send(&json!({
+                        "jsonrpc": "2.0",
+                        "id": w.client_req_id,
+                        "error": { "code": -32603, "message": "rust-analyzer backend exited unexpectedly" }
+                    }));
+                }
             }
         }
         for q in b.pending_folder_ready {
             if let Some(req_id) = q.msg.get("id").cloned()
                 && let Some(c) = self.clients.get(&q.client_id)
+            {
+                c.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": { "code": -32603, "message": "rust-analyzer backend exited unexpectedly" }
+                }));
+            }
+        }
+        for (cid, q) in b.pending_init {
+            if let Some(req_id) = q.get("id").cloned()
+                && let Some(c) = self.clients.get(&cid)
             {
                 c.send(&json!({
                     "jsonrpc": "2.0",
@@ -2980,11 +3852,17 @@ impl Daemon {
     }
 
     fn pick_eviction_victim(&self) -> Option<BackendId> {
-        // Never evict a backend with in-flight requests; prefer 0 active clients,
-        // then oldest last_activity.
+        // Never evict a backend with in-flight, retrying, or queued requests;
+        // prefer 0 active clients, then oldest last_activity.
         self.backends
             .values()
-            .filter(|b| b.in_flight.is_empty() && b.pending_folder_ready.is_empty())
+            .filter(|b| {
+                b.in_flight.is_empty()
+                    && b.retrying.is_empty()
+                    && b.pending_folder_ready.is_empty()
+                    && b.pending_init.is_empty()
+                    && b.pending_added_folders.is_empty()
+            })
             .min_by_key(|b| {
                 let active = self
                     .clients
@@ -3003,7 +3881,8 @@ impl Daemon {
         let Some(b) = self.backends.get(&bid) else {
             return false;
         };
-        b.in_flight.values().any(|r| r.client_id == cid)
+        b.in_flight.values().any(|r| r.has_active_client(cid))
+            || b.retrying.values().any(|r| r.has_active_client(cid))
             || b.pending_init.iter().any(|(c, _)| *c == cid)
             || b.pending_folder_ready.iter().any(|q| q.client_id == cid)
     }
@@ -3040,12 +3919,19 @@ impl Daemon {
         //    hibernate backends with zero active clients past idle grace.
         let mut to_stop = Vec::new();
         for (&bid, b) in &mut self.backends {
-            let active_ws: HashSet<&Path> = self
+            let mut active_ws: HashSet<&Path> = HashSet::new();
+            for c in self
                 .clients
                 .values()
                 .filter(|c| c.active && c.backend_id == Some(bid))
-                .filter_map(|c| c.workspace_root.as_deref())
-                .collect();
+            {
+                if let Some(ws) = c.workspace_root.as_deref() {
+                    active_ws.insert(ws);
+                }
+                for ef in c.extra_folders.keys() {
+                    active_ws.insert(ef.as_path());
+                }
+            }
 
             if active_ws.is_empty() {
                 let grace = if self.clients.values().any(|c| c.backend_id == Some(bid)) {
@@ -3058,7 +3944,12 @@ impl Daemon {
                 } else {
                     self.cfg.idle_timeout.min(ORPHAN_BACKEND_GRACE)
                 };
-                if b.in_flight.is_empty() && now.saturating_duration_since(b.last_activity) >= grace
+                if b.in_flight.is_empty()
+                    && b.retrying.is_empty()
+                    && b.pending_init.is_empty()
+                    && b.pending_folder_ready.is_empty()
+                    && b.pending_added_folders.is_empty()
+                    && now.saturating_duration_since(b.last_activity) >= grace
                 {
                     to_stop.push(bid);
                 }
@@ -3166,9 +4057,11 @@ fn run_daemon() -> Result<i32> {
             let ev_tx = accept_tx.clone();
             thread::spawn(move || {
                 let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let Ok(bytes) = wire::receive(&mut stream) else {
                     return;
                 };
+                let _ = stream.set_read_timeout(None);
                 let Ok(hs) = serde_json::from_slice::<Handshake>(&bytes) else {
                     return;
                 };
@@ -3344,5 +4237,321 @@ mod tests {
             json!(false)
         );
         assert_eq!(config_section(&base, Some("rust-analyzer")), base);
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.max(1))
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn usize(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                0
+            } else {
+                (self.next() as usize) % bound
+            }
+        }
+    }
+
+    /// Reader that delivers at most `step` bytes per `read` to torture chunk boundaries.
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        step: usize,
+    }
+    impl Read for ChunkedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let rem = self.data.len().saturating_sub(self.pos);
+            let n = rem.min(self.step).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn fuzz_lsp_framing_parser() {
+        let mut rng = Rng::new(0xC0FF_EE12_3456_789A);
+
+        // 1. Round-trip 500 randomized valid JSON-RPC objects across tiny chunk sizes.
+        for i in 0..500u64 {
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "id": if i % 3 == 0 { json!(format!("str-{i}")) } else { json!(i) },
+                "method": "textDocument/hover",
+                "params": {
+                    "text": format!("🦀 unicode {} {}", "x".repeat(rng.usize(256)), i),
+                    "n": rng.next()
+                }
+            });
+            let mut wire = encode_lsp_message(&msg);
+            if i % 2 == 0 {
+                // Inject extra benign header before Content-Length.
+                let mut prefixed =
+                    b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n".to_vec();
+                prefixed.extend_from_slice(&wire);
+                wire = prefixed;
+            }
+            let step = [1, 2, 3, 7, 19, 64][rng.usize(6)];
+            let mut r = BufReader::with_capacity(
+                step.max(1),
+                ChunkedReader {
+                    data: &wire,
+                    pos: 0,
+                    step,
+                },
+            );
+            let parsed = read_lsp_message(&mut r).unwrap().unwrap();
+            assert_eq!(parsed, msg);
+            assert!(read_lsp_message(&mut r).unwrap().is_none());
+        }
+
+        // 2. Adversarial header & payload rejection (must never panic or OOM).
+        let bad_cases: Vec<Vec<u8>> = vec![
+            // Header flood (> MAX_LSP_HEADERS)
+            format!(
+                "{}Content-Length: 2\r\n\r\n{{}}",
+                "X-Pad: a\r\n".repeat(MAX_LSP_HEADERS + 2)
+            )
+            .into_bytes(),
+            // Overlong single header line (> MAX_LSP_HEADER_LINE)
+            format!("X-Huge: {}\r\n\r\n", "A".repeat(MAX_LSP_HEADER_LINE + 64)).into_bytes(),
+            // Huge Content-Length exceeding MAX_LSP_MESSAGE
+            format!("Content-Length: {}\r\n\r\n{{}}", MAX_LSP_MESSAGE + 1).into_bytes(),
+            // Signed / non-digit Content-Length
+            b"Content-Length: +2\r\n\r\n{}".to_vec(),
+            b"Content-Length: -1\r\n\r\n{}".to_vec(),
+            b"Content-Length: abc\r\n\r\n{}".to_vec(),
+            // Missing Content-Length
+            b"Content-Type: text/plain\r\n\r\n{}".to_vec(),
+            // Truncated header
+            b"Content-Length: 2\r\n".to_vec(),
+            // Truncated body
+            b"Content-Length: 10\r\n\r\n{}".to_vec(),
+            // Invalid UTF-8 in header
+            vec![b'X', b':', 0xFF, b'\r', b'\n', b'\r', b'\n'],
+            // Valid JSON but NOT a JSON-RPC object
+            b"Content-Length: 4\r\n\r\nnull".to_vec(),
+            b"Content-Length: 3\r\n\r\n123".to_vec(),
+            b"Content-Length: 7\r\n\r\n[1,2,3]".to_vec(),
+            b"Content-Length: 4\r\n\r\n\"hi\"".to_vec(),
+        ];
+        for case in bad_cases {
+            let mut r = BufReader::new(case.as_slice());
+            assert!(
+                read_lsp_message(&mut r).is_err(),
+                "expected error for {:?}",
+                String::from_utf8_lossy(&case[..case.len().min(80)])
+            );
+        }
+
+        // 3. Pure random byte fuzzing (1,000 arbitrary buffers must never panic).
+        for _ in 0..1000 {
+            let len = rng.usize(256);
+            let mut raw = vec![0u8; len];
+            for b in &mut raw {
+                *b = (rng.next() & 0xFF) as u8;
+            }
+            let mut r = BufReader::new(raw.as_slice());
+            let _ = read_lsp_message(&mut r);
+        }
+    }
+
+    #[test]
+    fn fuzz_lsp_utf16_content_changes_against_oracle() {
+        // Independent UTF-16 oracle: splits on `\n`, strips optional trailing `\r`
+        // for column indexing, replaces in UTF-16 code units, re-encodes UTF-8.
+        fn oracle_pos(text: &str, target_line: usize, target_u16: usize) -> usize {
+            let lines: Vec<&str> = text.split_inclusive('\n').collect();
+            if target_line >= lines.len() {
+                return text.len();
+            }
+            let prefix: usize = lines[..target_line].iter().map(|s| s.len()).sum();
+            let raw = lines[target_line];
+            let body = raw
+                .strip_suffix('\n')
+                .unwrap_or(raw)
+                .strip_suffix('\r')
+                .unwrap_or(raw.strip_suffix('\n').unwrap_or(raw));
+            let mut u16_acc = 0usize;
+            for (bidx, ch) in body.char_indices() {
+                if u16_acc >= target_u16 {
+                    return prefix + bidx;
+                }
+                u16_acc += ch.len_utf16();
+            }
+            prefix + body.len()
+        }
+
+        let atoms = [
+            "a",
+            "fn ",
+            "let x = 1;",
+            "é",
+            "λ",
+            "中",
+            "—",
+            "🦀",
+            "𝄞",
+            "👨‍👩‍👧",
+            "\n",
+            "\r\n",
+            "",
+        ];
+        let mut rng = Rng::new(0xBAD5_EED0_CAFE_BABE);
+
+        for _ in 0..600 {
+            let mut doc = String::new();
+            let n_atoms = rng.usize(18);
+            for _ in 0..n_atoms {
+                doc.push_str(atoms[rng.usize(atoms.len())]);
+            }
+            let mut oracle = doc.clone();
+
+            let n_edits = 1 + rng.usize(10);
+            for _ in 0..n_edits {
+                let mode = rng.usize(10);
+                let mut repl = String::new();
+                for _ in 0..rng.usize(4) {
+                    repl.push_str(atoms[rng.usize(atoms.len())]);
+                }
+                if mode == 0 {
+                    // Full document replacement.
+                    let change = vec![json!({ "text": repl })];
+                    apply_content_changes(&mut doc, &change);
+                    oracle = repl;
+                } else {
+                    let line_count = doc.split_inclusive('\n').count() + 2;
+                    let sl = rng.usize(line_count);
+                    let el = rng.usize(line_count);
+                    let sc = rng.usize(24);
+                    let ec = rng.usize(24);
+                    let change = vec![json!({
+                        "range": {
+                            "start": { "line": sl, "character": sc },
+                            "end": { "line": el, "character": ec }
+                        },
+                        "text": repl
+                    })];
+                    apply_content_changes(&mut doc, &change);
+                    let s = oracle_pos(&oracle, sl, sc);
+                    let e = oracle_pos(&oracle, el, ec).max(s);
+                    oracle.replace_range(s..e, &repl);
+                }
+                assert_eq!(doc, oracle);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_uri_round_trip_and_workspace_filtering() {
+        let segs = [
+            "home",
+            "ben",
+            "my repo",
+            "wt#1",
+            "a%20b",
+            "c?d=e",
+            "日本語",
+            "🦀rust",
+            "foo+bar",
+            "sub-dir_2.0~x",
+        ];
+        let mut rng = Rng::new(0x1337_BEEF_9876_5432);
+
+        for _ in 0..500 {
+            let depth = 1 + rng.usize(5);
+            let mut p = PathBuf::from("/");
+            for _ in 0..depth {
+                p.push(segs[rng.usize(segs.len())]);
+            }
+            let uri = path_to_uri(&p);
+            assert_eq!(uri_to_path(&uri).as_deref(), Some(p.as_path()), "uri={uri}");
+            assert!(uri_in_root(&uri, &uri));
+
+            let child = p.join("src/lib.rs");
+            let child_uri = path_to_uri(&child);
+            assert!(uri_in_root(&child_uri, &uri));
+            assert!(uri_in_root(&child_uri, &format!("{uri}/")));
+            // Lowercase percent-encoding must still match uppercase root URI.
+            let lower_child = child_uri.to_ascii_lowercase();
+            if !child
+                .to_string_lossy()
+                .chars()
+                .any(|c| c.is_ascii_uppercase())
+            {
+                assert!(uri_in_root(&lower_child, &uri), "{lower_child} vs {uri}");
+            }
+            // localhost authority form must also match.
+            let localhost_child = child_uri.replacen("file:///", "file://localhost/", 1);
+            assert!(uri_in_root(&localhost_child, &uri));
+
+            // Sibling prefix trap must NEVER match.
+            let mut sib_os = p.into_os_string();
+            sib_os.push("-other");
+            let sib_uri = path_to_uri(&PathBuf::from(sib_os).join("src/lib.rs"));
+            assert!(!uri_in_root(&sib_uri, &uri), "{sib_uri} vs {uri}");
+        }
+
+        // Malformed / edge URIs must never panic.
+        for bad in [
+            "",
+            "http://example.com/a",
+            "file://relative",
+            "file:///a%2",
+            "file:///a%ZZb",
+            "file:///a%🦀",
+            "file:///",
+            "file://localhost/tmp/x",
+        ] {
+            let _ = uri_to_path(bad);
+            let _ = uri_in_root(bad, "file:///tmp");
+            let _ = uri_in_root("file:///tmp/a", bad);
+        }
+
+        // Filter stress test across all supported methods + arbitrary JSON shapes.
+        let others = vec!["file:///wt/sib%201".to_owned(), "file:///wt/b".to_owned()];
+        let mut rename = json!({
+            "changes": {
+                "file:///wt/a/src/lib.rs": [],
+                "file:///wt/sib%201/src/lib.rs": [],
+                "file:///wt/b/src/lib.rs": [],
+                "file:///wt/b2/src/lib.rs": []
+            },
+            "documentChanges": [
+                { "textDocument": { "uri": "file:///wt/a/src/lib.rs" }, "edits": [] },
+                { "textDocument": { "uri": "file:///wt/b/src/lib.rs" }, "edits": [] },
+                { "kind": "rename", "oldUri": "file:///wt/sib%201/old.rs", "newUri": "file:///wt/sib%201/new.rs" }
+            ]
+        });
+        filter_response_for_workspace("textDocument/rename", &mut rename, &others);
+        let ch = rename["changes"].as_object().unwrap();
+        assert_eq!(ch.len(), 2);
+        assert!(ch.contains_key("file:///wt/a/src/lib.rs"));
+        assert!(ch.contains_key("file:///wt/b2/src/lib.rs"));
+        assert_eq!(rename["documentChanges"].as_array().unwrap().len(), 1);
+
+        for method in [
+            "workspace/symbol",
+            "textDocument/references",
+            "textDocument/definition",
+            "callHierarchy/incomingCalls",
+            "callHierarchy/outgoingCalls",
+            "typeHierarchy/subtypes",
+            "textDocument/rename",
+        ] {
+            for shape in [Value::Null, json!(42), json!("x"), json!([]), json!({})] {
+                let mut v = shape;
+                filter_response_for_workspace(method, &mut v, &others);
+            }
+        }
     }
 }

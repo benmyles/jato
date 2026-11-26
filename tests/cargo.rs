@@ -6919,3 +6919,901 @@ fn rust_analyzer_shares_backends_across_worktrees_hibernates_and_shims() {
     );
     assert!(!shim_bin.exists());
 }
+
+#[test]
+fn rust_analyzer_adversarial_chaos_coalescing_cache_and_recovery() {
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    // Fast deterministic chaos mock LSP server written in Python 3.
+    // Supports:
+    //  - Recording every received backend message into `LOG_FILE` (JSONL)
+    //  - Out-of-order delayed responses (`slow_ms` param)
+    //  - Transient `-32801` ContentModified errors (`fail_32801` times per key)
+    //  - Notification flooding (`flood` param -> emits N publishDiagnostics)
+    //  - Returning the backend's current open document text (`method == "chaos/docText"`)
+    //  - Returning backend PID + call counters (`method == "chaos/stats"`)
+    let chaos_script = r#"#!/usr/bin/env python3
+import json, os, sys, threading, time
+
+log_path = os.environ["CHAOS_LOG"]
+log_lock = threading.Lock()
+out_lock = threading.Lock()
+state_lock = threading.Lock()
+
+docs = {}
+folders = set()
+counts = {"hover": 0, "documentSymbol": 0, "didChangeWorkspaceFolders": 0, "cancel": 0, "init": 0}
+fail_counts = {}
+next_delay = 0
+
+def log(ev):
+    with log_lock:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(ev) + "\n")
+
+def send(msg):
+    body = json.dumps(msg).encode("utf-8")
+    frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+    with out_lock:
+        try:
+            sys.stdout.buffer.write(frame)
+            sys.stdout.buffer.flush()
+        except BrokenPipeError:
+            pass
+
+def read_msg():
+    cl = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        s = line.decode("utf-8", "replace").strip()
+        if not s:
+            break
+        if s.lower().startswith("content-length:"):
+            cl = int(s.split(":", 1)[1].strip())
+    if cl is None:
+        return None
+    body = sys.stdin.buffer.read(cl)
+    if len(body) < cl:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+def handle_request(msg):
+    rid = msg["id"]
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        with state_lock:
+            counts["init"] += 1
+            for wf in params.get("workspaceFolders") or []:
+                folders.add(wf["uri"])
+        log({"pid": os.getpid(), "ev": "initialize", "folders": sorted(folders)})
+        send({
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": {
+                "capabilities": {
+                    "hoverProvider": True,
+                    "definitionProvider": True,
+                    "documentSymbolProvider": True,
+                    "textDocumentSync": 2
+                },
+                "serverInfo": {"name": "chaos-ra", "version": "1.0"}
+            }
+        })
+        return
+    if method == "shutdown":
+        send({"jsonrpc": "2.0", "id": rid, "result": None})
+        return
+
+    delay_ms = int(params.get("delay_ms", 0))
+    if delay_ms > 0:
+        time.sleep(delay_ms / 1000.0)
+
+    if method == "textDocument/hover":
+        key = params.get("retry_key")
+        need_fails = int(params.get("fail_32801", 0))
+        if key and need_fails > 0:
+            with state_lock:
+                seen = fail_counts.get(key, 0)
+                if seen < need_fails:
+                    fail_counts[key] = seen + 1
+                    log({"pid": os.getpid(), "ev": "retry_32801", "key": key, "n": seen + 1})
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "error": {"code": -32801, "message": "content modified"}
+                    })
+                    return
+        with state_lock:
+            counts["hover"] += 1
+            n = counts["hover"]
+            uri = (params.get("textDocument") or {}).get("uri", "")
+            doc_text = docs.get(uri)
+        log({"pid": os.getpid(), "ev": "hover", "n": n, "tag": params.get("tag")})
+        send({
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": {"contents": f"hover:{params.get('tag','ok')}:call={n}:doc={doc_text}"}
+        })
+        return
+
+    if method == "textDocument/documentSymbol":
+        uri = (params.get("textDocument") or {}).get("uri", "")
+        with state_lock:
+            counts["documentSymbol"] += 1
+            n = counts["documentSymbol"]
+            text = docs.get(uri)
+        if text is None and uri.startswith("file://"):
+            try:
+                with open(uri[len("file://"):], "r") as f:
+                    text = f.read()
+            except OSError:
+                text = ""
+        log({"pid": os.getpid(), "ev": "documentSymbol", "n": n, "uri": uri})
+        send({
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": [{"name": (text or "").strip(), "call": n}]
+        })
+        return
+
+    if method == "chaos/flood":
+        n = int(params.get("count", 1500))
+        uri = params["uri"]
+        for i in range(n):
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {"uri": uri, "diagnostics": [{"message": f"d-{i}"}]}
+            })
+        send({"jsonrpc": "2.0", "id": rid, "result": {"flooded": n}})
+        return
+
+    if method == "chaos/stats":
+        with state_lock:
+            snap = {
+                "pid": os.getpid(),
+                "counts": dict(counts),
+                "folders": sorted(folders),
+                "docs": dict(docs)
+            }
+        send({"jsonrpc": "2.0", "id": rid, "result": snap})
+        return
+
+    send({"jsonrpc": "2.0", "id": rid, "result": {"echo": method, "params": params}})
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if "id" in msg and method:
+        threading.Thread(target=handle_request, args=(msg,), daemon=True).start()
+        continue
+    if method == "initialized":
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": False}})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": True}})
+    elif method == "workspace/didChangeWorkspaceFolders":
+        ev = params.get("event") or {}
+        with state_lock:
+            counts["didChangeWorkspaceFolders"] += 1
+            for a in ev.get("added") or []:
+                folders.add(a["uri"])
+            for r in ev.get("removed") or []:
+                folders.discard(r["uri"])
+        log({"pid": os.getpid(), "ev": "folders", "added": ev.get("added"), "removed": ev.get("removed")})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": False}})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": True}})
+    elif method == "textDocument/didOpen":
+        td = params["textDocument"]
+        with state_lock:
+            docs[td["uri"]] = td["text"]
+        log({"pid": os.getpid(), "ev": "didOpen", "uri": td["uri"], "text": td["text"]})
+    elif method == "textDocument/didChange":
+        td = params["textDocument"]
+        uri = td["uri"]
+        with state_lock:
+            cur = docs.get(uri, "")
+            for ch in params.get("contentChanges") or []:
+                if "range" not in ch:
+                    cur = ch["text"]
+                else:
+                    # Simple line 0 col 0 prepend/insert used in test
+                    r = ch["range"]
+                    lines = cur.splitlines(True)
+                    sl, sc = r["start"]["line"], r["start"]["character"]
+                    el, ec = r["end"]["line"], r["end"]["character"]
+                    def off(l, c):
+                        return sum(len(x) for x in lines[:l]) + c
+                    s, e = off(sl, sc), off(el, ec)
+                    cur = cur[:s] + ch["text"] + cur[e:]
+            docs[uri] = cur
+        log({"pid": os.getpid(), "ev": "didChange", "uri": uri, "text": docs[uri]})
+    elif method == "textDocument/didClose":
+        uri = params["textDocument"]["uri"]
+        with state_lock:
+            docs.pop(uri, None)
+        log({"pid": os.getpid(), "ev": "didClose", "uri": uri})
+    elif method == "$/cancelRequest":
+        with state_lock:
+            counts["cancel"] += 1
+        log({"pid": os.getpid(), "ev": "cancel", "id": params.get("id")})
+    elif method == "exit":
+        break
+"#;
+
+    struct Client {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+    impl Client {
+        fn spawn(
+            jato: &Path,
+            cwd: &Path,
+            cache: &Path,
+            chaos_bin: &Path,
+            log_file: &Path,
+            idle_secs: &str,
+        ) -> Self {
+            let mut child = Command::new(jato)
+                .arg("rust-analyzer")
+                .current_dir(cwd)
+                .env("JATO_CACHE_DIR", cache)
+                .env("JATO_RUST_ANALYZER", chaos_bin)
+                .env("CHAOS_LOG", log_file)
+                .env("JATO_RA_IDLE_SECS", idle_secs)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+            Self {
+                child,
+                stdin,
+                stdout,
+            }
+        }
+        fn send_raw(&mut self, bytes: &[u8]) {
+            self.stdin.write_all(bytes).unwrap();
+            self.stdin.flush().unwrap();
+        }
+        fn send(&mut self, msg: &Value) {
+            let body = serde_json::to_vec(msg).unwrap();
+            write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+            self.stdin.write_all(&body).unwrap();
+            self.stdin.flush().unwrap();
+        }
+        fn recv(&mut self) -> Option<Value> {
+            let mut len = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = self.stdout.read_line(&mut line).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let t = line.trim_end_matches(['\r', '\n']);
+                if t.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = t.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    len = v.trim().parse::<usize>().ok();
+                }
+            }
+            let mut buf = vec![0u8; len?];
+            self.stdout.read_exact(&mut buf).ok()?;
+            serde_json::from_slice(&buf).ok()
+        }
+        fn wait_id(&mut self, id: &Value) -> Value {
+            while let Some(m) = self.recv() {
+                if m.get("id") == Some(id) {
+                    return m;
+                }
+            }
+            panic!("EOF waiting for id {id}");
+        }
+        fn req(&mut self, id: Value, method: &str, params: Value) -> Value {
+            self.send(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }));
+            self.wait_id(&id)
+        }
+        fn init(&mut self, root: &Path) {
+            let uri = format!("file://{}", root.display());
+            let name = root.file_name().unwrap().to_string_lossy().into_owned();
+            let r = self.req(
+                json!(1),
+                "initialize",
+                json!({
+                    "processId": std::process::id(),
+                    "rootUri": uri,
+                    "workspaceFolders": [{ "uri": uri, "name": name }],
+                    "capabilities": {}
+                }),
+            );
+            assert!(r.pointer("/result/capabilities").is_some(), "bad init: {r}");
+            self.send(&json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
+        }
+        fn close(mut self) {
+            let _ = self.req(json!(9999), "shutdown", Value::Null);
+            self.send(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null }));
+            drop(self.stdin);
+            drop(self.stdout);
+            let _ = self.child.wait();
+        }
+    }
+
+    let tmp = scratch();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let cache = base.join("cache");
+    let cache_hib = base.join("cache-hib");
+    let log_file = base.join("chaos.jsonl");
+    let chaos_bin = base.join("chaos-ra.py");
+    write(&chaos_bin, chaos_script);
+    fs::set_permissions(&chaos_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let jato = Path::new(env!("CARGO_BIN_EXE_jato"));
+
+    struct StopGuard(PathBuf, Vec<PathBuf>);
+    impl Drop for StopGuard {
+        fn drop(&mut self) {
+            for c in &self.1 {
+                let _ = Command::new(&self.0)
+                    .env("JATO_CACHE_DIR", c)
+                    .args(["rust-analyzer", "stop"])
+                    .output();
+            }
+        }
+    }
+    let _guard = StopGuard(jato.to_path_buf(), vec![cache.clone(), cache_hib.clone()]);
+
+    // Create a 3-worktree git repo.
+    let wt1 = base.join("wt1");
+    let wt2 = base.join("wt2");
+    let wt3 = base.join("wt3");
+    write(
+        wt1.join("Cargo.toml"),
+        "[package]\nname='chaos'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(wt1.join("src/lib.rs"), "pub fn v1() {}\n");
+    success(Command::new("git").args(["init", "-q"]).current_dir(&wt1));
+    success(
+        Command::new("git")
+            .args(["config", "user.email", "t@e.com"])
+            .current_dir(&wt1),
+    );
+    success(
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&wt1),
+    );
+    success(Command::new("git").args(["add", "."]).current_dir(&wt1));
+    success(
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&wt1),
+    );
+    for wt in [&wt2, &wt3] {
+        success(
+            Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    wt.to_str().unwrap(),
+                    "HEAD",
+                ])
+                .current_dir(&wt1),
+        );
+    }
+
+    let ra_status = |cache: &Path| -> Value {
+        let out = success(Command::new(jato).env("JATO_CACHE_DIR", cache).args([
+            "rust-analyzer",
+            "status",
+            "--json",
+        ]));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // 1. THUNDERING HERD COLD START: 8 clients start simultaneously -> 1 daemon, 1 cap probe, 8/8 init ok.
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let b = barrier.clone();
+        let j = jato.to_path_buf();
+        let w = [wt1.clone(), wt2.clone(), wt3.clone()][i % 3].clone();
+        let c = cache.clone();
+        let cb = chaos_bin.clone();
+        let lf = log_file.clone();
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            let mut cl = Client::spawn(&j, &w, &c, &cb, &lf, "0");
+            cl.init(&w);
+            cl.close();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let log_after_herd = fs::read_to_string(&log_file).unwrap_or_default();
+    let probe_inits = log_after_herd
+        .lines()
+        .filter(|l| l.contains("\"ev\": \"initialize\""))
+        .count();
+    assert_eq!(
+        probe_inits, 1,
+        "thundering herd must coalesce into 1 capability probe, got {probe_inits}:\n{log_after_herd}"
+    );
+
+    // 2. PROTOCOL EDGE CASES: request before initialize (-32002) and duplicate initialize (-32600).
+    let mut c1 = Client::spawn(jato, &wt1, &cache, &chaos_bin, &log_file, "0");
+    let pre_init = c1.req(json!(0), "textDocument/hover", json!({}));
+    assert_eq!(
+        pre_init.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32002),
+        "{pre_init}"
+    );
+    c1.init(&wt1);
+    let dup_init = c1.req(json!(2), "initialize", json!({}));
+    assert_eq!(
+        dup_init.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32600),
+        "{dup_init}"
+    );
+
+    // 3. COLLIDING CLIENT IDs (`0`, `"str-id"`) + OUT-OF-ORDER RESPONSES across 2 clients.
+    let mut c2 = Client::spawn(jato, &wt2, &cache, &chaos_bin, &log_file, "0");
+    c2.init(&wt2);
+    c1.send(&json!({
+        "jsonrpc": "2.0", "id": 0, "method": "textDocument/hover",
+        "params": { "tag": "c1-slow", "delay_ms": 180 }
+    }));
+    c1.send(&json!({
+        "jsonrpc": "2.0", "id": "str-id", "method": "textDocument/hover",
+        "params": { "tag": "c1-fast", "delay_ms": 10 }
+    }));
+    c2.send(&json!({
+        "jsonrpc": "2.0", "id": 0, "method": "textDocument/hover",
+        "params": { "tag": "c2-zero", "delay_ms": 20 }
+    }));
+    c2.send(&json!({
+        "jsonrpc": "2.0", "id": "str-id", "method": "textDocument/hover",
+        "params": { "tag": "c2-str", "delay_ms": 30 }
+    }));
+    let r1a = c1.recv().unwrap();
+    let r1b = c1.recv().unwrap();
+    let mut c1_map = std::collections::HashMap::new();
+    c1_map.insert(
+        r1a["id"].to_string(),
+        r1a["result"]["contents"].as_str().unwrap().to_owned(),
+    );
+    c1_map.insert(
+        r1b["id"].to_string(),
+        r1b["result"]["contents"].as_str().unwrap().to_owned(),
+    );
+    assert!(c1_map["0"].contains("c1-slow"), "{c1_map:?}");
+    assert!(c1_map["\"str-id\""].contains("c1-fast"), "{c1_map:?}");
+
+    let r2a = c2.recv().unwrap();
+    let r2b = c2.recv().unwrap();
+    let mut c2_map = std::collections::HashMap::new();
+    c2_map.insert(
+        r2a["id"].to_string(),
+        r2a["result"]["contents"].as_str().unwrap().to_owned(),
+    );
+    c2_map.insert(
+        r2b["id"].to_string(),
+        r2b["result"]["contents"].as_str().unwrap().to_owned(),
+    );
+    assert!(c2_map["0"].contains("c2-zero"), "{c2_map:?}");
+    assert!(c2_map["\"str-id\""].contains("c2-str"), "{c2_map:?}");
+
+    // 4. SINGLEFLIGHT COALESCING: 6 identical slow hovers sent together -> backend executes ONCE!
+    let stats_before = c1.req(json!(10), "chaos/stats", json!({}));
+    let hovers_before = stats_before["result"]["counts"]["hover"].as_u64().unwrap();
+    let mut sf_clients: Vec<Client> = (0..6)
+        .map(|_| {
+            let mut cl = Client::spawn(jato, &wt1, &cache, &chaos_bin, &log_file, "0");
+            cl.init(&wt1);
+            cl
+        })
+        .collect();
+    let shared_uri = format!("file://{}/src/lib.rs", wt1.display());
+    for (idx, cl) in sf_clients.iter_mut().enumerate() {
+        cl.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 50 + idx,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": { "uri": shared_uri },
+                "position": { "line": 0, "character": 0 },
+                "tag": "coalesce-me",
+                "delay_ms": 220
+            }
+        }));
+    }
+    for (idx, cl) in sf_clients.iter_mut().enumerate() {
+        let r = cl.wait_id(&json!(50 + idx));
+        assert!(
+            r["result"]["contents"]
+                .as_str()
+                .unwrap()
+                .contains("coalesce-me"),
+            "{r}"
+        );
+    }
+    let stats_after = c1.req(json!(11), "chaos/stats", json!({}));
+    let hovers_after = stats_after["result"]["counts"]["hover"].as_u64().unwrap();
+    assert_eq!(
+        hovers_after - hovers_before,
+        1,
+        "6 concurrent identical hovers must coalesce to 1 backend call (got {})",
+        hovers_after - hovers_before
+    );
+    let st_sf = ra_status(&cache);
+    assert!(
+        st_sf["requests_coalesced"].as_u64().unwrap_or(0) >= 5,
+        "{st_sf}"
+    );
+
+    // 5. SOUND SINGLE-FILE SYNTAX CACHE + EXTERNAL DISK INVALIDATION + OPEN/EDIT INVALIDATION.
+    let sym1 = c1.req(
+        json!(20),
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": shared_uri } }),
+    );
+    assert_eq!(sym1["result"][0]["name"], "pub fn v1() {}", "{sym1}");
+    let call1 = sym1["result"][0]["call"].as_u64().unwrap();
+    let sym2 = sf_clients[0].req(
+        json!(21),
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": shared_uri } }),
+    );
+    assert_eq!(
+        sym2["result"][0]["call"].as_u64(),
+        Some(call1),
+        "2nd call must hit syntax cache: {sym2}"
+    );
+    let st_cache = ra_status(&cache);
+    assert!(
+        st_cache["cache_hits"].as_u64().unwrap_or(0) >= 1,
+        "{st_cache}"
+    );
+
+    // External on-disk modification (no LSP notification!) MUST invalidate cache immediately.
+    write(wt1.join("src/lib.rs"), "pub fn v2_external_edit() {}\n");
+    let sym3 = c1.req(
+        json!(22),
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": shared_uri } }),
+    );
+    assert_eq!(
+        sym3["result"][0]["name"], "pub fn v2_external_edit() {}",
+        "{sym3}"
+    );
+    assert_eq!(
+        sym3["result"][0]["call"].as_u64(),
+        Some(call1 + 1),
+        "{sym3}"
+    );
+
+    // Open buffer shadows disk -> cache miss, repeat -> cache hit, didChange -> cache miss.
+    c1.send(&json!({
+        "jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": { "textDocument": { "uri": shared_uri, "languageId": "rust", "version": 1, "text": "pub fn open_a() {}\n" } }
+    }));
+    let sym4 = c1.req(
+        json!(23),
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": shared_uri } }),
+    );
+    assert_eq!(sym4["result"][0]["name"], "pub fn open_a() {}", "{sym4}");
+    let sym5 = sf_clients[0].req(
+        json!(24),
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": shared_uri } }),
+    );
+    assert_eq!(
+        sym5["result"][0]["call"], sym4["result"][0]["call"],
+        "open-doc repeat should hit cache"
+    );
+
+    // 6. MULTI-CLIENT DIVERGENT BUFFER CLOSE RESTORATION.
+    sf_clients[0].send(&json!({
+        "jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": { "textDocument": { "uri": shared_uri, "languageId": "rust", "version": 1, "text": "pub fn diverged_b() {}\n" } }
+    }));
+    let st_div = sf_clients[0].req(json!(25), "chaos/stats", json!({}));
+    assert_eq!(
+        st_div["result"]["docs"][&shared_uri],
+        "pub fn diverged_b() {}\n"
+    );
+    // When sf_clients[0] closes, backend MUST restore c1's `"pub fn open_a() {}\n"`!
+    sf_clients[0].send(&json!({
+        "jsonrpc": "2.0", "method": "textDocument/didClose",
+        "params": { "textDocument": { "uri": shared_uri } }
+    }));
+    let st_restored = sf_clients[0].req(json!(26), "chaos/stats", json!({}));
+    assert_eq!(
+        st_restored["result"]["docs"][&shared_uri], "pub fn open_a() {}\n",
+        "closing second holder must restore remaining holder's buffer"
+    );
+
+    // 7. `-32801` AUTOMATIC RETRY + PARTIAL & FULL `$/cancelRequest` (in-flight and mid-retry).
+    let retry_ok = c1.req(
+        json!(30),
+        "textDocument/hover",
+        json!({ "tag": "retry-pass", "retry_key": "k1", "fail_32801": 2 }),
+    );
+    assert!(
+        retry_ok["result"]["contents"]
+            .as_str()
+            .unwrap()
+            .contains("retry-pass"),
+        "{retry_ok}"
+    );
+
+    // Cancel while sleeping inside `-32801` retry backoff -> must NOT retry again!
+    c1.send(&json!({
+        "jsonrpc": "2.0", "id": 301, "method": "textDocument/hover",
+        "params": { "tag": "cancel-mid-retry", "retry_key": "k-cancel", "fail_32801": 5 }
+    }));
+    std::thread::sleep(Duration::from_millis(80));
+    c1.send(&json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 301 } }));
+    std::thread::sleep(Duration::from_millis(450));
+    let log_retry = fs::read_to_string(&log_file).unwrap_or_default();
+    let k_cancel_hits = log_retry
+        .lines()
+        .filter(|l| l.contains("\"key\": \"k-cancel\""))
+        .count();
+    assert_eq!(
+        k_cancel_hits, 1,
+        "cancelled -32801 retry must not re-fire (got {k_cancel_hits})"
+    );
+
+    // Partial cancel on a 2-waiter coalesced request: cancelling waiter 1 must NOT cancel waiter 2!
+    c1.send(&json!({
+        "jsonrpc": "2.0", "id": 31, "method": "textDocument/hover",
+        "params": { "tag": "partial-cancel", "delay_ms": 250 }
+    }));
+    sf_clients[0].send(&json!({
+        "jsonrpc": "2.0", "id": 32, "method": "textDocument/hover",
+        "params": { "tag": "partial-cancel", "delay_ms": 250 }
+    }));
+    std::thread::sleep(Duration::from_millis(40));
+    c1.send(&json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 31 } }));
+    let w2_res = sf_clients[0].wait_id(&json!(32));
+    assert!(
+        w2_res["result"]["contents"]
+            .as_str()
+            .unwrap()
+            .contains("partial-cancel"),
+        "{w2_res}"
+    );
+
+    // Full cancel on a solo in-flight request MUST forward `$/cancelRequest` to backend.
+    let cancel_before = c1.req(json!(33), "chaos/stats", json!({}))["result"]["counts"]["cancel"]
+        .as_u64()
+        .unwrap();
+    c1.send(&json!({
+        "jsonrpc": "2.0", "id": 34, "method": "textDocument/hover",
+        "params": { "tag": "solo-cancel", "delay_ms": 300 }
+    }));
+    std::thread::sleep(Duration::from_millis(40));
+    c1.send(&json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 34 } }));
+    std::thread::sleep(Duration::from_millis(60));
+    let cancel_after = c1.req(json!(35), "chaos/stats", json!({}))["result"]["counts"]["cancel"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        cancel_after > cancel_before,
+        "solo cancel must reach backend"
+    );
+
+    // 8. ROGUE CLIENT PROTECTIONS:
+    //  (a) Cannot unload sibling's workspace folder via didChangeWorkspaceFolders
+    let wt2_uri = format!("file://{}", wt2.display());
+    c1.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWorkspaceFolders",
+        "params": { "event": { "added": [], "removed": [{ "uri": wt2_uri, "name": "wt2" }] } }
+    }));
+    let st_folders = c1.req(json!(36), "chaos/stats", json!({}));
+    assert!(
+        st_folders["result"]["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u.as_str() == Some(wt2_uri.as_str())),
+        "rogue client must not unload sibling workspace folder: {st_folders}"
+    );
+
+    //  (b) Malformed LSP framing from rogue clients (giant header, header flood, non-object JSON)
+    for bad in [
+        format!("X-Huge: {}\r\n\r\n", "A".repeat(9000)).into_bytes(),
+        format!("{}Content-Length: 2\r\n\r\n{{}}", "X: 1\r\n".repeat(40)).into_bytes(),
+        b"Content-Length: 3\r\n\r\n123".to_vec(),
+    ] {
+        let mut rogue = Client::spawn(jato, &wt1, &cache, &chaos_bin, &log_file, "0");
+        rogue.send_raw(&bad);
+        drop(rogue.stdin);
+        let _ = rogue.child.wait();
+    }
+    let alive_after_rogue = c2.req(
+        json!(37),
+        "textDocument/hover",
+        json!({ "tag": "post-rogue" }),
+    );
+    assert!(
+        alive_after_rogue["result"]["contents"]
+            .as_str()
+            .unwrap()
+            .contains("post-rogue")
+    );
+
+    //  (c) SIGSTOP wedged client backpressure: flooding 1,500 diagnostics to a SIGSTOP'd client
+    //      must NOT stall healthy sibling clients!
+    let mut wedged = sf_clients.pop().unwrap();
+    let wedged_pid = wedged.child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(wedged_pid, libc::SIGSTOP);
+    }
+    let _ = c1.req(
+        json!(38),
+        "chaos/flood",
+        json!({ "uri": shared_uri, "count": 1500 }),
+    );
+    let t0 = Instant::now();
+    let fast_sib = c2.req(
+        json!(39),
+        "textDocument/hover",
+        json!({ "tag": "unblocked" }),
+    );
+    assert!(
+        fast_sib["result"]["contents"]
+            .as_str()
+            .unwrap()
+            .contains("unblocked")
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "healthy sibling stalled by SIGSTOP'd client: {:?}",
+        t0.elapsed()
+    );
+    unsafe {
+        libc::kill(wedged_pid, libc::SIGCONT);
+        libc::kill(wedged_pid, libc::SIGKILL);
+    }
+    let _ = wedged.child.wait();
+
+    //  (d) Abrupt client SIGKILL mid-request -> sibling remains healthy.
+    let mut doomed = sf_clients.pop().unwrap();
+    doomed.send(&json!({
+        "jsonrpc": "2.0", "id": 40, "method": "textDocument/hover",
+        "params": { "tag": "killed-client", "delay_ms": 200 }
+    }));
+    let _ = doomed.child.kill();
+    let _ = doomed.child.wait();
+    let sib_ok = c1.req(
+        json!(41),
+        "textDocument/hover",
+        json!({ "tag": "after-kill" }),
+    );
+    assert!(
+        sib_ok["result"]["contents"]
+            .as_str()
+            .unwrap()
+            .contains("after-kill")
+    );
+
+    // 9. BACKEND SIGKILL CRASH MID-REQUEST + SEAMLESS AUTO-RECOVERY WITH DOC REPLAY.
+    let old_backend_pid = c1.req(json!(42), "chaos/stats", json!({}))["result"]["pid"]
+        .as_u64()
+        .unwrap() as libc::pid_t;
+    c1.send(&json!({
+        "jsonrpc": "2.0", "id": 43, "method": "textDocument/hover",
+        "params": { "tag": "mid-crash", "delay_ms": 2000 }
+    }));
+    std::thread::sleep(Duration::from_millis(60));
+    unsafe {
+        libc::kill(old_backend_pid, libc::SIGKILL);
+    }
+    let crash_err = c1.wait_id(&json!(43));
+    assert_eq!(
+        crash_err.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32603),
+        "backend crash must immediately fail in-flight request cleanly: {crash_err}"
+    );
+    // Next request on the SAME client transparently spawns a new backend and replays open docs!
+    let recovered = c1.req(json!(44), "chaos/stats", json!({}));
+    let new_backend_pid = recovered["result"]["pid"].as_u64().unwrap() as libc::pid_t;
+    assert_ne!(new_backend_pid, old_backend_pid);
+    assert_eq!(
+        recovered["result"]["docs"][&shared_uri], "pub fn open_a() {}\n",
+        "auto-recovery must replay open docs to new backend: {recovered}"
+    );
+
+    // 10. PROXY EXITS PROMPTLY ON `jato rust-analyzer stop` EVEN WITH STDIN STILL OPEN.
+    let mut open_stdin_client = Client::spawn(jato, &wt1, &cache, &chaos_bin, &log_file, "0");
+    open_stdin_client.init(&wt1);
+    for cl in sf_clients {
+        cl.close();
+    }
+    c1.close();
+    c2.close();
+    let t_stop = Instant::now();
+    success(
+        Command::new(jato)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["rust-analyzer", "stop"]),
+    );
+    // Intentionally keep `open_stdin_client.stdin` (and `stdout`) open and verify proxy exits promptly!
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    let mut exited = false;
+    while Instant::now() < wait_deadline {
+        if matches!(open_stdin_client.child.try_wait(), Ok(Some(_))) {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        exited,
+        "proxy hung on open stdin after `jato rust-analyzer stop` ({:?})",
+        t_stop.elapsed()
+    );
+    drop(open_stdin_client.stdin);
+    drop(open_stdin_client.stdout);
+
+    // 11. HIBERNATION + WAKE VIA INCREMENTAL `didChange` MUST NOT DOUBLE-APPLY THE EDIT.
+    let mut ch = Client::spawn(jato, &wt1, &cache_hib, &chaos_bin, &log_file, "2");
+    ch.init(&wt1);
+    ch.send(&json!({
+        "jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": { "textDocument": { "uri": shared_uri, "languageId": "rust", "version": 1, "text": "fn main() {}\n" } }
+    }));
+    let before_hib = ch.req(json!(1), "chaos/stats", json!({}));
+    assert_eq!(before_hib["result"]["docs"][&shared_uri], "fn main() {}\n");
+    std::thread::sleep(Duration::from_secs(4));
+    let st_h = ra_status(&cache_hib);
+    assert_eq!(st_h["backends"].as_array().unwrap().len(), 0, "{st_h}");
+    // Wake client by sending an incremental `didChange` prepending `// hdr\n` at (0,0)!
+    ch.send(&json!({
+        "jsonrpc": "2.0", "method": "textDocument/didChange",
+        "params": {
+            "textDocument": { "uri": shared_uri, "version": 2 },
+            "contentChanges": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+                "text": "// hdr\n"
+            }]
+        }
+    }));
+    let after_wake = ch.req(json!(2), "chaos/stats", json!({}));
+    assert_eq!(
+        after_wake["result"]["docs"][&shared_uri], "// hdr\nfn main() {}\n",
+        "waking via incremental didChange must apply the edit exactly once: {after_wake}"
+    );
+    ch.close();
+    success(
+        Command::new(jato)
+            .env("JATO_CACHE_DIR", &cache_hib)
+            .args(["rust-analyzer", "stop"]),
+    );
+}

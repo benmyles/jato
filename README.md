@@ -52,11 +52,11 @@ Installs to `~/.claude/skills/jato/` (honors `CLAUDE_CONFIG_DIR`), `~/.agents/sk
 
 ### Shared `rust-analyzer` across sessions & worktrees
 
-Running many coding-agent sessions or editors across worktrees normally spawns one 4–6 GiB `rust-analyzer` process per session (>100 GiB across 20+ worktrees). `jato rust-analyzer` multiplexes LSP clients into one shared, tuned `rust-analyzer` backend per repository (sharing `sysroot`, dependencies, proc-macro server, and a per-repo `cargo.targetDir` across sibling git worktrees), starts lazily (`0 B` until the first `.rs` file open or query), filters worktree URIs per client, hibernates idle backends transparently (auto-waking with unsaved buffers intact), and enforces a total RSS budget with LRU eviction:
+Running many coding-agent sessions or editors across worktrees normally spawns one 4–6 GiB `rust-analyzer` process per session (>100 GiB across 20+ worktrees). `jato rust-analyzer` multiplexes LSP clients into one shared, tuned `rust-analyzer` backend per repository (sharing `sysroot`, dependencies, proc-macro server, and a per-repo `cargo.targetDir` across sibling git worktrees), starts lazily (`0 B` RAM and ~1.5 ms warm `initialize` until the first `.rs` file open or query), coalesces concurrent identical read queries and burst worktree additions, serves verified single-file syntax requests (`documentSymbol`, `foldingRange`, `selectionRange`) from a content/stat-fingerprinted cache (<1 ms), filters worktree URIs per client, hibernates idle backends transparently (auto-waking with unsaved buffers intact), auto-recovers from backend crashes with zero orphan children, and enforces a total RSS budget with LRU eviction:
 
 ```sh
 jato rust-analyzer shim install    # transparently intercept `rust-analyzer` on PATH
-jato rust-analyzer status          # inspect shared backends, worktrees, and RSS
+jato rust-analyzer status          # inspect shared backends, worktrees, hits, and RSS
 jato rust-analyzer stop            # stop the shared daemon and all backends
 jato rust-analyzer shim uninstall  # remove shim and restore any previous rustup link
 ```
@@ -242,7 +242,7 @@ test-threads = 4     # default RUST_TEST_THREADS per binary (overridden by CLI -
 | `JATO_RA_IDLE_SECS` | Idle seconds before hibernating a worktree/backend (default `600`; `0` disables). |
 | `JATO_RA_SHARE_WORKTREES` | `1` (default) shares one backend across git worktrees of a repo; `0` isolates each worktree. |
 | `JATO_RA_LAZY` | `1` (default) defers spawning `rust-analyzer` until first file open/query; `0` spawns on `initialize`. |
-| `JATO_RA_THREADS` / `JATO_RA_PRIME` / `JATO_RA_PROC_MACROS` / `JATO_RA_LRU` | Tune per-backend worker threads (`4–8`), eager cache priming (`0`), `proc-macro-srv` count (`1`), and syntax-tree LRU (`64`). |
+| `JATO_RA_THREADS` / `JATO_RA_PRIME` / `JATO_RA_PROC_MACROS` / `JATO_RA_LRU` | Tune per-backend worker threads (`4–8`), eager cache priming (`0`), `proc-macro-srv` count (`1`), and syntax-tree LRU (`128`). |
 | `JATO_RA_TARGET_DIR` / `JATO_RA_CHECK_ON_SAVE` / `JATO_RA_PASSTHROUGH=1` | Override shared per-repo `cargo.targetDir` (`1`/`0`/path), `checkOnSave` (`0`/`1`), or bypass multiplexing. |
 
 </details>
