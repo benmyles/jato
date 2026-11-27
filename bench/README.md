@@ -1,6 +1,6 @@
 # Jato measurements
 
-The whole Olo workspace was measured on a build server with Jato 0.19.0, 0.18.0 and 0.17.0 and on a laptop with Jato 0.15.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
+The whole Olo workspace was measured on a build server with Jato 0.19.0, 0.18.0 and 0.17.0 and on a laptop with Jato 0.15.0, shared `jato rust-analyzer` with 0.20.0, what watching costs with 0.12.0 and 0.14.0, everything else with 0.12.0.
 
 Benchmarks ran on an Intel Core Ultra 7 356H (16 logical processors, 15 available to the session, 62 GiB) with Fedora 45, Linux 7.3.4 and Btrfs with zstd compression. The machine was shared with other people's builds throughout: its load average is given with each set of numbers, and wall-clock times moved with it. Comparisons within one table were taken in one sitting, rotating the order of contenders where there was more than one run.
 
@@ -265,6 +265,20 @@ With 0.14 programs tell of their own reads. For one check of `olo-system`, three
 | Seconds | 1.86 to 2.02 | 1.99 to 3.12 | 1.81 to 2.81 |
 
 A build from nothing has slack that hides those waits: two cold checks of `olo-system` run side by side at a load of 50, one watched each way, took 397.88 and 397.91 s for 429 and 430 processor-seconds. ripgrep from nothing at a load of 31, three runs in alternation: bare Cargo 8.2 to 9.5 s and 25.0 to 26.5 processor-seconds, Jato with the kernel alone 9.9 to 11.5 s and 27.0 to 28.2, Jato with notes 9.7 to 10.8 s and 26.9 to 28.5.
+
+## Shared `rust-analyzer` across worktrees (0.20.0)
+
+Measured on a 64-core Linux 7.3.4 build server (Btrfs, live background load 43–79, isolated `JATO_CACHE_DIR`) against `shiftup-v2` (main checkout + 11 sibling git worktrees) and `olo` (pinned `nightly-2026-11-14`):
+
+- **Standalone unshared `rust-analyzer`**: 4.2–5.7 GiB RSS per session (~118 GiB across 21 active clients).
+- **Idle / lazy sessions**: 9 sessions across `shiftup-v2` worktrees and `olo` that only sent `initialize` consumed **0 B RAM** (0 backends spawned), with **1.5 ms** warm lazy `initialize` via stat-validated toolchain caching (down from 72.6 ms).
+- **Multi-worktree sharing & query latency**:
+  - 15 active clients across 12 `shiftup-v2` worktrees shared **1 backend** at **2.44 GiB RSS** (~35× reduction vs ~86 GiB unshared), with 15/15 resolving `hover` and `definition` strictly inside their own worktree.
+  - 21 active clients across 12 `shiftup-v2` worktrees + `olo` ran in **2 backends** (**9.23 GiB** total RSS even after full `workspace/symbol` indexing vs ~118 GiB unshared), with 11/11 sibling worktrees isolated.
+  - Warm 2nd-client attach + `hover` on `shiftup-v2` (`openai.rs`, 39 KB): **3.20 ms** (vs **47.7 s** cold first query; ~15,000× faster); on `olo`: **1.35 ms**.
+  - Cached single-file `documentSymbol`: **0.56 ms** min / **0.75 ms** median (vs **7.76 ms** uncached).
+  - 8 concurrent identical `workspace/symbol` queries coalesced into 1 backend query in **36.3 ms**.
+  - Live `SIGKILL` backend crash recovery on `shiftup-v2`: reaped full process group (`-pgrp`) with 0 orphan `proc-macro-srv`/`cargo` children and recovered in **9.97 s** (vs 44.5 s cold, 4.5× faster via shared `cargo.targetDir`).
 
 ## Reproduction
 

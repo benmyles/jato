@@ -56,6 +56,7 @@ Running many coding-agent sessions or editors across worktrees normally spawns o
 
 ```sh
 jato rust-analyzer shim install    # transparently intercept `rust-analyzer` on PATH
+jato rust-analyzer shim status     # check active shim and target binary (use --help for options)
 jato rust-analyzer status          # inspect shared backends, worktrees, hits, and RSS
 jato rust-analyzer stop            # stop the shared daemon and all backends
 jato rust-analyzer shim uninstall  # remove shim and restore any previous rustup link
@@ -96,19 +97,20 @@ Checking and building all 121 packages of **Olo** (1,502 Rust compilations, 113 
 
 - **Open-source workspaces (`check --workspace` in a fresh git worktree, ext4)**: `ripgrep` **0.1 s**, `rust-analyzer` **0.4 s**, `tokio` **0.4 s**, `cargo` **0.7 s**, `nushell` **2.5 s**, `ruff` **9.1 s**.
 - **Cached & parallel tests (`ripgrep`, ext4)**: `jato test --workspace` in a brand-new worktree takes **1.68 s** (restored build + cached tests) vs **2.97 s** for bare `cargo test --workspace` in an already-built target.
+- **Shared `rust-analyzer` across 12 `shiftup-v2` worktrees + `olo`** *(21 active LSP clients, 64-core Linux server, load 43–79)*: **2 shared backends** (`9.23 GiB` total RSS after full `workspace/symbol` indexing vs ~118 GiB unshared; `0 B` per idle session; `1.5 ms` warm lazy `initialize`; `3.2 ms` warm 2nd-client hover vs `47.7 s` cold; `<1 ms` cached `documentSymbol`).
 - **Full measurements, conditions, `ripgrep` vs sccache/kache, Btrfs numbers, and reproduction scripts**: [bench/README.md](bench/README.md).
 
 ---
 
 ## How it works
 
-1. **Syscall observation instead of flag parsing**: Every watched Cargo, `rustc`, `build.rs`, C/C++/asm, and test process runs under a Linux `seccomp_unotify` filter. To keep observation overhead near zero (~1% on cold builds), watched programs preload a tiny zero-allocation shim (`libjato_shim.so`) that sends read notes directly from a fixed allowlisted instruction address while writes, renames, unlinks, execs, and unshimmed binaries are still trapped by the kernel (`JATO_NOTES=0` routes everything through the kernel).
+1. **Syscall observation instead of flag parsing**: Every watched Cargo, `rustc`, `build.rs`, C/C++/asm, and test process runs under a Linux `seccomp_unotify` filter. To keep observation overhead near zero (~1% on cold builds), watched programs preload a tiny zero-allocation shim (`libjato_fast.so`) that sends read notes directly from a fixed allowlisted instruction address while writes, renames, unlinks, execs, and unshimmed binaries are still trapped by the kernel (`JATO_NOTES=0` routes everything through the kernel).
 2. **Two-phase manifest lookup**: A command's key hashes its normalized arguments and relevant environment variables. On lookup, Jato checks the recorded input manifest (files by content with stat fast-path, symlinks, directory listings, and env vars) in parallel. If everything matches, outputs and diagnostics are restored transactionally and Cargo never runs.
 3. **Whole builds, near builds, seeding, and edits**:
    - **Whole builds** (`build`, `check`, `clippy`, `test --no-run`, `bench --no-run`) restore the entire `target/` in one shot, preserving terminal/non-terminal diagnostic color rules.
    - **Near builds** start from the closest cached build when only compiler inputs, manifests/lockfiles, or specific build scripts changed: stale outputs are omitted, Cargo compiles only the delta, and obsolete outputs are pruned.
    - **Cross-command seeding** seeds an empty `target/` (e.g., `jato test -p foo` or `jato clippy` after `jato check`) from a compatible workspace build and prunes unused outputs afterward.
-   - **In-place edit recording** records edited states in already-built targets once you pause editing (`JATO_EDIT_WINDOW`) and machine load allows (`JATO_BUSY`), while handing on relocated `rustc` incremental state across checkouts (using `--remap-path-prefix`, descriptor paths, or an optional unprivileged mount namespace).
+   - **In-place edit recording** records edited states in already-built targets once you pause editing (`JATO_EDIT_WINDOW`) and machine load allows (`JATO_BUSY`), while handing on relocated `rustc` incremental state across checkouts (using `--remap-path-prefix`, descriptor paths, or an optional unprivileged mount namespace that canonicalizes `--out-dir`, `--extern`, `-L`, and `-C incremental=` onto one mountpoint for zero-copy CGU hardlinking).
 4. **Build scripts, C/C++, and tests**:
    - Hermetic `build.rs` executions are cached via a separate preload shim (`libjato_script.so`) that replays `OUT_DIR` files and relocated Cargo directives.
    - C/C++/asm compilers invoked by build scripts (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `nasm`, `yasm`) are transparently cached via `PATH` wrappers with `-ffile-prefix-map`.
@@ -136,7 +138,7 @@ These four tools solve overlapping problems at different layers: **kache** and *
 | **Build scripts & C/C++** | Caches both `build.rs` runs and nested C/C++/asm | Caches C/C++/CUDA; Cargo still runs `build.rs` | Caches C/C++/CUDA; Cargo still runs `build.rs` | First-class sandboxed `cargo_build_script` & C/C++ rules |
 | **Incremental `rustc` state** | Saved & handed on across cleans and worktrees | Disabled during cached builds (cold first edit) | Skips caching incremental crates (dev crates miss unless `CARGO_INCREMENTAL=0`) | Non-incremental `rustc` actions by default |
 | **Test caching** | Observed test-binary caching + parallel runner | None | None | First-class sandboxed test caching, sharding, & RBE |
-| **Daemon & idle RAM** | None (`0 MiB`); shared FIFO jobserver | Background daemon (`21–115 MiB` RSS measured) | Local client-server daemon | Persistent JVM server (hundreds of MiB to multi-GiB) |
+| **Daemon & idle RAM** | None (`0 MiB`) for builds; optional on-demand daemon for `jato rust-analyzer` (`0 B` per idle session, auto-exits when unused) | Background daemon (`21–115 MiB` RSS measured) | Local client-server daemon | Persistent JVM server (hundreds of MiB to multi-GiB) |
 | **Local storage** | SQLite + BLAKE3 CAS; reflinks, ext4 zstd + RAM hot tier | SQLite + BLAKE3 CAS; reflinks or hardlinks/copies | Flat disk cache (no reflink target dedup) | Output base + content-addressed disk cache |
 | **Remote cache / RBE** | Built-in `file://` and HTTP/1.1 CAS; no S3 SDK or RBE | Native S3-compatible (S3/R2/MinIO) + GHA; no RBE | S3, GCS, Azure, Redis, Memcached, WebDAV, GHA + `sccache-dist` | Industry-standard REAPI: remote cache + RBE worker farms |
 | **Platforms** | Linux (`x86_64`, `aarch64`, 5.5+); passthrough elsewhere | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows |
@@ -243,7 +245,7 @@ test-threads = 4     # default RUST_TEST_THREADS per binary (overridden by CLI -
 | `JATO_RA_SHARE_WORKTREES` | `1` (default) shares one backend across git worktrees of a repo; `0` isolates each worktree. |
 | `JATO_RA_LAZY` | `1` (default) defers spawning `rust-analyzer` until first file open/query; `0` spawns on `initialize`. |
 | `JATO_RA_THREADS` / `JATO_RA_PRIME` / `JATO_RA_PROC_MACROS` / `JATO_RA_LRU` | Tune per-backend worker threads (`4–8`), eager cache priming (`0`), `proc-macro-srv` count (`1`), and syntax-tree LRU (`128`). |
-| `JATO_RA_TARGET_DIR` / `JATO_RA_CHECK_ON_SAVE` / `JATO_RA_PASSTHROUGH=1` | Override shared per-repo `cargo.targetDir` (`1`/`0`/path), `checkOnSave` (`0`/`1`), or bypass multiplexing. |
+| `JATO_RA_TARGET_DIR` / `JATO_RA_CHECK_ON_SAVE` / `JATO_RUST_ANALYZER` / `JATO_RA_PASSTHROUGH=1` | Override shared per-repo `cargo.targetDir` (`1`/`0`/path), `checkOnSave` (`0`/`1`), explicit real `rust-analyzer` binary path, or bypass multiplexing. |
 
 </details>
 
