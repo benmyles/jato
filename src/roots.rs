@@ -407,7 +407,7 @@ fn replace_all(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 
 /// Replace `from` where it stands for that directory, not for the start of
 /// a sibling's name. None if nothing was replaced.
-fn replace_path(text: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn replace_path(text: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
     let finder = memchr::memmem::Finder::new(from);
     let mut out = Vec::new();
     let mut copied = 0;

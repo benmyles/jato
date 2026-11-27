@@ -1553,16 +1553,27 @@ fn named(program: Option<&str>) -> String {
 }
 
 /// Paths the compiler reported writing, from its JSON messages.
-fn reported_artifacts(stderr: &[u8], cwd: &Path, target: Option<&Path>) -> Vec<PathBuf> {
+fn reported_artifacts(
+    stderr: &[u8],
+    cwd: &Path,
+    target: Option<&Path>,
+    mounted: Option<(&Path, &Path)>,
+) -> Vec<PathBuf> {
     stderr
         .split(|b| *b == b'\n')
         .filter(|line| memchr::memmem::find(line, b"\"artifact\"").is_some())
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .filter(|message| message["$message_type"] == "artifact")
-        // Named as the output directory was: through the alias of the
-        // directory the compiler ran in, or of the one held open for it.
+        // Named as the output directory was: through the target mount
+        // namespace, the directory the compiler ran in, or the one held open
+        // for it.
         .filter_map(|message| {
             let path = Path::new(message["artifact"].as_str()?);
+            if let Some((real, mp)) = mounted
+                && let Ok(rest) = path.strip_prefix(mp)
+            {
+                return Some(real.join(rest));
+            }
             if let (Ok(rest), Some(target)) = (path.strip_prefix(HELD_ALIAS), target) {
                 return Some(target.join(rest));
             }
@@ -3136,7 +3147,12 @@ pub fn record(
     // do so in the file an earlier build left, or after moving it aside.
     // What that file held does not change what they write.
     let artifacts = if job.facts.compiles() {
-        reported_artifacts(stderr, &job.request.cwd, roots.path(roots::TARGET))
+        reported_artifacts(
+            stderr,
+            &job.request.cwd,
+            roots.path(roots::TARGET),
+            job.mounted(),
+        )
     } else {
         Vec::new()
     };
@@ -4597,7 +4613,24 @@ pub fn record(
         });
         staged.push(output);
     }
-    let detail = encode_detail(0, &roots.mark(stdout), &roots.mark(stderr));
+    fn demount<'a>(bytes: &'a [u8], mounted: Option<(&Path, &Path)>) -> std::borrow::Cow<'a, [u8]> {
+        if let Some((real, mp)) = mounted
+            && let Some(replaced) = crate::roots::replace_path(
+                bytes,
+                mp.as_os_str().as_bytes(),
+                real.as_os_str().as_bytes(),
+            )
+        {
+            return std::borrow::Cow::Owned(replaced);
+        }
+        std::borrow::Cow::Borrowed(bytes)
+    }
+    let mounted = job.mounted();
+    let detail = encode_detail(
+        0,
+        &roots.mark(&demount(stdout, mounted)),
+        &roots.mark(&demount(stderr, mounted)),
+    );
     manifest.detail = *blake3::hash(&detail).as_bytes();
     manifest.normalize();
     if job.scope == Scope::Build
@@ -5208,24 +5241,29 @@ fn options_mark_key(job: &Job) -> Option<String> {
     Some(hex.as_str()[..24].to_owned())
 }
 
-fn options_mark_cached(job: &Job, cache_dir: &Path) -> Option<(Vec<u8>, [u8; 8])> {
-    let locks = cache_dir.join("locks");
-    let key = options_mark_key(job);
-    if let Some(k) = &key {
-        let cached = locks.join(format!("mark-{k}"));
-        if let Ok(bytes) = fs::read(&cached)
-            && bytes.len() >= 10
-        {
-            let hlen = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-            if bytes.len() == 2 + hlen + 8 && hlen >= 7 && &bytes[2..6] == b"RSIC" {
-                let header = bytes[2..2 + hlen].to_vec();
-                let mark: [u8; 8] = bytes[2 + hlen..].try_into().ok()?;
-                return Some((header, mark));
-            }
-        }
+fn read_options_mark_cache(cache_dir: &Path, key: &str) -> Option<(Vec<u8>, [u8; 8])> {
+    let cached = cache_dir.join("locks").join(format!("mark-{key}"));
+    let bytes = fs::read(&cached).ok()?;
+    if bytes.len() < 10 {
+        return None;
     }
+    let hlen = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    if bytes.len() == 2 + hlen + 8 && hlen >= 7 && &bytes[2..6] == b"RSIC" {
+        let header = bytes[2..2 + hlen].to_vec();
+        let mark: [u8; 8] = bytes[2 + hlen..].try_into().ok()?;
+        return Some((header, mark));
+    }
+    None
+}
+
+fn compute_options_mark_cached(
+    job: &Job,
+    cache_dir: &Path,
+    key: Option<&str>,
+) -> Option<(Vec<u8>, [u8; 8])> {
+    let locks = cache_dir.join("locks");
     let (header, mark) = options_mark(job, cache_dir)?;
-    if let Some(k) = &key
+    if let Some(k) = key
         && header.len() <= u16::MAX as usize
     {
         let _ = fs::create_dir_all(&locks);
@@ -5392,13 +5430,23 @@ fn give_saved_state(job: &Job, store: &mut Store, recipe: &Digest) -> SavedState
         }
         let need_mark = manifest.saved_in != here_where;
         let (placed, mark) = if need_mark {
-            std::thread::scope(|s| {
-                let cache_dir = store.dir.as_path();
-                let handle = s.spawn(|| options_mark_cached(job, cache_dir));
-                let placed = store.place_saved(&manifest.saved, &job.roots);
-                let mark = handle.join().ok().flatten();
-                (placed, mark)
-            })
+            let key = options_mark_key(job);
+            let cached = key
+                .as_deref()
+                .and_then(|k| read_options_mark_cache(&store.dir, k));
+            if cached.is_some() {
+                (store.place_saved(&manifest.saved, &job.roots), cached)
+            } else {
+                std::thread::scope(|s| {
+                    let cache_dir = store.dir.as_path();
+                    let key_ref = key.as_deref();
+                    let handle =
+                        s.spawn(move || compute_options_mark_cached(job, cache_dir, key_ref));
+                    let placed = store.place_saved(&manifest.saved, &job.roots);
+                    let mark = handle.join().ok().flatten();
+                    (placed, mark)
+                })
+            }
         } else {
             (store.place_saved(&manifest.saved, &job.roots), None)
         };
@@ -5816,7 +5864,13 @@ fn alone(mut job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
             drop(store);
             let mut cmd = original(&argv[0], &argv[1..]);
             let setup = if let Some((real, mp)) = job.mounted() {
-                crate::mount::attach(&mut cmd, real, mp).is_ok()
+                match crate::mount::enter_for_exec(real, mp) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log(job.name(), format_args!("target mount skipped: {e}"));
+                        false
+                    }
+                }
             } else if let Some(dir) = job.held() {
                 hold(&mut cmd, dir).is_ok()
             } else {
@@ -5854,10 +5908,21 @@ fn alone(mut job: Job, program: &OsStr, args: &[OsString]) -> Result<i32> {
                 drop(store);
                 return passthrough(original(program, args));
             }
-            let status = cmd
-                .env(crate::jobs::HELD, "1")
-                .status()
-                .context("starting the compiler")?;
+            let status = match cmd.env(crate::jobs::HELD, "1").status() {
+                Ok(status) => status,
+                Err(e) if job.mounted().is_some() || job.held().is_some() => {
+                    log(job.name(), format_args!("target mount skipped: {e}"));
+                    drop(lock);
+                    drop(store);
+                    let mut fallback = original(program, args);
+                    if let Some(place) = place {
+                        fallback.env(crate::jobs::HELD, "1");
+                        place.keep_through_exec();
+                    }
+                    return passthrough(fallback);
+                }
+                Err(e) => return Err(e).context("starting the compiler"),
+            };
             drop(place);
             if status.success() {
                 keep_state(&job, &mut store, &recipe, Left::Since(since));
@@ -5984,6 +6049,34 @@ mod tests {
         assert_eq!(
             script_env_deps(printed),
             vec![b"CC".to_vec(), b"ZLIB".to_vec()]
+        );
+    }
+
+    #[test]
+    fn reported_artifacts_translates_mounted_target_paths() {
+        let stderr = concat!(
+            r#"{"$message_type":"artifact","artifact":"/cache/mnt/target/debug/deps/libfoo.d","emit":"dep-info"}"#,
+            "\n",
+            r#"{"$message_type":"artifact","artifact":"/proc/self/fd/219/debug/deps/libbar.d","emit":"dep-info"}"#,
+            "\n",
+            r#"{"$message_type":"artifact","artifact":"/proc/self/cwd/target/debug/deps/libbaz.d","emit":"dep-info"}"#,
+            "\n",
+        );
+        let real = Path::new("/work/ws/target");
+        let mp = Path::new("/cache/mnt/target");
+        let got = reported_artifacts(
+            stderr.as_bytes(),
+            Path::new("/work/ws"),
+            Some(real),
+            Some((real, mp)),
+        );
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/work/ws/target/debug/deps/libfoo.d"),
+                PathBuf::from("/work/ws/target/debug/deps/libbar.d"),
+                PathBuf::from("/work/ws/target/debug/deps/libbaz.d"),
+            ]
         );
     }
 }

@@ -340,8 +340,21 @@ fn first_ra_on_path() -> Option<PathBuf> {
     None
 }
 
+const SHIM_HELP: &str = "\
+Usage
+  jato rust-analyzer shim install [--dir DIR]   Install a transparent rust-analyzer shim
+  jato rust-analyzer shim uninstall [--dir DIR] Remove the shim and restore any rustup link
+  jato rust-analyzer shim status                Show active rust-analyzer shim status
+";
+
 fn cmd_shim(args: &[OsString]) -> Result<i32> {
     let sub = args.first().and_then(|a| a.to_str());
+    if matches!(sub, Some("-h" | "--help" | "help"))
+        || args.iter().any(|a| a == "-h" || a == "--help")
+    {
+        print!("{SHIM_HELP}");
+        return Ok(0);
+    }
     let mut explicit_dir: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
@@ -4553,5 +4566,22 @@ mod tests {
                 filter_response_for_workspace(method, &mut v, &others);
             }
         }
+    }
+
+    #[test]
+    fn shim_help_flags_succeed_without_touching_filesystem() {
+        for args in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["help"],
+            vec!["install", "--help"],
+            vec!["uninstall", "-h"],
+            vec!["status", "--help"],
+        ] {
+            let os: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            assert_eq!(cmd_shim(&os).unwrap(), 0, "args: {os:?}");
+        }
+        let bad = vec![OsString::from("bogus")];
+        assert!(cmd_shim(&bad).is_err());
     }
 }

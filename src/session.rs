@@ -131,7 +131,16 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).env_remove("JATO_SESSION");
             let setup = if let Some((real, mp)) = mounted {
-                crate::mount::attach(&mut cmd, real, mp).is_ok()
+                match crate::mount::enter_for_exec(real, mp) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log(
+                            &program.to_string_lossy(),
+                            format_args!("target mount skipped: {e}"),
+                        );
+                        false
+                    }
+                }
             } else if let Some(dir) = &held {
                 command::hold(&mut cmd, dir).is_ok()
             } else {
@@ -176,7 +185,22 @@ pub fn ask(session: &OsStr, program: &OsStr, args: &[OsString], tool: bool) -> R
                 fallback.args(args).env_remove("JATO_SESSION");
                 return command::passthrough(fallback).map(Some);
             }
-            let status = cmd.status().context("starting the compiler")?;
+            let status = match cmd.status() {
+                Ok(status) => status,
+                Err(e) if mounted.is_some() || held.is_some() => {
+                    log(
+                        &program.to_string_lossy(),
+                        format_args!("target mount skipped: {e}"),
+                    );
+                    let mut fallback = Command::new(program);
+                    fallback
+                        .args(args)
+                        .env_remove("JATO_SESSION")
+                        .env(crate::jobs::HELD, "1");
+                    fallback.status().context("starting the compiler")?
+                }
+                Err(e) => return Err(e).context("starting the compiler"),
+            };
             drop(place);
             let mut w = Writer(Vec::new());
             w.0.push(status.success().into());

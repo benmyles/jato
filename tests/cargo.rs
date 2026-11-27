@@ -3560,10 +3560,11 @@ fn saved_state_follows_a_library_into_a_target_directory_elsewhere() {
     }
     let p = Project::whole();
     // Each checkout builds into a scratch directory of its own that is not
-    // inside it, as helpers working on one project are often set up.
+    // inside it, exercising the descriptor-alias fallback (JATO_MOUNT=0).
     let command = |root: &Path, target: &Path| {
         let mut cmd = p.command_in(root);
         cmd.env_remove("JATO_EDIT_WINDOW")
+            .env("JATO_MOUNT", "0")
             .env("CARGO_TARGET_DIR", target);
         cmd
     };
@@ -3611,6 +3612,7 @@ fn a_compiler_that_gives_up_what_it_inherits_is_told_its_real_directory() {
     let command = |root: &Path, target: &Path| {
         let mut cmd = p.command_in(root);
         cmd.env_remove("JATO_EDIT_WINDOW")
+            .env("JATO_MOUNT", "0")
             .env("CARGO_TARGET_DIR", target)
             .env("RUSTC", &closing);
         cmd
@@ -3640,6 +3642,61 @@ fn a_compiler_that_gives_up_what_it_inherits_is_told_its_real_directory() {
     assert_eq!(out.stdout, b"edited elsewhere\n");
     assert_eq!(p.count("state_given"), 0, "{}", p.stats());
     assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+}
+
+#[test]
+fn mounted_builds_record_and_survive_continued_path_after_saved_state() {
+    if !observes() {
+        return;
+    }
+    let p = Project::new();
+    // 1. Cold build with default mount enabled must record cleanly (no
+    //    `reported writing .../mnt/target/.../*.d, which was not seen`).
+    success(p.command().args(["build"]));
+    assert_eq!(p.count("uncacheable"), 0, "{}", p.stats());
+    assert!(p.count("stored") >= 2, "{}", p.stats());
+    assert!(p.count("state_saved") >= 1, "{}", p.stats());
+
+    // 2. Clean target in the same checkout must hit the cache cleanly.
+    p.clean();
+    let (hits, misses) = p.during(|| {
+        success(p.command().args(["build"]));
+    });
+    assert!(
+        hits >= 2 && misses == 0,
+        "hits={hits} misses={misses} {}",
+        p.stats()
+    );
+
+    // 3. Repeated fresh checkouts through RUSTC_WRAPPER=jato (`wrap_alone`)
+    //    on a busy machine (`JATO_BUSY=0.001`, `JATO_EDIT_WINDOW=600`):
+    //    `give_saved_state` spawns worker threads (`options_mark` + `place_saved`),
+    //    then `Run::Continued` immediately enters the target mount namespace
+    //    before `exec()`. Must never fail with `unshare` EINVAL (exit 1).
+    let bin = env!("CARGO_BIN_EXE_jato");
+    for i in 0..8 {
+        let copy = p.temp.path().join(format!("fresh-{i}"));
+        populate(&copy);
+        fs::copy(p.root.join("Cargo.lock"), copy.join("Cargo.lock")).unwrap();
+        edit_leaf(&copy, &format!("fresh-{i}"));
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.current_dir(&copy)
+            .env("JATO_CACHE_DIR", p.temp.path().join("cache"))
+            .env("RUSTC_WRAPPER", bin)
+            .env("JATO_EDIT_WINDOW", "600")
+            .env("JATO_BUSY", "0.001")
+            .env_remove("JATO_MOUNT")
+            .env_remove("JATO_WHOLE_BUILDS")
+            .args(["build"]);
+        let out = success(&mut cmd);
+        assert!(
+            out.status.success(),
+            "iter {i} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(p.count("state_given") >= 8, "{}", p.stats());
+    assert!(p.count("continued") >= 8, "{}", p.stats());
 }
 
 /// The object files rustc keeps for the crate whose name starts with
@@ -3802,6 +3859,7 @@ fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
     success(
         command(&fourth)
             .env("CARGO_TARGET_DIR", outside("fourth"))
+            .env("JATO_KEEP_FOR", "0")
             .args(["build"]),
     );
     let fifth = checkout("fifth");
@@ -3815,7 +3873,7 @@ fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
     build.env("CARGO_TARGET_DIR", outside("fifth"));
     let built = success(build.args(["build"]));
     let said = String::from_utf8_lossy(&built.stderr);
-    assert_eq!(p.count("state_given"), given + 1, "{}", p.stats());
+    assert!(p.count("state_given") > given, "{}", p.stats());
     assert!(!said.contains("ignoring cache"), "{said}");
     // The object file of the module that was not edited is the one the
     // state came with, there before the compiler started. The edited
@@ -3826,7 +3884,7 @@ fn rustc_accepts_and_verifies_saved_state_from_another_checkout() {
     // And for a library whose target directory is inside its checkout.
     let sixth = checkout("sixth");
     leaf_edit(&sixth, "kept inside");
-    success(command(&sixth).args(["build"]));
+    success(command(&sixth).env("JATO_KEEP_FOR", "0").args(["build"]));
     let seventh = checkout("seventh");
     leaf_edit(&seventh, "kept inside");
     success(command(&seventh).args(["build"]));

@@ -101,12 +101,10 @@ mod imp {
             })
         }
 
-        /// Enter a private unprivileged user+mount namespace and bind-mount
-        /// `real_target` onto `mountpoint`. Async-signal-safe.
-        pub unsafe fn enter(&self) -> io::Result<()> {
-            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
+        /// Finish configuring user/mount mappings and the target bind-mount
+        /// immediately after `unshare(CLONE_NEWUSER | CLONE_NEWNS)`.
+        /// Async-signal-safe.
+        unsafe fn finish_after_unshare(&self) -> io::Result<()> {
             // Writing "deny" to setgroups is required before unprivileged gid_map.
             let _ = unsafe { write_proc_file(self.setgroups.as_ptr(), b"deny\n") };
             unsafe {
@@ -139,6 +137,15 @@ mod imp {
             }
             Ok(())
         }
+
+        /// Enter a private unprivileged user+mount namespace and bind-mount
+        /// `real_target` onto `mountpoint`. Async-signal-safe.
+        pub unsafe fn enter(&self) -> io::Result<()> {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { self.finish_after_unshare() }
+        }
     }
 
     pub fn attach(cmd: &mut Command, real_target: &Path, mountpoint: &Path) -> io::Result<()> {
@@ -147,6 +154,36 @@ mod imp {
             cmd.pre_exec(move || plan.enter());
         }
         Ok(())
+    }
+
+    /// Enter a private unprivileged user+mount namespace in the current process
+    /// right before `exec()` (when no `fork()` precedes `unshare()`).
+    ///
+    /// On Linux, `pthread_join()` (used by `std::thread::scope` in
+    /// `give_saved_state` / `place_saved`) wakes on `CLONE_CHILD_CLEARTID`
+    /// microseconds before the exiting thread finishes kernel `do_exit()`.
+    /// Calling `unshare(CLONE_NEWUSER)` in that window fails with `EINVAL`
+    /// without altering process state; retrying briefly closes the race.
+    pub fn enter_for_exec(real_target: &Path, mountpoint: &Path) -> io::Result<()> {
+        let plan = Plan::new(real_target, mountpoint)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let mut spins = 0u32;
+        loop {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINVAL) || std::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            spins += 1;
+            if spins <= 16 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        unsafe { plan.finish_after_unshare() }
     }
 
     /// Canonical mountpoint for target directories under `cache`, if
@@ -216,12 +253,15 @@ mod imp {
     pub fn attach(_: &mut Command, _: &Path, _: &Path) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
+    pub fn enter_for_exec(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
     pub fn available(_: &Path) -> Option<PathBuf> {
         None
     }
 }
 
-pub use imp::{Plan, attach, available};
+pub use imp::{Plan, attach, available, enter_for_exec};
 
 /// Replace a leading `real_target` path prefix (at a component boundary) in
 /// `path_bytes` with `mountpoint`.
@@ -268,6 +308,12 @@ pub fn rewrite_arg(
     if bytes.starts_with(b"--out-dir=") {
         return rewrite_at(b"--out-dir=".len());
     }
+    if bytes.starts_with(b"-Cincremental=") {
+        return rewrite_at(b"-Cincremental=".len());
+    }
+    if bytes.starts_with(b"--codegen=incremental=") {
+        return rewrite_at(b"--codegen=incremental=".len());
+    }
     if bytes.starts_with(b"--extern=") {
         let rest = &bytes[b"--extern=".len()..];
         let eq = memchr::memchr(b'=', rest)?;
@@ -290,6 +336,9 @@ pub fn rewrite_arg(
     }
     if prev_b == Some(b"--out-dir") {
         return rewrite_at(0);
+    }
+    if matches!(prev_b, Some(b"-C" | b"--codegen")) && bytes.starts_with(b"incremental=") {
+        return rewrite_at(b"incremental=".len());
     }
     if prev_b == Some(b"--extern") {
         let eq = memchr::memchr(b'=', bytes)?;
@@ -352,6 +401,30 @@ mod tests {
             rw(None, "-Lnative=/work/a/target/debug/build/x/out").as_deref(),
             Some("-Lnative=/cache/mnt/target/debug/build/x/out")
         );
+        assert_eq!(
+            rw(Some("-C"), "incremental=/work/a/target/debug/incremental").as_deref(),
+            Some("incremental=/cache/mnt/target/debug/incremental")
+        );
+        assert_eq!(
+            rw(None, "-Cincremental=/work/a/target/debug/incremental").as_deref(),
+            Some("-Cincremental=/cache/mnt/target/debug/incremental")
+        );
+        assert_eq!(
+            rw(
+                Some("--codegen"),
+                "incremental=/work/a/target/debug/incremental"
+            )
+            .as_deref(),
+            Some("incremental=/cache/mnt/target/debug/incremental")
+        );
+        assert_eq!(
+            rw(
+                None,
+                "--codegen=incremental=/work/a/target/debug/incremental"
+            )
+            .as_deref(),
+            Some("--codegen=incremental=/cache/mnt/target/debug/incremental")
+        );
         // Boundary safety: must not rewrite `/work/a/target2`.
         assert_eq!(rw(Some("--out-dir"), "/work/a/target2/debug/deps"), None);
         // Non-target flags are untouched.
@@ -363,5 +436,47 @@ mod tests {
     fn available_probe_never_panics() {
         let dir = tempfile::tempdir().unwrap();
         let _ = available(dir.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enter_for_exec_succeeds_immediately_after_joining_worker_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(mp) = available(dir.path()) else {
+            return;
+        };
+        let real = dir.path().join("target");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("sentinel"), b"ok").unwrap();
+        for iter in 0..40 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                // Mirror give_saved_state / place_saved joining worker threads
+                // immediately before Run::Continued enters the mount namespace.
+                std::thread::scope(|s| {
+                    for _ in 0..4 {
+                        s.spawn(|| std::hint::black_box(1 + 1));
+                    }
+                });
+                let ok = enter_for_exec(&real, &mp).is_ok()
+                    && std::fs::read(mp.join("sentinel")).ok().as_deref() == Some(b"ok".as_slice());
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            }
+            let mut status: libc::c_int = 0;
+            loop {
+                let r = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+                if r < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break;
+            }
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "enter_for_exec failed after thread::scope on iter {iter} (status {status})"
+            );
+        }
     }
 }
