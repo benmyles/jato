@@ -3681,10 +3681,22 @@ fn mounted_builds_record_and_survive_continued_path_after_saved_state() {
         edit_leaf(&copy, &format!("fresh-{i}"));
         let mut cmd = Command::new(env!("CARGO"));
         cmd.current_dir(&copy)
+            .env("CARGO_HOME", p.temp.path().join("cargo"))
+            .env("CARGO_TARGET_DIR", copy.join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
             .env("JATO_CACHE_DIR", p.temp.path().join("cache"))
             .env("RUSTC_WRAPPER", bin)
             .env("JATO_EDIT_WINDOW", "600")
             .env("JATO_BUSY", "0.001")
+            .env("TERM", "xterm-256color")
+            .env_remove("CI")
+            .env_remove("CARGO_INCREMENTAL")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTC_BOOTSTRAP")
+            .env_remove("JATO_DISABLE")
             .env_remove("JATO_MOUNT")
             .env_remove("JATO_WHOLE_BUILDS")
             .args(["build"]);
