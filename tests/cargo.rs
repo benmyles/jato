@@ -7887,3 +7887,64 @@ while True:
             .args(["rust-analyzer", "stop"]),
     );
 }
+
+#[test]
+fn concurrent_builds_in_same_target_and_poisoned_cargo_env_do_not_spin() {
+    if !observes() {
+        return;
+    }
+    let p = Project::whole();
+    let jato = env!("CARGO_BIN_EXE_jato");
+
+    // 1. Reproduce `cargo watch` exporting `CARGO` and a hook script doing
+    //    `CARGO=$(command -v jato); "$CARGO" build -q` in two simultaneous
+    //    processes sharing the exact same checkout and target directory.
+    //    Neither may self-exec loop or race restoring/unlinking `target/`.
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let mut cmd = p.command();
+        cmd.env("CARGO", jato).args(["build", "-q"]);
+        children.push(cmd.spawn().unwrap());
+    }
+    for mut child in children {
+        let status = child.wait().unwrap();
+        assert!(status.success(), "concurrent jato build failed: {status}");
+    }
+    // The first build records the whole build; the second waits on the target
+    // lock and immediately hits the freshly recorded whole build.
+    assert_eq!(p.count("build_stored"), 1, "{}", p.stats());
+    assert!(p.count("build_hit") >= 1, "{}", p.stats());
+
+    // 2. Same with `CARGO=jato` (bare name) and `jato test` (`cargo_host_triple`).
+    let jato_dir = Path::new(jato).parent().unwrap();
+    let path_with_jato = std::env::join_paths(std::iter::once(jato_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let out = success(
+        p.command()
+            .env("PATH", &path_with_jato)
+            .env("CARGO", "jato")
+            .args(["test", "-q"]),
+    );
+    assert!(out.status.success());
+
+    // 3. Edit and trigger two concurrent builds in the already-built target:
+    //    both must succeed cleanly with zero target corruption.
+    edit_leaf(&p.root, "concurrent-edit");
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let mut cmd = p.command();
+        cmd.env("CARGO", jato).args(["build", "-q"]);
+        children.push(cmd.spawn().unwrap());
+    }
+    for mut child in children {
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "concurrent edited jato build failed: {status}"
+        );
+    }
+    let out = success(p.command().env("CARGO", jato).args(["run", "-q"]));
+    assert_eq!(out.stdout, b"concurrent-edit\n");
+}

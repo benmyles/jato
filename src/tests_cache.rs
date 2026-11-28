@@ -81,8 +81,11 @@ fn target_triple(args: &[OsString]) -> Option<String> {
 }
 
 fn cargo_host_triple(toolchain: Option<&OsStr>) -> Option<String> {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let (cargo, unset_cargo) = crate::cargo_program().ok()?;
     let mut cmd = Command::new(cargo);
+    if unset_cargo {
+        cmd.env_remove("CARGO");
+    }
     if let Some(tc) = toolchain {
         cmd.arg(tc);
     }

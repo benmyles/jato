@@ -406,8 +406,121 @@ struct CargoOptions {
     dev: bool,
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether `candidate` refers to `jato` itself (by filename, canonical target,
+/// or inode), which must never be executed recursively as `cargo`.
+fn is_jato_binary(candidate: &OsStr, path_env: Option<&OsStr>, own_exe: Option<&Path>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let p = Path::new(candidate);
+    if p.file_name() == Some(OsStr::new("jato")) {
+        return true;
+    }
+    let own_canon = own_exe.and_then(|e| std::fs::canonicalize(e).ok());
+    let own_id = own_exe
+        .and_then(|e| std::fs::metadata(e).ok())
+        .map(|m| (m.dev(), m.ino()));
+    let matches_self = |target: &Path| -> bool {
+        if target.file_name() == Some(OsStr::new("jato")) {
+            return true;
+        }
+        if let Ok(canon) = std::fs::canonicalize(target) {
+            if canon.file_name() == Some(OsStr::new("jato")) {
+                return true;
+            }
+            if own_canon.as_deref() == Some(canon.as_path()) {
+                return true;
+            }
+        }
+        if own_id.is_some()
+            && let Ok(meta) = std::fs::metadata(target)
+            && Some((meta.dev(), meta.ino())) == own_id
+        {
+            return true;
+        }
+        false
+    };
+    if p.components().count() > 1 {
+        return matches_self(p);
+    }
+    if let Some(path_env) = path_env {
+        for dir in env::split_paths(path_env) {
+            let full = dir.join(p);
+            if is_executable_file(&full) {
+                return matches_self(&full);
+            }
+        }
+    }
+    false
+}
+
+/// Resolve the real `cargo` binary to invoke, guarding against `CARGO` (or a
+/// `cargo` shim on `PATH`) pointing back to `jato`. For example, a shell script
+/// running under `cargo watch` (which exports `CARGO`) that does
+/// `CARGO=$(command -v jato)` re-exports `CARGO=/.../jato` to `jato`; without
+/// this guard `jato` would exec itself under seccomp in an infinite loop.
+///
+/// Returns `(program, should_unset_cargo_env)`. Keeps the bare name `"cargo"`
+/// whenever the first `cargo` on `PATH` is not `jato` so whole-build recipes
+/// stay identical whether `CARGO` was unset or poisoned.
+fn resolve_cargo(
+    cargo_env: Option<&OsStr>,
+    path_env: Option<&OsStr>,
+    own_exe: Option<&Path>,
+) -> Result<(OsString, bool)> {
+    let mut poisoned = false;
+    if let Some(cargo) = cargo_env
+        && !cargo.is_empty()
+    {
+        if !is_jato_binary(cargo, path_env, own_exe) {
+            return Ok((cargo.to_owned(), false));
+        }
+        poisoned = true;
+    }
+    if let Some(path_env) = path_env {
+        let mut saw_first = false;
+        for dir in env::split_paths(path_env) {
+            let candidate = dir.join("cargo");
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            if !is_jato_binary(candidate.as_os_str(), None, own_exe) {
+                // First `cargo` on PATH is real: use `"cargo"` to match normal recipes.
+                let program = if !saw_first {
+                    OsString::from("cargo")
+                } else {
+                    candidate.into_os_string()
+                };
+                return Ok((program, poisoned));
+            }
+            saw_first = true;
+        }
+        if saw_first || poisoned {
+            bail!("CARGO resolves to jato and no real `cargo` executable was found on PATH");
+        }
+    } else if poisoned {
+        bail!("CARGO points to jato and PATH is unset");
+    }
+    Ok((OsString::from("cargo"), false))
+}
+
+pub(crate) fn cargo_program() -> Result<(OsString, bool)> {
+    let cargo_env = env::var_os("CARGO");
+    let path_env = env::var_os("PATH");
+    let own = env::current_exe().ok();
+    resolve_cargo(cargo_env.as_deref(), path_env.as_deref(), own.as_deref())
+}
+
 fn cargo_command(args: &[OsString], options: CargoOptions) -> Result<Command> {
-    let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let (cargo_exe, unset_cargo) = cargo_program()?;
+    let mut cmd = Command::new(cargo_exe);
+    if unset_cargo {
+        cmd.env_remove("CARGO");
+    }
     if options.dev {
         dev::args(&mut cmd, args);
     } else {
@@ -1026,5 +1139,80 @@ mod tests {
         );
         assert_eq!(build("test one two"), None);
         assert_eq!(build("test -p"), None);
+    }
+
+    #[test]
+    fn resolve_cargo_guards_against_recursive_jato_invocation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin_a = dir.path().join("bin-a");
+        let bin_b = dir.path().join("bin-b");
+        std::fs::create_dir_all(&bin_a).unwrap();
+        std::fs::create_dir_all(&bin_b).unwrap();
+        let fake_jato = bin_a.join("jato");
+        let fake_cargo = bin_b.join("cargo");
+        let symlink_to_jato = bin_a.join("my-wrapper");
+        for file in [&fake_jato, &fake_cargo] {
+            std::fs::write(file, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::os::unix::fs::symlink(&fake_jato, &symlink_to_jato).unwrap();
+        let path_normal = env::join_paths([&bin_a, &bin_b]).unwrap();
+
+        // Unset CARGO with real cargo first on PATH keeps bare "cargo".
+        assert_eq!(
+            resolve_cargo(None, Some(&path_normal), Some(&fake_jato)).unwrap(),
+            (OsString::from("cargo"), false)
+        );
+        // Explicit custom non-jato CARGO is preserved untouched.
+        assert_eq!(
+            resolve_cargo(
+                Some(fake_cargo.as_os_str()),
+                Some(&path_normal),
+                Some(&fake_jato)
+            )
+            .unwrap(),
+            (fake_cargo.clone().into_os_string(), false)
+        );
+        // Poisoned CARGO pointing to jato (by path, bare name, or symlink) falls back to real cargo and unsets CARGO.
+        for poisoned in [
+            fake_jato.as_os_str(),
+            OsStr::new("jato"),
+            symlink_to_jato.as_os_str(),
+            OsStr::new("my-wrapper"),
+        ] {
+            assert_eq!(
+                resolve_cargo(Some(poisoned), Some(&path_normal), Some(&fake_jato)).unwrap(),
+                (OsString::from("cargo"), true),
+                "poisoned={poisoned:?}"
+            );
+        }
+        // If `cargo` earlier on PATH is itself symlinked to jato, skip it and pick the real cargo further down PATH.
+        let cargo_shim = bin_a.join("cargo");
+        std::os::unix::fs::symlink(&fake_jato, &cargo_shim).unwrap();
+        assert_eq!(
+            resolve_cargo(None, Some(&path_normal), Some(&fake_jato)).unwrap(),
+            (fake_cargo.clone().into_os_string(), false)
+        );
+        assert_eq!(
+            resolve_cargo(
+                Some(fake_jato.as_os_str()),
+                Some(&path_normal),
+                Some(&fake_jato)
+            )
+            .unwrap(),
+            (fake_cargo.into_os_string(), true)
+        );
+        // When no real cargo exists anywhere on PATH, fail cleanly instead of self-exec looping.
+        let path_only_jato = env::join_paths([&bin_a]).unwrap();
+        assert!(
+            resolve_cargo(
+                Some(fake_jato.as_os_str()),
+                Some(&path_only_jato),
+                Some(&fake_jato)
+            )
+            .is_err()
+        );
+        assert!(resolve_cargo(None, Some(&path_only_jato), Some(&fake_jato)).is_err());
     }
 }

@@ -1292,6 +1292,69 @@ fn prepare(cmd: &Command, name: &str) -> Result<Option<Prepared>> {
     Ok(Some(Prepared { job, store, recipe }))
 }
 
+/// Canonicalize a target directory path even before it exists by resolving
+/// its longest existing ancestor and re-appending remaining components.
+fn canonical_target(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut tail = Vec::new();
+    let mut cur = path;
+    while let Some(name) = cur.file_name() {
+        tail.push(name.to_owned());
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        cur = parent;
+        if let Ok(mut real) = std::fs::canonicalize(cur) {
+            for part in tail.into_iter().rev() {
+                real.push(part);
+            }
+            return real;
+        }
+    }
+    path.to_owned()
+}
+
+/// Serialize concurrent whole-build operations targeting the exact same
+/// `target/` directory so simultaneous `jato build` calls never race restoring
+/// or unlinking files in place, and the second immediately hits the cache
+/// entry the first just recorded.
+///
+/// Skipped when already nested inside an active `JATO_SESSION` (e.g. a build
+/// script invoking `jato`) to prevent self-deadlock.
+fn lock_target(store: &mut Store, job: &Job, name: &str) -> Option<std::fs::File> {
+    if std::env::var_os("JATO_SESSION").is_some() {
+        return None;
+    }
+    let target = job.roots.path(crate::roots::TARGET)?;
+    let canonical = canonical_target(target);
+    let mut hash = blake3::Hasher::new_derive_key("jato target lock v1");
+    hash.update(canonical.as_os_str().as_bytes());
+    let hex = hash.finalize().to_hex();
+    let locks = store.dir.join("locks");
+    let _ = std::fs::create_dir_all(&locks);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(locks.join(format!("target-{}", &hex.as_str()[..32])))
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            store.flush();
+            log(
+                name,
+                "waiting for another jato build in this target directory",
+            );
+            file.lock().ok()?;
+            Some(file)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Run a Cargo command that only builds, or fill in what it would build.
 pub fn build(cmd: Command, name: &str) -> Result<i32> {
     let begun = Instant::now();
@@ -1303,6 +1366,7 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
     else {
         return command::passthrough(cmd);
     };
+    let target_lock = lock_target(&mut store, &job, name);
     let mut cache = LookupCache::default();
     match command::reuse_cached(&job, &mut store, &recipe, true, Some(&mut cache)) {
         Ok(Some((outcome, _))) => {
@@ -1332,14 +1396,23 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
             let prepared = Prepared { job, store, recipe };
             return match supervise(cmd, prepared, name, begun, true, Some(start))? {
                 Supervised::Ran(code) => Ok(code),
-                Supervised::Unwatched(cmd) => command::passthrough(cmd),
+                Supervised::Unwatched(cmd) => {
+                    drop(target_lock);
+                    command::passthrough(cmd)
+                }
                 Supervised::Doubted => match prepare(&again, name)? {
                     Some(prepared) => match supervise(again, prepared, name, begun, true, None)? {
                         Supervised::Ran(code) => Ok(code),
-                        Supervised::Unwatched(cmd) => command::passthrough(cmd),
+                        Supervised::Unwatched(cmd) => {
+                            drop(target_lock);
+                            command::passthrough(cmd)
+                        }
                         Supervised::Doubted => bail!("a build from nothing cannot be in doubt"),
                     },
-                    None => command::passthrough(again),
+                    None => {
+                        drop(target_lock);
+                        command::passthrough(again)
+                    }
                 },
             };
         }
@@ -1353,7 +1426,10 @@ pub fn build(cmd: Command, name: &str) -> Result<i32> {
     let prepared = Prepared { job, store, recipe };
     match make(cmd, prepared, name, begun, true, Some(&mut cache))? {
         Supervised::Ran(code) => Ok(code),
-        Supervised::Unwatched(cmd) => command::passthrough(cmd),
+        Supervised::Unwatched(cmd) => {
+            drop(target_lock);
+            command::passthrough(cmd)
+        }
         Supervised::Doubted => bail!("a build from nothing cannot be in doubt"),
     }
 }
@@ -1523,6 +1599,7 @@ pub fn ready(cmd: Command, name: &str) {
     else {
         return;
     };
+    let _target_lock = lock_target(&mut store, &job, name);
     let mut cache = LookupCache::default();
     match command::reuse_cached(&job, &mut store, &recipe, true, Some(&mut cache)) {
         Ok(Some(_)) => return,

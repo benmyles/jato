@@ -1,5 +1,13 @@
 # Work journal
 
+## 2026-11-28 — fix recursive `CARGO=jato` self-exec seccomp spin loop and serialize same-target whole builds
+
+- Diagnosed a live 100% CPU hang reported by ShiftUp V2 (`scripts/dev.sh` spawning `cargo watch` → `scripts/swap.sh serve` & `worker` running `jato build -q -p shiftup-server`):
+  - **Root cause (`CARGO` self-exec loop)**: `cargo watch` exports `CARGO=/.../bin/cargo`, and `swap.sh` assigned `CARGO=$(command -v jato 2>/dev/null || echo cargo)` — which in POSIX shell re-exports `CARGO=/home/ben/.cargo/bin/jato` into `jato`'s environment. `cargo_command()` (`src/main.rs`) blindly ran `Command::new(env::var_os("CARGO")...)`, spawning `jato` itself under its own `seccomp_unotify` filter; inside the nested child, `observe::available()` returned `false`, so `session::build()` fell through to `command::passthrough(cmd)` (`CommandExt::exec()`), replacing the child PID with `jato` in an infinite same-PID self-`execve()` loop (~10,000 seccomp traps/sec, pinning CPU forever).
+  - **Fix (`src/main.rs`, `src/tests_cache.rs`)**: added `resolve_cargo()` / `cargo_program()`, which detects when `CARGO` (or a `cargo` shim on `PATH`) resolves to `jato` (by filename, canonical target, or inode), skips any `jato` shim to find the real `cargo` on `PATH` (preserving the bare `"cargo"` name when the first `cargo` on `PATH` is real so whole-build recipes stay identical), removes the poisoned `CARGO` env var from the child command, and bails cleanly if no real `cargo` exists. Used it in both `cargo_command()` and `tests_cache::cargo_host_triple()`.
+  - **Per-target whole-build lock (`src/session.rs`)**: added an `flock`-backed `locks/target-<blake3(canonical_target)>` lock around `session::build()` and `session::ready()` (skipped when nested inside `JATO_SESSION` and dropped before `passthrough`) so simultaneous `jato build` calls sharing one `target/` serialize cleanly instead of racing on restore/unlink, and the second immediately hits the freshly recorded whole build.
+  - Added unit test `resolve_cargo_guards_against_recursive_jato_invocation` and integration test `concurrent_builds_in_same_target_and_poisoned_cargo_env_do_not_spin`.
+
 ## 2026-11-27 — fix `unshare(CLONE_NEWUSER)` thread-join race, mounted `reported_artifacts`, and `shim --help`
 
 - Diagnosed and fixed two production bugs in target bind-mounting (`src/mount.rs`, `src/command.rs`, `src/session.rs`, `src/roots.rs`) plus a CLI help nit in `jato rust-analyzer`:
