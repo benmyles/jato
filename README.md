@@ -9,7 +9,7 @@ Jato remembers whole Cargo builds, individual `rustc` / C / C++ / assembly compi
 - **Soundness by observation**: Uses Linux `seccomp_unotify` + a minimal read-note preload shim to observe every file, directory, symlink, and subprocess actually read — catching procedural macros, build scripts, linkers, and C headers automatically.
 - **Incremental `rustc` state across checkouts**: Saves and relocates `rustc` incremental state so your *first* edit in a brand-new worktree compiles incrementally instead of from scratch.
 - **Cached build scripts, C/C++, and parallel tests**: Caches hermetic `build.rs` executions (`OUT_DIR` + directives), C/C++/asm compilations started by build scripts, and passing hermetic test binaries, while running workspace test binaries in parallel.
-- **Built for multi-worktree & coding agents**: Zero idle daemon RAM, shared machine-wide jobserver FIFO so parallel builds don't thrash cores, Btrfs/XFS reflinks, optional RAM hot tier on ext4, a zero-dependency `file://` / `http://` remote cache, and a shared `jato rust-analyzer` LSP multiplexer & transparent shim so dozens of agent sessions across worktrees share one `rust-analyzer` per repo instead of consuming 100+ GiB RAM.
+- **Built for multi-worktree & coding agents**: Zero idle daemon RAM, shared machine-wide jobserver FIFO so parallel builds don't thrash cores, Btrfs/XFS reflinks, optional RAM hot tier on ext4, a zero-dependency `file://` / `http://` remote cache, and a cache-backed shared `jato rust-analyzer` LSP multiplexer & transparent shim (with target pre-seeding, `jato check` `checkOnSave`, and 2–3 ms CLI semantic queries via `jato diag` / `def` / `refs` / `hover` / `symbols`).
 
 > **Platform**: Linux (`x86_64` and `aarch64`, kernel 5.5+). On macOS and Windows, `jato` passes commands straight through to Cargo.
 
@@ -50,19 +50,31 @@ Coding agents working in separate git worktrees share one cache and one CPU budg
 
 Installs to `~/.claude/skills/jato/` (honors `CLAUDE_CONFIG_DIR`), `~/.agents/skills/jato/`, and `~/.gemini/antigravity-cli/skills/jato/`.
 
-### Shared `rust-analyzer` across sessions & worktrees
+### Cache-backed shared `rust-analyzer` & instant CLI semantic queries
 
-Running many coding-agent sessions or editors across worktrees normally spawns one 4–6 GiB `rust-analyzer` process per session (>100 GiB across 20+ worktrees). `jato rust-analyzer` multiplexes LSP clients into one shared, tuned `rust-analyzer` backend per repository (sharing `sysroot`, dependencies, proc-macro server, and a per-repo `cargo.targetDir` across sibling git worktrees), starts lazily (`0 B` RAM and ~1.5 ms warm `initialize` until the first `.rs` file open or query), coalesces concurrent identical read queries and burst worktree additions, serves verified single-file syntax requests (`documentSymbol`, `foldingRange`, `selectionRange`) from a content/stat-fingerprinted cache (<1 ms), filters worktree URIs per client, hibernates idle backends transparently (auto-waking with unsaved buffers intact), auto-recovers from backend crashes with zero orphan children, and enforces a total RSS budget with LRU eviction:
+Running many coding-agent sessions or editors across worktrees normally spawns one 4–6 GiB `rust-analyzer` process per session (>100 GiB across 20+ worktrees), and every cold `rust-analyzer` startup recompiles build scripts and proc macros from scratch. `jato rust-analyzer` bridges `rust-analyzer` into Jato's build cache and multiplexes LSP clients into one shared, tuned backend per repository:
+
+- **Cache-backed `rust-analyzer` (on by default)**: wires `RUSTC_WRAPPER=jato` and `JATO_CACHE_DIR` into `rust-analyzer`'s Cargo env (reusing cached build scripts, proc macros, and dependencies while sharing CPU slots), asynchronously pre-seeds an empty shared `cargo.targetDir` from a compatible recorded Jato whole build, and routes default `checkOnSave` through `jato check --workspace --all-targets --message-format=json` in an isolated sibling `-check` target directory (automatically backing off if a client customizes `check.*`, `cargo.features`/`target`, or disables `checkOnSave`).
+- **Multi-worktree sharing & low RAM**: shares `sysroot`, dependencies, proc-macro server, and `cargo.targetDir` across sibling git worktrees, starts lazily (`0 B` RAM and ~1.5 ms warm `initialize` until first file open/query), coalesces concurrent identical read queries and burst worktree additions, serves verified single-file syntax requests (`documentSymbol`, `foldingRange`, `selectionRange`) from a content/stat-fingerprinted cache, filters worktree URIs per client, hibernates idle backends transparently (auto-waking with unsaved buffers intact), auto-recovers from crashes with zero orphans, and enforces an RSS budget with LRU eviction.
+- **Instant CLI semantic queries** (reuse the exact same warm daemon, with `--json` for coding agents):
 
 ```sh
 jato rust-analyzer shim install    # transparently intercept `rust-analyzer` on PATH
-jato rust-analyzer shim status     # check active shim and target binary (use --help for options)
-jato rust-analyzer status          # inspect shared backends, worktrees, hits, and RSS
+jato rust-analyzer status          # inspect shared backends, seeding, CLI queries, and RSS
 jato rust-analyzer stop            # stop the shared daemon and all backends
-jato rust-analyzer shim uninstall  # remove shim and restore any previous rustup link
+
+# Millisecond CLI diagnostics & semantic navigation over the warm daemon (1-based LINE:COL):
+jato diag src/lib.rs               # ~2-3 ms warm typecheck diagnostics (exits 1 on errors)
+jato diag                          # checks git-modified .rs files (or --workspace for all)
+jato diag --check src/lib.rs       # full rustc borrowck/macro diagnostics via cached `jato check`
+jato def src/lib.rs:42:9           # go to definition (--type for type def, --impl for impls)
+jato refs src/lib.rs:42:9          # find all references (--no-decl, --limit N, --json)
+jato hover src/lib.rs:42:9         # type signature and doc comments
+jato symbols src/lib.rs            # file symbol outline (syntax-cached)
+jato symbols --query MyStruct      # workspace symbol search (--json)
 ```
 
-Non-LSP invocations (`rust-analyzer --version`, `analysis-stats`, `parse`, etc.) pass straight through to the real binary. You can also point an editor/LSP client directly at `jato rust-analyzer` without installing the shim.
+Non-LSP invocations (`rust-analyzer --version`, `analysis-stats`, `parse`, etc.) pass straight through to the real binary. You can also point an editor/LSP client directly at `jato rust-analyzer` without installing the shim, or remove it anytime with `jato rust-analyzer shim uninstall`.
 
 ### Plain Cargo / `RUSTC_WRAPPER`
 
@@ -97,7 +109,7 @@ Checking and building all 121 packages of **Olo** (1,502 Rust compilations, 113 
 
 - **Open-source workspaces (`check --workspace` in a fresh git worktree, ext4)**: `ripgrep` **0.1 s**, `rust-analyzer` **0.4 s**, `tokio` **0.4 s**, `cargo` **0.7 s**, `nushell` **2.5 s**, `ruff` **9.1 s**.
 - **Cached & parallel tests (`ripgrep`, ext4)**: `jato test --workspace` in a brand-new worktree takes **1.68 s** (restored build + cached tests) vs **2.97 s** for bare `cargo test --workspace` in an already-built target.
-- **Shared `rust-analyzer` across 12 `shiftup-v2` worktrees + `olo`** *(21 active LSP clients, 64-core Linux server, load 43–79)*: **2 shared backends** (`9.23 GiB` total RSS after full `workspace/symbol` indexing vs ~118 GiB unshared; `0 B` per idle session; `1.5 ms` warm lazy `initialize`; `3.2 ms` warm 2nd-client hover vs `47.7 s` cold; `<1 ms` cached `documentSymbol`).
+- **Shared & cache-backed `rust-analyzer` + CLI semantic queries** *(64-core Linux server, ext4)*: across 12 `shiftup-v2` worktrees + `olo` (21 active LSP clients, load 43–79), **2 shared backends** used `9.23 GiB` total RSS (vs ~118 GiB unshared; `0 B` idle; `1.5 ms` warm lazy init). With build-cache pre-seeding on `shiftup-v2` (load 24, 6,700 pre-seeded files), cold first `jato diag` dropped from **53.8 s** (unseeded) to **22.8 s** (**2.36× faster**); warm end-to-end CLI query medians: `jato def` **2.2 ms**, `jato hover` **2.3 ms**, `jato symbols <file>` **2.3 ms**, `jato diag <file>` **2.9 ms**, `jato refs` **26.7 ms**, `jato symbols --query` **30.2 ms**.
 - **Full measurements, conditions, `ripgrep` vs sccache/kache, Btrfs numbers, and reproduction scripts**: [bench/README.md](bench/README.md).
 
 ---
@@ -245,7 +257,8 @@ test-threads = 4     # default RUST_TEST_THREADS per binary (overridden by CLI -
 | `JATO_RA_SHARE_WORKTREES` | `1` (default) shares one backend across git worktrees of a repo; `0` isolates each worktree. |
 | `JATO_RA_LAZY` | `1` (default) defers spawning `rust-analyzer` until first file open/query; `0` spawns on `initialize`. |
 | `JATO_RA_THREADS` / `JATO_RA_PRIME` / `JATO_RA_PROC_MACROS` / `JATO_RA_LRU` | Tune per-backend worker threads (`4–8`), eager cache priming (`0`), `proc-macro-srv` count (`1`), and syntax-tree LRU (`128`). |
-| `JATO_RA_TARGET_DIR` / `JATO_RA_CHECK_ON_SAVE` / `JATO_RUST_ANALYZER` / `JATO_RA_PASSTHROUGH=1` | Override shared per-repo `cargo.targetDir` (`1`/`0`/path), `checkOnSave` (`0`/`1`), explicit real `rust-analyzer` binary path, or bypass multiplexing. |
+| `JATO_RA_TARGET_DIR` / `JATO_RA_CACHE` / `JATO_RA_SEED` / `JATO_RA_CHECK_JATO` | Shared per-repo `cargo.targetDir` (`1`/`0`/path), wire `RUSTC_WRAPPER=jato` (`1`), pre-seed empty `targetDir` from Jato whole builds (`1`), and route `checkOnSave` through `jato check` in an isolated `-check` target dir (`1`). |
+| `JATO_RA_CHECK_ON_SAVE` / `JATO_RUST_ANALYZER` / `JATO_RA_PASSTHROUGH=1` | Override `checkOnSave` (`0`/`1`), explicit real `rust-analyzer` binary path, or bypass multiplexing. |
 
 </details>
 

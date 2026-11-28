@@ -1,6 +1,6 @@
 ---
 name: jato
-description: Use Jato in Rust Cargo projects to restore builds that were made before (in this checkout, another worktree or after a clean), keep several builds from overloading the machine, share rust-analyzer across sessions and worktrees to save RAM and speed up LSP queries, check edits on save, or find out why something was compiled again. Use when setting up Jato or when building, testing, running, or using rust-analyzer in a Cargo project where Jato is available.
+description: Use Jato in Rust Cargo projects to restore builds that were made before (in this checkout, another worktree or after a clean), keep several builds from overloading the machine, share cache-backed rust-analyzer across sessions and worktrees to save RAM and speed up startup/LSP queries, run instant millisecond CLI semantic queries (jato diag, jato def, jato refs, jato hover, jato symbols) instead of repeated cargo check calls, check edits on save, or find out why something was compiled again. Use when setting up Jato or when building, testing, running, typechecking, navigating code, or using rust-analyzer in a Cargo project where Jato is available.
 ---
 
 # Use Jato in a Cargo project
@@ -46,13 +46,26 @@ For a tool that starts Cargo itself, prefix its command with `RUSTC_WRAPPER="$(c
 
 - To share verified builds and tests across machines or CI runners, set `JATO_REMOTE=file:///shared/dir` or `JATO_REMOTE=http://host:port/prefix` (or persist with `jato remote <URL>`); use `JATO_REMOTE_READONLY=1` for read-only pulls and `JATO_REMOTE_TOKEN` for Bearer auth.
 
-## Share `rust-analyzer` across sessions and worktrees
+## Share `rust-analyzer` & run instant CLI semantic queries
 
-To stop dozens of agent sessions or worktrees from spawning separate 4–6 GiB `rust-analyzer` processes (and to speed up warm attaches and repeat queries):
+To stop dozens of agent sessions or worktrees from spawning separate 4–6 GiB `rust-analyzer` processes — and to get sub-5 ms typecheck diagnostics and semantic navigation without invoking Cargo:
 
 - Run `jato rust-analyzer shim install` once to transparently intercept `rust-analyzer` on `PATH` (or configure an editor/LSP client to invoke `jato rust-analyzer` directly). Non-LSP flags and subcommands (`--version`, `analysis-stats`, `parse`, etc.) pass straight through to the real binary; check status with `jato rust-analyzer shim status` (`--help` for usage) and remove with `jato rust-analyzer shim uninstall` (which restores any previous `rustup` symlink).
-- Concurrent sessions and sibling git worktrees of the same repository share one tuned `rust-analyzer` backend (`sysroot`, dependencies, proc-macro server, and a shared per-repo `cargo.targetDir`), with lazy startup (`0 B` RAM and ~1.5 ms warm `initialize` until the first `.rs` file open or query), batched worktree loading, singleflight coalescing of concurrent identical queries, a sound content/stat-fingerprinted cache for single-file syntax requests (`documentSymbol`, `foldingRange`, `selectionRange`), strict per-worktree URI filtering, automatic hibernation with seamless buffer-preserving auto-wake, and crash recovery.
-- Inspect live sharing, cache hits, coalescing, and RSS with `jato rust-analyzer status` (or `--json`), stop all shared backends cleanly with `jato rust-analyzer stop`, and tune or bypass with `JATO_RA_MEMORY`, `JATO_RA_MAX_BACKENDS`, `JATO_RA_IDLE_SECS`, `JATO_RA_SHARE_WORKTREES=0`, `JATO_RA_LAZY=0`, `JATO_RUST_ANALYZER`, or `JATO_RA_PASSTHROUGH=1`.
+- Concurrent sessions and sibling git worktrees of the same repository share one cache-backed, tuned `rust-analyzer` backend (`sysroot`, dependencies, proc-macro server, and a shared per-repo `cargo.targetDir`), with:
+  - **Jato build-cache integration** (enabled by default): wires `RUSTC_WRAPPER=jato` and `JATO_CACHE_DIR` into `rust-analyzer`'s Cargo env (sharing unit cache hits and CPU slots), asynchronously pre-seeds an empty shared `cargo.targetDir` from a compatible recorded Jato whole build (cutting cold startup by ~2–3×), and routes default `checkOnSave` through `jato check --workspace --all-targets --message-format=json` in an isolated sibling `-check` target directory (backing off automatically when a client customizes `check.*`, `cargo.features`/`target`, or disables `checkOnSave`).
+  - **Low RAM & fast sharing**: lazy startup (`0 B` RAM and ~1.5 ms warm `initialize` until the first `.rs` file open or query), batched worktree loading, singleflight coalescing of concurrent identical queries, a sound content/stat-fingerprinted cache for single-file syntax requests (`documentSymbol`, `foldingRange`, `selectionRange`), strict per-worktree URI filtering, automatic hibernation with buffer-preserving auto-wake, and crash recovery.
+- **Instant CLI semantic queries (prefer these between small edits instead of running `cargo check` repeatedly!)**: all 5 commands connect directly to the same warm `jato rust-analyzer` daemon (keeping it warm across queries up to `JATO_RA_IDLE_SECS`), support `--json` for structured agent output, and use 1-based `FILE:LINE:COL` (or `FILE LINE COL`):
+
+| Task | Command | Notes |
+| --- | --- | --- |
+| Instant typecheck diagnostics (~2–3 ms warm) | `jato diag [FILE...] [--workspace] [--json]` | Exits `0` clean / `1` on errors; with no args checks git-modified `.rs` files (or current crate) |
+| Full `rustc` borrow-checker / macro / lint check | `jato diag --check [FILE...] [--json]` | Runs Jato-cached `jato check --message-format=json` with the same output/JSON schema |
+| Go to definition / type / implementations | `jato def <FILE:LINE:COL> [--type\|--impl] [--json]` | Prints `file:line:col: <preview>` |
+| Find all references | `jato refs <FILE:LINE:COL> [--no-decl] [--limit N] [--json]` | Sorted across workspace; `--json` defaults to unlimited |
+| Type signature & docs at position | `jato hover <FILE:LINE:COL> [--json]` | Prints resolved type signature and doc comments |
+| File outline or workspace symbol search | `jato symbols <FILE>` or `jato symbols --query <Q> [--json]` | File outline hits the daemon's <3 ms syntax cache |
+
+- Inspect live sharing, seeding, CLI queries, cache hits, coalescing, and RSS with `jato rust-analyzer status` (or `--json`), stop all shared backends cleanly with `jato rust-analyzer stop`, and tune or disable pieces with `JATO_RA_CACHE=0`, `JATO_RA_SEED=0`, `JATO_RA_CHECK_JATO=0`, `JATO_RA_MEMORY`, `JATO_RA_MAX_BACKENDS`, `JATO_RA_IDLE_SECS`, `JATO_RA_SHARE_WORKTREES=0`, `JATO_RA_LAZY=0`, `JATO_RUST_ANALYZER`, or `JATO_RA_PASSTHROUGH=1`.
 
 ## Choose an edit loop
 

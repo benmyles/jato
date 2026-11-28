@@ -7948,3 +7948,543 @@ fn concurrent_builds_in_same_target_and_poisoned_cargo_env_do_not_spin() {
     let out = success(p.command().env("CARGO", jato).args(["run", "-q"]));
     assert_eq!(out.stdout, b"concurrent-edit\n");
 }
+
+#[test]
+fn rust_analyzer_cache_seeding_check_override_and_cli_semantic_queries() {
+    if !observes() {
+        return;
+    }
+    let jato = env!("CARGO_BIN_EXE_jato");
+    let has_ra = Command::new(jato)
+        .args(["rust-analyzer", "--version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_ra {
+        return;
+    }
+
+    // All 5 CLI semantic commands must respond cleanly to --help without touching any daemon.
+    for sub in ["diag", "def", "refs", "hover", "symbols"] {
+        let out = Command::new(jato).args([sub, "--help"]).output().unwrap();
+        assert!(out.status.success(), "{sub} --help failed");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Usage:"),
+            "{sub} --help missing Usage"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    let repo = tmp.path().join("repo");
+    let wt2 = tmp.path().join("wt2");
+    fs::create_dir_all(repo.join("src")).unwrap();
+
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"semq\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("build.rs"),
+        "fn main() { println!(\"cargo:rustc-cfg=seeded_ok\"); }\n",
+    )
+    .unwrap();
+    let math_src = "\
+/// Multiplies `x` by two.
+pub fn double_val(x: i32) -> i32 {
+    x * 2
+}
+
+pub trait Compute {
+    fn compute(&self) -> i32;
+}
+
+pub struct Counter {
+    pub value: i32,
+}
+
+impl Compute for Counter {
+    fn compute(&self) -> i32 {
+        double_val(self.value)
+    }
+}
+";
+    let lib_src = "\
+pub mod math;
+
+// emoji comment 🦀 to exercise UTF-16 columns
+pub fn run_calc(n: i32) -> i32 {
+    let c = math::Counter { value: n };
+    math::double_val(c.value) + math::Compute::compute(&c)
+}
+";
+    fs::write(repo.join("src/math.rs"), math_src).unwrap();
+    fs::write(repo.join("src/lib.rs"), lib_src).unwrap();
+
+    // Initialize git repo + sibling worktree so worktree sharing & git-modified `jato diag` work.
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+        &["add", "."],
+        &["commit", "-q", "-m", "init"],
+    ] {
+        success(Command::new("git").current_dir(&repo).args(args));
+    }
+    success(Command::new("git").current_dir(&repo).args([
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feat",
+        wt2.to_str().unwrap(),
+    ]));
+
+    struct DaemonGuard<'a> {
+        jato: &'a str,
+        cache: PathBuf,
+    }
+    impl Drop for DaemonGuard<'_> {
+        fn drop(&mut self) {
+            let _ = Command::new(self.jato)
+                .env("JATO_CACHE_DIR", &self.cache)
+                .args(["rust-analyzer", "stop"])
+                .output();
+        }
+    }
+    let _daemon_guard = DaemonGuard {
+        jato,
+        cache: cache.clone(),
+    };
+
+    // 1. Run `jato check --workspace --all-targets` first so Jato has a recorded whole build.
+    let target = tmp.path().join("cargo-target");
+    success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("JATO_WHOLE_BUILDS", "1")
+            .env("JATO_EDIT_WINDOW", "0")
+            .env("JATO_BUSY", "0")
+            .args(["check", "--workspace", "--all-targets"]),
+    );
+
+    // 2. Run `jato diag src/lib.rs --json` (starts shared daemon, pre-seeds ra-target, warms Salsa DB).
+    let diag_clean = Command::new(jato)
+        .current_dir(&repo)
+        .env("JATO_CACHE_DIR", &cache)
+        .env("JATO_WHOLE_BUILDS", "1")
+        .env("JATO_EDIT_WINDOW", "0")
+        .env("JATO_BUSY", "0")
+        .args(["diag", "src/lib.rs", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        diag_clean.status.success(),
+        "clean diag failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&diag_clean.stdout),
+        String::from_utf8_lossy(&diag_clean.stderr)
+    );
+    let diag_json: Value = serde_json::from_slice(&diag_clean.stdout).unwrap();
+    assert_eq!(diag_json["errors"], 0, "{diag_json}");
+    assert_eq!(diag_json["mode"], "rust-analyzer");
+
+    // Verify daemon status reflects cache-backed, jato-check, pre-seeded target, and CLI query count!
+    let status_out = success(Command::new(jato).env("JATO_CACHE_DIR", &cache).args([
+        "rust-analyzer",
+        "status",
+        "--json",
+    ]));
+    let status: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status["backends"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["backends"][0]["cache_backed"], true, "{status}");
+    assert_eq!(status["backends"][0]["check_via_jato"], true, "{status}");
+    assert!(
+        status["backends"][0]["seeded_files"].as_u64().unwrap_or(0) > 0,
+        "expected pre-seeded files from recorded whole build: {status}"
+    );
+    assert!(
+        status["backends_seeded"].as_u64().unwrap_or(0) >= 1,
+        "{status}"
+    );
+    assert!(status["cli_queries"].as_u64().unwrap_or(0) >= 1, "{status}");
+
+    // 3. Introduce a type error in `src/lib.rs`: `jato diag` with explicit file AND with no args
+    //    (auto-detecting git-modified `.rs` files) must both catch it and exit 1!
+    let broken_lib = lib_src.replace(
+        "math::double_val(c.value) + math::Compute::compute(&c)",
+        "\"not an i32\"",
+    );
+    fs::write(repo.join("src/lib.rs"), &broken_lib).unwrap();
+    let diag_err = Command::new(jato)
+        .current_dir(&repo)
+        .env("JATO_CACHE_DIR", &cache)
+        .args(["diag", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        diag_err.status.code(),
+        Some(1),
+        "expected exit 1 on type error: stdout={} stderr={}",
+        String::from_utf8_lossy(&diag_err.stdout),
+        String::from_utf8_lossy(&diag_err.stderr)
+    );
+    let err_json: Value = serde_json::from_slice(&diag_err.stdout).unwrap();
+    assert!(
+        err_json["errors"].as_u64().unwrap_or(0) >= 1,
+        "expected error diagnostic: {err_json}"
+    );
+    assert!(
+        err_json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["file"] == "src/lib.rs" && d["severity"] == "error"),
+        "{err_json}"
+    );
+
+    // Restore clean `src/lib.rs` -> `jato diag` returns exit 0 again.
+    fs::write(repo.join("src/lib.rs"), lib_src).unwrap();
+    let diag_fixed = Command::new(jato)
+        .current_dir(&repo)
+        .env("JATO_CACHE_DIR", &cache)
+        .args(["diag", "src/lib.rs"])
+        .output()
+        .unwrap();
+    assert!(
+        diag_fixed.status.success(),
+        "diag after fix failed: {}",
+        String::from_utf8_lossy(&diag_fixed.stdout)
+    );
+
+    // 4. `jato diag --check` catches rustc borrow-checker errors (`E0499`) via Jato-cached `jato check`,
+    //    and works with a relative `--manifest-path` from a parent directory.
+    let borrow_lib = format!(
+        "{lib_src}\npub fn bad_borrow() {{ let mut x = 1; let a = &mut x; let b = &mut x; *a = 2; *b = 3; }}\n"
+    );
+    fs::write(repo.join("src/lib.rs"), &borrow_lib).unwrap();
+    let check_err = Command::new(jato)
+        .current_dir(tmp.path())
+        .env("JATO_CACHE_DIR", &cache)
+        .env("CARGO_TARGET_DIR", &target)
+        .args([
+            "diag",
+            "--check",
+            "--manifest-path",
+            "repo/Cargo.toml",
+            "repo/src/lib.rs",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(check_err.status.code(), Some(1));
+    let check_json: Value = serde_json::from_slice(&check_err.stdout).unwrap();
+    assert_eq!(check_json["mode"], "check");
+    assert_eq!(check_json["other_files_failed"], false, "{check_json}");
+    assert!(
+        check_json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "E0499"),
+        "expected E0499 borrowck diagnostic from --check: {check_json}"
+    );
+
+    // 4b. Verify an LSP editor client gets BOTH `check.overrideCommand` (`jato check`
+    //     in `<ra-target>-check` publishing rustc `E0499`) AND native push diagnostics!
+    {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::process::Stdio;
+        let mut child = Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .env("JATO_WHOLE_BUILDS", "1")
+            .env("JATO_EDIT_WINDOW", "0")
+            .env("JATO_BUSY", "0")
+            .arg("rust-analyzer")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let send = |w: &mut std::process::ChildStdin, msg: &Value| {
+            let b = serde_json::to_vec(msg).unwrap();
+            write!(w, "Content-Length: {}\r\n\r\n", b.len()).unwrap();
+            w.write_all(&b).unwrap();
+            w.flush().unwrap();
+        };
+        let canon_repo = fs::canonicalize(&repo).unwrap();
+        let root_uri = format!("file://{}", canon_repo.display());
+        let lib_uri = format!("{root_uri}/src/lib.rs");
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "processId": std::process::id(),
+                    "rootUri": root_uri,
+                    "workspaceFolders": [{ "uri": root_uri, "name": "repo" }],
+                    "capabilities": { "textDocument": { "publishDiagnostics": {} } }
+                }
+            }),
+        );
+        let recv_one = |r: &mut BufReader<std::process::ChildStdout>| -> Option<Value> {
+            let mut len = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r.read_line(&mut line).ok()? == 0 {
+                    return None;
+                }
+                let t = line.trim_end_matches(['\r', '\n']);
+                if t.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = t.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    len = v.trim().parse::<usize>().ok();
+                }
+            }
+            let mut buf = vec![0u8; len?];
+            r.read_exact(&mut buf).ok()?;
+            serde_json::from_slice(&buf).ok()
+        };
+        let init_resp = recv_one(&mut stdout).unwrap();
+        assert_eq!(init_resp["id"], 1);
+        send(
+            &mut stdin,
+            &serde_json::json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
+        );
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                "params": { "textDocument": { "uri": lib_uri, "languageId": "rust", "version": 1, "text": borrow_lib } }
+            }),
+        );
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "method": "textDocument/didSave",
+                "params": { "textDocument": { "uri": lib_uri } }
+            }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            while let Some(m) = recv_one(&mut stdout) {
+                if tx.send(m).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut saw_e0499 = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(m) = rx.recv_timeout(rem) else {
+                break;
+            };
+            if m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+                && m.pointer("/params/diagnostics")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| arr.iter().any(|d| d["code"] == "E0499"))
+            {
+                saw_e0499 = true;
+                break;
+            }
+        }
+        send(
+            &mut stdin,
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": null }),
+        );
+        send(
+            &mut stdin,
+            &serde_json::json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+        );
+        drop(stdin);
+        let _ = child.wait();
+        let _ = reader_thread.join();
+        assert!(
+            saw_e0499,
+            "expected checkOnSave overrideCommand (`jato check`) to publish E0499 via publishDiagnostics"
+        );
+        // Verify isolated sibling `<ra-target>-check` dir was populated without touching `repo/target`.
+        let ra_tdir = status["backends"][0]["target_dir"].as_str().unwrap();
+        assert!(
+            Path::new(&format!("{ra_tdir}-check")).is_dir(),
+            "expected isolated check target dir {ra_tdir}-check"
+        );
+        assert!(
+            !repo.join("target").exists(),
+            "checkOnSave via jato must not pollute workspace target/"
+        );
+    }
+
+    fs::write(repo.join("src/lib.rs"), lib_src).unwrap();
+
+    // 5. `jato def`, `jato def --type`, `jato def --impl`, `jato refs`, `jato hover`, `jato symbols`.
+    // In `src/lib.rs` line 6: `    math::double_val(c.value) + math::Compute::compute(&c)`
+    // `double_val` starts at column 11 (1-based).
+    let def_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["def", "src/lib.rs:6:12", "--json"]),
+    );
+    let def_json: Value = serde_json::from_slice(&def_out.stdout).unwrap();
+    assert!(
+        def_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["file"] == "src/math.rs" && l["line"] == 2),
+        "expected def to point to src/math.rs:2: {def_json}"
+    );
+
+    // `jato def --type` on `c` at line 6 col 22 (`c.value`) -> `struct Counter` in src/math.rs:10.
+    let typedef_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["def", "--type", "src/lib.rs:6:22", "--json"]),
+    );
+    let typedef_json: Value = serde_json::from_slice(&typedef_out.stdout).unwrap();
+    assert!(
+        typedef_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["file"] == "src/math.rs" && l["line"] == 10),
+        "expected --type def to point to Counter at src/math.rs:10: {typedef_json}"
+    );
+
+    // `jato def --impl` on `trait Compute` at `src/math.rs:6:11` -> `impl Compute for Counter` at line 14.
+    let impl_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["def", "--impl", "src/math.rs:6:11", "--json"]),
+    );
+    let impl_json: Value = serde_json::from_slice(&impl_out.stdout).unwrap();
+    assert!(
+        impl_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["file"] == "src/math.rs" && l["line"] == 14),
+        "expected --impl to point to impl Compute at src/math.rs:14: {impl_json}"
+    );
+
+    // `jato refs` on `double_val` at `src/math.rs:2:8` (with and without `--no-decl`).
+    let refs_all_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["refs", "src/math.rs:2:8", "--json"]),
+    );
+    let refs_all: Value = serde_json::from_slice(&refs_all_out.stdout).unwrap();
+    let all_arr = refs_all.as_array().unwrap();
+    assert!(
+        all_arr.len() >= 3,
+        "expected decl + 2 calls for double_val: {refs_all}"
+    );
+    let refs_nodecl_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["refs", "--no-decl", "src/math.rs", "2", "8", "--json"]),
+    );
+    let refs_nodecl: Value = serde_json::from_slice(&refs_nodecl_out.stdout).unwrap();
+    assert!(
+        refs_nodecl.as_array().unwrap().len() < all_arr.len(),
+        "--no-decl should exclude declaration: {refs_nodecl} vs {refs_all}"
+    );
+
+    // `jato hover` on `double_val`.
+    let hover_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["hover", "src/math.rs:2:8", "--json"]),
+    );
+    let hover_json: Value = serde_json::from_slice(&hover_out.stdout).unwrap();
+    let hover_text = hover_json["contents"].as_str().unwrap_or("");
+    assert!(
+        hover_text.contains("pub fn double_val") && hover_text.contains("Multiplies"),
+        "expected signature + doc comment in hover: {hover_json}"
+    );
+
+    // `jato symbols` document mode (twice so second hits syntax cache) + workspace search mode.
+    let syms_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["symbols", "src/math.rs", "--json"]),
+    );
+    let syms_json: Value = serde_json::from_slice(&syms_out.stdout).unwrap();
+    assert!(
+        syms_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "double_val" && s["kind"] == "fn"),
+        "{syms_json}"
+    );
+    let _ = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["symbols", "src/math.rs"]),
+    );
+    let wsyms_out = success(
+        Command::new(jato)
+            .current_dir(&repo)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["symbols", "--query", "Counter", "--json"]),
+    );
+    let wsyms_json: Value = serde_json::from_slice(&wsyms_out.stdout).unwrap();
+    assert!(
+        wsyms_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "Counter"),
+        "{wsyms_json}"
+    );
+
+    // 6. Sibling git worktree `wt2` reuses the SAME single backend and stays strictly worktree-isolated!
+    let wt2_def_out = success(
+        Command::new(jato)
+            .current_dir(&wt2)
+            .env("JATO_CACHE_DIR", &cache)
+            .args(["def", "src/lib.rs:6:12", "--json"]),
+    );
+    let wt2_def: Value = serde_json::from_slice(&wt2_def_out.stdout).unwrap();
+    assert!(
+        wt2_def
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["file"] == "src/math.rs" && l["line"] == 2),
+        "wt2 def should resolve inside wt2 (relative src/math.rs, not repo path): {wt2_def}"
+    );
+    let status2_out = success(Command::new(jato).env("JATO_CACHE_DIR", &cache).args([
+        "rust-analyzer",
+        "status",
+        "--json",
+    ]));
+    let status2: Value = serde_json::from_slice(&status2_out.stdout).unwrap();
+    assert_eq!(
+        status2["backends"].as_array().unwrap().len(),
+        1,
+        "wt2 must share the single backend with repo: {status2}"
+    );
+    assert!(
+        status2["cache_hits"].as_u64().unwrap_or(0) >= 1,
+        "repeat documentSymbol should hit syntax cache: {status2}"
+    );
+}

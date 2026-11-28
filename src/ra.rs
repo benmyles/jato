@@ -29,7 +29,7 @@ use crate::wire;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -41,10 +41,16 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+#[path = "ra_cli.rs"]
+mod cli;
+
+pub use cli::{cli_def, cli_diag, cli_hover, cli_refs, cli_symbols};
 
 pub const HELP: &str = "\
 Usage
@@ -55,6 +61,13 @@ Usage
   jato rust-analyzer shim uninstall [--dir DIR]
                                               Remove the shim and restore any rustup link
   jato rust-analyzer shim status              Show active rust-analyzer shim status
+
+Instant CLI queries (reuse the same warm rust-analyzer daemon):
+  jato diag [OPTIONS] [FILE...]               Instant file/workspace diagnostics
+  jato def <FILE:LINE:COL> [--type|--impl]    Go to definition / type / implementation
+  jato refs <FILE:LINE:COL> [--no-decl]       Find all references
+  jato hover <FILE:LINE:COL>                  Show type signature and docs
+  jato symbols [FILE | --query QUERY]         List document or workspace symbols
 
 Non-LSP rust-analyzer flags and subcommands (--version, analysis-stats, parse,
 etc.) pass straight through to the real rust-analyzer binary.
@@ -70,6 +83,9 @@ Environment
   JATO_RA_PROC_MACROS     proc-macro-srv processes per backend (default: 1)
   JATO_RA_LRU             Syntax tree LRU capacity per backend (default: 128)
   JATO_RA_TARGET_DIR      1 (default) shares per-repo cargo.targetDir; 0 disables; or custom path
+  JATO_RA_CACHE           1 (default) wires RUSTC_WRAPPER=jato & JATO_CACHE_DIR into backends; 0 disables
+  JATO_RA_SEED            1 (default) pre-seeds an empty shared cargo.targetDir from Jato's cache; 0 disables
+  JATO_RA_CHECK_JATO      1 (default) routes checkOnSave through `jato check --message-format=json`; 0 disables
   JATO_RA_CHECK_ON_SAVE   0 or 1 to override rust-analyzer checkOnSave
   JATO_RUST_ANALYZER      Explicit path to the real rust-analyzer binary
   JATO_RA_PASSTHROUGH=1   Bypass multiplexing and exec the real rust-analyzer directly
@@ -158,10 +174,20 @@ fn is_lsp_invocation(args: &[OsString]) -> bool {
 // ---- binary & toolchain resolution -----------------------------------------
 
 fn is_self(path: &Path) -> bool {
-    let Ok(own) = env::current_exe().and_then(fs::canonicalize) else {
+    let Some(own) = own_jato_exe().and_then(|p| fs::canonicalize(&p).ok().or(Some(p))) else {
         return false;
     };
-    fs::canonicalize(path).ok().is_some_and(|p| p == own)
+    if fs::canonicalize(path).ok().is_some_and(|p| p == own) {
+        return true;
+    }
+    if path.components().count() == 1
+        && let Some(name) = path.to_str()
+        && let Some(path_env) = env::var_os("PATH")
+        && let Some(found) = crate::tools::find(name, &path_env)
+    {
+        return fs::canonicalize(&found).ok().is_some_and(|p| p == own);
+    }
+    false
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -196,9 +222,11 @@ fn find_rustup() -> Option<PathBuf> {
 fn rustup_which(rustup: &Path, cwd: &Path, toolchain: Option<&str>, bin: &str) -> Option<PathBuf> {
     let mut cmd = Command::new(rustup);
     cmd.arg("which");
+    // Always remove inherited RUSTUP_TOOLCHAIN so daemon startup env cannot
+    // bleed across clients when `toolchain` is `None`.
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
     if let Some(tc) = toolchain {
         cmd.arg("--toolchain").arg(tc);
-        cmd.env_remove("RUSTUP_TOOLCHAIN");
     }
     cmd.arg(bin)
         .current_dir(cwd)
@@ -217,6 +245,13 @@ fn rustup_which(rustup: &Path, cwd: &Path, toolchain: Option<&str>, bin: &str) -
 /// and gracefully falling back to another installed rustup toolchain when a
 /// workspace's pinned toolchain (e.g. a pinned nightly) omits `rust-analyzer`.
 pub fn resolve_real_ra(cwd: &Path) -> Result<PathBuf> {
+    let tc = env::var("RUSTUP_TOOLCHAIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    resolve_real_ra_for(cwd, tc.as_deref())
+}
+
+fn resolve_real_ra_for(cwd: &Path, toolchain: Option<&str>) -> Result<PathBuf> {
     if let Some(explicit) = env::var_os("JATO_RUST_ANALYZER")
         && !explicit.is_empty()
     {
@@ -227,7 +262,7 @@ pub fn resolve_real_ra(cwd: &Path) -> Result<PathBuf> {
         bail!("JATO_RUST_ANALYZER does not point to a valid rust-analyzer binary: {explicit:?}");
     }
     if let Some(rustup) = find_rustup() {
-        if let Some(found) = rustup_which(&rustup, cwd, None, "rust-analyzer") {
+        if let Some(found) = rustup_which(&rustup, cwd, toolchain, "rust-analyzer") {
             return Ok(fs::canonicalize(&found).unwrap_or(found));
         }
         // Active toolchain lacks rust-analyzer (e.g., pinned nightly without the
@@ -266,9 +301,9 @@ pub fn resolve_real_ra(cwd: &Path) -> Result<PathBuf> {
     )
 }
 
-fn resolve_rustc(cwd: &Path) -> PathBuf {
+fn resolve_rustc_for(cwd: &Path, toolchain: Option<&str>) -> PathBuf {
     if let Some(rustup) = find_rustup()
-        && let Some(found) = rustup_which(&rustup, cwd, None, "rustc")
+        && let Some(found) = rustup_which(&rustup, cwd, toolchain, "rustc")
     {
         return fs::canonicalize(&found).unwrap_or(found);
     }
@@ -577,6 +612,8 @@ enum Handshake {
         pid: u32,
         #[serde(default)]
         overrides: ClientEnvOverrides,
+        #[serde(default)]
+        cli: bool,
     },
 }
 
@@ -590,6 +627,12 @@ struct ClientEnvOverrides {
     lru: Option<usize>,
     target_dir: Option<String>,
     check_on_save: Option<bool>,
+    #[serde(default)]
+    cache: Option<bool>,
+    #[serde(default)]
+    seed: Option<bool>,
+    #[serde(default)]
+    check_via_jato: Option<bool>,
     rustup_toolchain: Option<String>,
     rust_analyzer_bin: Option<PathBuf>,
 }
@@ -615,6 +658,9 @@ impl ClientEnvOverrides {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             check_on_save: parse_bool("JATO_RA_CHECK_ON_SAVE"),
+            cache: parse_bool("JATO_RA_CACHE"),
+            seed: parse_bool("JATO_RA_SEED"),
+            check_via_jato: parse_bool("JATO_RA_CHECK_JATO"),
             rustup_toolchain: env::var("RUSTUP_TOOLCHAIN")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -643,6 +689,12 @@ struct DaemonStatus {
     requests_coalesced: u64,
     #[serde(default)]
     cache_hits: u64,
+    #[serde(default)]
+    backends_seeded: u64,
+    #[serde(default)]
+    seeded_files_total: u64,
+    #[serde(default)]
+    cli_queries: u64,
     backends: Vec<BackendStatus>,
 }
 
@@ -658,15 +710,31 @@ struct BackendStatus {
     idle_secs: u64,
     active_clients: usize,
     open_docs: usize,
+    #[serde(default)]
+    cache_backed: bool,
+    #[serde(default)]
+    check_via_jato: bool,
+    #[serde(default)]
+    seeded_files: usize,
     workspaces: Vec<PathBuf>,
 }
 
 fn connect_existing(cache: &Path) -> Option<UnixStream> {
     let addr = daemon_addr(cache).ok()?;
-    UnixStream::connect_addr(&addr).ok()
+    let stream = UnixStream::connect_addr(&addr).ok()?;
+    // Authenticate the daemon peer UID (`SO_PEERCRED`) before sending any
+    // handshake or workspace source contents over the abstract Unix socket.
+    if !wire::same_user(&stream) {
+        return None;
+    }
+    Some(stream)
 }
 
 fn connect_or_start_daemon(cache: &Path) -> Result<UnixStream> {
+    connect_or_start_daemon_until(cache, Instant::now() + Duration::from_secs(10))
+}
+
+fn connect_or_start_daemon_until(cache: &Path, deadline: Instant) -> Result<UnixStream> {
     if let Some(stream) = connect_existing(cache) {
         return Ok(stream);
     }
@@ -677,12 +745,23 @@ fn connect_or_start_daemon(cache: &Path) -> Result<UnixStream> {
         .truncate(false)
         .write(true)
         .open(dir.join("daemon.lock"))?;
-    lock_file.lock().context("locking rust-analyzer daemon")?;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for jato rust-analyzer daemon startup lock");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e).context("locking rust-analyzer daemon"),
+        }
+    }
     if let Some(stream) = connect_existing(cache) {
         return Ok(stream);
     }
 
-    let exe = env::current_exe()?;
+    let exe = own_jato_exe().context("locating current jato binary")?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -702,7 +781,6 @@ fn connect_or_start_daemon(cache: &Path) -> Result<UnixStream> {
     }
     cmd.spawn().context("spawning jato rust-analyzer daemon")?;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Some(stream) = connect_existing(cache) {
             return Ok(stream);
@@ -759,23 +837,50 @@ fn cmd_status(json_out: bool) -> Result<i32> {
         }
     );
     println!(
-        "Sharing    {} shared attaches, {} coalesced, {} cache hits, {} hibernated, {} evicted (idle {} s)",
+        "Sharing    {} shared attaches, {} coalesced, {} cache hits, {} CLI queries, {} seeded ({} files), {} hibernated, {} evicted (idle {} s)",
         status.backends_reused,
         status.requests_coalesced,
         status.cache_hits,
+        status.cli_queries,
+        status.backends_seeded,
+        status.seeded_files_total,
         status.backends_hibernated,
         status.backends_evicted,
         status.idle_secs
     );
     for b in &status.backends {
+        let mut tags = Vec::new();
+        if b.cache_backed {
+            tags.push("cache");
+        }
+        if b.check_via_jato {
+            tags.push("jato-check");
+        }
+        let state = if b.pid == 0 {
+            "seeding"
+        } else if b.quiescent {
+            "ready"
+        } else {
+            "loading"
+        };
+        let extra = if tags.is_empty() && b.seeded_files == 0 {
+            String::new()
+        } else {
+            let mut parts: Vec<String> = tags.into_iter().map(str::to_owned).collect();
+            if b.seeded_files > 0 {
+                parts.push(format!("seeded={}", b.seeded_files));
+            }
+            format!(" [{}]", parts.join(","))
+        };
         println!(
-            "  #{} pid={} rss={} clients={} docs={} {} group={}",
+            "  #{} pid={} rss={} clients={} docs={} {}{} group={}",
             b.id,
             b.pid,
             mib(b.rss_bytes),
             b.active_clients,
             b.open_docs,
-            if b.quiescent { "ready" } else { "loading" },
+            state,
+            extra,
             b.group.display()
         );
         for ws in &b.workspaces {
@@ -808,6 +913,7 @@ fn run_proxy(_args: &[OsString]) -> Result<i32> {
         cwd,
         pid: std::process::id(),
         overrides: ClientEnvOverrides::from_env(),
+        cli: false,
     };
     let hs_bytes = serde_json::to_vec(&handshake)?;
 
@@ -1336,7 +1442,7 @@ fn caps_cache_path(cache: &Path, ra_bin: &Path) -> PathBuf {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
     let len = meta.as_ref().map_or(0, fs::Metadata::len);
-    let mut h = blake3::Hasher::new_derive_key("jato ra caps v1");
+    let mut h = blake3::Hasher::new_derive_key("jato ra caps v3");
     h.update(ra_bin.as_os_str().as_bytes());
     h.update(&mtime.to_le_bytes());
     h.update(&len.to_le_bytes());
@@ -1447,6 +1553,110 @@ struct DaemonConfig {
     lru_capacity: usize,
     shared_target_dir: Option<String>,
     check_on_save: Option<bool>,
+    cache: bool,
+    seed: bool,
+    check_via_jato: bool,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveRaConfig {
+    target_dir: Option<PathBuf>,
+    check_target_dir: Option<PathBuf>,
+    cache_backed: bool,
+    seed: bool,
+    check_via_jato: bool,
+    cargo_extra_env: BTreeMap<OsString, OsString>,
+}
+
+fn client_customized_cargo(client_opts: &Value) -> bool {
+    let cargo_keys = [
+        "features",
+        "allFeatures",
+        "noDefaultFeatures",
+        "target",
+        "allTargets",
+        "extraArgs",
+        "cfgs",
+    ];
+    client_opts
+        .get("cargo")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.keys().any(|k| cargo_keys.contains(&k.as_str())))
+}
+
+fn client_customized_check(client_opts: &Value) -> bool {
+    let custom_keys = [
+        "overrideCommand",
+        "command",
+        "extraArgs",
+        "features",
+        "allFeatures",
+        "allTargets",
+        "targets",
+        "workspace",
+        "noDefaultFeatures",
+        "invocationStrategy",
+        "invocationLocation",
+    ];
+    let has_custom_check = client_opts
+        .get("check")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.keys().any(|k| custom_keys.contains(&k.as_str())));
+    let has_legacy_check = client_opts
+        .get("checkOnSave")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.keys().any(|k| custom_keys.contains(&k.as_str())));
+    has_custom_check || has_legacy_check || client_customized_cargo(client_opts)
+}
+
+fn ensure_object<'a>(val: &'a mut Value, key: &str) -> &'a mut Map<String, Value> {
+    if !val.is_object() {
+        *val = Value::Object(Map::new());
+    }
+    let map = val.as_object_mut().unwrap();
+    let entry = map
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    entry.as_object_mut().unwrap()
+}
+
+fn ensure_nested_object<'a>(
+    map: &'a mut Map<String, Value>,
+    key: &str,
+) -> &'a mut Map<String, Value> {
+    let entry = map
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    entry.as_object_mut().unwrap()
+}
+
+fn sibling_check_target_dir(target_dir: &Path) -> PathBuf {
+    let mut name = target_dir
+        .file_name()
+        .map(OsStr::to_os_string)
+        .unwrap_or_else(|| OsString::from("ra-target"));
+    name.push("-check");
+    target_dir.with_file_name(name)
+}
+
+fn own_jato_exe() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let raw = exe.to_string_lossy();
+    if let Some(stripped) = raw.strip_suffix(" (deleted)") {
+        let p = PathBuf::from(stripped);
+        if is_executable_file(&p) {
+            return Some(fs::canonicalize(&p).unwrap_or(p));
+        }
+        return None;
+    }
+    let canon = fs::canonicalize(&exe).unwrap_or(exe);
+    is_executable_file(&canon).then_some(canon)
 }
 
 impl DaemonConfig {
@@ -1520,10 +1730,19 @@ impl DaemonConfig {
                     "0" | "false" | "no" => Some(false),
                     _ => None,
                 }),
+            cache: parse_bool("JATO_RA_CACHE", true),
+            seed: parse_bool("JATO_RA_SEED", true),
+            check_via_jato: parse_bool("JATO_RA_CHECK_JATO", true),
         }
     }
 
-    fn backend_target_dir(&self, key: &BackendKey, ov: &ClientEnvOverrides) -> Option<PathBuf> {
+    fn backend_target_dir(
+        &self,
+        group: &Path,
+        rustc_bin: &Path,
+        workspace_root: &Path,
+        ov: &ClientEnvOverrides,
+    ) -> Option<PathBuf> {
         let setting = ov
             .target_dir
             .as_deref()
@@ -1532,27 +1751,56 @@ impl DaemonConfig {
             Some("0" | "false" | "off") => None,
             Some("1" | "true" | "on") | None => {
                 let mut h = blake3::Hasher::new_derive_key("jato ra target v1");
-                h.update(key.group.as_os_str().as_bytes());
+                h.update(group.as_os_str().as_bytes());
                 h.update(&[0]);
-                h.update(key.rustc_bin.as_os_str().as_bytes());
+                h.update(rustc_bin.as_os_str().as_bytes());
                 Some(self.target_root.join(&h.finalize().to_hex()[..16]))
             }
-            Some(custom) => Some(PathBuf::from(custom)),
+            Some(custom) => {
+                let p = PathBuf::from(custom);
+                Some(if p.is_absolute() {
+                    p
+                } else {
+                    workspace_root.join(p)
+                })
+            }
         }
     }
 
     fn merged_ra_settings(
         &self,
-        key: &BackendKey,
+        group: &Path,
+        rustc_bin: &Path,
+        workspace_root: &Path,
         client_opts: &Value,
         ov: &ClientEnvOverrides,
-    ) -> Value {
+    ) -> (Value, EffectiveRaConfig) {
+        self.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            workspace_root,
+            client_opts,
+            ov,
+            own_jato_exe().as_deref(),
+        )
+    }
+
+    fn merged_ra_settings_with_exe(
+        &self,
+        group: &Path,
+        rustc_bin: &Path,
+        workspace_root: &Path,
+        client_opts: &Value,
+        ov: &ClientEnvOverrides,
+        jato_exe: Option<&Path>,
+    ) -> (Value, EffectiveRaConfig) {
         let threads = ov.threads.unwrap_or(self.threads);
         let prime = ov.prime.unwrap_or(self.prime);
         let proc_macros = ov.proc_macros.unwrap_or(self.proc_macros);
         let lru = ov.lru.unwrap_or(self.lru_capacity);
         let check_on_save = ov.check_on_save.or(self.check_on_save);
-        let target_dir = self.backend_target_dir(key, ov);
+        let target_dir = self.backend_target_dir(group, rustc_bin, workspace_root, ov);
+        let cache_wanted = ov.cache.unwrap_or(self.cache) && jato_exe.is_some();
 
         let mut base = json!({
             "numThreads": threads,
@@ -1567,9 +1815,20 @@ impl DaemonConfig {
                 "capacity": lru
             }
         });
-        if let Some(dir) = target_dir {
-            let _ = fs::create_dir_all(&dir);
+        if let Some(ref dir) = target_dir {
             base["cargo"] = json!({ "targetDir": dir.to_string_lossy() });
+        }
+        if cache_wanted && let Some(exe) = jato_exe {
+            let cargo = ensure_object(&mut base, "cargo");
+            let extra = ensure_nested_object(cargo, "extraEnv");
+            extra.insert(
+                "RUSTC_WRAPPER".to_owned(),
+                Value::String(exe.to_string_lossy().into_owned()),
+            );
+            extra.insert(
+                "JATO_CACHE_DIR".to_owned(),
+                Value::String(self.cache_dir.to_string_lossy().into_owned()),
+            );
         }
         if let Some(cos) = check_on_save {
             base["checkOnSave"] = Value::Bool(cos);
@@ -1595,7 +1854,130 @@ impl DaemonConfig {
         if let Some(cos) = ov.check_on_save {
             base["checkOnSave"] = Value::Bool(cos);
         }
-        base
+        if ov.cache == Some(true)
+            && let Some(exe) = jato_exe
+        {
+            let cargo = ensure_object(&mut base, "cargo");
+            let extra = ensure_nested_object(cargo, "extraEnv");
+            extra.insert(
+                "RUSTC_WRAPPER".to_owned(),
+                Value::String(exe.to_string_lossy().into_owned()),
+            );
+            extra.insert(
+                "JATO_CACHE_DIR".to_owned(),
+                Value::String(self.cache_dir.to_string_lossy().into_owned()),
+            );
+        }
+
+        // Determine effective cargo.targetDir after client overrides.
+        // Note: `cargo.targetDir: true` tells rust-analyzer to use a subdir
+        // inside Cargo's target dir, which we leave untouched rather than
+        // aliasing onto Jato's shared target dir.
+        let effective_target_dir = match base.pointer("/cargo/targetDir") {
+            Some(Value::String(s)) if !s.trim().is_empty() => {
+                let p = PathBuf::from(s);
+                Some(if p.is_absolute() {
+                    p
+                } else {
+                    workspace_root.join(p)
+                })
+            }
+            Some(Value::Bool(_)) => None,
+            _ => target_dir,
+        };
+
+        // Compute effective_cache_backed AFTER client overrides so overriding
+        // `cargo.extraEnv.RUSTC_WRAPPER` disables seeding and jato-check too.
+        let effective_cache_backed = cache_wanted
+            && jato_exe.is_some_and(|exe| {
+                base.pointer("/cargo/extraEnv/RUSTC_WRAPPER")
+                    .and_then(Value::as_str)
+                    .is_some_and(|w| Path::new(w) == exe)
+            });
+
+        // Collect effective `cargo.extraEnv` string values for seed compatibility.
+        let mut cargo_extra_env = BTreeMap::new();
+        let mut custom_cache_dir = false;
+        if let Some(extra) = base.pointer("/cargo/extraEnv").and_then(Value::as_object) {
+            for (k, v) in extra {
+                if let Some(val) = v.as_str() {
+                    if k == "JATO_CACHE_DIR" && Path::new(val) != self.cache_dir {
+                        custom_cache_dir = true;
+                    }
+                    cargo_extra_env.insert(OsString::from(k), OsString::from(val));
+                }
+            }
+        }
+
+        // Route checkOnSave through `jato check --workspace --all-targets --message-format=json`
+        // into an isolated sibling `-check` target dir (so Jato restores never race
+        // with rust-analyzer's own direct `cargo` build-script/proc-macro runs).
+        let check_on_save_disabled = base.get("checkOnSave") == Some(&Value::Bool(false))
+            || base.pointer("/checkOnSave/enable") == Some(&Value::Bool(false));
+        let client_has_override = client_opts.pointer("/check/overrideCommand").is_some()
+            || client_opts
+                .pointer("/checkOnSave/overrideCommand")
+                .is_some();
+        let check_target_dir = effective_target_dir
+            .as_deref()
+            .map(sibling_check_target_dir);
+        let want_check_jato =
+            effective_cache_backed && ov.check_via_jato.unwrap_or(self.check_via_jato);
+        // Without a dedicated target dir, only inject check.overrideCommand if
+        // the user explicitly forced JATO_RA_CHECK_JATO=1 (avoids contending
+        // with the workspace's primary `target/` by default).
+        let target_ok_for_check = check_target_dir.is_some() || ov.check_via_jato == Some(true);
+        let allow_override = want_check_jato
+            && target_ok_for_check
+            && !check_on_save_disabled
+            && !client_has_override
+            && (ov.check_via_jato == Some(true) || !client_customized_check(client_opts));
+
+        let mut check_via_jato_active = false;
+        if allow_override && let Some(exe) = jato_exe {
+            let has_cargo_target_env = base.pointer("/cargo/extraEnv/CARGO_TARGET_DIR").is_some();
+            let check = ensure_object(&mut base, "check");
+            check.insert(
+                "overrideCommand".to_owned(),
+                json!([
+                    exe.to_string_lossy(),
+                    "check",
+                    "--workspace",
+                    "--all-targets",
+                    "--message-format=json"
+                ]),
+            );
+            if let Some(ref dir) = check_target_dir {
+                let has_check_target_env = check
+                    .get("extraEnv")
+                    .and_then(|v| v.get("CARGO_TARGET_DIR"))
+                    .is_some();
+                if !has_cargo_target_env && !has_check_target_env {
+                    let extra = ensure_nested_object(check, "extraEnv");
+                    extra.insert(
+                        "CARGO_TARGET_DIR".to_owned(),
+                        Value::String(dir.to_string_lossy().into_owned()),
+                    );
+                }
+            }
+            check_via_jato_active = true;
+        }
+
+        let seed_enabled = effective_cache_backed
+            && ov.seed.unwrap_or(self.seed)
+            && effective_target_dir.is_some()
+            && !custom_cache_dir
+            && !client_customized_cargo(client_opts);
+
+        let effective = EffectiveRaConfig {
+            target_dir: effective_target_dir,
+            check_target_dir: check_via_jato_active.then_some(check_target_dir).flatten(),
+            cache_backed: effective_cache_backed,
+            seed: seed_enabled,
+            check_via_jato: check_via_jato_active,
+            cargo_extra_env,
+        };
+        (base, effective)
     }
 }
 
@@ -1609,6 +1991,57 @@ struct BackendKey {
     group: PathBuf,
     ra_bin: PathBuf,
     rustc_bin: PathBuf,
+    settings_hash: [u8; 32],
+}
+
+fn settings_fingerprint(ra_settings: &Value, effective: &EffectiveRaConfig) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("jato ra settings v1");
+    if let Ok(bytes) = serde_json::to_vec(ra_settings) {
+        h.update(&bytes);
+    }
+    h.update(&[
+        u8::from(effective.cache_backed),
+        u8::from(effective.check_via_jato),
+    ]);
+    if let Some(ref dir) = effective.target_dir {
+        h.update(dir.as_os_str().as_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Owns a spawned `rust-analyzer` child process group and guarantees it is
+/// killed and reaped on drop even if a queued `BackendSpawned` event is
+/// discarded during daemon shutdown.
+struct ManagedChild {
+    child: Option<Child>,
+    pid: u32,
+}
+
+impl ManagedChild {
+    fn new(child: Child) -> Self {
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    fn take(&mut self) -> Option<Child> {
+        self.child.take()
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let pgrp = self.pid as libc::pid_t;
+            unsafe {
+                libc::kill(-pgrp, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1721,6 +2154,7 @@ struct ClientState {
     id: ClientId,
     cwd: PathBuf,
     overrides: ClientEnvOverrides,
+    is_cli: bool,
     tx: ClientWriter,
     workspace_root: Option<PathBuf>,
     workspace_uri: Option<String>,
@@ -1832,11 +2266,17 @@ struct QueuedReadyMsg {
 struct BackendState {
     id: BackendId,
     key: BackendKey,
-    child: Child,
+    child: Option<Child>,
     pid: u32,
+    cancelled: Arc<AtomicBool>,
+    setup_handle: Option<thread::JoinHandle<()>>,
     tx: Sender<Vec<u8>>,
     target_dir: Option<PathBuf>,
     ra_settings: Value,
+    cache_backed: bool,
+    check_via_jato: bool,
+    seeded_files: usize,
+    cli_warmed: bool,
     init_result: Option<Value>,
     ready: bool,
     quiescent: bool,
@@ -1973,6 +2413,7 @@ fn is_coalesceable_read_method(method: &str) -> bool {
             | "textDocument/documentSymbol"
             | "textDocument/foldingRange"
             | "textDocument/selectionRange"
+            | "textDocument/diagnostic"
             | "workspace/symbol"
     )
 }
@@ -1981,6 +2422,7 @@ enum DaemonEvent {
     NewLspClient {
         cwd: PathBuf,
         overrides: ClientEnvOverrides,
+        cli: bool,
         stream: UnixStream,
     },
     StatusRequest(UnixStream),
@@ -1990,6 +2432,11 @@ enum DaemonEvent {
     CapsProbed {
         ra_bin: PathBuf,
         result: Result<Value, String>,
+    },
+    BackendSpawned {
+        bid: BackendId,
+        child: ManagedChild,
+        seeded_files: usize,
     },
     BackendMessage(BackendId, Value),
     BackendExited(BackendId),
@@ -2051,8 +2498,12 @@ struct Daemon {
     backends_evicted: u64,
     requests_coalesced: u64,
     cache_hits: u64,
+    backends_seeded: u64,
+    seeded_files_total: u64,
+    cli_queries: u64,
     tick_count: u64,
     shutdown: bool,
+    stop_reply: Option<UnixStream>,
 }
 
 impl Daemon {
@@ -2075,8 +2526,12 @@ impl Daemon {
             backends_evicted: 0,
             requests_coalesced: 0,
             cache_hits: 0,
+            backends_seeded: 0,
+            seeded_files_total: 0,
+            cli_queries: 0,
             tick_count: 0,
             shutdown: false,
+            stop_reply: None,
         }
     }
 
@@ -2085,24 +2540,28 @@ impl Daemon {
             DaemonEvent::NewLspClient {
                 cwd,
                 overrides,
+                cli,
                 stream,
-            } => self.on_new_client(cwd, overrides, stream),
+            } => self.on_new_client(cwd, overrides, cli, stream),
             DaemonEvent::StatusRequest(stream) => self.on_status(stream),
-            DaemonEvent::StopRequest(mut stream) => {
-                self.shutdown_all_backends();
-                let _ = wire::send(&mut stream, br#"{"ok":true}"#);
+            DaemonEvent::StopRequest(stream) => {
+                self.stop_reply = Some(stream);
                 self.shutdown = true;
             }
             DaemonEvent::ClientMessage(cid, msg) => self.on_client_message(cid, msg),
             DaemonEvent::ClientDisconnected(cid) => self.on_client_disconnected(cid),
             DaemonEvent::CapsProbed { ra_bin, result } => self.on_caps_probed(ra_bin, result),
+            DaemonEvent::BackendSpawned {
+                bid,
+                child,
+                seeded_files,
+            } => self.on_backend_spawned(bid, child, seeded_files),
             DaemonEvent::BackendMessage(bid, msg) => self.on_backend_message(bid, msg),
             DaemonEvent::BackendExited(bid) => self.on_backend_exited(bid),
             DaemonEvent::FireRetry(bid, token) => self.on_fire_retry(bid, token),
             DaemonEvent::FlushAddedFolders(bid) => self.flush_added_folders(bid),
             DaemonEvent::Tick => self.on_tick(),
             DaemonEvent::SignalStop => {
-                self.shutdown_all_backends();
                 self.shutdown = true;
             }
         }
@@ -2125,12 +2584,13 @@ impl Daemon {
         {
             return Ok((entry.ra_bin.clone(), entry.rustc_bin.clone()));
         }
+        let tc = overrides.rustup_toolchain.as_deref();
         let ra_bin = if let Some(explicit) = overrides.rust_analyzer_bin.as_deref() {
             fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf())
         } else {
-            resolve_real_ra(workspace_root)?
+            resolve_real_ra_for(workspace_root, tc)?
         };
-        let rustc_bin = resolve_rustc(workspace_root);
+        let rustc_bin = resolve_rustc_for(workspace_root, tc);
         self.toolchain_cache.insert(
             key,
             CachedToolchain {
@@ -2147,6 +2607,7 @@ impl Daemon {
         &mut self,
         cwd: PathBuf,
         overrides: ClientEnvOverrides,
+        cli: bool,
         mut stream: UnixStream,
     ) {
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -2180,6 +2641,7 @@ impl Daemon {
                 id,
                 cwd,
                 overrides,
+                is_cli: cli,
                 tx: out_tx,
                 workspace_root: None,
                 workspace_uri: None,
@@ -2223,6 +2685,9 @@ impl Daemon {
                 idle_secs: now.saturating_duration_since(b.last_activity).as_secs(),
                 active_clients: count,
                 open_docs: b.open_docs.len(),
+                cache_backed: b.cache_backed,
+                check_via_jato: b.check_via_jato,
+                seeded_files: b.seeded_files,
                 workspaces,
             });
         }
@@ -2242,6 +2707,9 @@ impl Daemon {
             backends_evicted: self.backends_evicted,
             requests_coalesced: self.requests_coalesced,
             cache_hits: self.cache_hits,
+            backends_seeded: self.backends_seeded,
+            seeded_files_total: self.seeded_files_total,
+            cli_queries: self.cli_queries,
             backends,
         };
         if let Ok(bytes) = serde_json::to_vec(&status) {
@@ -2348,6 +2816,10 @@ impl Daemon {
             return;
         }
 
+        if self.clients.get(&cid).is_some_and(|c| c.is_cli) && has_id {
+            self.cli_queries += 1;
+        }
+
         self.dispatch_to_backend(bid, cid, msg);
     }
 
@@ -2422,16 +2894,25 @@ impl Daemon {
         } else {
             workspace_root.clone()
         };
-        let key = BackendKey {
-            group,
-            ra_bin: ra_bin.clone(),
-            rustc_bin,
-        };
         let init_options = params
             .get("initializationOptions")
             .cloned()
             .filter(Value::is_object)
             .unwrap_or_else(|| Value::Object(Map::new()));
+        let (eff_settings, eff_cfg) = self.cfg.merged_ra_settings(
+            &group,
+            &rustc_bin,
+            &workspace_root,
+            &init_options,
+            &overrides,
+        );
+        let settings_hash = settings_fingerprint(&eff_settings, &eff_cfg);
+        let key = BackendKey {
+            group,
+            ra_bin: ra_bin.clone(),
+            rustc_bin,
+            settings_hash,
+        };
         let supports_progress = params
             .pointer("/capabilities/window/workDoneProgress")
             .and_then(Value::as_bool)
@@ -2645,9 +3126,13 @@ impl Daemon {
             (bid, true)
         };
 
+        let is_cli = self.clients.get(&cid).is_some_and(|c| c.is_cli);
         if let Some(c) = self.clients.get_mut(&cid) {
             c.backend_id = Some(bid);
             c.active = true;
+        }
+        if is_cli && let Some(b) = self.backends.get_mut(&bid) {
+            b.cli_warmed = true;
         }
 
         // Ensure this client's primary workspace (when reusing) and any extra
@@ -2750,62 +3235,165 @@ impl Daemon {
         let bid = self.next_backend_id;
         self.next_backend_id += 1;
 
-        let target_dir = self.cfg.backend_target_dir(&key, overrides);
-        let ra_settings = self.cfg.merged_ra_settings(&key, client_opts, overrides);
+        let (ra_settings, effective) = self.cfg.merged_ra_settings(
+            &key.group,
+            &key.rustc_bin,
+            initial_ws,
+            client_opts,
+            overrides,
+        );
+        let target_dir = effective.target_dir.clone();
 
         let log_path = self
             .cfg
             .cache_dir
             .join("rust-analyzer")
             .join(format!("backend-{bid}.log"));
-        let stderr = File::create(&log_path).map_or_else(|_| Stdio::null(), Stdio::from);
 
         let mut cmd = Command::new(&key.ra_bin);
         cmd.current_dir(initial_ws)
             .env("JATO_RA_PASSTHROUGH", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
             .process_group(0);
         if env::var_os("MALLOC_ARENA_MAX").is_none() {
             cmd.env("MALLOC_ARENA_MAX", "2");
         }
+        if effective.cache_backed
+            && let Some(exe) = own_jato_exe()
+        {
+            cmd.env("RUSTC_WRAPPER", &exe)
+                .env("JATO_CACHE_DIR", &self.cfg.cache_dir);
+        } else if env::var_os("RUSTC_WRAPPER").is_some_and(|w| is_self(Path::new(&w))) {
+            cmd.env_remove("RUSTC_WRAPPER");
+        }
         if let Some(tc) = overrides.rustup_toolchain.as_deref() {
             cmd.env("RUSTUP_TOOLCHAIN", tc);
+        } else {
+            cmd.env_remove("RUSTUP_TOOLCHAIN");
         }
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "jato rust-analyzer: failed to spawn {}: {e}",
-                    key.ra_bin.display()
-                );
-                return None;
-            }
-        };
-        let pid = child.id();
-        let mut stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
-
         let (out_tx, out_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-        thread::spawn(move || {
-            for bytes in out_rx {
-                if stdin.write_all(&bytes).is_err() || stdin.flush().is_err() {
-                    break;
-                }
-            }
-        });
-
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setup_cancelled = Arc::clone(&cancelled);
         let ev_tx = self.tx.clone();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            while let Ok(Some(msg)) = read_lsp_message(&mut reader) {
-                if ev_tx.send(DaemonEvent::BackendMessage(bid, msg)).is_err() {
-                    break;
+        let cache_dir = self.cfg.cache_dir.clone();
+        let ws_for_seed = initial_ws.to_path_buf();
+        let target_for_seed = target_dir.clone();
+        let check_target_to_create = effective.check_target_dir.clone();
+        let seed_enabled = effective.seed;
+        let rustup_tc = overrides.rustup_toolchain.clone();
+        let cargo_extra_env = effective.cargo_extra_env.clone();
+        let ra_bin_for_log = key.ra_bin.clone();
+
+        struct SetupExitGuard {
+            ev_tx: Sender<DaemonEvent>,
+            bid: BackendId,
+            armed: bool,
+        }
+        impl Drop for SetupExitGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = self.ev_tx.send(DaemonEvent::BackendExited(self.bid));
                 }
             }
-            let _ = ev_tx.send(DaemonEvent::BackendExited(bid));
+        }
+
+        let setup_handle = thread::spawn(move || {
+            let mut exit_guard = SetupExitGuard {
+                ev_tx: ev_tx.clone(),
+                bid,
+                armed: true,
+            };
+            if setup_cancelled.load(Ordering::Acquire) {
+                exit_guard.armed = false;
+                return;
+            }
+            let mut seeded_files = 0usize;
+            if let Some(ref tdir) = target_for_seed {
+                if seed_enabled {
+                    match crate::command::seed_target_for_workspace(
+                        &cache_dir,
+                        &ws_for_seed,
+                        tdir,
+                        rustup_tc.as_deref(),
+                        &cargo_extra_env,
+                        &setup_cancelled,
+                    ) {
+                        Ok(n) => seeded_files = n,
+                        Err(e) => {
+                            eprintln!("jato rust-analyzer: pre-seed skipped: {e:#}");
+                        }
+                    }
+                }
+                let _ = fs::create_dir_all(tdir);
+            }
+            if let Some(ref check_dir) = check_target_to_create {
+                let _ = fs::create_dir_all(check_dir);
+            }
+            if setup_cancelled.load(Ordering::Acquire) {
+                exit_guard.armed = false;
+                return;
+            }
+
+            let stderr = File::create(&log_path).map_or_else(|_| Stdio::null(), Stdio::from);
+            cmd.stderr(stderr);
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "jato rust-analyzer: failed to spawn {}: {e}",
+                        ra_bin_for_log.display()
+                    );
+                    return;
+                }
+            };
+            let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+                let _guard = ManagedChild::new(child);
+                return;
+            };
+            let managed = ManagedChild::new(child);
+            if setup_cancelled.load(Ordering::Acquire) {
+                exit_guard.armed = false;
+                drop(managed);
+                return;
+            }
+
+            // Send `BackendSpawned` strictly before starting the stdout reader so
+            // the daemon always receives `BackendSpawned` ahead of any `BackendMessage`
+            // or `BackendExited` on the FIFO event channel. `ManagedChild` guarantees
+            // `-pgrp` is killed and reaped even if `ev_tx` is dropped or unread.
+            if ev_tx
+                .send(DaemonEvent::BackendSpawned {
+                    bid,
+                    child: managed,
+                    seeded_files,
+                })
+                .is_err()
+            {
+                exit_guard.armed = false;
+                return;
+            }
+            exit_guard.armed = false;
+
+            thread::spawn(move || {
+                for bytes in out_rx {
+                    if stdin.write_all(&bytes).is_err() || stdin.flush().is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let read_tx = ev_tx.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                while let Ok(Some(msg)) = read_lsp_message(&mut reader) {
+                    if read_tx.send(DaemonEvent::BackendMessage(bid, msg)).is_err() {
+                        break;
+                    }
+                }
+                let _ = read_tx.send(DaemonEvent::BackendExited(bid));
+            });
         });
 
         let now = Instant::now();
@@ -2826,6 +3414,11 @@ impl Daemon {
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or("workspace");
+        // Note: intentionally do NOT advertise `textDocument.diagnostic` here.
+        // Advertising pull diagnostics makes rust-analyzer suppress native
+        // `textDocument/publishDiagnostics` pushes for push-only editors, while
+        // rust-analyzer still answers explicit `textDocument/diagnostic` pull
+        // requests from `jato diag` without it.
         let init_msg = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -2861,11 +3454,17 @@ impl Daemon {
         let backend = BackendState {
             id: bid,
             key: key.clone(),
-            child,
-            pid,
+            child: None,
+            pid: 0,
+            cancelled,
+            setup_handle: Some(setup_handle),
             tx: out_tx,
             target_dir,
             ra_settings,
+            cache_backed: effective.cache_backed,
+            check_via_jato: effective.check_via_jato,
+            seeded_files: 0,
+            cli_warmed: false,
             init_result: None,
             ready: false,
             quiescent: false,
@@ -2892,6 +3491,33 @@ impl Daemon {
         Some(bid)
     }
 
+    fn on_backend_spawned(
+        &mut self,
+        bid: BackendId,
+        mut managed: ManagedChild,
+        seeded_files: usize,
+    ) {
+        if let Some(b) = self.backends.get_mut(&bid) {
+            let now = Instant::now();
+            b.pid = managed.pid;
+            b.child = managed.take();
+            b.seeded_files = seeded_files;
+            b.setup_handle = None;
+            b.last_activity = now;
+            for folder in b.loaded_folders.values_mut() {
+                if !folder.ready {
+                    folder.added_at = now;
+                }
+            }
+            if seeded_files > 0 {
+                self.backends_seeded += 1;
+                self.seeded_files_total += seeded_files as u64;
+            }
+        }
+        // If `bid` was stopped/evicted before its setup thread finished, dropping
+        // `managed` here immediately SIGKILLs `-pgrp` and waits on the child.
+    }
+
     fn replay_client_docs(&mut self, bid: BackendId, cid: ClientId) {
         let docs: Vec<(String, ClientDoc)> = self
             .clients
@@ -2916,12 +3542,25 @@ impl Daemon {
         language_id: &str,
         text: &str,
     ) {
+        let caller_is_cli = self.clients.get(&cid).is_some_and(|c| c.is_cli);
+        let has_editor_holder = self
+            .backends
+            .get(&bid)
+            .and_then(|b| b.open_docs.get(uri))
+            .is_some_and(|existing| {
+                existing
+                    .holders
+                    .iter()
+                    .any(|&h| h != cid && self.clients.get(&h).is_some_and(|c| !c.is_cli))
+            });
         let Some(b) = self.backends.get_mut(&bid) else {
             return;
         };
         if let Some(existing) = b.open_docs.get_mut(uri) {
             existing.holders.insert(cid);
-            if existing.text != text {
+            // Never let a transient CLI query overwrite an active editor's
+            // unsaved buffer in the shared backend.
+            if existing.text != text && !(caller_is_cli && has_editor_holder) {
                 existing.version += 1;
                 existing.text = text.to_owned();
                 existing.digest = *blake3::hash(text.as_bytes()).as_bytes();
@@ -3128,17 +3767,38 @@ impl Daemon {
         // If this is a request for a workspace that was just added/started and
         // has not finished initial Cargo metadata load yet, queue it briefly so
         // the client gets real results instead of an early empty response.
+        let is_cli_client = self.clients.get(&cid).is_some_and(|c| c.is_cli);
         if msg.get("id").is_some()
             && let Some(ws) = client_root.as_ref()
             && let Some(folder) = b.loaded_folders.get(ws)
-            && !folder.is_ready_or_timed_out()
         {
-            b.pending_folder_ready.push_back(QueuedReadyMsg {
-                client_id: cid,
-                workspace_root: ws.clone(),
-                msg,
-            });
-            return;
+            if !folder.is_ready_or_timed_out() {
+                b.pending_folder_ready.push_back(QueuedReadyMsg {
+                    client_id: cid,
+                    workspace_root: ws.clone(),
+                    msg,
+                });
+                return;
+            }
+            // Never let `jato diag` silently return 0 errors when workspace
+            // analysis timed out before becoming ready.
+            if !folder.ready
+                && is_cli_client
+                && method.as_deref() == Some("textDocument/diagnostic")
+                && let Some(req_id) = msg.get("id").cloned()
+            {
+                if let Some(c) = self.clients.get(&cid) {
+                    c.send(&json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32001,
+                            "message": "rust-analyzer workspace analysis did not finish within ready timeout"
+                        }
+                    }));
+                }
+                return;
+            }
         }
 
         self.send_request_or_notif(bid, cid, msg);
@@ -3280,7 +3940,11 @@ impl Daemon {
                         }
                         return;
                     }
-                    doc.holders.iter().copied().next()
+                    // Prefer non-CLI editor holders deterministically when restoring.
+                    doc.holders
+                        .iter()
+                        .copied()
+                        .min_by_key(|h| (self.clients.get(h).is_some_and(|c| c.is_cli), *h))
                 }
                 None => return,
             }
@@ -3418,9 +4082,12 @@ impl Daemon {
             if req.waiters.is_empty() {
                 return;
             }
-            // Retry transient `ContentModified` (-32801) caused by sibling worktree reload.
+            // Retry transient `ContentModified` (-32801) or retriggerable LSP 3.17
+            // `ServerCancelled` (-32802 with `data.retriggerRequest == true`).
             let err_code = msg.pointer("/error/code").and_then(Value::as_i64);
-            if matches!(err_code, Some(-32801)) && req.retries_left > 0 {
+            let retrigger = err_code == Some(-32802)
+                && msg.pointer("/error/data/retriggerRequest") == Some(&Value::Bool(true));
+            if (matches!(err_code, Some(-32801)) || retrigger) && req.retries_left > 0 {
                 req.retries_left -= 1;
                 if let Some(b) = self.backends.get_mut(&bid) {
                     let token = b.next_retry_token;
@@ -3651,19 +4318,18 @@ impl Daemon {
     }
 
     fn flush_ready_queue(&mut self, bid: BackendId) {
-        let queued: Vec<QueuedReadyMsg> = {
+        let queued: Vec<(QueuedReadyMsg, bool)> = {
             let Some(b) = self.backends.get_mut(&bid) else {
                 return;
             };
             let mut ready = Vec::new();
             let mut keep = VecDeque::new();
             while let Some(item) = b.pending_folder_ready.pop_front() {
-                let is_ready = b
-                    .loaded_folders
-                    .get(&item.workspace_root)
-                    .is_none_or(FolderState::is_ready_or_timed_out);
+                let folder = b.loaded_folders.get(&item.workspace_root);
+                let is_ready = folder.is_none_or(FolderState::is_ready_or_timed_out);
+                let timed_out = folder.is_some_and(|f| !f.ready && f.is_ready_or_timed_out());
                 if is_ready {
-                    ready.push(item);
+                    ready.push((item, timed_out));
                 } else {
                     keep.push_back(item);
                 }
@@ -3671,10 +4337,26 @@ impl Daemon {
             b.pending_folder_ready = keep;
             ready
         };
-        for item in queued {
-            if self.clients.contains_key(&item.client_id) {
-                self.send_request_or_notif(bid, item.client_id, item.msg);
+        for (item, timed_out) in queued {
+            let Some(c) = self.clients.get(&item.client_id) else {
+                continue;
+            };
+            if timed_out
+                && c.is_cli
+                && item.msg.get("method").and_then(Value::as_str) == Some("textDocument/diagnostic")
+                && let Some(req_id) = item.msg.get("id").cloned()
+            {
+                c.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32001,
+                        "message": "rust-analyzer workspace analysis did not finish within ready timeout"
+                    }
+                }));
+                continue;
             }
+            self.send_request_or_notif(bid, item.client_id, item.msg);
         }
     }
 
@@ -3707,17 +4389,20 @@ impl Daemon {
         let Some(mut b) = self.backends.remove(&bid) else {
             return;
         };
+        b.cancelled.store(true, Ordering::Release);
         if self.backend_by_key.get(&b.key) == Some(&bid) {
             self.backend_by_key.remove(&b.key);
         }
         // Reap any orphaned proc-macro-srv / cargo children in the crashed
         // backend's process group BEFORE `wait()` reaps `b.pid` (so the PGID
         // cannot be reused and shared `target_dir` locks release immediately).
-        let pgrp = b.pid as libc::pid_t;
-        unsafe {
-            libc::kill(-pgrp, libc::SIGKILL);
+        if let Some(mut child) = b.child.take() {
+            let pgrp = b.pid as libc::pid_t;
+            unsafe {
+                libc::kill(-pgrp, libc::SIGKILL);
+            }
+            let _ = child.wait();
         }
-        let _ = b.child.wait();
 
         // Fail any in-flight or retrying requests cleanly so clients never hang.
         for req in b.in_flight.into_values().chain(b.retrying.into_values()) {
@@ -3780,6 +4465,7 @@ impl Daemon {
         counted_as_eviction: bool,
     ) -> Option<thread::JoinHandle<()>> {
         let mut b = self.backends.remove(&bid)?;
+        b.cancelled.store(true, Ordering::Release);
         if self.backend_by_key.get(&b.key) == Some(&bid) {
             self.backend_by_key.remove(&b.key);
         }
@@ -3794,17 +4480,23 @@ impl Daemon {
                 c.backend_id = None;
             }
         }
-        b.send(
-            &json!({ "jsonrpc": "2.0", "id": b.next_req_id, "method": "shutdown", "params": null }),
-        );
-        b.send(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null }));
+        if b.child.is_some() {
+            b.send(
+                &json!({ "jsonrpc": "2.0", "id": b.next_req_id, "method": "shutdown", "params": null }),
+            );
+            b.send(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null }));
+        }
         drop(b.tx);
+        let setup_handle = b.setup_handle.take();
+        let Some(mut child) = b.child.take() else {
+            return setup_handle;
+        };
         let pid = b.pid;
         Some(thread::spawn(move || {
             let pgrp = pid as libc::pid_t;
             let deadline = Instant::now() + Duration::from_millis(1200);
             while Instant::now() < deadline {
-                if matches!(b.child.try_wait(), Ok(Some(_))) {
+                if matches!(child.try_wait(), Ok(Some(_))) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -3814,8 +4506,7 @@ impl Daemon {
             }
             let term_deadline = Instant::now() + Duration::from_millis(300);
             while Instant::now() < term_deadline {
-                if matches!(b.child.try_wait(), Ok(Some(_))) && unsafe { libc::kill(-pgrp, 0) } != 0
-                {
+                if matches!(child.try_wait(), Ok(Some(_))) && unsafe { libc::kill(-pgrp, 0) } != 0 {
                     return;
                 }
                 thread::sleep(Duration::from_millis(25));
@@ -3823,8 +4514,8 @@ impl Daemon {
             unsafe {
                 libc::kill(-pgrp, libc::SIGKILL);
             }
-            let _ = b.child.kill();
-            let _ = b.child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
             for _ in 0..20 {
                 if unsafe { libc::kill(-pgrp, 0) } != 0 {
                     break;
@@ -3846,7 +4537,12 @@ impl Daemon {
     }
 
     fn refresh_rss(&mut self) {
-        let pids: Vec<u32> = self.backends.values().map(|b| b.pid).collect();
+        let pids: Vec<u32> = self
+            .backends
+            .values()
+            .map(|b| b.pid)
+            .filter(|&p| p != 0)
+            .collect();
         let measured = measure_group_rss(&pids);
         for b in self.backends.values_mut() {
             if let Some(&rss) = measured.get(&b.pid) {
@@ -3865,12 +4561,15 @@ impl Daemon {
     }
 
     fn pick_eviction_victim(&self) -> Option<BackendId> {
-        // Never evict a backend with in-flight, retrying, or queued requests;
-        // prefer 0 active clients, then oldest last_activity.
+        // Never evict a backend that is still seeding/initializing or has
+        // in-flight, retrying, or queued requests; prefer 0 active clients,
+        // then oldest last_activity.
         self.backends
             .values()
             .filter(|b| {
-                b.in_flight.is_empty()
+                b.pid != 0
+                    && b.ready
+                    && b.in_flight.is_empty()
                     && b.retrying.is_empty()
                     && b.pending_folder_ready.is_empty()
                     && b.pending_init.is_empty()
@@ -3947,11 +4646,20 @@ impl Daemon {
             }
 
             if active_ws.is_empty() {
+                if b.pid == 0 {
+                    continue;
+                }
                 let grace = if self.clients.values().any(|c| c.backend_id == Some(bid)) {
                     if self.cfg.idle_timeout.is_zero() {
                         continue;
                     }
                     self.cfg.idle_timeout
+                } else if b.cli_warmed {
+                    if self.cfg.idle_timeout.is_zero() {
+                        ORPHAN_BACKEND_GRACE
+                    } else {
+                        self.cfg.idle_timeout
+                    }
                 } else if self.cfg.idle_timeout.is_zero() {
                     ORPHAN_BACKEND_GRACE
                 } else {
@@ -3974,6 +4682,8 @@ impl Daemon {
             if b.ready && b.loaded_folders.len() > 1 {
                 let folder_grace = if self.cfg.idle_timeout.is_zero() {
                     ORPHAN_BACKEND_GRACE
+                } else if b.cli_warmed {
+                    self.cfg.idle_timeout
                 } else {
                     self.cfg.idle_timeout.min(ORPHAN_BACKEND_GRACE)
                 };
@@ -4081,9 +4791,15 @@ fn run_daemon() -> Result<i32> {
                 let event = match hs {
                     Handshake::Status => DaemonEvent::StatusRequest(stream),
                     Handshake::Stop => DaemonEvent::StopRequest(stream),
-                    Handshake::Lsp { cwd, overrides, .. } => DaemonEvent::NewLspClient {
+                    Handshake::Lsp {
                         cwd,
                         overrides,
+                        cli,
+                        ..
+                    } => DaemonEvent::NewLspClient {
+                        cwd,
+                        overrides,
+                        cli,
                         stream,
                     },
                 };
@@ -4109,13 +4825,22 @@ fn run_daemon() -> Result<i32> {
     });
 
     let mut daemon = Daemon::new(cfg, tx);
-    for event in rx {
+    for event in &rx {
         daemon.handle(event);
         if daemon.shutdown {
             break;
         }
     }
+    // Join all backend shutdown/setup threads first, then drain any queued
+    // `BackendSpawned` events so `ManagedChild::drop` reaps every child before
+    // acknowledging `jato rust-analyzer stop`.
     daemon.shutdown_all_backends();
+    while let Ok(ev) = rx.try_recv() {
+        drop(ev);
+    }
+    if let Some(mut stream) = daemon.stop_reply.take() {
+        let _ = wire::send(&mut stream, br#"{"ok":true}"#);
+    }
     Ok(0)
 }
 
@@ -4250,6 +4975,194 @@ mod tests {
             json!(false)
         );
         assert_eq!(config_section(&base, Some("rust-analyzer")), base);
+    }
+
+    #[test]
+    fn cache_backed_settings_wire_wrapper_and_check_override_respecting_client_opts() {
+        let cfg = DaemonConfig {
+            cache_dir: PathBuf::from("/tmp/jato-cache"),
+            target_root: PathBuf::from("/tmp/jato-cache-ra-targets"),
+            memory_budget: 4 << 30,
+            max_backends: 8,
+            idle_timeout: Duration::from_secs(600),
+            share_worktrees: true,
+            lazy: true,
+            threads: 4,
+            prime: false,
+            proc_macros: 1,
+            lru_capacity: 128,
+            shared_target_dir: None,
+            check_on_save: None,
+            cache: true,
+            seed: true,
+            check_via_jato: true,
+        };
+        let group = Path::new("/repo/.git");
+        let rustc_bin = Path::new("/usr/bin/rustc");
+        let ws = Path::new("/repo");
+        let exe = Path::new("/home/ben/.cargo/bin/jato");
+
+        // 1. Default config wires RUSTC_WRAPPER, JATO_CACHE_DIR, check.overrideCommand,
+        //    and an isolated sibling `-check` target dir for checkOnSave.
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({}),
+            &ClientEnvOverrides::default(),
+            Some(exe),
+        );
+        assert!(eff.cache_backed);
+        assert!(eff.seed);
+        assert!(eff.check_via_jato);
+        let tdir = eff.target_dir.as_ref().unwrap();
+        let check_dir = eff.check_target_dir.as_ref().unwrap();
+        assert_ne!(tdir, check_dir);
+        assert!(check_dir.to_string_lossy().ends_with("-check"));
+        assert_eq!(
+            settings.pointer("/cargo/extraEnv/RUSTC_WRAPPER"),
+            Some(&json!("/home/ben/.cargo/bin/jato"))
+        );
+        assert_eq!(
+            settings.pointer("/cargo/extraEnv/JATO_CACHE_DIR"),
+            Some(&json!("/tmp/jato-cache"))
+        );
+        assert_eq!(
+            settings.pointer("/check/overrideCommand"),
+            Some(&json!([
+                "/home/ben/.cargo/bin/jato",
+                "check",
+                "--workspace",
+                "--all-targets",
+                "--message-format=json"
+            ]))
+        );
+        assert_eq!(
+            settings.pointer("/check/extraEnv/CARGO_TARGET_DIR"),
+            Some(&json!(check_dir.to_string_lossy()))
+        );
+
+        // 2. Client customizing check.command (clippy) or cargo.features / cargo.target
+        //    keeps client settings instead of forcing overrideCommand.
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({ "check": { "command": "clippy" } }),
+            &ClientEnvOverrides::default(),
+            Some(exe),
+        );
+        assert!(eff.cache_backed);
+        assert!(!eff.check_via_jato);
+        assert!(settings.pointer("/check/overrideCommand").is_none());
+        assert_eq!(settings.pointer("/check/command"), Some(&json!("clippy")));
+
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({ "cargo": { "features": "all" } }),
+            &ClientEnvOverrides::default(),
+            Some(exe),
+        );
+        assert!(eff.cache_backed);
+        assert!(!eff.seed);
+        assert!(!eff.check_via_jato);
+        assert!(settings.pointer("/check/overrideCommand").is_none());
+
+        // 3. Client disabling checkOnSave (bool or legacy object) skips overrideCommand.
+        for opt in [
+            json!({ "checkOnSave": false }),
+            json!({ "checkOnSave": { "enable": false } }),
+        ] {
+            let (settings, eff) = cfg.merged_ra_settings_with_exe(
+                group,
+                rustc_bin,
+                ws,
+                &opt,
+                &ClientEnvOverrides::default(),
+                Some(exe),
+            );
+            assert!(!eff.check_via_jato);
+            assert!(settings.pointer("/check/overrideCommand").is_none());
+        }
+
+        // 4. JATO_RA_CACHE=0 or client overriding RUSTC_WRAPPER disables wrapper,
+        //    seeding, and check override cleanly.
+        let ov_off = ClientEnvOverrides {
+            cache: Some(false),
+            ..ClientEnvOverrides::default()
+        };
+        let (settings, eff) =
+            cfg.merged_ra_settings_with_exe(group, rustc_bin, ws, &json!({}), &ov_off, Some(exe));
+        assert!(!eff.cache_backed);
+        assert!(!eff.seed);
+        assert!(!eff.check_via_jato);
+        assert!(settings.pointer("/cargo/extraEnv/RUSTC_WRAPPER").is_none());
+        assert!(settings.pointer("/check/overrideCommand").is_none());
+
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({ "cargo": { "extraEnv": { "RUSTC_WRAPPER": "sccache" } } }),
+            &ClientEnvOverrides::default(),
+            Some(exe),
+        );
+        assert!(!eff.cache_backed);
+        assert!(!eff.seed);
+        assert!(!eff.check_via_jato);
+        assert!(settings.pointer("/check/overrideCommand").is_none());
+
+        // 5. Client custom cargo.targetDir (relative resolved against ws, and boolean `true`).
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({ "cargo": { "targetDir": "target/ra-custom" } }),
+            &ClientEnvOverrides::default(),
+            Some(exe),
+        );
+        assert_eq!(
+            eff.target_dir.as_deref(),
+            Some(Path::new("/repo/target/ra-custom"))
+        );
+        assert_eq!(
+            settings.pointer("/check/extraEnv/CARGO_TARGET_DIR"),
+            Some(&json!("/repo/target/ra-custom-check"))
+        );
+
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({ "cargo": { "targetDir": true } }),
+            &ClientEnvOverrides::default(),
+            Some(exe),
+        );
+        assert!(eff.target_dir.is_none());
+        assert!(!eff.seed);
+        assert!(!eff.check_via_jato);
+        assert!(settings.pointer("/check/overrideCommand").is_none());
+
+        // 6. Client passing `extraEnv: null` must not break JATO_RA_CACHE=1 injection.
+        let ov_force = ClientEnvOverrides {
+            cache: Some(true),
+            ..ClientEnvOverrides::default()
+        };
+        let (settings, eff) = cfg.merged_ra_settings_with_exe(
+            group,
+            rustc_bin,
+            ws,
+            &json!({ "cargo": { "extraEnv": null } }),
+            &ov_force,
+            Some(exe),
+        );
+        assert!(eff.cache_backed);
+        assert_eq!(
+            settings.pointer("/cargo/extraEnv/RUSTC_WRAPPER"),
+            Some(&json!("/home/ben/.cargo/bin/jato"))
+        );
     }
 
     struct Rng(u64);

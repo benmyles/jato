@@ -3003,6 +3003,384 @@ pub fn seed_from(job: &Job, store: &mut Store, recipe: &Digest) -> Option<Start>
     })
 }
 
+/// Resolve `target` to a stable canonical path even if it does not exist yet
+/// (matching `session::canonical_target` so both share the same target lock).
+#[cfg(target_os = "linux")]
+fn canonical_target_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = fs::canonicalize(cur) {
+            let mut out = canon;
+            for part in missing.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        let Some(name) = cur.file_name() else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Pre-seed an empty target directory (such as `rust-analyzer`'s shared
+/// `cargo.targetDir`) from the best compatible recorded whole build of
+/// `workspace_root` in `cache_dir`.
+///
+/// Constructs the `TARGET` root directly from `target_dir` (never climbing to
+/// an ancestor `CACHEDIR.TAG`), rejects any output path containing `..` or
+/// absolute components, only writes files inside `target_dir`, skips
+/// non-blockingly when another process holds `locks/target-<hash>`, requires no
+/// manifest/target replanning (`replanned.is_empty()`), leaves out stale or
+/// path-pinned parts and build scripts whose inputs changed, and aborts early
+/// if `cancelled` is set.
+///
+/// Returns the number of restored files (`0` if `target_dir` is already
+/// populated, busy, cancelled, or no compatible build exists).
+#[cfg(target_os = "linux")]
+pub fn seed_target_for_workspace(
+    cache_dir: &Path,
+    workspace_root: &Path,
+    target_dir: &Path,
+    rustup_toolchain: Option<&str>,
+    extra_env: &BTreeMap<OsString, OsString>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<usize> {
+    use std::path::Component;
+    use std::sync::atomic::Ordering;
+
+    if cancelled.load(Ordering::Acquire)
+        || env::var_os("JATO_DISABLE").is_some_and(|v| v == "1")
+        || env::var_os("JATO_WHOLE_BUILDS").is_some_and(|v| v == "0")
+        || env::var_os("JATO_NEAR").is_some_and(|v| v == "0")
+        || env::var_os("JATO_SEED").is_some_and(|v| v == "0")
+        || env::var_os("JATO_RELOCATE").is_some_and(|v| v == "0")
+    {
+        return Ok(0);
+    }
+
+    let canon_ws =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let resolved_target = if target_dir.is_absolute() {
+        target_dir.to_path_buf()
+    } else {
+        canon_ws.join(target_dir)
+    };
+    let canon_target = canonical_target_path(&resolved_target);
+    let (Some(work_root), Some(target_root)) =
+        (roots::Root::new(&canon_ws), roots::Root::new(&canon_target))
+    else {
+        return Ok(0);
+    };
+    let roots = Roots {
+        work: Some(work_root),
+        target: Some(target_root),
+    };
+    if !target_is_empty(&roots) {
+        return Ok(0);
+    }
+
+    // Serialize non-blockingly with any concurrent `jato check`/`build`
+    // targeting `canon_target`: pre-seeding is an optimization and must never
+    // stall `rust-analyzer` startup or daemon shutdown.
+    let mut lock_hash = blake3::Hasher::new_derive_key("jato target lock v1");
+    lock_hash.update(canon_target.as_os_str().as_bytes());
+    let locks_dir = cache_dir.join("locks");
+    let _ = fs::create_dir_all(&locks_dir);
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(locks_dir.join(format!("target-{}", &lock_hash.finalize().to_hex()[..32])))?;
+    match lock_file.try_lock() {
+        Ok(()) => (),
+        Err(fs::TryLockError::WouldBlock) => {
+            log("ra-seed", "target dir is busy; skipping optional pre-seed");
+            return Ok(0);
+        }
+        Err(e) => return Err(e).context("locking target dir for seeding"),
+    }
+
+    // Re-check under the lock in case another process populated it first.
+    if cancelled.load(Ordering::Acquire) || !target_is_empty(&roots) {
+        return Ok(0);
+    }
+
+    let begun = Instant::now();
+    let mut store = Store::open_at(cache_dir.to_path_buf())?;
+
+    let mut env_map: BTreeMap<OsString, OsString> = env::vars_os().collect();
+    // Never bleed the daemon's startup RUSTUP_TOOLCHAIN into a client that did not set one.
+    match rustup_toolchain {
+        Some(tc) => {
+            env_map.insert(OsString::from("RUSTUP_TOOLCHAIN"), OsString::from(tc));
+        }
+        None => {
+            env_map.remove(OsStr::new("RUSTUP_TOOLCHAIN"));
+        }
+    }
+    for (k, v) in extra_env {
+        env_map.insert(k.clone(), v.clone());
+    }
+    let cargo_prog = crate::cargo_program()
+        .map(|(p, _)| p)
+        .unwrap_or_else(|_| OsString::from("cargo"));
+    let request = Request {
+        program: cargo_prog,
+        args: vec![OsString::from("check")],
+        cwd: canon_ws,
+        env: env_map,
+        spare: false,
+    };
+    let job = Job::build(request, "ra-seed", roots, Vec::new());
+    let (env_tag, _) = build_profile_tag(&job);
+
+    store.begin_read();
+    let zero_recipe = [0u8; 32];
+    let mut candidates = store
+        .whole_builds(&env_tag, &zero_recipe)
+        .unwrap_or_default();
+    if candidates.is_empty() {
+        log(
+            "ra-seed",
+            "no recorded whole builds match this toolchain/profile",
+        );
+        store.end_read();
+        return Ok(0);
+    }
+    // Prefer check/clippy builds (`kind <= 1`) to restore `.rmeta`, build
+    // scripts, and proc-macros without copying huge debug binaries; fall back
+    // to build/test builds if no check/clippy build is cached.
+    candidates.sort_by_key(|(_, cand, kind, outputs)| {
+        let is_check_like = *kind <= 1;
+        (
+            std::cmp::Reverse(is_check_like),
+            std::cmp::Reverse(*outputs),
+            std::cmp::Reverse(cand.used),
+        )
+    });
+
+    let mut here = Here::new(
+        &job.roots,
+        &job.request.env,
+        &job.path,
+        job.facts.width,
+        job.facts.ansi,
+    );
+    struct SeedPick {
+        at: usize,
+        count: usize,
+        manifest: Manifest,
+        again: Vec<bool>,
+        scripts: Vec<bool>,
+    }
+    let mut best: Option<SeedPick> = None;
+    let time = time_before(&job.roots);
+    for (at, (cand_recipe, candidate, _, _)) in candidates.iter().enumerate().take(8) {
+        if cancelled.load(Ordering::Acquire) {
+            store.end_read();
+            return Ok(0);
+        }
+        let stored = store.record(candidate).unwrap_or_default();
+        let manifest = match Manifest::decode_verified(&stored, cand_recipe, &candidate.key) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                log(
+                    "ra-seed",
+                    format_args!("candidate {at}: decode failed: {e:#}"),
+                );
+                continue;
+            }
+        };
+        if manifest.parts.is_empty() {
+            log("ra-seed", format_args!("candidate {at}: no parts"));
+            continue;
+        }
+        let mut probes = manifest
+            .inputs
+            .iter()
+            .filter(|i| i.root == roots::WORK && matches!(i.state, State::File(_)))
+            .take(4)
+            .peekable();
+        if probes.peek().is_some()
+            && !probes.any(|i| job.roots.join(i.root, &i.path).is_some_and(|p| p.exists()))
+        {
+            log(
+                "ra-seed",
+                format_args!("candidate {at}: workspace probe mismatch"),
+            );
+            continue;
+        }
+        let elsewhere = manifest.placed(&job.roots).err();
+        if elsewhere.is_some() && manifest.pinned.is_empty() {
+            log(
+                "ra-seed",
+                format_args!("candidate {at}: pinned without part map"),
+            );
+            continue;
+        }
+        let differences = match manifest.differences(&mut here, &mut store, MOST) {
+            Ok(d) => d,
+            Err(e) => {
+                log(
+                    "ra-seed",
+                    format_args!("candidate {at}: differences exceeded: {e:?}"),
+                );
+                continue;
+            }
+        };
+        let Stale {
+            mut again,
+            scripts,
+            replanned,
+        } = match manifest.stale_parts(&differences) {
+            Ok(s) => s,
+            Err(e) => {
+                log(
+                    "ra-seed",
+                    format_args!("candidate {at}: stale_parts rejected: {e:?}"),
+                );
+                continue;
+            }
+        };
+        // Standalone pre-seeding has no post-Cargo prune pass, so skip
+        // candidates whose manifests/targets/lockfile changed (`replanned`).
+        if !replanned.is_empty() {
+            log(
+                "ra-seed",
+                format_args!(
+                    "candidate {at}: skipped because manifests/targets changed ({} replanned)",
+                    replanned.len()
+                ),
+            );
+            continue;
+        }
+        if elsewhere.is_some() {
+            for &part in &manifest.pinned {
+                again[part as usize] = true;
+            }
+        }
+        let count = again.iter().filter(|a| **a).count();
+        if count * 2 > manifest.parts.len() {
+            log(
+                "ra-seed",
+                format_args!(
+                    "candidate {at}: too many stale parts ({count}/{})",
+                    manifest.parts.len()
+                ),
+            );
+            continue;
+        }
+        best = Some(SeedPick {
+            at,
+            count,
+            manifest,
+            again,
+            scripts,
+        });
+        break;
+    }
+
+    let Some(SeedPick {
+        at,
+        count,
+        manifest,
+        again,
+        scripts,
+    }) = best
+    else {
+        store.end_read();
+        return Ok(0);
+    };
+
+    let candidate = &candidates[at].1;
+    let mut leave = vec![false; manifest.outputs.len()];
+    let mut kept: HashSet<u32> = HashSet::new();
+    let mut gone: HashSet<Digest> = HashSet::new();
+    for (part, again) in manifest.parts.iter().zip(&again) {
+        for &output in &part.outputs {
+            if *again {
+                leave[output as usize] = true;
+                gone.insert(manifest.outputs[output as usize].digest);
+            } else {
+                kept.insert(output);
+            }
+        }
+    }
+    let is_safe_target_rel = |p: &Path| {
+        !p.as_os_str().is_empty()
+            && p.components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    };
+    for (idx, output) in manifest.outputs.iter().enumerate() {
+        if output.root != roots::TARGET || !is_safe_target_rel(&output.path) {
+            leave[idx] = true;
+            continue;
+        }
+        if output.size > 0 && !kept.contains(&(idx as u32)) && gone.contains(&output.digest) {
+            leave[idx] = true;
+        }
+    }
+    for (script, again) in manifest.scripts.iter().zip(&scripts) {
+        if *again || leave[script.program as usize] {
+            leave[script.program as usize] = true;
+            for &output in &script.outputs {
+                leave[output as usize] = true;
+            }
+        }
+    }
+
+    if cancelled.load(Ordering::Acquire) || !target_is_empty(&job.roots) {
+        store.end_read();
+        return Ok(0);
+    }
+
+    let mut damaged = false;
+    let how = crate::cas::Placing {
+        tree: true,
+        leave: Some(&leave),
+        time,
+        remap_out: None,
+    };
+    let restored = store.restore(candidate, &manifest, &job.roots, how, &mut damaged);
+    store.end_read();
+    let restored = match restored {
+        Ok(Some(restored)) => restored,
+        Ok(None) => {
+            if damaged {
+                store.forget(&candidate.key);
+            }
+            return Ok(0);
+        }
+        Err(e) => {
+            log("ra-seed", format_args!("could not seed target: {e:#}"));
+            return Ok(0);
+        }
+    };
+    store.count("ra_seeded", 1);
+    store.count("restored_bytes", restored.bytes);
+    log(
+        "ra-seed",
+        format_args!(
+            "pre-seeded rust-analyzer target in {} ms: {} of {} files placed, {} of {} compilations left out",
+            begun.elapsed().as_millis(),
+            restored.files,
+            manifest.outputs.len(),
+            count,
+            manifest.parts.len(),
+        ),
+    );
+    Ok(restored.files)
+}
+
 /// The directories in which git keeps the repositories a command looked
 /// at: those named `.git`, those a file of that name leads to, as it does
 /// in a worktree, and the one a worktree shares with the others.

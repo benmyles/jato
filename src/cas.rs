@@ -1153,6 +1153,10 @@ fn stage_file(
 
 impl Store {
     pub fn open() -> Result<Self> {
+        Self::open_at(cache_dir()?)
+    }
+
+    pub fn open_at(dir: PathBuf) -> Result<Self> {
         let env_limit = env::var("JATO_MAX_SIZE")
             .ok()
             .map(|s| parse_size(&s))
@@ -1162,7 +1166,6 @@ impl Store {
             .filter(|s| !s.trim().is_empty())
             .map(|s| parse_size(&s))
             .transpose()?;
-        let dir = cache_dir()?;
         let mut store = match Self::at(dir.clone()) {
             Err(e) if damaged_index(&e) => {
                 set_aside(&dir);

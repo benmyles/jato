@@ -10,7 +10,7 @@ mod observe;
 mod ra;
 #[cfg(not(target_os = "linux"))]
 mod ra {
-    use anyhow::Result;
+    use anyhow::{Result, bail};
     use std::ffi::OsString;
     pub fn shim_main(args: &[OsString]) -> Result<i32> {
         let mut cmd = std::process::Command::new("rust-analyzer");
@@ -19,6 +19,28 @@ mod ra {
     }
     pub fn main(args: &[OsString]) -> Result<i32> {
         shim_main(args)
+    }
+    fn stub(name: &str, args: &[OsString]) -> Result<i32> {
+        if args.iter().any(|a| a == "-h" || a == "--help") {
+            println!("jato {name} requires Linux (shared jato rust-analyzer daemon).");
+            return Ok(0);
+        }
+        bail!("jato {name} requires Linux")
+    }
+    pub fn cli_diag(args: &[OsString]) -> Result<i32> {
+        stub("diag", args)
+    }
+    pub fn cli_def(args: &[OsString]) -> Result<i32> {
+        stub("def", args)
+    }
+    pub fn cli_refs(args: &[OsString]) -> Result<i32> {
+        stub("refs", args)
+    }
+    pub fn cli_hover(args: &[OsString]) -> Result<i32> {
+        stub("hover", args)
+    }
+    pub fn cli_symbols(args: &[OsString]) -> Result<i32> {
+        stub("symbols", args)
     }
 }
 mod remote;
@@ -91,7 +113,12 @@ Usage
   jato cargo [ARGUMENTS...]        Run any Cargo command, including +toolchain
   jato dev [ACTION] [ARGS...]       Use the fast development profile (default build)
   jato watch [OPTIONS]             Check on save, with changed packages first
-  jato rust-analyzer [CMD]         Share rust-analyzer across sessions & worktrees
+  jato rust-analyzer [CMD]         Share cache-backed rust-analyzer across sessions & worktrees (Linux)
+  jato diag [OPTIONS] [FILE...]    Instant typecheck diagnostics via warm rust-analyzer (Linux)
+  jato def <FILE:LINE:COL>         Go to definition / type / impl via warm rust-analyzer (Linux)
+  jato refs <FILE:LINE:COL>        Find references via warm rust-analyzer (Linux)
+  jato hover <FILE:LINE:COL>       Show type signature and docs via warm rust-analyzer (Linux)
+  jato symbols [FILE|--query Q]    List file or workspace symbols via warm rust-analyzer (Linux)
   jato stats [--json]              Show cache contents and counters
   jato why                         Explain why the last build was not cached or relocated
   jato limit [SIZE|--unset]         Read or set this cache directory's budget
@@ -946,6 +973,11 @@ fn run() -> Result<i32> {
         }
         Some("watch") => return watch::run(&args[1..], options),
         Some("rust-analyzer") => return ra::main(&args[1..]),
+        Some("diag") => return ra::cli_diag(&args[1..]),
+        Some("def") => return ra::cli_def(&args[1..]),
+        Some("refs") => return ra::cli_refs(&args[1..]),
+        Some("hover") => return ra::cli_hover(&args[1..]),
+        Some("symbols") => return ra::cli_symbols(&args[1..]),
         Some("cargo") => return cargo(&args[1..], options),
         // Started by this program to see a command's stragglers out.
         Some("__answer") if args.len() == 2 => {
